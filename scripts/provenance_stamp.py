@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-provenance_stamp.py - Firma y Trazabilidad Operativa de Acciones de Trading.
-Auditoría y metadatos de atribución para operaciones y decisiones agénticas.
+provenance_stamp.py - Operational Provenance and Trade Attribution Stamp.
+Auditing and attribution metadata for agentic trades and decisions.
 
-Registra de forma determinista el origen de cada orden y evaluación:
-Cada orden, salida a mercado, lección o ajuste de stop lleva una firma estructurada que identifica:
-1. Qué agente o evaluador emitió la señal (y su versión).
-2. Qué loop operacional ejecutó la orden.
-3. Qué estrategia técnica cuantitativa generó la hipótesis.
-4. Qué modelo de dimensionamiento de riesgo se utilizó.
+Deterministically logs the origin of every order and evaluation:
+Every order, market exit, lesson, or stop adjustment carries a structured signature identifying:
+1. Which agent or evaluator emitted the signal (and its version).
+2. Which operational loop executed the order.
+3. Which quantitative strategy generated the thesis.
+4. Which risk sizing model was applied.
 
-Gramática Canónica:
+Canonical Grammar:
   🤖 <agent>@<version> · via <loop>@<version> · strategy:<name>@<version> · sizing:<model>
 """
 
@@ -38,7 +38,7 @@ def generate_provenance_stamp(
     author: str = "agent"
 ) -> Dict[str, Any]:
     """
-    Genera el bloque estructurado de procedencia y el string canónico.
+    Generates structured provenance block and canonical string.
     """
     evaluator_full = f"{evaluator}@{evaluator_version}"
     loop_full = f"{loop}@{loop_version}"
@@ -61,7 +61,7 @@ def generate_provenance_stamp(
 
 def parse_provenance_stamp(stamp_str: str) -> Optional[Dict[str, str]]:
     """
-    Parsea un string de procedencia canónico en sus componentes estructurados.
+    Parses a canonical provenance string into structured components.
     """
     pattern = r"🤖\s+([^@]+)@([^\s]+)\s+·\s+via\s+([^@]+)@([^\s]+)\s+·\s+strategy:([^@]+)@([^\s]+)\s+·\s+sizing:([^\s]+)"
     match = re.search(pattern, stamp_str)
@@ -80,7 +80,7 @@ def parse_provenance_stamp(stamp_str: str) -> Optional[Dict[str, str]]:
 
 def stamp_trade_record(trade_record: Dict[str, Any], **kwargs) -> Dict[str, Any]:
     """
-    Adjunta metadatos de procedencia a un registro de trade antes de guardarlo en ledger.
+    Attaches provenance metadata to a trade record before saving to ledger.
     """
     prov = generate_provenance_stamp(**kwargs)
     trade_record["provenance"] = prov
@@ -89,6 +89,6 @@ def stamp_trade_record(trade_record: Dict[str, Any], **kwargs) -> Dict[str, Any]
 
 if __name__ == "__main__":
     test_stamp = generate_provenance_stamp()
-    print("Canónico:", test_stamp["canonical_stamp"])
+    print("Canonical:", test_stamp["canonical_stamp"])
     parsed = parse_provenance_stamp(test_stamp["canonical_stamp"])
-    print("Parseado:", parsed)
+    print("Parsed:", parsed)

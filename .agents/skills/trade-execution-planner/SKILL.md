@@ -48,5 +48,5 @@ Generate a clear, ranked table with 5 to 6 setups ordered by confluence and prob
 
 ## Phase 4: Notion Journal Sync
 Sync the chosen position to Notion:
-- Database: `Trading Journal - Futuros` (`collection://<YOUR_NOTION_COLLECTION_ID>`).
-- Include all parameters, strategy notes, and execution status (`Abierta` or `Pendiente`).
+- Database: `Trading Journal - Futures` (`collection://<YOUR_NOTION_COLLECTION_ID>`).
+- Include all parameters, strategy notes, and execution status (`Open` or `Pending`).

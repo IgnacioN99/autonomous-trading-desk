@@ -1,47 +1,47 @@
-# 🅿️ Parking Lot — Registro Inmutable de Estrategias e Ideas Diferidas
+# 🅿️ Parking Lot — Immutable Registry of Deferred Strategies & Ideas
 
-Este archivo es el repositorio formal de ideas cuantitativas, arquitecturas e hipótesis que están **fuera del alcance inmediato**, pero que deben preservarse intactas sin generar ruido ni context rot en las sesiones operativas diarias.
-
----
-
-## 💡 1. Estrategias Cuantitativas Diferidas
-
-### [PL-01] Arbitraje de Tasa de Financiación Tripartita (Funding Harvest Multi-Exchange)
-* **Fecha:** 2026-09-23 | **Estado:** `DIFERIDA`
-* **Hipótesis:** Long Spot (o Perp en exchange con funding negativo) vs Short Perp en Binance (funding positivo extremo). Capturar el yield pasivo cada 8 horas sin exposición direccional ($\Delta = 0$).
-* **Requisitos:** Integración con segundo exchange (Bybit / Hyperliquid / OKX) y sincronización atómica de órdenes entre APIs.
-* **Gatillo de activación:** Cuando la tasa de financiamiento anualizada supere el 25% APR durante más de 3 días consecutivos.
-
-### [PL-02] Stat-Arb Cointegrado con Filtro de Kalman Adaptativo
-* **Fecha:** 2026-09-23 | **Estado:** `EN EVALUACIÓN`
-* **Hipótesis:** Sustituir la regresión OLS estática de beta ($\beta_{A/B}$) por un Filtro de Kalman de espacio de estados que actualice el ratio de cobertura en tiempo real barra a barra para absorber cambios estructurales de volatilidad.
-* **Requisitos:** Implementar `pykalman` o filtro bayesiano propio en `scripts/quant_risk_engine.py`.
-
-### [PL-03] Microestructura L2: Order Flow Toxicity (VPIN - Volume-Synchronized Probability of Toxicity)
-* **Fecha:** 2026-09-23 | **Estado:** `DIFERIDA`
-* **Hipótesis:** Calcular el VPIN en bloques de volumen constante para anticipar quiebres de soportes por flujo institucional tóxico antes de que aparezcan en velas de 15m.
+This file serves as the formal repository for quantitative hypotheses, architectures, and strategies that are **outside current immediate scope**, but must be preserved intact without causing cognitive noise or context rot in daily trading sessions.
 
 ---
 
-## 🛠️ 2. Infraestructura y Automatización
+## 💡 1. Deferred Quantitative Strategies
 
-### [PL-04] Feed Directo WebSocket para Trailing Stop de Cero Latencia
-* **Fecha:** 2026-09-23 | **Estado:** `DIFERIDA`
-* **Hipótesis:** Reemplazar el sondeo REST de precios por un listener WebSocket directo a `wss://fstream.binance.com/ws/!miniTicker@arr` para actualizar trailing stops en sub-100ms.
-* **Riesgo:** Requiere mantener un proceso demonio persistente en background.
+### [PL-01] Tripartite Funding Rate Arbitrage (Multi-Exchange Funding Harvest)
+* **Date:** 2026-09-23 | **Status:** `DEFERRED`
+* **Hypothesis:** Long Spot (or Perp on exchange with negative funding) vs Short Perp on Binance (extreme positive funding). Harvest passive yield every 8 hours with zero directional risk ($\Delta = 0$).
+* **Requirements:** Integration with secondary exchange (Bybit / Hyperliquid / OKX) and atomic cross-API order routing.
+* **Activation Trigger:** When annualized net funding APR clears 25% for more than 3 consecutive days.
 
-### [PL-05] Notificaciones Push de Ejecución y Alertas (Telegram / Discord Webhook)
-* **Fecha:** 2026-09-23 | **Estado:** `LISTO PARA DESARROLLO`
-* **Hipótesis:** Disparar un mensaje breve cada vez que el Fast-Track ejecute una orden, se cobre un TP1 o el Night Cutoff Loop blinde a Break-Even.
+### [PL-02] Cointegrated Stat-Arb with Adaptive Kalman Filter
+* **Date:** 2026-09-23 | **Status:** `UNDER EVALUATION`
+* **Hypothesis:** Replace static OLS beta regression ($\beta_{A/B}$) with a state-space Kalman Filter that continuously updates hedge ratios bar-by-bar to absorb structural volatility shifts.
+* **Requirements:** Implement `pykalman` or custom Bayesian recursive filter in `scripts/quant_risk_engine.py`.
 
----
-
-## 📈 3. Gestión de Capital y Reglas de Escala
-
-### [PL-06] Transición a Mainnet con Escalado Gradual de Riesgo
-* **Fecha:** 2026-09-23 | **Estado:** `DIFERIDA`
-* **Criterio de Graduación:** Requiere acumular al menos 50 operaciones auditadas en Testnet con Sharpe Ratio $> 1.4$, Max Drawdown $< 5\%$ y cero fallos de Stop Loss huérfano.
+### [PL-03] L2 Microstructure: Order Flow Toxicity (VPIN - Volume-Synchronized Probability of Toxicity)
+* **Date:** 2026-09-23 | **Status:** `DEFERRED`
+* **Hypothesis:** Compute VPIN across constant volume buckets to detect institutional order flow toxicity and anticipate support breakdown before appearance on 15m candlesticks.
 
 ---
 
-*Regla: Toda nueva idea se agrega al final sin reescribir las anteriores. Cuando una idea se implementa, se marca como `GRADUADA` citando el PR o commit correspondiente.*
+## 🛠️ 2. Infrastructure & Automation
+
+### [PL-04] Direct WebSocket Feed for Zero-Latency Trailing Stop
+* **Date:** 2026-09-23 | **Status:** `DEFERRED`
+* **Hypothesis:** Replace REST price polling with a direct WebSocket listener at `wss://fstream.binance.com/ws/!miniTicker@arr` to update structural trailing stops sub-100ms.
+* **Risk:** Requires managing a persistent background daemon process.
+
+### [PL-05] Execution Push Notifications & Webhooks (Telegram / Discord)
+* **Date:** 2026-09-23 | **Status:** `READY FOR IMPLEMENTATION`
+* **Hypothesis:** Dispatch an immediate concise alert whenever Fast-Track places a trade, a TP1 is hit, or the Night Cutoff Loop locks a position to Break-Even.
+
+---
+
+## 📈 3. Capital Management & Scaling Rules
+
+### [PL-06] Mainnet Transition with Phased Risk Scaling
+* **Date:** 2026-09-23 | **Status:** `DEFERRED`
+* **Graduation Criteria:** Requires accumulating at least 50 audited trades on Testnet with Sharpe Ratio $> 1.4$, Max Drawdown $< 5\%$, and zero orphan Stop Loss failures.
+
+---
+
+*Rule: Every new idea is appended to the bottom without editing prior entries. When an idea is implemented, it is marked as `GRADUATED` citing the relevant PR or commit.*

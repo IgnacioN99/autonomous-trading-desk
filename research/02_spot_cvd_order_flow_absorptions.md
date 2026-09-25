@@ -1,22 +1,22 @@
-# Microestructura del Flujo de Órdenes: Spot CVD vs Perpetual CVD
+# Order Flow Microstructure: Spot CVD vs Perpetual CVD
 
-## 1. Definición y Mecánica del Cumulative Volume Delta (CVD)
-El Volume Delta representa la diferencia neta entre el volumen ejecutado al precio de demanda (compras agresivas a mercado) y el volumen ejecutado al precio de oferta (ventas agresivas a mercado):
+## 1. Definition and Mechanics of Cumulative Volume Delta (CVD)
+Volume Delta represents the net difference between market buyer volume (aggressive market orders lifting the ask) and market seller volume (aggressive market orders hitting the bid):
 
-Delta = Volumen_Ask - Volumen_Bid
-CVD_t = Sumatorio(Delta_i) desde i=0 hasta t
+$$\text{Delta} = \text{Volume}_{\text{Ask}} - \text{Volume}_{\text{Bid}}$$
+$$\text{CVD}_t = \sum_{i=0}^t \text{Delta}_i$$
 
-## 2. La Disparidad Spot CVD vs Perpetual CVD (Detección de Trampas)
-En Binance y los principales exchanges, los mercados Spot y Futuros Perpetuos operan con dinámicas de liquidez radicalmente distintas:
-- Spot CVD: Refleja compras y ventas de inversores con capital real 1:1, sin apalancamiento forzado ni liquidaciones sintéticas. Representa el dinero institucional genuino.
-- Perpetual CVD: Refleja la agresividad de operadores apalancados (retail e intradía), fuertemente influenciado por cascadas de liquidación y stop hunts.
+## 2. Spot CVD vs. Perpetual CVD Disparity (Trap Detection)
+On Binance and major digital asset exchanges, Spot and Perpetual Futures markets operate under fundamentally different liquidity dynamics:
+- **Spot CVD:** Reflects purchases and sales executed by investors with unhedged 1:1 unleveraged capital. Free from synthetic liquidation mechanics, it represents genuine institutional demand.
+- **Perpetual CVD:** Reflects aggressive leveraged speculation (retail and day traders), heavily distorted by cascading liquidation cascades and structural stop runs.
 
-### Patrones de Divergencia Críticos:
-1. Trampa de Apalancamiento (Bull Trap / Stop Hunt):
-   - El precio sube y el Perpetual CVD se dispara verticalmente.
-   - El Spot CVD permanece plano o diverge a la baja (ventas pasivas al contado).
-   - Diagnóstico: Subida frágil financiada con deuda minorista. Los market makers absorberán la liquidez y provocarán un flash dump hacia el soporte previo.
-2. Absorción Institucional en Soporte (Accumulation Footprint):
-   - El precio cae hacia un nivel de soporte y se lateraliza.
-   - El Perpetual CVD cae en pánico (ventas retail), pero el Spot CVD comienza a subir o el precio deja de marcar mínimos más bajos.
-   - Diagnóstico: Compradores pasivos al contado están absorbiendo toda la oferta agresiva. Configuración de compra de alta probabilidad.
+### Critical Divergence Patterns:
+1. **Leverage Trap (Bull Trap / Stop Run):**
+   - Price advances as Perpetual CVD spikes aggressively upward.
+   - Spot CVD remains flat or diverges downward (passive spot distribution).
+   - *Diagnostic:* Fragile advance financed by retail leverage debt. Market makers will absorb bids and induce a flash dump toward prior support.
+2. **Institutional Absorption at Support (Accumulation Footprint):**
+   - Price declines into key support and consolidates sideways.
+   - Perpetual CVD collapses in panic (retail panic dumping), but Spot CVD turns upward or price stops registering lower lows.
+   - *Diagnostic:* Passive spot buyers are absorbing all aggressive market supply. High-probability mean-reversion long setup.

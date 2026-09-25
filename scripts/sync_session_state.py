@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-sync_session_state.py - Sincronizador Determinista de Estado de Sesión y Cartera.
-Actúa como la Fuente Única de la Verdad (Single Source of Truth) para instancias limpias
-de agentes de IA, eliminando la sobrecarga de contexto, la pérdida de información y las alucinaciones.
+sync_session_state.py - Deterministic Session and Portfolio State Synchronizer.
+Acts as the Single Source of Truth for clean-room AI agent instances,
+eliminating context bloat, information loss, and hallucinations.
 
-Zero Tokens LLM / Latencia ~600ms.
-Genera 'logs/session_state.json' y emite un resumen ejecutivo tipado para el Cold-Start.
+Zero LLM Tokens / Latency ~600ms.
+Generates 'logs/session_state.json' and outputs a typed executive summary for cold-start priming.
 """
 
 import os
@@ -15,7 +15,7 @@ import time
 import datetime
 from typing import Dict, List, Any
 
-# Asegurar path local
+# Ensure local path resolution
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import execute_futures_trade as eft
 
@@ -24,13 +24,13 @@ STATE_FILE = os.path.join(LOGS_DIR, "session_state.json")
 AUDIT_LOG = os.path.join(LOGS_DIR, "trades_audit.jsonl")
 
 def get_start_of_day_utc() -> int:
-    """Devuelve el timestamp en ms del inicio del día actual (00:00:00 UTC)."""
+    """Returns timestamp in ms for the start of the current UTC day (00:00:00 UTC)."""
     now = datetime.datetime.now(datetime.timezone.utc)
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     return int(start.timestamp() * 1000)
 
 def load_audit_metadata() -> Dict[str, dict]:
-    """Carga los metadatos más recientes de trades_audit.jsonl por símbolo."""
+    """Loads latest metadata from trades_audit.jsonl keyed by symbol."""
     meta = {}
     if os.path.exists(AUDIT_LOG):
         try:
@@ -51,8 +51,8 @@ def load_audit_metadata() -> Dict[str, dict]:
 
 def sync_session_state(target_env: str = "testnet") -> dict:
     """
-    Sincroniza directamente contra el ledger de Binance Futures Mainnet/Testnet
-    y genera el estado estructurado de la sesión.
+    Synchronizes directly against the Binance Futures ledger (Mainnet/Testnet)
+    and generates the structured session state.
     """
     os.makedirs(LOGS_DIR, exist_ok=True)
     audit_meta = load_audit_metadata()
@@ -63,7 +63,7 @@ def sync_session_state(target_env: str = "testnet") -> dict:
     btc_ticker = eft.send_signed_request("GET", "/fapi/v1/ticker/price", {"symbol": "BTCUSDT"}, target_env=target_env)
     btc_price = float(btc_ticker.get("price", 0.0)) if isinstance(btc_ticker, dict) else 0.0
 
-    # 2. Posiciones Activas en Ledger
+    # 2. Active Ledger Positions
     pos_res = eft.send_signed_request("GET", "/fapi/v2/positionRisk", target_env=target_env)
     active_positions = []
     long_notional = 0.0
@@ -102,14 +102,14 @@ def sync_session_state(target_env: str = "testnet") -> dict:
                     "margin_usdt": round(margin, 2),
                     "entry_order_id": meta_trade.get("entry_order_id"),
                     "entry_time_ts": meta_trade.get("timestamp"),
-                    "entry_time_utc": datetime.datetime.fromtimestamp(meta_trade.get("timestamp", now_ts), datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC") if meta_trade.get("timestamp") else "Desconocido",
+                    "entry_time_utc": datetime.datetime.fromtimestamp(meta_trade.get("timestamp", now_ts), datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC") if meta_trade.get("timestamp") else "Unknown",
                     "sl_price": meta_trade.get("sl_price"),
                     "sl_algo_id": meta_trade.get("sl_algo_id"),
                     "tp1_price": meta_trade.get("tp1_price"),
                     "tp2_price": meta_trade.get("tp2_price")
                 })
 
-    # 3. Órdenes Algo (Stop Loss) activas en Binance
+    # 3. Active Algo Orders (Stop Loss) on Binance
     algos_res = eft.send_signed_request("GET", "/fapi/v1/openAlgoOrders", target_env=target_env)
     active_sl_orders = []
     if isinstance(algos_res, list):
@@ -123,7 +123,7 @@ def sync_session_state(target_env: str = "testnet") -> dict:
                 "close_position": a.get("closePosition", False)
             })
 
-    # Verificar si alguna posición activa carece de Stop Loss y actualizar con el precio vivo del ledger
+    # Verify active positions with active SL orders
     algo_map = {a["symbol"]: a for a in active_sl_orders}
     for pos in active_positions:
         live_algo = algo_map.get(pos["symbol"])
@@ -134,7 +134,7 @@ def sync_session_state(target_env: str = "testnet") -> dict:
         else:
             pos["sl_algo_verified"] = False
 
-    # 4. Órdenes Límite Abiertas (TP1, TP2)
+    # 4. Open Limit Orders (TP1, TP2)
     open_orders_res = eft.send_signed_request("GET", "/fapi/v1/openOrders", target_env=target_env)
     active_tp_orders = []
     if isinstance(open_orders_res, list):
@@ -149,7 +149,7 @@ def sync_session_state(target_env: str = "testnet") -> dict:
                 "type": o.get("type")
             })
 
-    # 5. Trades de Hoy y PnL Realizado
+    # 5. Today's Trades & Realized PnL
     start_ms = get_start_of_day_utc()
     trades_res = eft.send_signed_request("GET", "/fapi/v1/userTrades", {"startTime": start_ms, "limit": 100}, target_env=target_env)
     today_realized_pnl = 0.0
@@ -174,22 +174,22 @@ def sync_session_state(target_env: str = "testnet") -> dict:
     net_realized_today = today_realized_pnl - today_commissions
     win_rate_today = (wins_count / closed_trades_count * 100) if closed_trades_count > 0 else 0.0
 
-    # 6. Cálculo de Exposición Delta de Cartera
+    # 6. Portfolio Delta Exposure Calculation
     total_active_notional = long_notional + short_notional
     net_notional_delta = long_notional - short_notional
     delta_ratio = (net_notional_delta / total_active_notional) if total_active_notional > 0 else 0.0
 
     if delta_ratio > 0.35:
         portfolio_delta_bias = "LONG_HEAVY"
-        delta_advice = "🚨 DESBALANCE ALCISTA: Prohibido abrir más Longs. Se exige abrir cobertura Short o neutralizar antes de nuevo riesgo."
+        delta_advice = "🚨 BULLISH IMBALANCE: Additional Longs prohibited. Short hedge or risk neutralization required prior to new exposure."
     elif delta_ratio < -0.35:
         portfolio_delta_bias = "SHORT_HEAVY"
-        delta_advice = "🚨 DESBALANCE BAJISTA: Prohibido abrir más Shorts. Se exige abrir pata Long de soporte o neutralizar."
+        delta_advice = "🚨 BEARISH IMBALANCE: Additional Shorts prohibited. Long support leg or risk neutralization required."
     else:
         portfolio_delta_bias = "DELTA_BALANCED"
-        delta_advice = "⚖️ EQUILIBRIO DELTA-NEUTRAL: Cartera balanceada con exposición direccional acotada (Δ ≈ 0)."
+        delta_advice = "⚖️ DELTA-NEUTRAL EQUILIBRIUM: Balanced portfolio with bounded directional exposure (Δ ≈ 0)."
 
-    # Empaquetar estado consolidado
+    # Package consolidated state
     state = {
         "last_updated_utc": now_utc,
         "target_env": target_env,
@@ -219,7 +219,7 @@ def sync_session_state(target_env: str = "testnet") -> dict:
         }
     }
 
-    # Guardar en archivo atómico con kernel-level replace
+    # Save to atomic file with kernel-level replace
     try:
         from utils.atomic_writer import atomic_write_json
         atomic_write_json(STATE_FILE, state)
@@ -230,34 +230,34 @@ def sync_session_state(target_env: str = "testnet") -> dict:
     return state
 
 def format_markdown_summary(state: dict) -> str:
-    """Genera un reporte compacto en Markdown para consumo directo de cualquier agente."""
+    """Generates a compact Markdown report for direct consumption by any agent."""
     exp = state["portfolio_exposure"]
     closed = state["closed_today_summary"]
     btc = state["macro_btc"]
 
     lines = [
-        f"# 📡 ESTADO DE SESIÓN & CARTERA ({state['last_updated_utc']})",
+        f"# 📡 SESSION & PORTFOLIO STATE ({state['last_updated_utc']})",
         f"**BTC:** ${btc['price_usdt']:,.2f} USDT | **Env:** {state['target_env'].upper()}",
         "",
-        "### 📊 Balance Operativo de Hoy",
-        f"* **Trades Cerrados Hoy:** {closed['closed_trades_count']} (Ganados: {closed['wins']} | Perdidos: {closed['losses']} | Win Rate: {closed['win_rate_pct']}%)",
-        f"* **PnL Realizado Neto Hoy:** **{'+' if closed['net_realized_pnl_usdt'] >= 0 else ''}{closed['net_realized_pnl_usdt']:.4f} USDT** (Comisiones: -${closed['commissions_usdt']:.4f})",
-        f"* **PnL Flotante Total:** **{'+' if exp['total_floating_pnl_usdt'] >= 0 else ''}{exp['total_floating_pnl_usdt']:.4f} USDT**",
+        "### 📊 Today's Operating Balance",
+        f"* **Closed Trades Today:** {closed['closed_trades_count']} (Wins: {closed['wins']} | Losses: {closed['losses']} | Win Rate: {closed['win_rate_pct']}%)",
+        f"* **Net Realized PnL Today:** **{'+' if closed['net_realized_pnl_usdt'] >= 0 else ''}{closed['net_realized_pnl_usdt']:.4f} USDT** (Commissions: -${closed['commissions_usdt']:.4f})",
+        f"* **Total Floating PnL:** **{'+' if exp['total_floating_pnl_usdt'] >= 0 else ''}{exp['total_floating_pnl_usdt']:.4f} USDT**",
         "",
-        f"### ⚖️ Exposición & Delta de Cartera: `{exp['delta_bias']}`",
-        f"* **Nocional Long:** ${exp['long_notional_usdt']:.2f} | **Nocional Short:** ${exp['short_notional_usdt']:.2f} | **Delta Neto:** ${exp['net_notional_delta_usdt']:+.2f}",
-        f"* **Regla Táctica:** {exp['delta_advice']}",
+        f"### ⚖️ Portfolio Exposure & Delta: `{exp['delta_bias']}`",
+        f"* **Long Notional:** ${exp['long_notional_usdt']:.2f} | **Short Notional:** ${exp['short_notional_usdt']:.2f} | **Net Delta:** ${exp['net_notional_delta_usdt']:+.2f}",
+        f"* **Tactical Rule:** {exp['delta_advice']}",
         "",
-        f"### 🛡️ Posiciones Activas ({exp['total_active_positions']})"
+        f"### 🛡️ Active Positions ({exp['total_active_positions']})"
     ]
 
     if not state["active_positions"]:
-        lines.append("* *Ninguna posición abierta. Cartera en reposo plano.*")
+        lines.append("* *No open positions. Portfolio in flat rest.*")
     else:
-        lines.append("| Par | Dir | Entrada | Mark | PnL (USDT) | ROE % | Margen | SL Algo | TP1 / TP2 |")
+        lines.append("| Pair | Dir | Entry | Mark | PnL (USDT) | ROE % | Margin | Algo SL | TP1 / TP2 |")
         lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
         for p in state["active_positions"]:
-            sl_icon = "✅" if p.get("sl_algo_verified") else "🚨 HUÉRFANA"
+            sl_icon = "✅" if p.get("sl_algo_verified") else "🚨 ORPHAN"
             tp_str = f"{p.get('tp1_price', 'N/A')} / {p.get('tp2_price', 'N/A')}"
             lines.append(f"| **{p['symbol']}** | {p['direction']} {p['leverage']}x | {p['entry_price']} | {p['mark_price']} | {p['unrealized_pnl_usdt']:+.2f} | {p['roe_pct']:+.1f}% | ${p['margin_usdt']:.2f} | {sl_icon} {p.get('sl_price', 'N/A')} | {tp_str} |")
 

@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 """
-report_agent_issue.py - Generador Autónomo de GitHub Issues para Fallas del Setup Agéntico.
+report_agent_issue.py - Autonomous GitHub Issue Generator for Agentic Setup Failures.
 
-Permite a los subagentes, hooks y loops del desk reportar programáticamente cualquier fallo,
-excepción no capturada, anomalía de infraestructura o error de herramientas directamente
-en el repositorio https://github.com/IgnacioN99/autonomous-trading-desk/issues.
+Enables subagents, hooks, and trading desk loops to programmatically report unhandled exceptions,
+infrastructure anomalies, or tool errors directly to the repository:
+https://github.com/IgnacioN99/autonomous-trading-desk/issues.
 
-Características de Resiliencia:
-1. Despacho Directo a GitHub: Utiliza la API REST v3 con GITHUB_TOKEN (Personal Access Token).
-2. Cola Local Resiliente (Offline Backlog): Si GITHUB_TOKEN no está configurado o falla la red,
-   guarda el issue atómicamente en logs/issues_backlog.jsonl y permite sincronizarlo después con --sync-backlog.
-3. Anti-Spam / Deduplicación Inteligente: Calcula un fingerprint (hash) del error; si el mismo
-   fallo ocurrió en las últimas 24h, añade telemetría al issue existente en lugar de inundar el repo.
-4. Metadatos Forenses Automáticos: Incluye timestamp UTC, entorno (Testnet/Prod), agente emisor,
-   versión de Python y estado de la cartera.
+Resilience Features:
+1. Direct GitHub Dispatch: Uses GitHub REST API v3 with GITHUB_TOKEN (Personal Access Token).
+2. Resilient Offline Backlog: If GITHUB_TOKEN is not configured or network fails,
+   atomically enqueues the issue in logs/issues_backlog.jsonl for later sync via --sync-backlog.
+3. Intelligent Deduplication / Anti-Spam: Computes a SHA-256 fingerprint; if the same failure
+   occurred within the past 24 hours, updates telemetry rather than spamming new issues.
+4. Automatic Forensic Telemetry: Captures UTC timestamp, environment (Testnet/Prod), reporting agent,
+   Python version, and portfolio exposure state.
 
-Uso:
-  python3 scripts/report_agent_issue.py --title "Error en cálculo de cointegración" --error "ZeroDivisionError: ..." --category "quant_logic" --severity "HIGH"
+Usage:
+  python3 scripts/report_agent_issue.py --title "Cointegration Calculation Failure" --error "ZeroDivisionError: ..." --category "quant_logic" --severity "HIGH"
   python3 scripts/report_agent_issue.py --sync-backlog
 """
 
@@ -37,7 +37,7 @@ BACKLOG_FILE = os.path.join(LOGS_DIR, "issues_backlog.jsonl")
 FINGERPRINTS_FILE = os.path.join(LOGS_DIR, "issues_fingerprints.json")
 DEFAULT_REPO = "IgnacioN99/autonomous-trading-desk"
 
-# Cargar .env manualmente si existe para no depender de python-dotenv
+# Load local .env manually if present to avoid python-dotenv external dependency
 def load_env_file():
     env_path = os.path.join(BASE_DIR, ".env")
     if os.path.exists(env_path):
@@ -54,7 +54,7 @@ def load_env_file():
 load_env_file()
 
 def compute_fingerprint(title: str, error_detail: str) -> str:
-    """Genera un hash SHA-256 único para el tipo de error para evitar issues duplicados."""
+    """Generates a unique SHA-256 fingerprint for the error signature to prevent duplicates."""
     norm_text = f"{title.strip().lower()}|{error_detail.strip()[:200].lower()}"
     return hashlib.sha256(norm_text.encode("utf-8")).hexdigest()[:16]
 
@@ -80,14 +80,14 @@ def append_to_backlog(issue_payload: Dict[str, Any]):
         f.write(json.dumps(issue_payload, ensure_ascii=False) + "\n")
 
 def get_system_context() -> Dict[str, Any]:
-    """Recopila telemetría ligera del sistema sin romper en caso de fallo."""
+    """Collects lightweight system and portfolio telemetry fail-safely."""
     state_file = os.path.join(LOGS_DIR, "session_state.json")
     portfolio_summary = "FLAT / No state"
     if os.path.exists(state_file):
         try:
             with open(state_file, "r", encoding="utf-8") as f:
                 st = json.load(f)
-                portfolio_summary = f"Delta: {st.get('delta_bias', 'N/A')}, Activos: {len(st.get('active_positions', []))}, PnL Flotante: ${st.get('floating_pnl_usdt', 0.0):.2f}"
+                portfolio_summary = f"Delta: {st.get('delta_bias', 'N/A')}, Positions: {len(st.get('active_positions', []))}, Floating PnL: ${st.get('floating_pnl_usdt', 0.0):.2f}"
         except Exception:
             pass
 
@@ -108,7 +108,7 @@ def format_issue_markdown(
     remediation: str = "",
     fingerprint: str = ""
 ) -> str:
-    """Construye un cuerpo de Issue en Markdown técnico con diseño institucional."""
+    """Builds an institutional Markdown body for GitHub issues."""
     ctx = get_system_context()
     
     severity_emojis = {
@@ -120,28 +120,28 @@ def format_issue_markdown(
     sev_badge = severity_emojis.get(severity.upper(), f"⚪ {severity}")
 
     body = [
-        f"## 🚨 Informe Autónomo de Falla de Setup Agéntico",
+        f"## 🚨 Autonomous Agent Setup Failure Report",
         f"",
-        f"| Dimensión | Valor |",
+        f"| Dimension | Value |",
         f"| :--- | :--- |",
-        f"| **Severidad** | **{sev_badge}** |",
-        f"| **Categoría** | `{category}` |",
-        f"| **Agente / Módulo Emisor** | `{agent_name}` |",
-        f"| **Entorno de Ejecución** | `{ctx['target_env']}` |",
+        f"| **Severity** | **{sev_badge}** |",
+        f"| **Category** | `{category}` |",
+        f"| **Reporting Agent / Module** | `{agent_name}` |",
+        f"| **Execution Environment** | `{ctx['target_env']}` |",
         f"| **Timestamp UTC** | `{ctx['timestamp_utc']}` |",
-        f"| **Estado de Cartera** | `{ctx['portfolio_summary']}` |",
+        f"| **Portfolio State** | `{ctx['portfolio_summary']}` |",
         f"| **Fingerprint ID** | `{fingerprint}` |",
         f"",
         f"---",
         f"",
-        f"### 📋 Descripción del Fallo / Anomalía",
+        f"### 📋 Failure / Anomaly Description",
         f"{error_detail.strip()}",
         f""
     ]
 
     if stack_trace.strip():
         body.extend([
-            f"### 🔍 Traceback / Detalles Técnicos de Error",
+            f"### 🔍 Traceback / Technical Error Details",
             f"```text",
             f"{stack_trace.strip()}",
             f"```",
@@ -150,14 +150,14 @@ def format_issue_markdown(
 
     if remediation.strip():
         body.extend([
-            f"### 💡 Remediación / Solución Sugerida por el Agente",
+            f"### 💡 Suggested Remediation",
             f"{remediation.strip()}",
             f""
         ])
 
     body.extend([
         f"---",
-        f"*Reportado automáticamente por el harness de observabilidad de `autonomous-trading-desk`.*"
+        f"*Reported automatically by the `autonomous-trading-desk` observability harness.*"
     ])
 
     return "\n".join(body)
@@ -169,10 +169,10 @@ def dispatch_github_issue(
     repo: str = DEFAULT_REPO,
     token: Optional[str] = None
 ) -> Dict[str, Any]:
-    """Envía la petición HTTP POST a la API REST de GitHub."""
+    """Dispatches HTTP POST request to GitHub REST API."""
     token = token or os.getenv("GITHUB_TOKEN")
     if not token:
-        raise ValueError("GITHUB_TOKEN no configurado en entorno ni en .env")
+        raise ValueError("GITHUB_TOKEN is not configured in environment or .env")
 
     url = f"https://api.github.com/repos/{repo}/issues"
     headers = {
@@ -212,22 +212,22 @@ def report_issue(
     force_sync: bool = False
 ) -> Dict[str, Any]:
     """
-    Función principal exportable para que cualquier subagente o script reporte fallas.
-    Aplica deduplicación, formatado y despacho fail-safe (online o local backlog).
+    Main exportable function for subagents and desk scripts to report failures.
+    Applies deduplication, markdown formatting, and fail-safe dispatch (online or local backlog).
     """
     fingerprint = compute_fingerprint(title, error_detail)
     fp_cache = load_fingerprints()
     now_ts = int(time.time())
 
-    # Control de duplicados en ventana de 24 horas
+    # 24-hour deduplication control
     if not force_sync and fingerprint in fp_cache:
         last_seen = fp_cache[fingerprint].get("last_seen_ts", 0)
         count = fp_cache[fingerprint].get("count", 1)
-        if now_ts - last_seen < 86400: # Menos de 24h
+        if now_ts - last_seen < 86400: # Less than 24h
             fp_cache[fingerprint]["count"] = count + 1
             fp_cache[fingerprint]["last_seen_ts"] = now_ts
             save_fingerprints(fp_cache)
-            msg = f"Deduplicación activa: El error '{title}' ya fue reportado previamente (Incidencias: {count + 1}). Se omite spam de issue nuevo."
+            msg = f"Deduplication active: Error '{title}' was already reported previously (Occurrences: {count + 1}). Omitting duplicate issue."
             print(f"ℹ️ {msg}")
             return {
                 "success": True,
@@ -237,7 +237,7 @@ def report_issue(
                 "message": msg
             }
 
-    # Formatear etiquetas de GitHub
+    # Format GitHub labels
     labels = ["agent-failure", f"severity:{severity.lower()}"]
     if category:
         labels.append(f"cat:{category.lower()}")
@@ -274,7 +274,7 @@ def report_issue(
             issue_record["issue_number"] = gh_res.get("issue_number")
             issue_record["html_url"] = gh_res.get("html_url")
             
-            # Registrar fingerprint
+            # Record fingerprint
             fp_cache[fingerprint] = {
                 "title": title,
                 "issue_number": gh_res.get("issue_number"),
@@ -284,16 +284,16 @@ def report_issue(
             }
             save_fingerprints(fp_cache)
             
-            print(f"✅ GITHUB ISSUE CREADO EXITOSAMENTE: #{gh_res.get('issue_number')}")
+            print(f"✅ GITHUB ISSUE CREATED SUCCESSFULLY: #{gh_res.get('issue_number')}")
             print(f"   URL: {gh_res.get('html_url')}")
             return issue_record
         except Exception as e:
-            print(f"⚠️ Fallo al conectar con GitHub API ({e}). Guardando issue en el backlog local...", file=sys.stderr)
+            print(f"⚠️ Failed to connect to GitHub API ({e}). Saving issue to local backlog...", file=sys.stderr)
             issue_record["dispatch_error"] = str(e)
     else:
-        print(f"ℹ️ GITHUB_TOKEN no detectado. Encolando issue #{fingerprint[:8]} en el backlog local (logs/issues_backlog.jsonl)...")
+        print(f"ℹ️ GITHUB_TOKEN not detected. Enqueueing issue #{fingerprint[:8]} in local backlog (logs/issues_backlog.jsonl)...")
 
-    # Si no hay token o falló el despacho, encolar en backlog
+    # If no token or dispatch failed, enqueue in backlog
     append_to_backlog(issue_record)
     fp_cache[fingerprint] = {
         "title": title,
@@ -305,14 +305,14 @@ def report_issue(
     return issue_record
 
 def sync_backlog(repo: str = DEFAULT_REPO):
-    """Reintenta despachar todos los issues acumulados en el backlog local."""
+    """Retries dispatch of all pending offline backlog issues."""
     token = os.getenv("GITHUB_TOKEN")
     if not token:
-        print("❌ Error: GITHUB_TOKEN no está definido en el entorno ni en .env. No se puede sincronizar.")
+        print("❌ Error: GITHUB_TOKEN is not defined in environment or .env. Cannot sync.")
         return
 
     if not os.path.exists(BACKLOG_FILE):
-        print("✅ Backlog vacío. No hay issues pendientes de sincronización.")
+        print("✅ Backlog is empty. No issues pending synchronization.")
         return
 
     lines = []
@@ -320,10 +320,10 @@ def sync_backlog(repo: str = DEFAULT_REPO):
         lines = [line.strip() for line in f if line.strip()]
 
     if not lines:
-        print("✅ No hay registros en el backlog.")
+        print("✅ No entries found in backlog.")
         return
 
-    print(f"🔄 Sincronizando {len(lines)} issue(s) pendiente(s) hacia {repo}...")
+    print(f"🔄 Syncing {len(lines)} pending issue(s) to https://github.com/{repo}/issues...")
     remaining = []
     success_count = 0
 
@@ -337,32 +337,32 @@ def sync_backlog(repo: str = DEFAULT_REPO):
                 repo=repo,
                 token=token
             )
-            print(f"   ✅ Issue #{res.get('issue_number')} publicado: {item['title']} -> {res.get('html_url')}")
+            print(f"   ✅ Issue #{res.get('issue_number')} published: {item['title']} -> {res.get('html_url')}")
             success_count += 1
             time.sleep(1) # Rate limit cushion
         except Exception as e:
-            print(f"   ❌ Fallo al despachar '{item.get('title')}': {e}")
+            print(f"   ❌ Failed to dispatch '{item.get('title')}': {e}")
             remaining.append(line)
 
-    # Reescribir backlog solo con los pendientes que hayan fallado
+    # Rewrite backlog only with remaining failures
     with open(BACKLOG_FILE, "w", encoding="utf-8") as f:
         for r in remaining:
             f.write(r + "\n")
 
-    print(f"🏁 Sincronización completada: {success_count} publicados, {len(remaining)} restantes en backlog.")
+    print(f"🏁 Sync completed: {success_count} published, {len(remaining)} remaining in backlog.")
 
 def main():
-    parser = argparse.ArgumentParser(description="Reportador Autónomo de GitHub Issues para Fallas de Agentes")
-    parser.add_argument("--title", type=str, help="Título descriptivo del problema o fallo")
-    parser.add_argument("--error", type=str, help="Descripción detallada de la anomalía o fallo")
-    parser.add_argument("--category", type=str, default="agent_failure", choices=["agent_failure", "risk_gate", "tool_error", "quant_logic", "infra", "enhancement"], help="Categoría del problema")
-    parser.add_argument("--severity", type=str, default="HIGH", choices=["CRITICAL", "HIGH", "MEDIUM", "LOW"], help="Nivel de severidad")
-    parser.add_argument("--agent", type=str, default="cli_operator", help="Nombre del subagente o script emisor")
-    parser.add_argument("--stack-trace", type=str, default="", help="Traceback o payload de error técnico")
-    parser.add_argument("--remediation", type=str, default="", help="Solución o parche propuesto")
-    parser.add_argument("--repo", type=str, default=DEFAULT_REPO, help="Repositorio destino (ej. IgnacioN99/autonomous-trading-desk)")
-    parser.add_argument("--sync-backlog", action="store_true", help="Sincroniza issues encolados en logs/issues_backlog.jsonl contra GitHub")
-    parser.add_argument("--force", action="store_true", help="Ignora la deduplicación de 24h y fuerza la creación del issue")
+    parser = argparse.ArgumentParser(description="Autonomous GitHub Issue Reporter for Agent Failures")
+    parser.add_argument("--title", type=str, help="Descriptive title of the failure or anomaly")
+    parser.add_argument("--error", type=str, help="Detailed description of the failure or anomaly")
+    parser.add_argument("--category", type=str, default="agent_failure", choices=["agent_failure", "risk_gate", "tool_error", "quant_logic", "infra", "enhancement"], help="Issue category")
+    parser.add_argument("--severity", type=str, default="HIGH", choices=["CRITICAL", "HIGH", "MEDIUM", "LOW"], help="Severity level")
+    parser.add_argument("--agent", type=str, default="cli_operator", help="Reporting subagent or module name")
+    parser.add_argument("--stack-trace", type=str, default="", help="Traceback or technical error payload")
+    parser.add_argument("--remediation", type=str, default="", help="Suggested fix or proposed remediation")
+    parser.add_argument("--repo", type=str, default=DEFAULT_REPO, help="Target repository (e.g. IgnacioN99/autonomous-trading-desk)")
+    parser.add_argument("--sync-backlog", action="store_true", help="Sync queued issues in logs/issues_backlog.jsonl to GitHub")
+    parser.add_argument("--force", action="store_true", help="Bypass 24h deduplication and force issue creation")
 
     args = parser.parse_args()
 

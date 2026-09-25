@@ -1,388 +1,375 @@
-# GUÍA DEFINITIVA DE PROMPT ENGINEERING PARA AGENTES DE IA AUTÓNOMOS CON HERRAMIENTAS
-*Manual de Referencia de Grado de Producción para Arquitecturas Agénticas de Alto Rendimiento*
-*Cobertura Técnica: Claude 3.5 / 3.7 Sonnet, OpenAI GPT-4o / Reasoning Models (o1/o3), Google Gemini 1.5 / 2.0 Flash/Pro, Model Context Protocol (MCP)*
+# DEFINITIVE PROMPT ENGINEERING GUIDE FOR AUTONOMOUS AI AGENTS WITH TOOLS
+*Production-Grade Reference Manual for High-Performance Agentic Architectures*  
+*Technical Coverage: Claude 3.5 / 3.7 Sonnet, OpenAI GPT-4o / Reasoning Models (o1/o3), Google Gemini 1.5 / 2.0 Flash/Pro, Model Context Protocol (MCP)*
 
 ---
 
-## ÍNDICE DE CONTENIDOS
+## TABLE OF CONTENTS
 
-1. [Fundamentos Arquitectónicos y Mecánica de Atención en LLMs Frontier](#1-fundamentos-arquitectónicos-y-mecánica-de-atención-en-llms-frontier)
-   - 1.1 El rol de los delimitadores XML en la atención del Transformer (Self-Attention & Attention Routing)
-   - 1.2 XML frente a Markdown, JSON y texto libre: Comparativa de parseabilidad y entropía semántica
-   - 1.3 El fenómeno "Lost in the Middle" y la dinámica de Primacía / Recencia (Primacy & Recency Bias)
-   - 1.4 Optimización de Prefijos y Arquitectura del KV Cache (Prompt Caching en Anthropic y OpenAI)
-   - 1.5 Fenómenos de degradación: *Prompt Drift* y *Attention Dilution* en ejecuciones multietapa de largo horizonte
-   - 1.6 Estrategias de mitigación: Inyección Constitucional, *Sandwich Prompting* y Podado de Ventana Contextual
-2. [Jerarquía Canónica y Estructura Óptima del Context Window](#2-jerarquía-canónica-y-estructura-óptima-del-context-window)
-   - 2.1 Especificación formal del orden de bloques XML canónicos
-   - 2.2 Desglose anatómico de etiquetas núcleo (`<identity>`, `<context>`, `<tool_guidelines>`, `<rules>`, etc.)
-   - 2.3 Regla de partición estática vs. dinámica para maximizar el Cache Hit Rate (>90%)
-3. [Few-Shots Avanzados para Uso de Herramientas (Tool Calling)](#3-few-shots-avanzados-para-uso-de-herramientas-tool-calling)
-   - 3.1 Anatomía de un Few-Shot sintético de alta precisión
-   - 3.2 Ejemplos Positivos (Positive Few-Shots): Invocación óptima, minimización de llamadas y parámetros estructurados
-   - 3.3 Negative Few-Shots (El pilar crítico ignorado):
-     - Caso A: Información ya presente en el contexto / memoria local (Anti-Redundancia)
-     - Caso B: Violación de precondiciones de seguridad o de negocio (Aborto preventivo y degradación)
-     - Caso C: Petición teórica o explicativa pura (Supresión de triggers de ejecución)
-     - Caso D: Selección de herramienta secundaria/read-only vs. primaria/mutativa (Principio de mínimo privilegio)
-   - 3.4 Aprendizaje Contrastivo en Prompts: Emparejamiento POSITIVO vs. NEGATIVO en la frontera de decisión
-   - 3.5 Esquema formal de serialización XML: `<example>`, `<user_input>`, `<thinking>`, `<tool_call>`, `<result>`, `<final_response>`
-4. [Deliberación, Monólogo Interno y Scratchpads (`<thinking>` / `<scratchpad>`)](#4-deliberación-monólogo-interno-y-scratchpads-thinking--scratchpad)
-   - 4.1 Separación estricta entre Deliberación Interna y Emisión de Acciones Externas
-   - 4.2 Extended Thinking nativo vs. Scratchpad explícito en System Prompt
-   - 4.3 El patrón "Think Tool" en bucles agénticos multi-paso (Anthropic Agentic Framework)
-   - 4.4 Compuertas de Verificación de Precondiciones (*Precondition Checklists*) antes de acciones destructivas o mutativas
-   - 4.5 Auto-corrección y validación en tiempo de inferencia
-5. [Reglas Negativas, Compuertas de Seguridad y Manejo de Errores](#5-reglas-negativas-compuertas-de-seguridad-y-manejo-de-errores)
-   - 5.1 La psicología del LLM: El efecto "Pink Elephant" y la falla de las negaciones simples
-   - 5.2 Formulación Asertiva y Delimitación Invariante de Restricciones Negativas
-   - 5.3 Taxonomía de fallos en ejecución de herramientas y bucles de reintento
-   - 5.4 Ingeniería de Respuestas de Error para el Modelo (Actionable Feedback Loops)
-   - 5.5 Circuit Breakers, límites de recursión y degradación elegante
-6. [Plantilla Maestra de Producción (Production-Ready System Prompt Template)](#6-plantilla-maestra-de-producción-production-ready-system-prompt-template)
-   - 6.1 Plantilla modular completa lista para despliegue en producción
-   - 6.2 Checklist de validación pre-despliegue
-7. [Recomendaciones de Arquitectura y Buenas Prácticas para Sistemas Agénticos Modernos](#7-recomendaciones-de-arquitectura-y-buenas-prácticas-para-sistemas-agénticos-modernos)
-   - 7.1 Model Context Protocol (MCP) y contratos de herramientas
-   - 7.2 Prompts como Código (PaC), Datasets Dorados y Evaluaciones Sistemáticas
-   - 7.3 Patrones multi-agente: Enrutador, Especialistas y Revisor
+1. [Architectural Foundations & Attention Mechanics in Frontier LLMs](#1-architectural-foundations--attention-mechanics-in-frontier-llms)
+   - 1.1 The Role of XML Delimiters in Transformer Attention (Self-Attention & Attention Routing)
+   - 1.2 XML vs. Markdown, JSON, and Raw Text: Parseability and Semantic Entropy Comparison
+   - 1.3 The "Lost in the Middle" Phenomenon and Primacy / Recency Dynamics
+   - 1.4 Prefix Optimization and KV Cache Architecture (Prompt Caching in Anthropic & OpenAI)
+   - 1.5 Degradation Phenomena: Prompt Drift and Attention Dilution in Long-Horizon Workflows
+   - 1.6 Mitigation Strategies: Constitutional Injection, Sandwich Prompting, and Context Pruning
+2. [Canonical Hierarchy & Optimal Context Window Structure](#2-canonical-hierarchy--optimal-context-window-structure)
+   - 2.1 Formal Specification of Canonical XML Block Order
+   - 2.2 Anatomical Breakdown of Core Tags (`<identity>`, `<context>`, `<tool_guidelines>`, `<rules>`, etc.)
+   - 2.3 Static vs. Dynamic Partitioning Rule for Maximizing Cache Hit Rate (>90%)
+3. [Advanced Few-Shots for Tool Calling](#3-advanced-few-shots-for-tool-calling)
+   - 3.1 Anatomy of a High-Precision Synthetic Few-Shot Execution Trace
+   - 3.2 Positive Few-Shots: Optimal Invocation, Call Minimization, and Structured Parameters
+   - 3.3 Negative Few-Shots (The Critical Overlooked Pillar):
+     - Case A: Information Already Present in Context / Local Memory (Anti-Redundancy)
+     - Case B: Safety or Business Precondition Violation (Preventive Abort & Graceful Degradation)
+     - Case C: Purely Theoretical or Explanatory Query (Trigger Suppression)
+     - Case D: Secondary/Read-Only vs. Primary/Mutating Tool Selection (Principle of Least Privilege)
+   - 3.4 Contrastive Learning in Prompts: POSITIVE vs. NEGATIVE Pairing across Decision Boundaries
+   - 3.5 Formal XML Serialization Schema: `<example>`, `<user_input>`, `<thinking>`, `<tool_call>`, `<result>`, `<final_response>`
+4. [Deliberation, Inner Monologue, and Scratchpads (`<thinking>` / `<scratchpad>`)](#4-deliberation-inner-monologue-and-scratchpads-thinking--scratchpad)
+   - 4.1 Strict Separation Between Inner Deliberation and External Action Dispatch
+   - 4.2 Native Extended Thinking vs. Explicit Scratchpad in System Prompts
+   - 4.3 The "Think Tool" Pattern in Multi-Step Agentic Loops (Anthropic Agentic Framework)
+   - 4.4 Precondition Verification Checklists Prior to Destructive or Mutating Actions
+   - 4.5 Runtime Self-Correction and In-Flight Validation
+5. [Negative Rules, Security Gates, and Error Handling](#5-negative-rules-security-gates-and-error-handling)
+   - 5.1 LLM Psychology: The "Pink Elephant" Effect and the Failure of Simple Negations
+   - 5.2 Assertive Formulation and Invariant Delimitation of Negative Constraints
+   - 5.3 Error Taxonomy and Graceful Degradation
+   - 5.4 Error Response Engineering for Models (Actionable Feedback Loops)
+   - 5.5 Circuit Breakers, Recursion Limits, and Graceful Degradation
+6. [Production-Ready System Prompt Template](#6-production-ready-system-prompt-template)
+   - 6.1 Complete Modular Template Ready for Production Deployment
+   - 6.2 Pre-Deployment Validation Checklist
+7. [Architecture Recommendations & Best Practices for Modern Agentic Systems](#7-architecture-recommendations--best-practices-for-modern-agentic-systems)
+   - 7.1 Model Context Protocol (MCP) and Tool Contracts
+   - 7.2 Prompts as Code (PaC), Golden Datasets, and Systematic Evaluations
+   - 7.3 Multi-Agent Patterns: Router, Specialists, and Reviewer
+8. [Synthesis and Pre-Production Audit Checklist](#8-synthesis-and-pre-production-audit-checklist)
 
 ---
 
-# 1. Fundamentos Arquitectónicos y Mecánica de Atención en LLMs Frontier
+# 1. Architectural Foundations & Attention Mechanics in Frontier LLMs
 
-## 1.1 El rol de los delimitadores XML en la atención del Transformer (Self-Attention & Attention Routing)
+## 1.1 The Role of XML Delimiters in Transformer Attention (Self-Attention & Attention Routing)
 
-Los Grandes Modelos de Lenguaje (LLMs) frontier modernos (tales como Claude 3.5 Sonnet / Claude 3.7, GPT-4o, y Gemini 1.5 / 2.0 Pro) operan sobre capas profundas de mecanismos de auto-atención multi-cabezal (*Multi-Head Self-Attention*). En términos formales, cada capa calcula la matriz de atención según la ecuación canónica de Vaswani et al.:
+Modern frontier Large Language Models (LLMs)—including Claude 3.5 Sonnet / Claude 3.7, GPT-4o, and Gemini 1.5 / 2.0 Pro—operate across deep stacks of Multi-Head Self-Attention layers. Formally, each layer computes attention matrices using the canonical formulation (Vaswani et al.):
 
 $$\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V$$
 
-Donde $Q$ (Query), $K$ (Key) y $V$ (Value) representan proyecciones lineales del vector de incrustación (*embedding*) de cada token. En una entrada masiva (por ejemplo, de 50.000 a 200.000 tokens), el número total de pares de atención crece de forma cuadrática $O(N^2)$ (o pseudo-lineal en modelos con Sparse / FlashAttention).
+Where $Q$ (Query), $K$ (Key), and $V$ (Value) represent linear projections of token embedding vectors. In long context windows (e.g., 50,000 to 200,000 tokens), the total number of attention pairs scales quadratically $O(N^2)$ (or pseudo-linearly in Sparse / FlashAttention architectures).
 
 ```
-Matriz de Atención Típica (Sin etiquetas claras):
-Token_i  ─── (Atención dispersa entre miles de tokens sin fronteras) ───► Ruido semántico
+Typical Attention Matrix (Unstructured flat text):
+Token_i  ─── (Attention diffused across thousands of unsegmented tokens) ───► Semantic Noise
 
-Matriz de Atención Estructurada (Con delimitadores XML):
-<tool_rules> ─── [Cabezales de atención se anclan en los tokens <tag> y </tag>] ───► Agrupamiento Denso
-Token_rule_k ─── (Atención intra-bloque concentrada) ───► Alta fidelidad de cumplimiento
+Structured Attention Matrix (Explicit XML delimiters):
+<tool_rules> ─── [Attention heads anchor directly on <tag> and </tag> tokens] ───► Dense Clustering
+Token_rule_k ─── (Intra-block focused attention) ───► High Compliance Fidelity
 ```
 
-Cuando un prompt se formula como texto plano continuo o utilizando caracteres tipográficos débiles (como guiones, asteriscos o sangrías informales), los vectores de consulta $Q$ de los tokens en etapas avanzadas de la generación deben competir con una distribución de probabilidad suavizada sobre la totalidad del contexto.
+When a prompt is formatted as flat continuous text or relies on weak typographic markers (hyphens, asterisks, or informal whitespace), query vectors $Q$ at deeper generation steps must compete across a heavily diffused probability distribution over the entire context.
 
-### ¿Por qué las etiquetas XML provocan "Attention Routing" de alta fidelidad?
+### Why XML Tags Drive High-Fidelity "Attention Routing"
 
-1. **Tokens Delimitadores Dedicados en el Vocabulario BPE:** En los tokenizadores modernos (como `cl100k_base`, `o200k_base` de OpenAI, y los tokenizadores subword de Anthropic), combinaciones como `<`, `</`, `>`, o etiquetas enteras como `<context>`, `<rules>`, forman unidades BPE claramente discernibles o secuencias de tokens con patrones de activación estadística muy marcados.
-2. **Inducción de Atención Jerárquica:** Los delimitadores XML actúan como "anclas de atención" (*attention anchors*). Durante el preentrenamiento (donde se consumen ingentes volúmenes de HTML, XML, código y transcripciones estructuradas) y durante el RLHF (Reinforcement Learning from Human Feedback), los modelos frontier aprenden que el contenido encerrado entre `<tag>` y `</tag>` constituye un **ámbito semántico cerrado** (*closed semantic scope*).
-3. **Reducción del Crosstalk Semántico (Interferencia Cruzada):** Cuando las instrucciones del sistema, las definiciones de herramientas, los datos de entrada del usuario y el historial previo están encapsulados en etiquetas XML explícitas, los cabezales de atención especializados en seguir directivas aíslan el bloque de reglas respecto al bloque de datos de usuario, suprimiendo ataques de inyección indirecta de prompts (*Indirect Prompt Injection*) y evitando que los datos se interpreten como comandos.
+1. **Dedicated Tokenizer Tokens in BPE Vocabularies:** Modern tokenizers (such as OpenAI's `cl100k_base` / `o200k_base` and Anthropic's subword tokenizers) represent tags like `<`, `</`, `>`, or full tags like `<context>`, `<rules>` as distinct BPE units or token sequences with pronounced statistical activation signatures.
+2. **Hierarchical Attention Induction:** XML tags serve as structural attention anchors. During pretraining (consuming vast corpora of HTML, XML, code, and structured datasets) and during RLHF (Reinforcement Learning from Human Feedback), frontier models learn that text bounded between `<tag>` and `</tag>` constitutes a **closed semantic scope**.
+3. **Suppression of Semantic Cross-Talk:** When system directives, tool interfaces, external user payloads, and execution history are encapsulated in distinct XML tags, attention heads specialized in rule compliance isolate the operational constraint block from untrusted user data, mitigating indirect prompt injection and preventing raw data from being misconstrued as instructions.
 
 ---
 
-## 1.2 XML frente a Markdown, JSON y texto libre: Comparativa de parseabilidad y entropía semántica
+## 1.2 XML vs. Markdown, JSON, and Raw Text: Parseability and Semantic Entropy Comparison
 
-A la hora de estructurar prompts agénticos, los desarrolladores suelen dudar entre XML, Markdown, JSON o texto libre. La siguiente matriz resume su comportamiento bajo métricas de rendimiento agéntico:
+When structuring agentic prompts, developers often weigh XML against Markdown, JSON, or plain text. The following matrix summarizes empirical behavior under production agentic workloads:
 
-| Criterio | Etiquetas XML (`<tag>`) | Markdown (`#`, `**`, `-`) | JSON / YAML | Texto Libre Indentado |
+| Criterion | XML Tags (`<tag>`) | Markdown (`#`, `**`, `-`) | JSON / YAML | Indented Plain Text |
 | :--- | :--- | :--- | :--- | :--- |
-| **Resistencia al Escapado Accidental** | **Crítica (Muy Alta)**: Muy improbable que el usuario final use etiquetas de cierre coincidentes de forma casual. | **Baja**: El contenido de usuario frecuentemente incluye `#`, `-`, `*`, rompiendo la jerarquía visual. | **Media**: Caracteres como comillas dobles `"` y llaves `{}` se rompen con facilidad al interpolar texto. | **Nula**: Imposible discernir de forma robusta instrucciones de datos. |
-| **Afinidad Nativa de Entrenamiento** | **Óptima (Especialmente Claude)**: Anthropic entrenó a Claude explícitamente para reconocer sintaxis XML para desambiguación. | **Alta en OpenAI/Gemini**: Muy natural, pero propensa a colisiones sintácticas en tareas de código. | **Media-Alta**: Ideal para datos estructurados, pero costosa en tokens para directivas de comportamiento. | **Baja**: Produce la mayor variabilidad estocástica en respuestas. |
-| **Sobrecarga de Tokens (Token Overhead)** | **Baja / Marginal**: Los tokens `<tag>` y `</tag>` son extremadamente concisos (1 a 2 tokens por apertura/cierre). | **Muy Baja**: 1 token por encabezado, pero sin límite de cierre explícito (ambigüedad de fin de bloque). | **Alta**: Llaves, comillas dobles, claves repetidas generan inflación de tokens. | **Mínima en longitud, Máxima en ineficiencia de razonamiento**. |
-| **Parseabilidad Programática (Regex / DOM)** | **Determinística y Trivial**: `/<output>([\s\S]*?)<\/output>/` permite extraer la respuesta exacta sin heurísticas. | **Frágil**: Parsear secciones de markdown requiere analizadores AST complejos que fallan si el LLM varía el nivel de encabezado. | **Fragilidad por malformación**: Si el LLM omite una coma final o una comilla, `JSON.parse()` arroja excepción fatal. | **Imposible de automatizar de forma fiable**. |
-| **Enrutamiento de Atención (Attention Routing)** | **Excelente**: Crea fronteras ortogonales claras en las matrices de atención del modelo. | **Moderado**: Los encabezados marcan inicio, pero el final del ámbito queda difuso. | **Bueno para datos, pobre para razonamiento**: El modelo tiende a comprimir atención en la sintaxis. | **Pobre**: La atención se diluye a lo largo de párrafos planos. |
+| **Accidental Escape Resistance** | **Critical (Very High)**: Highly improbable for user input to casually generate exact matching closing tags. | **Low**: User text routinely contains `#`, `-`, `*`, disrupting document hierarchy. | **Medium**: Quotation marks `"` and braces `{}` frequently break upon raw string interpolation. | **None**: Impossible to deterministically separate instructions from data. |
+| **Native Training Affinity** | **Optimal (Especially Claude)**: Anthropic explicitly trained Claude to recognize XML tags for prompt disambiguation. | **High in OpenAI/Gemini**: Highly natural, but prone to syntax collisions in code generation tasks. | **Medium-High**: Ideal for structured payloads, but token-expensive for behavioral directives. | **Low**: Induces highest stochastic variance across outputs. |
+| **Token Overhead** | **Low / Marginal**: Tags like `<rules>` and `</rules>` are extremely compact (1-2 tokens per tag). | **Very Low**: 1 token per header, but lacks explicit closing boundaries (ambiguous scope end). | **High**: Keys, quotes, and structural brackets create token inflation. | **Minimal length, maximum reasoning inefficiency**. |
+| **Programmatic Parseability (Regex / DOM)** | **Deterministic & Trivial**: `/<output>([\s\S]*?)<\/output>/` reliably extracts targets without heuristics. | **Fragile**: Parsing markdown requires AST analyzers that fail if the LLM shifts heading levels. | **Malformed Fragility**: A single omitted trailing comma or unmatched quote causes fatal JSON parse exceptions. | **Unreliable to automate**. |
+| **Attention Routing** | **Excellent**: Creates orthogonal, unambiguous attention partitions. | **Moderate**: Headers establish entry points, but boundary termination remains diffuse. | **Good for data, poor for reasoning**: Models over-allocate attention to syntax parsing. | **Poor**: Attention dilutes linearly across unstructured paragraphs. |
 
 > [!IMPORTANT]
-> **Veredicto de Ingeniería:** Para la arquitectura global de System Prompts y Context Windows en agentes autónomos, **XML es el estándar de oro**. Debe reservarse JSON exclusivamente para el esquema de argumentos de las herramientas (`tools.parameters`) o dentro del bloque final de payload si una herramienta requiere JSON estricto.
+> **Engineering Verdict:** For overall System Prompt and Context Window architecture in autonomous agents, **XML is the gold standard**. Reserve JSON strictly for tool argument schemas (`tools.parameters`) or within final output payloads when downstream consumers require structured serialization.
 
 ---
 
-## 1.3 El fenómeno "Lost in the Middle" y la dinámica de Primacía / Recencia (Primacy & Recency Bias)
+## 1.3 The "Lost in the Middle" Phenomenon and Primacy / Recency Dynamics
 
-El estudio fundamental de Liu et al. (2023), *"Lost in the Middle: How Language Models Use Long Contexts"*, demostró experimentalmente que el rendimiento de recuperación e instrucción de un LLM sigue una curva en forma de U:
+The foundational study by Liu et al. (2023), *"Lost in the Middle: How Language Models Use Long Contexts"*, demonstrated empirically that information retrieval and instruction compliance follow a U-shaped performance curve across context length:
 
 ```
-Rendimiento / Retención de Instrucciones
+Instruction Compliance / Retrieval Accuracy
   ▲
   │   ████████                                        ████████
-1.0   │   █ Primacía █                                    █ Recencia █
-  │   █ (Inicio) █                                    █  (Final) █
+1.0   │   █ Primacy █                                     █ Recency  █
+  │   █ (Start) █                                     █  (End)   █
   │   ████████                                        ████████
   │            ╲                                    ╱
   │             ╲                                  ╱
 0.5│              ╲                              ╱
   │               ╲                            ╱
   │                ████████████████████████████
-0.0┼─────────────────────── "LOST IN THE MIDDLE" ──────────────────────► Posición del Token
-  0% (Inicio del Prompt)          50% (Centro del Contexto)        100% (Fin del Prompt)
+0.0┼─────────────────────── "LOST IN THE MIDDLE" ──────────────────────► Token Position
+  0% (Prompt Start)              50% (Context Middle)              100% (Prompt End)
 ```
 
-### Dinámica Psicolingüística en Modelos Autorregresivos:
-1. **Sesgo de Primacía (*Primacy Bias*):** Los tokens iniciales del contexto se procesan primero. Sus vectores de estado de atención en el KV cache sirven como la base de proyección para todos los tokens subsiguientes. Por ello, la **identidad ontológica, el rol fundamental y las restricciones absolutas de seguridad** deben ubicarse al principio.
-2. **El Valle del Olvido (*The Middle Valley*):** A medida que la ventana se llena con esquemas de decenas de herramientas, transcripciones de llamadas intermedias y logs de ejecución, los tokens situados entre el 30% y el 75% del context window sufren de menor gradiente de atención efectiva. Colocar reglas operativas críticas en el medio del prompt garantiza prácticamente su violación periódica.
-3. **Sesgo de Recencia (*Recency Bias*):** En modelos autorregresivos (Decoder-only), los últimos tokens generados e inyectados tienen una distancia posicional relativa mínima respecto al token $t+1$ que el modelo está a punto de predecir. Por ende, la **instrucción inmediata del usuario, los recordatorios de formato y las comprobaciones finales** disfrutan del foco de atención más nítido.
+### Psycholinguistic Dynamics in Autoregressive Models:
+1. **Primacy Bias:** Initial context tokens are processed first. Their Key/Value representations in the KV cache serve as the projection baseline for all subsequent generation steps. Consequently, **core role identity, fundamental purpose, and absolute safety constraints** belong at the very beginning of the prompt.
+2. **The Middle Valley:** As context expands with dozens of tool schemas, intermediate call traces, and runtime outputs, tokens positioned between 30% and 75% of the context window experience reduced effective attention gradient. Placing critical operational rules in the middle of a prompt practically guarantees periodic violation.
+3. **Recency Bias:** In autoregressive (decoder-only) architectures, the most recent tokens have minimal relative positional distance to token $t+1$. Therefore, **immediate user commands, output format reminders, and final pre-flight checks** benefit from the sharpest attention focus.
 
 ---
 
-## 1.4 Optimización de Prefijos y Arquitectura del KV Cache (Prompt Caching en Anthropic y OpenAI)
+## 1.4 Prefix Optimization and KV Cache Architecture (Prompt Caching in Anthropic & OpenAI)
 
-En sistemas agénticos de ciclo cerrado (loops de ReAct o Tool Use interactivo), el agente emite una llamada a una herramienta, el entorno ejecuta la herramienta y el resultado se añade al contexto para la siguiente llamada:
+In closed-loop agentic systems (ReAct or interactive tool-use loops), the agent calls a tool, the environment executes it, and the output is appended to the context for the next turn:
 
-$$\text{Turno } 1 \to \text{Turno } 2 \to \dots \to \text{Turno } N$$
+$$\text{Turn } 1 \to \text{Turn } 2 \to \dots \to \text{Turn } N$$
 
-En cada iteración, el System Prompt y las definiciones de herramientas se reenvían al modelo. Sin optimización, esto causa una latencia inaceptable y costes astronómicos.
+At every iteration, the System Prompt and tool definitions are resent to the model. Without optimization, this compounds latency and inference costs.
 
-### Mecánica del Prompt Caching
-Cuando el motor de inferencia (Anthropic Claude o OpenAI GPT) procesa un prefijo de tokens idéntico byte a byte, reutiliza los tensores de Clave y Valor (KV Tensors) previamente calculados y guardados en memoria rápida (SRAM/HBM del clúster de GPUs):
+### Mechanics of Prompt Caching
+When the inference engine (Anthropic Claude or OpenAI GPT) processes a token prefix that is byte-for-byte identical to a prior request, it reuses precomputed Key and Value tensors stored in GPU HBM/SRAM:
 
-- **Anthropic Claude:** Permite fijar puntos de control explícitos (`cache_control: {"type": "ephemeral"}`). Ofrece un **90% de descuento** en tokens de lectura cacheados y reduce el Time To First Token (TTFT) hasta en un 80%.
-- **OpenAI GPT-4o:** Aplica cacheo automático de prefijos para solicitudes con más de 1.024 tokens que compartan el mismo prefijo exacto, otorgando un **50% de descuento**.
+- **Anthropic Claude:** Allows setting explicit cache breakpoints (`cache_control: {"type": "ephemeral"}`). Delivers up to a **90% discount** on cached input tokens and reduces Time To First Token (TTFT) by up to 80%.
+- **OpenAI GPT-4o:** Automatically caches prefixes exceeding 1,024 tokens that share an exact match, granting a **50% discount**.
 
 ```
-PROMPT CACHING - PARTICIÓN FÍSICA EN MEMORIA:
+PROMPT CACHING - MEMORY PARTITIONING TOPOLOGY:
 
-[ BLOQUE ESTÁTICO: INVARIANTE Y CACHEADO (90% de ahorro) ]
+[ STATIC BLOCK: INVARIANT & CACHED (90% cost reduction) ]
 ┌────────────────────────────────────────────────────────┐
-│ <role> Definición de Rol y Misión                     │
-│ <tool_guidelines> Especificación de Herramientas      │
-│ <operational_rules> Reglas de Negocio Inmutables      │
-│ <negative_constraints> Restricciones Absolutas         │
-│ <few_shot_examples> Ejemplos Positivos y Negativos    │
+│ <role> Role Definition & Core Purpose                  │
+│ <tool_guidelines> Tool Usage Specifications            │
+│ <operational_rules> Immutable Business Invariants      │
+│ <negative_constraints> Absolute Safety Constraints     │
+│ <few_shot_examples> Positive & Negative Traces         │
 └────────────────────────────────────────────────────────┘
                           ▲
-                          │ Punto de corte de Cache (Cache Breakpoint)
+                          │ Cache Breakpoint
                           ▼
-[ BLOQUE DINÁMICO: MUTABLE POR TURNO (Procesamiento normal) ]
+[ DYNAMIC BLOCK: PER-TURN MUTATIONS (Standard Processing) ]
 ┌────────────────────────────────────────────────────────┐
-│ <runtime_state> Balance de cuenta, fecha, memoria     │
-│ <dialogue_history> Mensajes previos y tool_results    │
-│ <user_query> Instrucción activa actual                 │
-│ <reminder> Inyección Sandwich final                    │
+│ <runtime_state> Account balance, live prices, memory   │
+│ <dialogue_history> Prior turns and tool_results        │
+│ <user_query> Current active instruction                │
+│ <reminder> Final Sandwich prompt injection             │
 └────────────────────────────────────────────────────────┘
 ```
 
 > [!CAUTION]
-> **El Pecado Capital del Prompt Caching:** Insertar marcas de tiempo dinámicas (`{{current_timestamp}}`), identificadores de sesión efímeros (`session_id: 849204`) o balances variables al inicio del System Prompt invalida el hash del prefijo. Toda la computación subsiguiente se degrada a computación fría (*cold computation*), destruyendo la economía y la velocidad del agente.
+> **The Cardinal Sin of Prompt Caching:** Placing dynamic timestamps (`{{current_timestamp}}`), ephemeral session UUIDs (`session_id: 849204`), or volatile balances at the top of the System Prompt invalidates the prefix hash. The entire request drops to cold computation, destroying cost efficiency and response speed.
 
 ---
 
-## 1.5 Fenómenos de degradación: *Prompt Drift* y *Attention Dilution*
+## 1.5 Degradation Phenomena: Prompt Drift and Attention Dilution
 
-En agentes que ejecutan tareas complejas de larga duración (ej. investigación de 20 turnos, trading en tiempo real, refactorización de código), emergen dos patologías críticas:
+Agents executing extended, multi-turn tasks (deep research, real-time algorithmic trading, large-scale refactors) face two primary operational pathologies:
 
-### 1. *Attention Dilution* (Dilución de la Masa de Atención)
-En transformers estándar con softmax:
+### 1. Attention Dilution
+In standard softmax self-attention:
 $$\sum_{j=1}^{N} \alpha_{ij} = 1$$
-La masa de probabilidad de atención total por cabeza es finita e igual a 1. A medida que $N$ escala de 2.000 a 100.000 tokens, el peso promedio disponible por token disminuye matemáticamente. Si el contexto se satura con 40 páginas de outputs crudos de herramientas (JSON gigantes, traces de compilación, HTML no parseado), el "peso relativo" que el modelo puede asignar a las instrucciones de la etiqueta `<negative_constraints>` situada 80.000 tokens atrás se erosiona exponencialmente.
+Total attention probability mass per head is normalized to 1. As $N$ grows from 2,000 to 100,000 tokens, the mean attention budget per token mathematically diminishes. If the context becomes saturated with unpruned tool payloads (massive raw JSON dumps, verbose build logs, raw HTML), the relative attention weight allocated to `<negative_constraints>` defined 80,000 tokens earlier erodes exponentially.
 
-### 2. *Prompt Drift* (Deriva del Comportamiento Agéntico)
-El prompt drift es la desviación acumulativa del agente respecto a su política de actuación prescrita. Ocurre porque el modelo, al predecir autoregresivamente el siguiente token, se condiciona fuertemente a la **distribución sintáctica y semántica de los turnos inmediatamente anteriores** en lugar del System Prompt distante.
-- *Ejemplo típico:* Si durante 4 turnos sucesivos las herramientas han devuelto mensajes de error en formato informal o el modelo ha emitido explicaciones largas, el modelo tenderá progresivamente a volverse conversacional y abandonar la rigidez de su formato tipado o suspender sus compuertas de seguridad.
+### 2. Prompt Drift
+Prompt drift is the cumulative deviation of agent behavior away from its original policy specification. Because the model autoregressively predicts the next token conditioned heavily on the **syntactic and semantic distribution of recent turns**, an agent exposed to informal errors or conversational padding will gradually degrade into conversational chit-chat, ignoring typed schema contracts and safety gates.
 
 ---
 
-## 1.6 Estrategias de mitigación: Inyección Constitucional, *Sandwich Prompting* y Podado de Ventana
+## 1.6 Mitigation Strategies: Constitutional Injection, Sandwich Prompting, and Context Pruning
 
-Para garantizar que un agente mantenga un determinismo del 99.9% a lo largo de 50 turnos consecutivos, se aplican tres salvaguardas arquitectónicas:
+To guarantee that an agent maintains 99.9% behavioral consistency across 50+ consecutive turns, apply three architectural safeguards:
 
-### A. La Técnica del Sándwich (*Sandwich Prompting*)
-Consiste en colocar la definición estricta de las reglas nucleares al inicio (para sentar la base ontológica y aprovechar el prompt caching) y reinyectar un resumen conciso de los invariantes no negociables en el último turno del usuario o en el cierre del contexto (aprovechando el Recency Bias).
+### A. Sandwich Prompting
+Anchor foundational rules at the prompt opening (for ontological grounding and KV cache reuse), and reinject a concise summary of non-negotiable invariants within the final user turn or context terminator (exploiting Recency Bias).
 
-### B. Inyección Constitucional Dinámica (*Constitutional Reminders*)
-En lugar de permitir que el contexto crezca sin control, el middleware del agente inyecta en cada turno un mini-bloque contextual justo antes de la respuesta del modelo:
+### B. Dynamic Constitutional Reminders
+The orchestration harness injects a compact constitutional reminder immediately preceding the assistant turn:
 ```xml
 <system_reminder>
-Recordatorio Invariante: Nunca ejecutes una orden de mercado sin haber obtenido cotización previa en los últimos 5 segundos. Mantén el formato de salida estricto.
+Invariant Reminder: Never execute an unhedged order without verified Stop Loss indexing within the last 5 seconds. Maintain strict typed output schema.
 </system_reminder>
 ```
 
-### C. Podado Semántico y Paginación de Herramientas (*Context Pruning*)
-Las herramientas no deben devolver datos no estructurados masivos. Toda herramienta debe implementar paginación obligatoria (`limit`, `offset`), filtros de campos (`fields: ["id", "price"]`) y limpieza previa en el host (eliminación de scripts, tags HTML superfluos o payloads binarios).
+### C. Context Pruning & Structured Tool Pagination
+Tools must never return unbounded raw data. Every production tool must implement pagination (`limit`, `offset`), field projection filters (`fields: ["id", "price"]`), and host-side sanitization (stripping CSS, scripts, and duplicate records prior to LLM injection).
 
 ---
 
-# 2. Jerarquía Canónica y Estructura Óptima del Context Window
+# 2. Canonical Hierarchy & Optimal Context Window Structure
 
-## 2.1 Especificación formal del orden de bloques XML canónicos
+## 2.1 Formal Specification of Canonical XML Block Order
 
-A continuación se define la disposición canónica estandarizada para el System Prompt de cualquier agente autónomo de misión crítica. Este orden explota al máximo la arquitectura de atención y la compatibilidad con KV Cache:
+The standardized canonical order for mission-critical autonomous agent System Prompts optimizes both attention routing and KV cache hit rate:
 
 ```mermaid
 graph TD
-    A["1. &lt;identity_and_role&gt;<br/>(Ontología, Propósito Primario)"] --> B["2. &lt;operational_environment&gt;<br/>(Capacidades del Sistema, Límites)"]
-    B --> C["3. &lt;tool_use_protocol&gt;<br/>(Mecanismo de Invocación, Principios)"]
-    C --> D["4. &lt;invariants_and_rules&gt;<br/>(Reglas Operativas Obligatorias)"]
-    D --> E["5. &lt;negative_constraints&gt;<br/>(Límites y Prohibiciones Inquebrantables)"]
-    E --> F["6. &lt;deliberation_scratchpad_rules&gt;<br/>(Protocolo &lt;thinking&gt; y Checklists)"]
-    F --> G["7. &lt;few_shot_examples&gt;<br/>(Casos Positivos y Negativos Contrastivos)"]
-    G --> H["8. &lt;output_contract&gt;<br/>(Esquema Formal de Respuesta Final)"]
-    H -.->|LÍNEA DE CORTE DE CACHE KV| I["9. &lt;dynamic_context&gt;<br/>(Estado en Tiempo Real, Balances)"]
-    I --> J["10. &lt;conversation_history&gt;<br/>(Interacciones Previas + Tool Results)"]
-    J --> K["11. &lt;current_task_and_reminder&gt;<br/>(Input del Usuario + Sandwich Prompt)"]
+    A["1. &lt;identity_and_role&gt;<br/>(Ontology, Core Mission)"] --> B["2. &lt;operational_environment&gt;<br/>(System Capabilities, Runtime Bounds)"]
+    B --> C["3. &lt;tool_use_protocol&gt;<br/>(Invocation Rules, Principles)"]
+    C --> D["4. &lt;invariants_and_rules&gt;<br/>(Mandatory Business Rules)"]
+    D --> E["5. &lt;negative_constraints&gt;<br/>(Inviolable Boundaries & Prohibitions)"]
+    E --> F["6. &lt;deliberation_scratchpad_rules&gt;<br/>(&lt;thinking&gt; Protocol & Checklists)"]
+    F --> G["7. &lt;few_shot_examples&gt;<br/>(Contrastive Positive & Negative Traces)"]
+    G --> H["8. &lt;output_contract&gt;<br/>(Formal Output Specification)"]
+    H -.->|KV CACHE BREAKPOINT| I["9. &lt;dynamic_context&gt;<br/>(Real-Time State, Balances)"]
+    I --> J["10. &lt;conversation_history&gt;<br/>(Prior Steps & Tool Results)"]
+    J --> K["11. &lt;current_task_and_reminder&gt;<br/>(User Command + Sandwich Prompt)"]
 ```
 
 ---
 
-## 2.2 Desglose anatómico de etiquetas núcleo
+## 2.2 Anatomical Breakdown of Core Tags
 
 ### 1. `<identity_and_role>`
-Define la persona funcional, el nivel de seniority y el objetivo fundamental.
-- **Directriz:** Evitar adjetivos vagos ("eres un asistente servicial"). Usar mandatos operativos y límites de responsabilidad.
-- *Ejemplo:*
-  ```xml
-  <identity_and_role>
-  Eres el Agente Autónomo de Ejecución y Gestión de Riesgo (Nivel L4).
-  Tu función exclusiva es validar, calcular y ejecutar órdenes en mercados financieros siguiendo políticas matemáticas de preservación de capital.
-  No tienes autorización para opinar sobre temas ajenos a la operativa técnica.
-  </identity_and_role>
-  ```
+Defines functional persona, seniority, and operational scope. Avoid vague adjectives ("you are a helpful assistant"). Use crisp operational mandates.
+```xml
+<identity_and_role>
+You are the Autonomous Execution & Quantitative Risk Manager (L4).
+Your exclusive mandate is to validate, calculate, and deploy orders across digital asset derivatives following strict capital preservation policies.
+You are strictly unauthorized to discuss non-operational topics.
+</identity_and_role>
+```
 
 ### 2. `<operational_environment>`
-Proporciona al modelo la noción exacta de dónde está operando (sistema operativo, permisos, aislamiento, APIs disponibles).
-- *Ejemplo:*
-  ```xml
-  <operational_environment>
-  - Entorno de ejecución: Linux Sandbox aislado (sin acceso a internet fuera de endpoints autorizados).
-  - Modo de ejecución: Asíncrono con monitorización de tareas de fondo.
-  - Persistencia: Solo lectura en disco excepto en el directorio asignado `/workspace/scratch/`.
-  </operational_environment>
-  ```
+Establishes execution boundaries (operating system, isolation guarantees, network constraints, API endpoints).
+```xml
+<operational_environment>
+- Execution Runtime: Linux Sandbox container (isolated network; authorized API endpoints only).
+- Execution Mode: Asynchronous with persistent background task monitoring.
+- Storage Policy: Read-only on root filesystem; write permissions restricted to `/workspace/scratch/`.
+</operational_environment>
+```
 
 ### 3. `<tool_use_protocol>`
-Explica la filosofía general con la que el modelo debe interactuar con su arsenal de herramientas.
-- *Directrices de Anthropic:* "Treat descriptions like documentation for a junior hire".
-- Regla de nombres canónicos: `servicio_accion_objetivo` (ej. `binance_fetch_ticker`, `db_query_trades`).
-- *Ejemplo:*
-  ```xml
-  <tool_use_protocol>
-  1. Invoca herramientas únicamente cuando requieras información externa que no exista en el contexto actual.
-  2. Prefiere siempre herramientas de lectura no destructivas antes de herramientas de escritura/ejecución.
-  3. Comprueba siempre los tipos de datos requeridos por el esquema JSON antes de despachar la llamada.
-  </tool_use_protocol>
-  ```
+Codifies tool interaction guidelines. Follow Anthropic's rule: *"Treat tool descriptions like documentation for a junior engineer."*
+```xml
+<tool_use_protocol>
+1. Invoke tools only when external data is missing from current context.
+2. Favor non-destructive read operations before mutating or destructive calls.
+3. Validate parameter types and bounds against schema prior to dispatch.
+</tool_use_protocol>
+```
 
 ### 4. `<invariants_and_rules>`
-Reglas de negocio positivas que deben satisfacerse en todo estado del autómata.
-- *Ejemplo:*
-  ```xml
-  <invariants_and_rules>
-  - Invariante 1: Todo cálculo de tamaño de posición (lot size) debe utilizar la fórmula: `Risk_Capital / (Stop_Loss_Distance * Tick_Value)`.
-  - Invariante 2: Si el deslizamiento (slippage) estimado supera los 5 bps, se debe degradar a orden LIMIT en lugar de orden MARKET.
-  </invariants_and_rules>
-  ```
+Positive business logic invariants that must hold true across all state transitions.
+```xml
+<invariants_and_rules>
+- Invariant 1: Position sizing must strictly apply: `Risk_Capital / (Stop_Loss_Distance * Tick_Value)`.
+- Invariant 2: If estimated market slippage exceeds 5 bps, degrade from MARKET to LIMIT order.
+</invariants_and_rules>
+```
 
 ### 5. `<negative_constraints>`
-Prohibiciones taxativas redactadas con formulación asertiva y límites infranqueables. (Detalladas en la Sección 5).
+Unambiguous negative boundaries formulated assertively (detailed in Section 5).
 
 ### 6. `<deliberation_scratchpad_rules>`
-Instrucciones estrictas sobre cómo debe pensar el agente en privado antes de actuar (Detalladas en la Sección 4).
+Pre-execution reasoning protocol forcing deliberate planning before tool dispatch (detailed in Section 4).
 
 ### 7. `<few_shot_examples>`
-Biblioteca de patrones de uso que cubren tanto caminos felices como bordes de error y abstención (Detalladas en la Sección 3).
+Diverse execution traces covering positive flows, edge cases, and disciplined abstentions (detailed in Section 3).
 
 ### 8. `<output_contract>`
-Garantía tipada de lo que el agente debe emitir al usuario cuando concluye su trabajo o cuando requiere confirmación externa.
+Typed contract defining the exact response structure expected by downstream consumers.
 
 ---
 
-## 2.3 Regla de partición estática vs. dinámica para maximizar el Cache Hit Rate (>90%)
+## 2.3 Static vs. Dynamic Partitioning Rule for Maximizing Cache Hit Rate (>90%)
 
-Para lograr un rendimiento industrial óptimo en latencia y coste, el equipo de ingeniería debe estructurar los mensajes de la API respetando una separación física inmutable:
-
-| Partición | Componentes | Frecuencia de Modificación | Estado en Cache |
+| Partition | Components | Mutation Cadence | Cache Status |
 | :--- | :--- | :--- | :--- |
-| **Prefijo Estático (Bloque 1)** | `<identity_and_role>` hasta `<output_contract>` + Esquemas de `tools` en la llamada a la API. | Semanas / Meses (Solo en despliegues de versión). | **100% Cache HIT**. Se calcula una vez y se lee en 10-15 ms. |
-| **Punto de Quiebre de Cache** | Inserción de la directiva `cache_control: {"type": "ephemeral"}` (Anthropic) al final del bloque estático. | - | Marca el límite de serialización. |
-| **Sufijo Dinámico (Bloque 2)** | `<dynamic_context>` (timestamp UTC, balances actuales, precios de mercado), historial de mensajes y consultas del usuario. | Por cada turno o interacción. | **Cache MISS** (Se computa en cada llamada). |
+| **Static Prefix (Block 1)** | `<identity_and_role>` through `<output_contract>` + Tool parameter schemas. | Weeks / Months (Release deployments only). | **100% Cache HIT**. Computed once, served in 10-15 ms. |
+| **Cache Breakpoint** | Insertion of `cache_control: {"type": "ephemeral"}` at the close of `<output_contract>`. | - | Marks boundary for KV reuse. |
+| **Dynamic Suffix (Block 2)** | `<dynamic_context>` (UTC timestamps, live prices, portfolio state), execution history, active user prompt. | Per turn. | **Cache MISS** (Computed dynamically per step). |
 
 ---
 
-# 3. Few-Shots Avanzados para Uso de Herramientas (Tool Calling)
+# 3. Advanced Few-Shots for Tool Calling
 
-## 3.1 Anatomía de un Few-Shot sintético de alta precisión
+## 3.1 Anatomy of a High-Precision Synthetic Few-Shot Execution Trace
 
-El error más común en prompt engineering agéntico es incluir pocos ejemplos o ejemplos sintácticamente descuidados que no simulan el bucle completo de interacción.
-Un Few-Shot moderno no es una simple frase: es una **traza de ejecución completa** que modela el ciclo percepción-deliberación-acción-resultado.
+The most prevalent flaw in agent prompt design is relying on shallow, single-turn examples. A production few-shot is a **complete execution trace** modeling perception, deliberation, tool invocation, result interpretation, and final delivery:
 
 ```
-Anatomía de una Traza Few-Shot:
+Few-Shot Trace Architecture:
 ┌────────────────────────────────────────────────────────┐
 │ <example id="...">                                    │
-│   <user_input> Petición contextualizada                │
-│   <thinking> Deliberación y verificación de precondiciones│
-│   <tool_call> Invocación con argumentos validados      │
-│   <tool_result> Retorno simulado del entorno           │
-│   <thinking> Análisis post-ejecución                   │
-│   <final_response> Comunicación concisa al usuario     │
+│   <user_input> Contextualized command                  │
+│   <thinking> Deliberation & precondition checklist     │
+│   <tool_call> Validated tool invocation               │
+│   <tool_result> Environment execution payload          │
+│   <thinking> Post-execution synthesis                 │
+│   <final_response> Concise, typed response             │
 │ </example>                                             │
 └────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 3.2 Ejemplos Positivos (Positive Few-Shots): Invocación óptima
+## 3.2 Positive Few-Shots: Optimal Invocation
 
-Los ejemplos positivos deben enseñar:
-1. Selección de la herramienta adecuada con argumentos mínimos necesarios.
-2. Invocación paralela si las herramientas son independientes.
-3. Respeto al esquema sin alucinar campos ficticios.
-
----
-
-## 3.3 Negative Few-Shots: El pilar crítico ignorado
-
-La mayoría de los agentes fallan en producción no porque no sepan invocar herramientas, sino porque **sufren de "gatillo fácil" (hyper-triggering)**: llaman a herramientas innecesarias, degradando la latencia, agotando cuotas de API y generando riesgos operativos.
-Los **Negative Few-Shots** enseñan la virtud cardinal de un agente autónomo: **saber cuándo abstenerse de usar una herramienta**.
-
-### Caso A: Información ya presente en el contexto / memoria local (Anti-Redundancia)
-*Problema:* El usuario pide analizar un dato que ya fue devuelto en el turno anterior. El agente vuelve a consultar la API de forma innecesaria.
-*Objetivo:* Forzar al agente a consultar su propio historial y contexto antes de emitir un comando I/O.
-
-### Caso B: Violación de precondiciones de seguridad o de negocio (Aborto Preventivo)
-*Problema:* El usuario solicita una acción destructiva (ej. `execute_market_order` por $50.000) pero el saldo disponible en cuenta es de solo $10.000 o el mercado presenta alta volatilidad bloqueante.
-*Objetivo:* Enseñar al agente a abortar la llamada, explicar la discrepancia y salvaguardar el estado sin tocar la herramienta.
-
-### Caso C: Petición teórica o explicativa pura (Supresión de Triggers)
-*Problema:* El usuario formula una pregunta conceptual: *"¿Cómo funciona el stop loss dinámico en tu algoritmo?"*. El agente interpreta erróneamente que debe consultar el estado de los stop losses del broker e invoca `get_position_risk`.
-*Objetivo:* Demostrar que solicitudes de tipo pedagógico o explicativo deben responderse exclusivamente con lenguaje natural.
-
-### Caso D: Herramienta secundaria (Read-Only) vs. Primaria (Mutativa)
-*Problema:* El usuario dice: *"Comprueba si el script de trading está activo"*. El agente invoca `restart_trading_service` en vez de `get_service_status`.
-*Objetivo:* Aplicar el principio de mínimo privilegio (*Principle of Least Privilege*).
+Positive few-shots demonstrate:
+1. Selecting the optimal tool with minimum necessary arguments.
+2. Parallel invocation when tools are decoupled and independent.
+3. Strict schema compliance without hallucinated parameters.
 
 ---
 
-## 3.4 Aprendizaje Contrastivo en Prompts: Emparejamiento POSITIVO vs. NEGATIVO
+## 3.3 Negative Few-Shots: The Critical Overlooked Pillar
 
-La técnica más potente demostrada en la literatura técnica reciente es presentar **pares contrastivos** que compartan un enunciado superficial casi idéntico pero cuya semántica profunda exija bifurcar entre acción o abstención.
+Most autonomous agents fail in production not from inability to invoke tools, but from **hyper-triggering**: dispatching unnecessary calls, inflating latency, draining API rate limits, and creating operational risk. **Negative few-shots teach an autonomous agent the critical skill of abstention.**
+
+### Case A: Information Already in Context (Anti-Redundancy)
+*Scenario:* User asks to analyze data returned in the immediate preceding step. The agent needlessly queries the API again.  
+*Remedy:* Force the model to inspect its existing context before issuing I/O calls.
+
+### Case B: Safety or Business Precondition Violation (Preventive Abort)
+*Scenario:* User requests an action exceeding risk boundaries (e.g. `$50,000` order when risk cap is `$10,000`).  
+*Remedy:* Instruct the agent to abort the call, explain the policy violation, and preserve account state without touching the tool.
+
+### Case C: Purely Theoretical or Conceptual Request (Trigger Suppression)
+*Scenario:* User asks: *"How does dynamic trailing stop loss work in your algorithm?"* The agent misinterprets this as a command to query live exchange stops and calls `get_position_risk`.  
+*Remedy:* Exemplify that theoretical and educational inquiries must be answered with pure natural language.
+
+### Case D: Secondary (Read-Only) vs. Primary (Mutating) Tool Selection
+*Scenario:* User asks: *"Check if the trading engine is running."* The agent invokes `restart_service` instead of `get_service_status`.  
+*Remedy:* Enforce the Principle of Least Privilege across tool selection.
+
+---
+
+## 3.4 Contrastive Learning in Prompts: POSITIVE vs. NEGATIVE Pairing
+
+Pairing near-identical user requests that diverge based on subtle contextual preconditions provides the strongest signal to the model's self-attention layers:
 
 ```
-Par Contrastivo:
-Query A: "Actualiza el balance de la cuenta y muéstrame las operaciones abiertas."
-   ├── Contexto: Sin balance en los últimos 30 min.
-   └── Decisión: LLAMAR a fetch_account_balance() y fetch_open_orders().
+Contrastive Pair:
+Query A: "Refresh account balance and show open positions."
+   ├── Context: No balance data in context over the past 30 minutes.
+   └── Action: CALL fetch_account_balance() and fetch_open_orders().
 
-Query B: "Según el balance que acabas de obtener hace 10 segundos, ¿cuál es mi margen libre?"
-   ├── Contexto: Balance obtenido en el turno inmediato anterior.
-   └── Decisión: NO LLAMAR a herramientas. Responder directamente calculando con el dato en contexto.
+Query B: "Based on the balance fetched 10 seconds ago, what is my free margin?"
+   ├── Context: Balance fetched in immediate prior step.
+   └── Action: DO NOT CALL tools. Calculate and answer directly using context.
 ```
 
 ---
 
-## 3.5 Esquema formal de serialización XML para Few-Shots
-
-A continuación se presenta la codificación canónica de Few-Shots positivos y negativos que debe residir en el System Prompt:
+## 3.5 Formal XML Serialization Schema for Few-Shots
 
 ```xml
 <few_shot_examples>
 
-  <!-- EJEMPLO 1: POSITIVO (Búsqueda y cálculo necesario) -->
+  <!-- EXAMPLE 1: POSITIVE (Required External Query & Calculation) -->
   <example id="pos_01_fetch_and_calculate">
-    <scenario>El usuario requiere el estado de una posición que no existe en el contexto.</scenario>
-    <user_input>¿Cuál es el PnL no realizado de mi posición en BTC/USDT?</user_input>
+    <scenario>User requests position status missing from current context.</scenario>
+    <user_input>What is the unrealized PnL of my BTC/USDT position?</user_input>
     <thinking>
-      1. Evaluar contexto: No hay información de posiciones abiertas en los turnos recientes.
-      2. Determinar necesidad de herramienta: Se requiere consultar la API de intercambio.
-      3. Herramienta adecuada: `exchange_get_positions` con parámetro `symbol: "BTCUSDT"`.
-      4. Verificación de seguridad: Operación de solo lectura (Read-Only). No presenta riesgos mutativos.
+      1. Context Audit: No open position records present in recent turns.
+      2. Tool Requirement: Query exchange API.
+      3. Target Tool: `exchange_get_positions` with argument `symbol: "BTCUSDT"`.
+      4. Safety Verification: Read-only operation. Zero risk.
     </thinking>
     <tool_call name="exchange_get_positions">
       {"symbol": "BTCUSDT"}
@@ -391,61 +378,61 @@ A continuación se presenta la codificación canónica de Few-Shots positivos y 
       {"symbol": "BTCUSDT", "position_amt": 1.5, "entry_price": 64200.0, "mark_price": 65800.0, "unrealized_pnl": 2400.0}
     </tool_result>
     <thinking>
-      El resultado fue exitoso. PnL no realizado es +$2,400.00 USDT. Respondo al usuario de forma directa y sintética.
+      Result retrieved successfully. Unrealized PnL is +$2,400.00 USDT. Deliver concise response.
     </thinking>
     <final_response>
-      Tu posición actual en **BTC/USDT** (1.5 BTC) tiene un precio de entrada de $64,200.00 y un precio de marca de $65,800.00.
-      El **PnL no realizado es de +$2,400.00 USDT** (+2.49%).
+      Your active **BTC/USDT** position (1.5 BTC) has an entry price of $64,200.00 and mark price of $65,800.00.
+      Current **unrealized PnL is +$2,400.00 USDT** (+2.49%).
     </final_response>
   </example>
 
-  <!-- EJEMPLO 2: NEGATIVO (Información ya presente en memoria - Evitar Redundancia) -->
+  <!-- EXAMPLE 2: NEGATIVE (Data Already Present - Anti-Redundancy) -->
   <example id="neg_01_redundant_query">
-    <scenario>El contexto ya contiene la cotización de ETH/USDT obtenida hace 12 segundos.</scenario>
-    <user_input>¿A cuánto cotiza ETH ahora según lo que viste?</user_input>
+    <scenario>Context already contains ETH/USDT price fetched 12 seconds ago.</scenario>
+    <user_input>What is the ETH price based on what you just saw?</user_input>
     <thinking>
-      1. Evaluar contexto: El tool_result previo de `exchange_get_ticker` contiene `{"symbol": "ETHUSDT", "last_price": 3450.25, "timestamp": 1727271000}`.
-      2. Antipatrón detectado: Volver a invocar `exchange_get_ticker` causaría una llamada redundante e innecesaria.
-      3. Decisión: NO LLAMAR a ninguna herramienta. Usar el dato ya presente en el historial.
+      1. Context Audit: Prior tool_result for `exchange_get_ticker` contains `{"symbol": "ETHUSDT", "last_price": 3450.25, "timestamp": 1727271000}`.
+      2. Anti-Pattern Check: Re-invoking `exchange_get_ticker` would be redundant.
+      3. Decision: DO NOT CALL tools. Answer using existing context.
     </thinking>
     <final_response>
-      De acuerdo con la última lectura de hace unos instantes, **ETH/USDT cotiza a $3,450.25 USDT**.
+      Based on the recent ticker update, **ETH/USDT is trading at $3,450.25 USDT**.
     </final_response>
   </example>
 
-  <!-- EJEMPLO 3: NEGATIVO (Violación de Precondición de Seguridad - Aborto) -->
+  <!-- EXAMPLE 3: NEGATIVE (Safety Precondition Violation - Preventive Abort) -->
   <example id="neg_02_precondition_violation">
-    <scenario>El usuario ordena ejecutar una compra de alto volumen, pero el riesgo excede el límite máximo por trade.</scenario>
-    <user_input>Abre una orden de compra a mercado por 10 BTC ahora mismo en Binance.</user_input>
+    <scenario>User requests market buy exceeding per-trade risk threshold.</scenario>
+    <user_input>Place a market buy order for 10 BTC right now on Binance.</user_input>
     <thinking>
-      1. Evaluar precondiciones operativas:
-         - Parámetros requeridos: symbol="BTCUSDT", side="BUY", type="MARKET", quantity=10.0.
-         - Restricción Invariante de Seguridad: "El tamaño máximo permitido por orden es de 2.0 BTC".
-         - Cantidad solicitada: 10.0 BTC.
-      2. Detección de brecha: 10.0 BTC > 2.0 BTC límite estricto de la política de riesgo.
-      3. Decisión: BLOQUEO PREVENTIVO. Prohibido ejecutar `exchange_place_order`.
-      4. Acción: Abortar y reportar la violación de política al operador.
+      1. Precondition Audit:
+         - Parameters: symbol="BTCUSDT", side="BUY", type="MARKET", quantity=10.0.
+         - Invariant Rule: "Maximum per-trade position size is capped at 2.0 BTC".
+         - Requested Size: 10.0 BTC.
+      2. Boundary Breach: 10.0 BTC > 2.0 BTC limit.
+      3. Decision: PREVENTIVE BLOCK. Prohibited from executing `exchange_place_order`.
+      4. Action: Abort execution and notify user of policy breach.
     </thinking>
     <final_response>
-      [RECHAZO DE SEGURIDAD]: La orden solicitada de **10.0 BTC** excede el límite máximo de exposición por operación única fijado en **2.0 BTC**.
-      La herramienta de ejecución no ha sido activada para proteger el capital. Si deseas proceder, ajusta el volumen a un máximo de 2.0 BTC o solicita una anulación administrativa de la regla de riesgo.
+      [SAFETY REJECTION]: The requested order of **10.0 BTC** exceeds the maximum per-trade limit of **2.0 BTC**.
+      The order execution tool was not invoked to protect account equity. To proceed, resize order to $\le 2.0$ BTC or request an authorized policy override.
     </final_response>
   </example>
 
-  <!-- EJEMPLO 4: NEGATIVO (Petición puramente conceptual - No Trigger) -->
+  <!-- EXAMPLE 4: NEGATIVE (Purely Theoretical Request - Trigger Suppression) -->
   <example id="neg_03_pure_theoretical_query">
-    <scenario>El usuario consulta sobre teoría financiera o funcionamiento del bot.</scenario>
-    <user_input>Explícame qué diferencia hay entre una orden TWAP y una VWAP.</user_input>
+    <scenario>User inquires about algorithmic execution theory.</scenario>
+    <user_input>Explain the core difference between a TWAP and a VWAP execution algorithm.</user_input>
     <thinking>
-      1. Analizar intención del usuario: Pregunta educativa/teórica sobre algoritmos de ejecución.
-      2. Evaluar herramientas disponibles: `exchange_place_order`, `get_market_depth`, `fetch_account_balance`.
-      3. Correlación con herramientas: Cero. Ninguna herramienta aporta a responder una definición teórica.
-      4. Decisión: Responder directamente sin emitir ninguna llamada a herramientas.
+      1. Intent Analysis: Educational/theoretical query regarding execution algorithms.
+      2. Tool Evaluation: `exchange_place_order`, `get_market_depth`, `fetch_account_balance`.
+      3. Tool Relevance: None. No tool call is required to explain a concept.
+      4. Decision: Answer directly without triggering tools.
     </thinking>
     <final_response>
-      La diferencia principal radica en la métrica de ponderación:
-      - **TWAP (Time-Weighted Average Price):** Divide la orden total en fragmentos iguales ejecutados a intervalos de tiempo regulares, ignorando el volumen del mercado.
-      - **VWAP (Volume-Weighted Average Price):** Modula el ritmo de ejecución según la distribución histórica del volumen intradiario, ejecutando más volumen durante periodos de alta liquidez para minimizar el impacto en el precio (*market impact*).
+      The core distinction lies in the weighting mechanism:
+      - **TWAP (Time-Weighted Average Price):** Slices an order evenly across regular time intervals, irrespective of market volume.
+      - **VWAP (Volume-Weighted Average Price):** Dynamically paces execution proportionally to historical intraday volume curves, executing more aggressively during high-liquidity periods to minimize market impact.
     </final_response>
   </example>
 
@@ -454,63 +441,59 @@ A continuación se presenta la codificación canónica de Few-Shots positivos y 
 
 ---
 
-# 4. Deliberación, Monólogo Interno y Scratchpads (`<thinking>` / `<scratchpad>`)
+# 4. Deliberation, Inner Monologue, and Scratchpads (`<thinking>` / `<scratchpad>`)
 
-## 4.1 Separación estricta entre Deliberación Interna y Emisión de Acciones Externas
+## 4.1 Strict Separation Between Inner Deliberation and External Action Dispatch
 
-Uno de los mayores causantes de alucinaciones y llamadas a herramientas catastróficas es el fenómeno del **"Token-Level Premature Commitment"** (Compromiso prematuro a nivel de token).
+One of the primary causes of hallucinations and unintended tool calls is **"Token-Level Premature Commitment"**:
 
 ```
-Flujo Sin Deliberación (Alta Tasa de Falla):
-Prompt ──► LLM emite directamente argumentos JSON ──► Alucinación de valores o llamada prematura
+Unstructured Generation (High Failure Rate):
+Prompt ──► LLM immediately outputs JSON parameters ──► Hallucinated bounds or early dispatch
 
-Flujo Con Deliberación Estricta (<thinking>):
-Prompt ──► <thinking> Auto-auditoría, Verificación, CoT </thinking> ──► Invocación Segura
+Structured Generation (<thinking> Scratchpad):
+Prompt ──► <thinking> Self-Audit, Precondition Checklist, CoT </thinking> ──► Safe Tool Invocation
 ```
 
-Cuando un LLM genera texto autorregresivamente token tras token, si el primer token que emite es el inicio del bloque de la herramienta (ej. `{"name": "execute_order"...`), el modelo se ve forzado a completar los argumentos basándose exclusivamente en sus pesos latentes, sin haber tenido "espacio de cómputo en tokens" para planificar la coherencia lógica de los argumentos.
+When an LLM generates tokens autoregressively, if the first emitted token is a tool call (e.g. `{"name": "execute_order"...`), the model commits to arguments based on unguided latent space projections without token compute dedicated to verifying logical constraints.
 
-El uso explícito de etiquetas `<thinking>` o `<scratchpad>` otorga al modelo un **búfer de razonamiento oculto o visible** (*computation scratchpad*). Cada token emitido dentro de `<thinking>` expande el vector de estado interno del Transformer, permitiéndole "pensar antes de hablar".
+Encapsulating deliberation in explicit `<thinking>` tags provides a **dedicated reasoning compute buffer**. Every reasoning token emitted expands the Transformer's attention state, ensuring thorough plan validation before acting.
 
 ---
 
-## 4.2 Extended Thinking nativo vs. Scratchpad explícito en System Prompt
+## 4.2 Native Extended Thinking vs. Explicit Scratchpad in System Prompts
 
-En la generación actual de modelos conviven dos paradigmas de deliberación:
-
-### 1. Extended Thinking Nativo (Claude 3.7 Sonnet / OpenAI o1-o3 / Gemini Flash Thinking)
-- **Mecánica:** El modelo está entrenado mediante RL a gran escala para generar cadenas de pensamiento densas que la API abstrae en un bloque de metadatos `thinking: "..."`.
-- **Ventaja:** No requiere forzar la sintaxis en el System Prompt; el modelo decide dinámicamente la profundidad del razonamiento según la dificultad de la tarea.
-- **Regla de Integración Crítica (Anthropic API):** Si se utiliza Extended Thinking con herramientas, el desarrollador **debe devolver el bloque `thinking` intacto** en el historial de mensajes al responder con un `tool_result`. Modificar o podar este bloque provocará un error de validación `400 Bad Request` en la API de Anthropic.
-
-### 2. Scratchpad Explícito en System Prompt (`<thinking>`)
-- **Mecánica:** Diseñado mediante directivas e ingeniería de prompts para modelos que no disponen de Extended Thinking nativo o cuando se requiere forzar una auditoría con pasos deterministas invariables.
-- **Ventaja:** Permite imponer un protocolo formal paso a paso (checklist) que el modelo está obligado a imprimir antes de emitir cualquier herramienta.
+| Dimension | Native Extended Thinking (Claude 3.7 / OpenAI o1-o3) | Explicit System Prompt Scratchpad (`<thinking>`) |
+| :--- | :--- | :--- |
+| **Mechanism** | RL-trained hidden chain-of-thought surfaced via API metadata. | Prompt-engineered tags enforcing step-by-step scratchpad output. |
+| **Token Cost** | Billed as output/reasoning tokens. | Billed as standard output tokens. |
+| **Structure Control** | Model decides reasoning depth autonomously. | Developer enforces a mandatory, deterministic step-by-step checklist. |
+| **API Contract Rule** | **Anthropic:** The `thinking` block must be passed back unaltered in subsequent turns; altering it returns HTTP 400 Bad Request. | Standard conversational string; can be parsed, logged, or stripped cleanly. |
 
 ---
 
-## 4.3 El patrón "Think Tool" en bucles agénticos multi-paso
+## 4.3 The "Think Tool" Pattern in Multi-Step Agentic Loops
 
-Documentado por Anthropic en sus arquitecturas agénticas avanzadas, el patrón **"Think Tool"** consiste en registrar una función sintética en el catálogo de herramientas del agente:
+Pioneered in Anthropic's agentic research, the **Think Tool** registers a synthetic deliberation function in the agent's tool catalog:
 
 ```json
 {
   "name": "think",
-  "description": "Herramienta de deliberación interna. Invoca esta herramienta para pausar, evaluar los datos recibidos de turnos anteriores, auditar hipótesis y planificar el siguiente paso antes de interactuar con el entorno.",
+  "description": "Internal deliberation tool. Call this tool to pause, evaluate intermediate data, test hypotheses, and plan next actions before touching environment tools.",
   "parameters": {
     "type": "object",
     "properties": {
       "assessment": {
         "type": "string",
-        "description": "Evaluación crítica del estado actual: qué sabemos y qué falta."
+        "description": "Critical evaluation of current state: verified data vs missing data."
       },
       "preconditions_met": {
         "type": "boolean",
-        "description": "True si todas las condiciones de seguridad están satisfechas."
+        "description": "True if all safety gates and parameter requirements are satisfied."
       },
       "next_action": {
         "type": "string",
-        "description": "Acción específica que se ejecutará a continuación."
+        "description": "Specific subsequent tool call or final user response planned."
       }
     },
     "required": ["assessment", "preconditions_met", "next_action"]
@@ -518,206 +501,201 @@ Documentado por Anthropic en sus arquitecturas agénticas avanzadas, el patrón 
 }
 ```
 
-### ¿Por qué utilizar un "Think Tool" frente a texto plano?
-En frameworks de agentes donde cualquier emisión de texto no-JSON se interpreta como un mensaje dirigido al usuario final, registrar `think` como herramienta permite al agente deliberar **sin romper la tubería de ejecución desatendida ni molestar al usuario con reflexiones intermedias**.
+### Why Use a "Think Tool" Over Freeform Text?
+In headless agent frameworks where non-JSON text output is interpreted as a final message to the user, registering `think` as a tool allows the model to deliberate **without breaking the autonomous execution pipeline or polluting user-facing transcripts with scratchpad chatter**.
 
 ---
 
-## 4.4 Compuertas de Verificación de Precondiciones (*Precondition Checklists*)
+## 4.4 Precondition Verification Checklists
 
-Para herramientas que alteran el mundo exterior (ejecutar órdenes financieras, escribir archivos, borrar registros en bases de datos o enviar correos), el System Prompt debe exigir una **comprobación booleana exhaustiva** dentro del `<thinking>` antes de permitir la emisión del payload:
+For mutating or destructive operations (order execution, disk writes, database mutations, email dispatch), require an explicit **boolean verification matrix** inside `<thinking>` prior to payload dispatch:
 
 ```xml
 <precondition_checklist_protocol>
-Antes de emitir cualquier llamada a una herramienta clasificada como [MUTATIVA] o [DESTRUCTIVA], estás OBLIGADO a ejecutar y reflejar explícitamente en tu bloque <thinking> la siguiente matriz de verificación booleana:
+Before calling any tool classified as [MUTATING] or [DESTRUCTIVE], you MUST evaluate and print the following boolean checklist inside <thinking>:
 
-1. ¿Se han obtenido y verificado los parámetros mandatorios? (Sí/No)
-2. ¿Los datos provienen de una fuente de verdad confirmada en los últimos 60 segundos? (Sí/No)
-3. ¿La acción viola alguna restricción de la sección <negative_constraints>? (Sí/No)
-4. ¿Existe ambigüedad en la instrucción del usuario que amerite clarificación humana? (Sí/No)
+1. Are all mandatory parameters verified against their schema types? (Yes/No)
+2. Does the data originate from an authoritative source verified within the last 60 seconds? (Yes/No)
+3. Does this action violate any rule in <negative_constraints>? (Yes/No)
+4. Is there ambiguity in the user's instructions warranting human clarification? (Yes/No)
 
-REGLA DE PARADA: Si alguna de las preguntas 1 o 2 es "No", o si la pregunta 3 o 4 es "Sí", TIENES ESTRICTAMENTE PROHIBIDO emitir la herramienta. Debes abortar la acción y emitir una explicación en <final_response>.
+HALT RULE: If Question 1 or 2 is "No", or Question 3 or 4 is "Yes", calling the tool is STRICTLY FORBIDDEN. Abort execution and explain the issue in <final_response>.
 </precondition_checklist_protocol>
 ```
 
 ---
 
-# 5. Reglas Negativas, Compuertas de Seguridad y Manejo de Errores
+# 5. Negative Rules, Security Gates, and Error Handling
 
-## 5.1 La psicología del LLM: El efecto "Pink Elephant" y la falla de las negaciones simples
+## 5.1 LLM Psychology: The "Pink Elephant" Effect and the Failure of Simple Negations
 
-Uno de los hallazgos más consolidados en la ciencia cognitiva aplicada a LLMs es la propensión al sesgo de atención por negación:
+A consistent finding in cognitive evaluations of LLMs is attention capture through negation:
 
-> **El Experimento del Elefante Rosa:** Si a un LLM se le instruye: *"No pienses en un elefante rosa"*, los tokens "elefante" y "rosa" activan inmediatamente los clústeres semánticos de paquidermos rosados en las capas de atención intermedia. Al no existir un operador booleano unario de negación puro en la multiplicación matricial de un Transformer, el modelo termina asociando fuertemente el contexto subsiguiente con el concepto prohibido.
+> **The Pink Elephant Paradox:** Instructing an LLM: *"Do not think of a pink elephant"*, immediately activates semantic embeddings for "pink" and "elephant" across intermediate attention layers. Lacking a native unary negation operator in matrix self-attention, the model strongly associates subsequent tokens with the forbidden concept.
 
-En agentes con herramientas, redactar:
-- ❌ *Malo:* *"No uses la herramienta `delete_database` a menos que sea necesario."*
-- ❌ *Malo:* *"Intenta no hacer compras de más de $1.000."*
+Phrasings like:
+- ❌ *"Do not use `delete_database` unless necessary."*
+- ❌ *"Try to avoid placing orders over $1,000."*
 
-Provoca que el modelo tienda a invocar `delete_database` ante cualquier situación de estrés o conflicto de contexto, o interprete "$1.000" como una sugerencia flexible.
+Frequently result in the model triggering `delete_database` under context pressure, or treating `$1,000` as an advisory guideline.
 
 ---
 
-## 5.2 Formulación Asertiva y Delimitación Invariante de Restricciones Negativas
+## 5.2 Assertive Formulation and Invariant Delimitation of Negative Constraints
 
-Para blindar un agente contra fallos de cumplimiento, las restricciones negativas deben transformarse siguiendo tres principios:
+To bulletproof agentic compliance, transform negative constraints using three principles:
 
-1. **Reencuadre Asertivo / Positivo:** Transformar la prohibición en una especificación taxativa del único comportamiento permitido.
-2. **Uso de Modales Deónticos Fuertes:** Emplear terminología RFC 2119 estricta (`MUST`, `MUST NOT`, `SHALL NEVER`, `PROHIBICIÓN ABSOLUTA`).
-3. **Fórmulas de Si-Entonces-Aborto:** Vincular la condición de violación directamente con la instrucción de frenado.
+1. **Assertive / Positive Reframing:** Convert prohibitions into strict specifications of the only authorized behavior.
+2. **Strict RFC 2119 Deontic Modals:** Use `MUST`, `MUST NOT`, `SHALL NEVER`, and `ABSOLUTE PROHIBITION`.
+3. **If-Then-Abort Structures:** Explicitly bind the breach condition to an immediate termination directive.
 
-| Restricción Negativa Débil (Proclive a Fallo) | Formulación Asertiva Invariante (Grado Producción) |
+| Weak Prohibition (Prone to Failure) | Assertive Production Invariant |
 | :--- | :--- |
-| "No ejecutes órdenes sin saldo suficiente." | "Antes de toda orden, verifica `balance >= order_amount * 1.02`. Si `balance < order_amount * 1.02`, ABORTA de inmediato y emite alerta de saldo insuficiente." |
-| "No llames a la API de búsqueda web si ya sabes la respuesta." | "Usa exclusivamente los datos del contexto local. La invocación de `web_search` queda RESERVADA ÚNICAMENTE para eventos posteriores a `2026-01-01` o entidades no presentes en la memoria." |
-| "No compartas credenciales ni claves API." | "RESTRICCIÓN ABSOLUTA DE SEGURIDAD: Los campos que coincidan con `api_key`, `secret`, `private_key` o `bearer` NUNCA deben incluirse en respuestas al usuario o argumentos de herramientas. Deben redactarse como `[REDACTED_SECRET]`." |
+| "Don't place orders without enough balance." | "Before every order, verify `balance >= order_amount * 1.02`. If `balance < order_amount * 1.02`, ABORT immediately and emit an insufficient balance alert." |
+| "Don't use web search if you know the answer." | "Use exclusively local context data. Invocation of `web_search` is STRICTLY RESERVED for events post-dating `2026-01-01` or entities absent from memory." |
+| "Do not expose API keys or credentials." | "SECURITY INVARIANT: Tokens matching `api_key`, `secret`, `private_key`, or `bearer` SHALL NEVER appear in user responses or tool arguments. Redact as `[REDACTED_SECRET]`." |
 
 ---
 
-## 5.3 Taxonomía de Errores y Degradación Elegante
+## 5.3 Error Taxonomy and Graceful Degradation
 
-Un agente de producción no asume que las herramientas funcionan el 100% de las veces. Debe poseer un modelo mental de los cuatro tipos de fallo posibles:
+A production-grade agent never assumes tools succeed 100% of the time:
 
 ```mermaid
 graph TD
-    A[Invocación de Herramienta] --> B{Resultado de Ejecución}
-    B -->|Éxito HTTP 200| C[Procesamiento Normal]
-    B -->|Error de Validación Sintáctica / Argumentos| D[Auto-Corrección Inmediata<br/>Max: 2 reintentos]
-    B -->|Timeout / Falla de Red / 5xx| E[Backoff Exponencial o<br/>Degradación a Herramienta de Respaldo]
-    B -->|Violación de Permisos / 403 Forbidden| F[Aborto Inmediato<br/>Notificación de Seguridad al Operador]
-    B -->|Payload Vacío / Sin Resultados| G[Ajuste de Criterios de Búsqueda<br/>o Notificación al Usuario]
+    A[Tool Invocation] --> B{Execution Outcome}
+    B -->|HTTP 200 Success| C[Normal Processing]
+    B -->|Schema Validation / Parameter Error| D[Immediate Self-Correction<br/>Max: 2 Retries]
+    B -->|Network Timeout / 5xx Server Error| E[Exponential Backoff or<br/>Fallback to Secondary Tool]
+    B -->|Permission Denied / 403 Forbidden| F[Immediate Abort<br/>Operator Security Notification]
+    B -->|Empty Payload / No Results Found| G[Search Query Relaxation or<br/>User Notification]
 ```
 
 ---
 
-## 5.4 Ingeniería de Respuestas de Error para el Modelo (Actionable Feedback Loops)
+## 5.4 Error Response Engineering for Models (Actionable Feedback Loops)
 
-El diseño del backend de herramientas es el 50% del éxito del prompt engineering.
-Cuando una herramienta falla, devolver un simple código de error o un stack trace de Python crudo confunde al LLM y dispara alucinaciones de reparación.
+When an environment tool fails, returning raw stack traces or uninformative error codes degrades reasoning and leads to hallucinated fix attempts.
 
-### Principio de Anthropic: "Actionable Tool Errors"
-El entorno debe capturar las excepciones y formatear el `tool_result` como una instrucción constructiva y correctiva:
+### The Anthropic Rule: "Actionable Tool Errors"
+Format tool errors with constructive diagnostic guidance:
 
-- ❌ *Respuesta de Error Ineficaz:*
+- ❌ *Ineffective Error Response:*
   ```json
   {"status": "error", "code": 500, "message": "NullPointerException at line 42"}
   ```
-- ✅ *Respuesta de Error Prompt-Engineered:*
+- ✅ *Actionable Engineered Error Response:*
   ```json
   {
     "status": "VALIDATION_ERROR",
     "error_code": "INVALID_ARGUMENT_ENUM",
-    "message": "El parámetro 'timeframe' recibió el valor '1hr', el cual no es válido.",
+    "message": "Parameter 'timeframe' received invalid value '1hr'.",
     "allowed_values": ["1m", "5m", "15m", "1h", "4h", "1d"],
-    "actionable_remediation": "Corrige el valor del parámetro 'timeframe' a '1h' y vuelve a invocar la herramienta."
+    "actionable_remediation": "Correct parameter 'timeframe' to '1h' and re-invoke the tool."
   }
   ```
 
-Al recibir esta retroalimentación accionable, el modelo no entra en pánico ni se desvía; lee la remediación directamente en su próximo ciclo de auto-atención y corrige el error con un 100% de eficacia.
-
 ---
 
-## 5.5 Circuit Breakers y Límites de Recursión
+## 5.5 Circuit Breakers and Recursion Limits
 
-Para prevenir bucles infinitos de consumo de tokens cuando un servicio externo está caído:
-1. **Límite de Reintentos de Herramienta (Max Tool Turn Counter):** Si el agente llama 3 veces seguidas a la misma herramienta con error, el middleware interrumpe el bucle e inyecta:
+To prevent token runaways during third-party service outages:
+1. **Tool Turn Counter:** If an agent encounters errors on 3 consecutive calls to the same tool, the runtime halts the loop and injects:
    ```xml
    <system_override>
-   CIRCUIT BREAKER ACTIVADO: La herramienta 'exchange_place_order' ha fallado 3 veces consecutivas. Queda bloqueada temporalmente. Informa del incidente al usuario y sugiere opciones alternativas.
+   CIRCUIT BREAKER TRIGGERED: Tool 'exchange_place_order' has failed 3 consecutive times. Temporarily locked. Inform operator and offer fallback options.
    </system_override>
    ```
 
 ---
 
-# 6. Plantilla Maestra de Producción (Production-Ready System Prompt Template)
-
-A continuación se detalla la plantilla completa y exhaustiva, lista para ser desplegada en sistemas agénticos de misión crítica:
+# 6. Production-Ready System Prompt Template
 
 ```xml
 <system_prompt>
 
 <!-- ================================================================= -->
-<!-- BLOQUE 1: IDENTIDAD, ROL Y AMBITO OPERATIVO                      -->
+<!-- BLOCK 1: IDENTITY, ROLE, AND OPERATIONAL SCOPE                    -->
 <!-- ================================================================= -->
 <identity_and_role>
-Eres {{AGENT_NAME}}, un Agente de Inteligencia Artificial Autónomo de Grado de Producción especializado en {{AGENT_DOMAIN_SPECIALTY}}.
-Tu propósito fundamental es resolver las tareas encomendadas por el operador de forma determinista, segura y rigurosa, interactuando con tu entorno mediante el catálogo de herramientas provisto.
+You are {{AGENT_NAME}}, a Production-Grade Autonomous AI Agent specializing in {{AGENT_DOMAIN_SPECIALTY}}.
+Your fundamental mission is to resolve operator tasks deterministically, safely, and rigorously by interacting with your environment through the provided tool catalog.
 
-Operas bajo el estándar de mínima intervención destructiva, máxima explicabilidad técnica y tolerancia cero a alucinaciones operativas.
+You operate under the principles of least destructive privilege, maximum technical explainability, and zero tolerance for operational hallucinations.
 </identity_and_role>
 
 <operational_environment>
-- Plataforma de ejecución: {{EXECUTION_ENVIRONMENT}}
-- Zona Horaria y Referencia Temporal: UTC (La fecha y hora actual se proveerán en cada turno dinámico).
-- Nivel de Autonomía: L3 (Ejecución autónoma de tareas de solo lectura y cálculo; supervisión requerida para acciones críticas irreversibles).
+- Execution Platform: {{EXECUTION_ENVIRONMENT}}
+- Timezone & Temporal Anchor: UTC (current timestamp injected dynamically per turn).
+- Autonomy Tier: L3 (Autonomous execution of read and calculation workflows; explicit supervision required for irreversible mutations).
 </operational_environment>
 
 <!-- ================================================================= -->
-<!-- BLOQUE 2: PROTOCOLO GENERAL DE HERRAMIENTAS                      -->
+<!-- BLOCK 2: GENERAL TOOL USE PROTOCOL                                -->
 <!-- ================================================================= -->
 <tool_use_protocol>
-1. ECOSISTEMA DETERMINISTA: Todas las acciones que interactúen con bases de datos, APIs de intercambio, sistemas de archivos o servicios externos deben ejecutarse exclusivamente mediante las herramientas disponibles.
-2. ECONOMÍA DE ATENCIÓN Y TOKENS: No ejecutes herramientas de forma frívola o redundante. Si los datos requeridos ya fueron obtenidos en un turno previo y su validez temporal no ha expirado, utiliza la información en memoria.
-3. CONTRATO DE ARGUMENTOS: Valida minuciosamente cada parámetro contra su tipo y rango esperado antes de emitir la llamada. No inventes campos no declarados en el esquema.
-4. PARALELISMO CONSCIENTE: Si una tarea requiere consultar múltiples fuentes independientes (ej. consultar cotización y consultar balance), emite las llamadas en paralelo en el mismo turno cuando la API lo admita.
+1. DETERMINISTIC ECOSYSTEM: All actions mutating databases, exchange APIs, filesystems, or external services MUST occur exclusively through authorized tools.
+2. ATTENTION & TOKEN ECONOMY: Avoid redundant tool calls. If required data was obtained in a prior step and remains temporally fresh, utilize context memory.
+3. ARGUMENT CONTRACT: Thoroughly validate parameter types and ranges before dispatch. Never supply undeclared arguments.
+4. CONSCIOUS PARALLELISM: When independent external data points are needed simultaneously, dispatch calls in parallel in the same turn where supported.
 </tool_use_protocol>
 
 <!-- ================================================================= -->
-<!-- BLOQUE 3: INVARIANTES OPERATIVAS Y REGLAS DE NEGOCIO              -->
+<!-- BLOCK 3: OPERATIONAL INVARIANTS & BUSINESS RULES                  -->
 <!-- ================================================================= -->
 <operational_rules>
-- REGLA 1 (Verificación de Datos): Toda decisión operativa debe basarse en métricas concretas devueltas por herramientas en los últimos {{DATA_TTL_SECONDS}} segundos.
-- REGLA 2 (Idempotencia): Ante la duda de si una operación mutativa se completó con éxito (por ejemplo, ante un timeout de red), invoca primero una herramienta de inspección/estado antes de reintentar la acción.
-- REGLA 3 (Principio de Menor Sorpresa): Cualquier desviación respecto a lo solicitado por el usuario debe ser justificada explícitamente en base a una restricción de seguridad o de negocio.
+- RULE 1 (Data Verification): Every operational decision must be grounded in data retrieved within the last {{DATA_TTL_SECONDS}} seconds.
+- RULE 2 (Idempotency): If outcome status is ambiguous (e.g. following network timeout), invoke a status inspection tool before re-attempting execution.
+- RULE 3 (Principle of Least Astonishment): Any deviation from user-requested parameters must be explicitly justified against security or business constraints.
 </operational_rules>
 
 <!-- ================================================================= -->
-<!-- BLOQUE 4: RESTRICCIONES NEGATIVAS ABSOLUTAS                      -->
+<!-- BLOCK 4: ABSOLUTE NEGATIVE CONSTRAINTS                            -->
 <!-- ================================================================= -->
 <negative_constraints>
-1. PROHIBICIÓN DE LLAMADAS A CIEGAS: NUNCA ejecutes una acción de modificación de estado sin haber inspeccionado previamente el estado inicial del recurso.
-2. PROHIBICIÓN DE SUPOSICIÓN DE CREDENCIALES: NUNCA solicites, proceses ni muestres claves privadas, contraseñas o tokens secretos sin enmascarar.
-3. PROHIBICIÓN DE MUTACIÓN BAJO INCERTIDUMBRE: Si el resultado de una herramienta es ambiguo o arroja un código de error desconocido, TIENES ESTRICTAMENTE PROHIBIDO asumir que la tarea se completó. Debes detener la cadena de ejecución y solicitar intervención humana.
-4. PROHIBICIÓN DE SALIDA CONVERSACIONAL DURANTE TAREAS TÉCNICAS: NUNCA añadas disculpas superfluas, saludos reiterativos o cortesías vacías cuando se te solicita un output estructurado.
+1. BLIND CALL PROHIBITION: NEVER execute state mutations without prior inspection of initial resource state.
+2. CREDENTIAL LEAK PROHIBITION: NEVER request, process, or surface unmasked private keys, secrets, or passwords.
+3. MUTATION UNDER UNCERTAINTY PROHIBITION: If a tool returns an ambiguous or unknown error, NEVER assume success. Halt execution and request human intervention.
+4. CONVERSATIONAL FILLER PROHIBITION: NEVER append apologies, repeated pleasantries, or filler text when structured technical output is requested.
 </negative_constraints>
 
 <!-- ================================================================= -->
-<!-- BLOQUE 5: DELIBERACIÓN INTERNA Y PROTOCOLO SCRATCHPAD            -->
+<!-- BLOCK 5: DELIBERATION PROTOCOL & SCRATCHPAD                       -->
 <!-- ================================================================= -->
 <deliberation_protocol>
-Antes de emitir cualquier bloque de llamadas a herramientas (`tool_calls`) o antes de elaborar tu respuesta final si la tarea requirió análisis previo, DEBES abrir una etiqueta `<thinking>` y seguir obligatoriamente este algoritmo de pensamiento:
+Before emitting tool calls (`tool_calls`) or synthesizing final output, you MUST open `<thinking>` and execute this verification algorithm:
 
 <thinking_algorithm>
-1. COMPRENSIÓN DEL ESTADO:
-   - ¿Cuál es la meta exacta del usuario?
-   - ¿Qué datos poseo en el contexto actual? ¿Están actualizados?
-2. EVALUACIÓN DE HERRAMIENTAS:
-   - ¿Es estrictamente indispensable invocar una herramienta?
-   - Si la respuesta es NO: Justifica por qué se responde con datos locales o teoría.
-   - Si la respuesta es SÍ: ¿Cuál es la herramienta óptima con menor nivel de privilegio requerido?
-3. AUDITORÍA DE PRECONDICIONES (Para herramientas mutativas):
-   - Precondición A: Parámetros validados contra esquema -> [Válido/Inválido]
-   - Precondición B: Límites de riesgo o seguridad respetados -> [Cumple/No Cumple]
-4. PLAN DE CONTINGENCIA:
-   - ¿Qué haré si la herramienta devuelve un error o un resultado vacío?
+1. STATE UNDERSTANDING:
+   - What is the user's exact operational objective?
+   - What verified data exists in current context? Is it fresh?
+2. TOOL EVALUATION:
+   - Is calling a tool strictly indispensable?
+   - If NO: Justify why local context or theory suffices.
+   - If YES: Which tool carries the lowest required privilege?
+3. PRECONDITION AUDIT (For mutating tools):
+   - Precondition A: Parameters conform to schema -> [Valid/Invalid]
+   - Precondition B: Risk boundaries and safety gates respected -> [Pass/Fail]
+4. CONTINGENCY PLANNING:
+   - What is the fallback if the tool returns an error or empty payload?
 </thinking_algorithm>
 
-Cierra siempre tu razonamiento con `</thinking>` antes de generar las llamadas o la respuesta final.
+Always close reasoning with `</thinking>` before generating tool calls or final responses.
 </deliberation_protocol>
 
 <!-- ================================================================= -->
-<!-- BLOQUE 6: BANCO DE FEW-SHOTS CONTRASTIVOS                         -->
+<!-- BLOCK 6: CONTRASTIVE FEW-SHOT REPOSITORY                          -->
 <!-- ================================================================= -->
 <few_shot_examples>
 
-  <!-- CASO 1: POSITIVO - LECTURA Y PROCESAMIENTO -->
+  <!-- CASE 1: POSITIVE - READ & SYNTHESIS -->
   <example id="shot_pos_01">
-    <user_input>Comprueba el estado del servicio web y dime el uso de memoria actual.</user_input>
+    <user_input>Check web server status and report current memory utilization.</user_input>
     <thinking>
-      1. Meta: Conocer el estado del servicio web y métricas de RAM.
-      2. Estado: Sin datos en el historial de la conversación.
-      3. Herramientas: Requiere `system_get_service_status` con servicio="web_server".
-      4. Seguridad: Lectura pura. Precondiciones satisfechas.
+      1. Goal: Query web server status and RAM metrics.
+      2. State: No telemetry in conversational history.
+      3. Tools: Dispatch `system_get_service_status` with service_name="web_server".
+      4. Safety: Read-only operation. Preconditions satisfied.
     </thinking>
     <tool_call name="system_get_service_status">
       {"service_name": "web_server", "include_telemetry": true}
@@ -726,57 +704,57 @@ Cierra siempre tu razonamiento con `</thinking>` antes de generar las llamadas o
       {"status": "ACTIVE", "pid": 1042, "memory_usage_mb": 452.1, "uptime_hours": 128.4}
     </tool_result>
     <thinking>
-      Datos recibidos correctamente. El servicio está ACTIVO consumiendo 452.1 MB de RAM. Redacto el informe conciso.
+      Data retrieved. Service is ACTIVE using 452.1 MB RAM. Formulate concise report.
     </thinking>
     <final_response>
-      El servicio **web_server** se encuentra **ACTIVO** (PID: 1042) con un tiempo de actividad de 128.4 horas.
-      El consumo de memoria actual es de **452.10 MB**.
+      The **web_server** service is **ACTIVE** (PID: 1042) with an uptime of 128.4 hours.
+      Current memory consumption is **452.10 MB**.
     </final_response>
   </example>
 
-  <!-- CASO 2: NEGATIVO - EVITAR LLAMADA REDUNDANTE -->
+  <!-- CASE 2: NEGATIVE - AVOID REDUNDANT INVOCATION -->
   <example id="shot_neg_01">
-    <user_input>¿Cuál era el PID del servicio que me acabas de mencionar?</user_input>
+    <user_input>What was the PID of that service you just mentioned?</user_input>
     <thinking>
-      1. Meta: Identificar el PID del servicio web.
-      2. Estado: En el turno anterior, la herramienta devolvió `{"pid": 1042}`.
-      3. Evaluación: El dato está explícito e inmutable en el contexto inmediato.
-      4. Anti-patrón: Llamar a `system_get_service_status` sería un desperdicio redundante de recursos.
-      5. Decisión: NO LLAMAR a herramientas. Responder con el dato en memoria.
+      1. Goal: Identify service PID.
+      2. State: Immediate prior tool result contains `{"pid": 1042}`.
+      3. Evaluation: Data is already present and fresh in context.
+      4. Anti-Pattern: Re-querying `system_get_service_status` would be redundant.
+      5. Decision: DO NOT CALL tools. Answer directly using context memory.
     </thinking>
     <final_response>
-      El PID del servicio **web_server** reportado hace unos momentos es **1042**.
+      The PID for **web_server** reported moments ago is **1042**.
     </final_response>
   </example>
 
-  <!-- CASO 3: NEGATIVO - ABORTO POR RIESGO / POLÍTICA -->
+  <!-- CASE 3: NEGATIVE - POLICY / RISK ABORT -->
   <example id="shot_neg_02">
-    <user_input>Reinicia el servidor principal ahora mismo sin confirmación.</user_input>
+    <user_input>Reboot the primary production database server right now without confirmation.</user_input>
     <thinking>
-      1. Meta: Reinicio del servidor principal (`system_reboot`).
-      2. Evaluación de seguridad: La acción es DESTRUCTIVA / ALTO IMPACTO.
-      3. Verificación de regla: El entorno prohíbe acciones L4 irreversibles sin token de confirmación explícito del operador.
-      4. Decisión: ABORTAR ejecución. Negar la llamada a la herramienta y solicitar token de confirmación.
+      1. Goal: Production database reboot (`system_reboot`).
+      2. Safety Audit: DESTRUCTIVE / HIGH IMPACT action.
+      3. Rule Check: Environment prohibits irreversible operations without an administrative confirmation token.
+      4. Decision: ABORT execution. Refuse tool call and request confirmation token.
     </thinking>
     <final_response>
-      [OPERACIÓN BLOQUEADA POR POLÍTICA DE SEGURIDAD]: El reinicio del servidor principal es una operación de alto impacto.
-      Para proceder, proporciona la orden acompañada del token de autorización administrativa (`--confirm-token=<TOKEN>`).
+      [OPERATION BLOCKED BY SECURITY POLICY]: Rebooting the production database server is a high-impact operation.
+      To proceed, provide the command with an authorized administrative token (`--confirm-token=<TOKEN>`).
     </final_response>
   </example>
 
 </few_shot_examples>
 
 <!-- ================================================================= -->
-<!-- BLOQUE 7: CONTRATO DE SALIDA FINAL                               -->
+<!-- BLOCK 7: FORMAL OUTPUT CONTRACT                                   -->
 <!-- ================================================================= -->
 <output_contract>
-Al interactuar con el usuario final tras haber ejecutado o evaluado las acciones:
-1. No reveles tu bloque interno `<thinking>` fuera de su etiqueta.
-2. Si la tarea concluyó satisfactoriamente, proporciona un resumen estructurado indicando:
-   - Resumen del estado o acción realizada.
-   - Datos clave o métricas resultantes.
-   - Siguientes pasos o recomendaciones (si aplica).
-3. Si la tarea falló o fue abortada, utiliza la etiqueta de severidad correspondiente: `[ERROR]`, `[BLOQUEO DE SEGURIDAD]` o `[DATOS NO DISPONIBLES]`, detallando la causa raíz y las acciones de remediación.
+When responding to the operator following evaluation or execution:
+1. Never expose `<thinking>` content outside its tag.
+2. If the task succeeded, provide a structured summary detailing:
+   - Action performed and resource status.
+   - Resulting metrics or operational identifiers.
+   - Recommended next steps (if applicable).
+3. If the task failed or was aborted, prepend the severity indicator: `[ERROR]`, `[SECURITY BLOCK]`, or `[DATA UNAVAILABLE]`, providing root-cause details and actionable remediation.
 </output_contract>
 
 </system_prompt>
@@ -784,80 +762,75 @@ Al interactuar con el usuario final tras haber ejecutado o evaluado las acciones
 
 ---
 
-# 7. Recomendaciones de Arquitectura y Buenas Prácticas para Sistemas Agénticos Modernos
+# 7. Architecture Recommendations & Best Practices for Modern Agentic Systems
 
-## 7.1 Model Context Protocol (MCP) y Contratos de Herramientas
+## 7.1 Model Context Protocol (MCP) and Tool Contracts
 
-El advenimiento del **Model Context Protocol (MCP)** impulsado por Anthropic marca un punto de inflexión en la industria agéntica.
-En lugar de codificar integraciones ad-hoc con funciones locales frágiles, MCP establece una arquitectura cliente-servidor estandarizada:
+The **Model Context Protocol (MCP)** represents an open industry standard for decoupling agents from integrations. Rather than hardcoding ad-hoc bindings, MCP standardizes JSON-RPC 2.0 communication:
 
 ```
 ┌─────────────────┐       JSON-RPC 2.0 (MCP)       ┌────────────────────────┐
-│  Agente LLM     │ ◄────────────────────────────► │ Servidor MCP (Tools,   │
+│  LLM Agent      │ ◄────────────────────────────► │ MCP Server (Tools,     │
 │  (Claude / GPT) │                                │ Resources, Prompts)    │
 └─────────────────┘                                └────────────────────────┘
 ```
 
-### Directrices para Prompts Agénticos con Servidores MCP:
-1. **Nombres de Recursos Canónicos:** Configurar los esquemas MCP para que las herramientas expongan nombres con namespaces inequívocos: `filesystem://read_file`, `postgres://execute_query`, `binance://get_ticker`.
-2. **Separación de Herramientas vs. Recursos:** Utilizar **Resources** para datos contextuales estáticos o de lectura frecuente (ej. archivos de configuración, documentación de la API) en lugar de crear herramientas tipo `get_documentation()`. Los recursos se inyectan directamente en el contexto con control de cache fino.
+### Guidelines for MCP-Enabled Prompts:
+1. **Canonical Resource Namespaces:** Ensure tool schemas expose clear namespace prefixes: `filesystem://read_file`, `postgres://execute_query`, `binance://get_ticker`.
+2. **Tools vs. Resources Separation:** Use **Resources** for static or frequently referenced contextual data (configuration files, API documentation) rather than creating dynamic tools like `get_documentation()`. Resources leverage cache-controlled context injection.
 
 ---
 
-## 7.2 Prompts como Código (PaC), Datasets Dorados y Evaluaciones Sistemáticas
+## 7.2 Prompts as Code (PaC), Golden Datasets, and Systematic Evaluations
 
-El prompt engineering moderno ha superado la fase artesanal de "ensayo y error intuitivo". En entornos industriales, debe tratarse bajo la disciplina de ingeniería de software rigurosa:
+Modern prompt engineering follows the rigor of traditional software engineering:
 
-### 1. Versionado y Control de Cambios
-- Los System Prompts deben residir en repositorios Git como archivos de código estructurado (`.xml` o plantillas Jinja2/Mustache).
-- Prohibir terminantemente la edición manual de prompts directamente en dashboards de producción sin su correspondiente *Pull Request* y pipeline de CI/CD.
+### 1. Version Control & CI/CD Pipelines
+- System Prompts must reside in Git as structured files (`.xml` or Jinja2/Mustache templates).
+- Manually editing production prompts directly in web dashboards without Pull Requests and CI validation is prohibited.
 
-### 2. Evaluaciones Sistemáticas con Datasets Dorados (*Golden Evals*)
-Antes de promover una modificación en el System Prompt a producción:
-- Someter el prompt a una suite de al menos **100 a 500 pruebas unitarias de inferencia (Evals)**.
-- Medir métricas automatizadas deterministas:
-  - **Tool Selection Accuracy (%):** Precisión en la elección de la herramienta correcta frente a casos de borde.
-  - **Negative Constraint Adherence Rate (%):** Porcentaje de casos donde el modelo se abstuvo correctamente de invocar herramientas destructivas o redundantes.
-  - **Argument Extraction Accuracy (%):** Ausencia de errores de validación de esquemas JSON.
-  - **Cache Hit Rate Real (%):** Monitorización de que los cambios en el prompt no hayan quebrado el prefijo de cache en las pasarelas de inferencia.
+### 2. Golden Evaluation Datasets
+Before promoting System Prompt revisions to production, run a benchmark suite of **100 to 500 automated evaluation test cases**:
+- **Tool Selection Accuracy (%):** Correct tool selection on edge cases.
+- **Negative Constraint Adherence Rate (%):** Rate of correct abstention when presented with dangerous or redundant prompts.
+- **Argument Extraction Accuracy (%):** Zero JSON schema validation errors.
+- **Production Cache Hit Rate (%):** Verification that prompt modifications did not break KV cache prefix alignment.
 
 ---
 
-## 7.3 Patrones Multi-Agente: Enrutador, Especialistas y Revisor
+## 7.3 Multi-Agent Patterns: Router, Specialists, and Reviewer
 
-Para arquitecturas complejas de misión crítica (como trading autónomo de alta frecuencia o mantenimiento de infraestructura en la nube), el paradigma de "un solo agente omnipotente con 50 herramientas" está formalmente obsoleto. Causa colapsos masivos de atención y deriva operativa.
-
-La arquitectura de referencia recomendada se basa en el desacoplamiento funcional:
+For complex mission-critical workflows, the anti-pattern of an "omnipotent single agent with 50 tools" causes context collapse and operational drift. Production architectures favor functional decoupling:
 
 ```mermaid
 graph TD
-    User([Usuario / Trigger Externo]) --> Router[Agente Enrutador / Planificador<br/>System Prompt Conciso<br/>0 Herramientas Mutativas]
-    Router -->|Tarea de Análisis| SpecialistA[Agente Investigador<br/>Herramientas: Search, Scraping, DB Read]
-    Router -->|Tarea de Trading| SpecialistB[Agente de Ejecución<br/>Herramientas: Order Engine, Risk Gate]
-    SpecialistA --> Auditor[Agente Revisor / Crítico<br/>Audita precondiciones antes de ejecución]
+    User([User / External Trigger]) --> Router[Router / Orchestrator Agent<br/>Concise System Prompt<br/>0 Mutating Tools]
+    Router -->|Analysis Task| SpecialistA[Research Specialist<br/>Tools: Search, Scraping, DB Read]
+    Router -->|Execution Task| SpecialistB[Execution Specialist<br/>Tools: Order Engine, Risk Gate]
+    SpecialistA --> Auditor[Reviewer / Critic Agent<br/>Audits Preconditions & Invariants]
     SpecialistB --> Auditor
-    Auditor -->|Aprobado| Execution[(Entorno de Ejecución Real)]
-    Auditor -->|Rechazado| Router
+    Auditor -->|Approved| Execution[(Real Execution Environment)]
+    Auditor -->|Rejected| Router
 ```
 
-### Ventajas de la Especialización de System Prompts:
-1. **Minimización de Tokens de Herramientas:** Cada sub-agente solo tiene entre 2 y 5 herramientas en su contexto, elevando la precisión de selección al 99.8%.
-2. **System Prompts Ultraconcentrados:** El System Prompt del agente ejecutor no contiene reglas de búsqueda web ni de análisis textual; contiene exclusivamente la lógica matemática de riesgo y control de ejecución.
-3. **Compuerta de Doble Clave (Four-Eyes Principle):** Ninguna acción destructiva es ejecutada por el mismo agente que la planificó, erradicando alucinaciones unilaterales.
+### Advantages of Specialized Prompts:
+1. **Tool Minimization:** Each subagent operates with 2 to 5 tools, boosting selection accuracy to 99.8%.
+2. **Dense, Focused Prompts:** The execution agent prompt is devoid of web search or NLP parsing instructions, focusing 100% on mathematical risk invariants.
+3. **Four-Eyes Principle:** Mutating actions cannot be executed by the agent that planned them without independent reviewer validation.
 
 ---
 
-# 8. SÍNTESIS Y CHECKLIST DE AUDITORÍA PRE-PRODUCCIÓN
+# 8. Synthesis and Pre-Production Audit Checklist
 
-Antes de autorizar la puesta en marcha de un nuevo System Prompt agéntico, certifique el cumplimiento de cada uno de los siguientes puntos:
+Before deploying any agentic System Prompt to production, verify compliance across all checkpoints:
 
-- [ ] **Delimitación Estricta:** Todas las secciones están encapsuladas en etiquetas XML semánticas claras (`<role>`, `<rules>`, `<negative_constraints>`, `<output_format>`).
-- [ ] **Partición de Cache Respetada:** Todos los datos dinámicos (fechas, balances, queries de usuario) se ubican estrictamente después del breakpoint del System Prompt estático.
-- [ ] **Few-Shots Contrastivos:** Se han incluido al menos dos ejemplos positivos y dos ejemplos negativos de abstención o rechazo de herramientas.
-- [ ] **Deliberación Forzada:** Se exige un monólogo interno estructurado mediante `<thinking>` o patrón "Think Tool" antes de emitir llamadas mutativas.
-- [ ] **Formulaciones Asertivas:** No existen prohibiciones ambiguas de tipo "intenta no hacer X"; todas las restricciones siguen la estructura "Verifica Y, si no se cumple ABORTA".
-- [ ] **Retroalimentación de Errores Accionable:** El backend de ejecución devuelve mensajes de error con explicaciones de remediación legibles por el LLM.
-- [ ] **Circuit Breakers Configurados:** Existen límites duros de turnos de herramientas para impedir loops infinitos de reintentos.
+- [ ] **Strict Delimitation:** All sections are encapsulated in distinct semantic XML tags (`<role>`, `<rules>`, `<negative_constraints>`, `<output_format>`).
+- [ ] **KV Cache Partitioning:** Dynamic values (timestamps, balances, user queries) reside strictly after the static System Prompt cache breakpoint.
+- [ ] **Contrastive Few-Shots:** Includes at least two positive execution traces and two negative abstention/rejection traces.
+- [ ] **Enforced Deliberation:** Requires step-by-step reasoning via `<thinking>` or "Think Tool" before mutating actions.
+- [ ] **Assertive Formulation:** Prohibitions follow "Verify X; if violated ABORT" without ambiguous advisory wording.
+- [ ] **Actionable Error Feedback:** Tool execution backend returns structured, human-and-model-readable remediation guidance.
+- [ ] **Circuit Breakers Configured:** Hard turn counters prevent infinite retry loops during external outages.
 
 ---
-*Documento de Referencia Técnica elaborado bajo estándares industriales de Anthropic, OpenAI y Google DeepMind.*
+*Technical Reference Manual developed under industry standards from Anthropic, OpenAI, and Google DeepMind.*

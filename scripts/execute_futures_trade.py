@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-execute_futures_trade.py - Motor de Ejecución y Gestión de Riesgo para Binance Futures.
-Soporta Testnet y Prod, cálculo estricto de filtros, órdenes simétricas y algo-orders de Stop Loss.
+execute_futures_trade.py - Execution Engine and Risk Management Harness for Binance Futures.
+Supports Testnet and Prod, strict filter calculations, symmetric orders, and verified Algo Stop Loss.
 """
 
 import os
@@ -63,13 +63,13 @@ def get_server_time_offset(base_url, force_refresh=False):
 def send_signed_request(method, endpoint, params=None, target_env='testnet', retry_count=0):
     api_key, secret_key, base_url = get_client_config(target_env)
     if not api_key:
-        return {"error": "Credenciales de Binance no configuradas en .env"}
+        return {"error": "Binance credentials not configured in .env"}
 
     if params is None:
         params = {}
 
     offset = get_server_time_offset(base_url)
-    # Colchón de 1500ms para asegurar que el timestamp nunca se adelante al reloj del server
+    # 1500ms safety buffer to ensure timestamp never races ahead of server clock
     params['timestamp'] = int(time.time() * 1000) + offset - 1500
     params['recvWindow'] = 60000
 
@@ -94,7 +94,7 @@ def send_signed_request(method, endpoint, params=None, target_env='testnet', ret
         except Exception:
             pass
 
-        # Si Binance devuelve -1021 en HTTP 400, forzar re-sincronización y reintentar
+        # If Binance returns -1021 in HTTP 400, force re-synchronization and retry
         if isinstance(parsed, dict) and parsed.get('code') == -1021 and retry_count < 2:
             get_server_time_offset(base_url, force_refresh=True)
             return send_signed_request(method, endpoint, params=params, target_env=target_env, retry_count=retry_count + 1)
@@ -173,7 +173,7 @@ def place_algo_stop_loss(symbol, exit_side, sl_price, target_env='testnet'):
 
 def verify_algo_stop_loss(symbol, exit_side, sl_price=None, target_env='testnet'):
     """
-    Verifica que la orden Algo de Stop Loss realmente exista y esté activa en el exchange.
+    Verifies that the Algo Stop Loss order actually exists and is active on the exchange.
     """
     try:
         algos = send_signed_request('GET', '/fapi/v1/openAlgoOrders', {'symbol': symbol}, target_env=target_env)
@@ -210,10 +210,10 @@ def log_emergency_abort(symbol, direction, qty, sl_p, sl_order, abort_exit, targ
 
 def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty, leverage, bypass_delta_gate=False, target_env='testnet', bypass_all_gates=False):
     """
-    Compuertas Mecánicas de Software (Validación Determinista de Precondiciones).
-    Verifica invariantes matemáticos e impide físicamente la ejecución si se violan las reglas de riesgo.
-    En TESTNET, se permite el bypass libre de compuertas para pruebas, experimentos y stress tests.
-    En PROD, las compuertas son estrictas e inviolables.
+    Mechanical Software Gates (Deterministic Precondition Validation).
+    Verifies mathematical invariants and physically prevents execution if risk rules are violated.
+    In TESTNET, free bypass of gates is permitted for testing, experiments, and stress tests.
+    In PROD, gates are strict and inviolable.
     """
     if bypass_all_gates:
         return True, None
@@ -221,7 +221,7 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
     is_testnet = str(target_env).lower() == 'testnet'
     is_long = direction.upper() == 'LONG'
     
-    # 1. Gate Delta-Neutral (Permite bypass en testnet para pruebas libres)
+    # 1. Delta-Neutral Gate (Permits bypass in testnet for open sandbox testing)
     if not bypass_delta_gate and not is_testnet:
         log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'logs')
         state_file = os.path.join(log_dir, 'session_state.json')
@@ -231,47 +231,47 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
                     state_data = json.load(f)
                     delta_bias = state_data.get('portfolio_exposure', {}).get('delta_bias') or state_data.get('portfolio_delta_bias', 'NEUTRAL')
                     if delta_bias == 'LONG_HEAVY' and is_long:
-                        return False, "MECHANICAL HARD GATE REJECTION: Cartera en estado LONG_HEAVY (+Delta desbalanceado). Queda terminantemente prohibido abrir más Longs. Se exige cobertura Short o delta-neutral."
+                        return False, "MECHANICAL HARD GATE REJECTION: Portfolio is in LONG_HEAVY state (+Delta imbalanced). Opening additional Longs is strictly prohibited. Short hedge or neutral portfolio required."
                     elif delta_bias == 'SHORT_HEAVY' and not is_long:
-                        return False, "MECHANICAL HARD GATE REJECTION: Cartera en estado SHORT_HEAVY (-Delta desbalanceado). Queda terminantemente prohibido abrir más Shorts. Se exige cobertura Long o delta-neutral."
+                        return False, "MECHANICAL HARD GATE REJECTION: Portfolio is in SHORT_HEAVY state (-Delta imbalanced). Opening additional Shorts is strictly prohibited. Long hedge or neutral portfolio required."
             except Exception as e:
                 pass
 
-    # 2. Gate de Riesgo Monetario Máximo (Capped Risk - En testnet relajado hasta $50 para pruebas)
+    # 2. Maximum Monetary Risk Gate (Capped Risk - Relaxed up to $50 in testnet for sandbox testing)
     potential_dollar_loss = abs(cur_price - sl_price) * total_qty
     max_allowed_loss = 50.0 if is_testnet else (4.0 if leverage >= 10 else 2.50)
     if potential_dollar_loss > max_allowed_loss:
-        return False, f"MECHANICAL HARD GATE REJECTION: Riesgo monetario excede el límite permitido (${potential_dollar_loss:.2f} > ${max_allowed_loss:.2f} USDT). Ajustar margen o tamaño de posición."
+        return False, f"MECHANICAL HARD GATE REJECTION: Monetary risk exceeds allowed cap (${potential_dollar_loss:.2f} > ${max_allowed_loss:.2f} USDT). Adjust margin or position size."
 
-    # 3. Gate de Fricción Financiera y Comisiones (En testnet relajado para testing)
+    # 3. Financial Friction and Fee Gate (Relaxed in testnet for testing)
     if tp1_price and not is_testnet:
         profit_pct_tp1 = abs(tp1_price - cur_price) / cur_price
         if profit_pct_tp1 < 0.0035:
-            return False, f"MECHANICAL HARD GATE REJECTION: Distancia a TP1 ({profit_pct_tp1*100:.2f}%) menor al piso de fricción de 0.35%. Las comisiones taker devoran el edge estadístico."
+            return False, f"MECHANICAL HARD GATE REJECTION: Distance to TP1 ({profit_pct_tp1*100:.2f}%) below 0.35% friction floor. Taker commissions erode statistical edge."
 
     return True, None
 
 def execute_complete_trade(symbol, direction, leverage, margin_usdt, sl_price, tp1_price, tp2_price, target_env='testnet', trigger_price=None, order_type='MARKET', limit_price=None, bypass_delta_gate=False):
-    # Guardrail para PROD
+    # Guardrail for PROD
     MAX_PROD_MARGIN = 25.0
     if target_env.lower() == 'prod' and margin_usdt > MAX_PROD_MARGIN:
-        return {"success": False, "error": f"GUARDRAIL: Margen de {margin_usdt} USDT supera el límite máximo permitido de {MAX_PROD_MARGIN} USDT en red REAL."}
+        return {"success": False, "error": f"GUARDRAIL: Margin of {margin_usdt} USDT exceeds maximum allowed cap of {MAX_PROD_MARGIN} USDT on REAL network."}
 
     filters = get_symbol_filters(symbol, target_env=target_env)
     if not filters:
-        return {"success": False, "error": f"No se encontraron filtros para {symbol}"}
+        return {"success": False, "error": f"Filters not found for {symbol}"}
 
-    # 1. Consultar precio actual primero para validar filtros y gates
+    # 1. Fetch current price first to validate filters and gates
     ticker_res = send_signed_request('GET', '/fapi/v1/ticker/price', {'symbol': symbol}, target_env=target_env)
     cur_price = float(ticker_res.get('price', 0))
     if cur_price <= 0:
-        return {"success": False, "error": "No se pudo obtener el precio actual"}
+        return {"success": False, "error": "Could not fetch current market price"}
 
     is_long = direction.upper() == 'LONG'
     entry_side = 'BUY' if is_long else 'SELL'
     exit_side = 'SELL' if is_long else 'BUY'
 
-    # 2. Calcular cantidad exacta de tokens
+    # 2. Calculate exact token quantity
     notional_target = margin_usdt * leverage
     raw_qty = notional_target / cur_price
     total_qty = round_step(raw_qty, filters['stepSize'], filters['precision_qty'])
@@ -281,18 +281,18 @@ def execute_complete_trade(symbol, direction, leverage, margin_usdt, sl_price, t
         if bumped_qty * cur_price >= min_notional:
             total_qty = bumped_qty
     if total_qty < filters['minQty']:
-        return {"success": False, "error": f"Cantidad {total_qty} menor que el mínimo permitido {filters['minQty']}"}
+        return {"success": False, "error": f"Quantity {total_qty} lower than minimum allowed {filters['minQty']}"}
 
-    # 3. VERIFICACIÓN DE COMPUERTAS MECÁNICAS (HARD GATES)
+    # 3. MECHANICAL HARD GATES VERIFICATION
     gate_ok, gate_err = check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty, leverage, bypass_delta_gate=bypass_delta_gate, target_env=target_env)
     if not gate_ok:
         return {"success": False, "hard_gate_rejection": True, "error": gate_err}
 
-    # 4. Configurar margen Aislado y apalancamiento
+    # 4. Configure Isolated margin and leverage
     setup_margin_and_leverage(symbol, leverage, target_env=target_env)
 
-    # 4. Dividir TPs de forma asimétrica (30% TP1 / 70% TP2) para preservar la cola derecha (positive skewness)
-    # y evitar el truncamiento prematuro de beneficios (conforme a los principios de Kelly y valor esperado de NotebookLM).
+    # 5. Split TPs asymmetrically (30% TP1 / 70% TP2) to preserve positive right-tail skewness
+    # and prevent premature profit truncation.
     tp1_qty = round_step(total_qty * 0.30, filters['stepSize'], filters['precision_qty'])
     if tp1_qty < filters['minQty']:
         tp1_qty = filters['minQty']
@@ -303,23 +303,22 @@ def execute_complete_trade(symbol, direction, leverage, margin_usdt, sl_price, t
 
     tp2_qty = round_step(total_qty - tp1_qty, filters['stepSize'], filters['precision_qty'])
     if tp2_qty < filters['minQty']:
-        # Fallback a 50/50 si el tamaño de posición es demasiado pequeño para permitir 30/70 respetando minQty
+        # Fallback to 50/50 if position size is too small to split 30/70 while respecting minQty
         tp1_qty = round_step(total_qty / 2, filters['stepSize'], filters['precision_qty'])
         tp2_qty = round_step(total_qty - tp1_qty, filters['stepSize'], filters['precision_qty'])
 
-    # 5. Redondear precios de SL y TP
+    # 6. Round SL and TP prices
     sl_p = round_price(sl_price, filters['tickSize'], filters['precision_price'])
     tp1_p = round_price(tp1_price, filters['tickSize'], filters['precision_price'])
     tp2_p = round_price(tp2_price, filters['tickSize'], filters['precision_price'])
 
-    # 6. Validación de Gatillo Técnico (Breakout de confirmación de mecha)
+    # 7. Technical Trigger Validation (Confirmation breakout)
     if trigger_price is not None and trigger_price > 0:
         trigger_p = round_price(trigger_price, filters['tickSize'], filters['precision_price'])
         trigger_breached = (cur_price >= trigger_p) if is_long else (cur_price <= trigger_p)
 
         if not trigger_breached:
             if order_type.upper() == 'STOP_MARKET':
-                # Colocar orden condicional de entrada que se dispara automáticamente cuando el mercado rompe el gatillo
                 entry_params = {
                     'symbol': symbol,
                     'side': entry_side,
@@ -337,17 +336,17 @@ def execute_complete_trade(symbol, direction, leverage, margin_usdt, sl_price, t
                         "direction": direction.upper(),
                         "trigger_price": trigger_p,
                         "cur_price": cur_price,
-                        "message": f"Orden condicional STOP_MARKET colocada en {trigger_p}. Se ejecutará al romper la mecha institucional."
+                        "message": f"Conditional STOP_MARKET order placed at {trigger_p}. Will trigger upon institutional wick breakout."
                     }
                 else:
-                    return {"success": False, "error": f"Fallo al colocar orden condicional: {cond_order}"}
+                    return {"success": False, "error": f"Failed to place conditional order: {cond_order}"}
             else:
                 return {
                     "success": False,
-                    "error": f"GATILLO NO ALCANZADO: Precio actual {cur_price} no ha roto el gatillo institucional {trigger_p} ({direction}). Esperar confirmación o usar order_type='STOP_MARKET'."
+                    "error": f"TRIGGER NOT REACHED: Current price {cur_price} has not broken trigger level {trigger_p} ({direction}). Await confirmation or specify order_type='STOP_MARKET'."
                 }
 
-    # 7. Ejecutar Orden de Entrada (MARKET o LIMIT)
+    # 8. Execute Entry Order (MARKET or LIMIT)
     if order_type.upper() == 'LIMIT' and limit_price:
         lim_p = round_price(limit_price, filters['tickSize'], filters['precision_price'])
         entry_params = {
@@ -368,29 +367,28 @@ def execute_complete_trade(symbol, direction, leverage, margin_usdt, sl_price, t
 
     entry_order = send_signed_request('POST', '/fapi/v1/order', entry_params, target_env=target_env)
     if 'orderId' not in entry_order:
-        return {"success": False, "error": f"Fallo orden de entrada: {entry_order}"}
+        return {"success": False, "error": f"Entry order failed: {entry_order}"}
 
     actual_entry_price = float(entry_order.get('avgPrice', cur_price))
     if actual_entry_price == 0:
         actual_entry_price = cur_price
 
-    # 8. Ejecutar Stop Loss Hard (Algo Order, closePosition=true, reduceOnly=true)
+    # 9. Execute Hard Stop Loss (Algo Order, closePosition=true, reduceOnly=true)
     sl_order = place_algo_stop_loss(symbol, exit_side, sl_p, target_env=target_env)
     sl_verified, sl_info = verify_algo_stop_loss(symbol, exit_side, sl_p, target_env=target_env)
 
-    # Reintentos progresivos (hasta 3 intentos en ~2.8s) para absorber la latencia de indexación en Mainnet
+    # Progressive retries (up to 3 attempts in ~2.8s) to absorb Mainnet indexing latency
     if not sl_verified:
         for retry_delay in [0.8, 1.0, 1.2]:
             time.sleep(retry_delay)
-            # Reintentar colocación si la orden previa devolvió error
             if isinstance(sl_order, dict) and "error" in sl_order:
                 sl_order = place_algo_stop_loss(symbol, exit_side, sl_p, target_env=target_env)
             sl_verified, sl_info = verify_algo_stop_loss(symbol, exit_side, sl_p, target_env=target_env)
             if sl_verified:
                 break
 
-    # PROTOCOLO DE AUTO-DESTRUCCIÓN / FAIL-SAFE ATÓMICO:
-    # Si tras 3 reintentos (~2.8s) el Stop Loss NO está confirmado en el ledger de Binance, ABORTAR INMEDIATAMENTE
+    # ATOMIC AUTO-DESTRUCT / FAIL-SAFE PROTOCOL:
+    # If Stop Loss is NOT verified after 3 attempts (~2.8s), ABORT IMMEDIATELY
     if not sl_verified:
         send_signed_request('DELETE', '/fapi/v1/allOpenOrders', {'symbol': symbol}, target_env=target_env)
         abort_exit = send_signed_request('POST', '/fapi/v1/order', {
@@ -405,11 +403,11 @@ def execute_complete_trade(symbol, direction, leverage, margin_usdt, sl_price, t
             "success": False,
             "emergency_abort": True,
             "symbol": symbol,
-            "error": f"CRITICAL FAIL-SAFE ACTIVADO: No se pudo verificar el Stop Loss tras 3 intentos ({sl_order}). Posición cerrada a MERCADO inmediatamente (orden {abort_exit.get('orderId')}) para neutralizar exposición no protegida.",
+            "error": f"CRITICAL FAIL-SAFE TRIGGERED: Stop Loss could not be confirmed after 3 attempts ({sl_order}). Position closed at MARKET immediately (order {abort_exit.get('orderId')}) to eliminate unhedged exposure.",
             "abort_exit": abort_exit
         }
 
-    # 8. Ejecutar TP1 (LIMIT, 30% posición, Reduce-Only)
+    # 10. Execute TP1 (LIMIT, 30% position, Reduce-Only)
     tp1_params = {
         'symbol': symbol,
         'side': exit_side,
@@ -421,7 +419,7 @@ def execute_complete_trade(symbol, direction, leverage, margin_usdt, sl_price, t
     }
     tp1_order = send_signed_request('POST', '/fapi/v1/order', tp1_params, target_env=target_env)
 
-    # 9. Ejecutar TP2 (LIMIT, 70% posición restante, Reduce-Only)
+    # 11. Execute TP2 (LIMIT, 70% position remaining, Reduce-Only)
     tp2_params = {
         'symbol': symbol,
         'side': exit_side,
@@ -433,7 +431,7 @@ def execute_complete_trade(symbol, direction, leverage, margin_usdt, sl_price, t
     }
     tp2_order = send_signed_request('POST', '/fapi/v1/order', tp2_params, target_env=target_env)
 
-    # Registrar en log local con Procedencia Canónica y Escritura Atómica
+    # Log to local audit ledger with canonical provenance and atomic writing
     log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'logs')
     os.makedirs(log_dir, exist_ok=True)
     audit_file = os.path.join(log_dir, 'trades_audit.jsonl')
@@ -495,14 +493,14 @@ def move_sl_to_breakeven(symbol, target_env='testnet'):
     pos_res = send_signed_request('GET', '/fapi/v2/positionRisk', {'symbol': symbol}, target_env=target_env)
     active = [p for p in pos_res if float(p.get('positionAmt', 0)) != 0] if isinstance(pos_res, list) else []
     if not active:
-        return {"success": False, "error": f"No hay posición activa abierta en {symbol}"}
+        return {"success": False, "error": f"No active open position for {symbol}"}
 
     pos = active[0]
     entry_p = float(pos['entryPrice'])
     amt = float(pos['positionAmt'])
     exit_side = 'SELL' if amt > 0 else 'BUY'
 
-    # Consultar órdenes algo viejas de SL
+    # Query prior active SL algo orders
     open_algos = send_signed_request('GET', '/fapi/v1/openAlgoOrders', {'symbol': symbol}, target_env=target_env)
     old_sl_orders = []
     if isinstance(open_algos, list):
@@ -510,35 +508,35 @@ def move_sl_to_breakeven(symbol, target_env='testnet'):
             if ao.get('orderType') in ['STOP_MARKET', 'STOP'] and ao.get('algoId'):
                 old_sl_orders.append(ao)
 
-    # Redondear precio BE con colchón de comisiones (True Net Break-Even: cubre comisiones taker 0.10% + slippage 0.02%)
+    # Round BE price with fee buffer (True Net Break-Even: covers taker fees 0.10% + slippage 0.02%)
     fee_buffer = 0.0012
     is_long = amt > 0
     raw_be = entry_p * (1.0 + fee_buffer) if is_long else entry_p * (1.0 - fee_buffer)
     filters = get_symbol_filters(symbol, target_env=target_env)
     be_price = round_price(raw_be, filters['tickSize'], filters['precision_price']) if filters else raw_be
 
-    # Cancelar SL previo
+    # Cancel previous SL
     for ao in old_sl_orders:
         send_signed_request('DELETE', '/fapi/v1/algoOrder', {'symbol': symbol, 'algoId': ao['algoId']}, target_env=target_env)
 
-    # Colocar nuevo SL en Breakeven
+    # Place new SL at Breakeven
     new_sl = place_algo_stop_loss(symbol, exit_side, be_price, target_env=target_env)
     verified, _ = verify_algo_stop_loss(symbol, exit_side, be_price, target_env=target_env)
 
-    # ROLLBACK DE SEGURIDAD: Si falló la colocación del nuevo SL, restaurar inmediatamente el SL previo
+    # SAFETY ROLLBACK: If placing new SL fails, immediately restore previous SL
     if not verified and old_sl_orders:
         prev_trig = float(old_sl_orders[0].get('triggerPrice', 0))
         if prev_trig > 0:
             rollback_sl = place_algo_stop_loss(symbol, exit_side, prev_trig, target_env=target_env)
             return {
                 "success": False,
-                "error": f"Fallo al mover a Break-Even ({new_sl}). Rollback ejecutado: Stop Loss restaurado en {prev_trig}."
+                "error": f"Failed to move to Break-Even ({new_sl}). Rollback executed: Stop Loss restored at {prev_trig}."
             }
 
     return {
         "success": True,
         "symbol": symbol,
-        "message": f"Stop Loss movido a Break-Even ({be_price}) para posición {pos['positionAmt']} {symbol}",
+        "message": f"Stop Loss moved to Break-Even ({be_price}) for position {pos['positionAmt']} {symbol}",
         "entry_price": entry_p,
         "new_sl_price": be_price,
         "algo_order": new_sl
@@ -547,13 +545,13 @@ def move_sl_to_breakeven(symbol, target_env='testnet'):
 def get_positions_summary(target_env='testnet'):
     pos_res = send_signed_request('GET', '/fapi/v2/positionRisk', target_env=target_env)
     if not isinstance(pos_res, list):
-        return f"Error consultando posiciones: {pos_res}"
+        return f"Error querying positions: {pos_res}"
 
     active = [p for p in pos_res if float(p.get('positionAmt', 0)) != 0]
     if not active:
-        return "No tienes posiciones activas abiertas actualmente."
+        return "No active positions currently open."
 
-    lines = [f"📊 POSICIONES ACTIVAS ({target_env.upper()}):\n"]
+    lines = [f"📊 ACTIVE POSITIONS ({target_env.upper()}):\n"]
     for p in active:
         amt = float(p['positionAmt'])
         dir_str = 'LONG' if amt > 0 else 'SHORT'
@@ -563,20 +561,20 @@ def get_positions_summary(target_env='testnet'):
         margin = float(p.get('isolatedMargin', 0))
         roe = (unpnl / margin * 100) if margin > 0 else 0.0
         lines.append(f"• {p['symbol']} ({dir_str} {p['leverage']}x - {p['marginType'].upper()})")
-        lines.append(f"  Tamaño: {abs(amt)} | Entrada: {entry:.4f} | Precio Mark: {mark:.4f}")
-        lines.append(f"  PnL No Realizado: {unpnl:+.2f} USDT (ROE: {roe:+.2f}%)")
-        lines.append(f"  Precio Liquidación: {float(p.get('liquidationPrice', 0)):.4f}\n")
+        lines.append(f"  Size: {abs(amt)} | Entry: {entry:.4f} | Mark Price: {mark:.4f}")
+        lines.append(f"  Unrealized PnL: {unpnl:+.2f} USDT (ROE: {roe:+.2f}%)")
+        lines.append(f"  Liquidation Price: {float(p.get('liquidationPrice', 0)):.4f}\n")
     return "\n".join(lines)
 
 def audit_orphan_positions(target_env='testnet', auto_heal=False):
     """
-    Audita exhaustivamente todas las posiciones activas en la cuenta.
-    Detecta posiciones 'huérfanas' / 'desnudas' (sin Algo Stop Loss verificado en Binance).
-    Si auto_heal=True, coloca un Algo SL de emergencia calculado por buffer de volatilidad/liquidación.
+    Exhaustively audits all active positions in the account.
+    Detects 'orphan' / 'naked' positions (without verified Algo Stop Loss on Binance).
+    If auto_heal=True, places an emergency Algo SL calculated via volatility/liquidation buffer.
     """
     pos_res = send_signed_request('GET', '/fapi/v2/positionRisk', target_env=target_env)
     if not isinstance(pos_res, list):
-        return {"error": f"Error consultando posiciones: {pos_res}"}
+        return {"error": f"Error querying positions: {pos_res}"}
 
     active = [p for p in pos_res if float(p.get('positionAmt', 0)) != 0]
     if not active:
@@ -584,7 +582,7 @@ def audit_orphan_positions(target_env='testnet', auto_heal=False):
             "total_active": 0,
             "orphans_count": 0,
             "all_protected": True,
-            "message": "No hay posiciones abiertas en la cuenta."
+            "message": "No open positions in account."
         }
 
     positions_report = []
@@ -601,7 +599,7 @@ def audit_orphan_positions(target_env='testnet', auto_heal=False):
         margin = float(p.get('isolatedMargin', 0))
         unpnl = float(p.get('unRealizedProfit', 0))
 
-        # Consultar órdenes algo activas en el exchange
+        # Query active algo orders on exchange
         algos = send_signed_request('GET', '/fapi/v1/openAlgoOrders', {'symbol': sym}, target_env=target_env)
         active_sls = []
         if isinstance(algos, list):
@@ -628,7 +626,7 @@ def audit_orphan_positions(target_env='testnet', auto_heal=False):
             if auto_heal:
                 filters = get_symbol_filters(sym, target_env=target_env)
                 if filters:
-                    # Buffer de emergencia del 2.5%
+                    # 2.5% emergency buffer
                     dist = 0.025
                     raw_sl = entry_p * (1 - dist) if pos_dir == 'LONG' else entry_p * (1 + dist)
                     heal_sl = round_price(raw_sl, filters['tickSize'], filters['precision_price'])
@@ -650,27 +648,27 @@ def audit_orphan_positions(target_env='testnet', auto_heal=False):
     }
 
 def close_position_market(symbol, target_env='testnet'):
-    # 1. Posición activa
+    # 1. Active position
     pos_res = send_signed_request('GET', '/fapi/v2/positionRisk', {'symbol': symbol}, target_env=target_env)
     active = [p for p in pos_res if float(p.get('positionAmt', 0)) != 0] if isinstance(pos_res, list) else []
     if not active:
-        return {"success": False, "error": f"No hay posición abierta en {symbol}"}
+        return {"success": False, "error": f"No open position in {symbol}"}
 
     amt = float(active[0]['positionAmt'])
     exit_side = 'SELL' if amt > 0 else 'BUY'
     qty = abs(amt)
 
-    # 2. Cancelar todas las órdenes abiertas normales
+    # 2. Cancel all standard open orders
     send_signed_request('DELETE', '/fapi/v1/allOpenOrders', {'symbol': symbol}, target_env=target_env)
 
-    # 3. Cancelar todas las órdenes algo abiertas vía REST nativo
+    # 3. Cancel all open algo orders via native REST
     open_algos = send_signed_request('GET', '/fapi/v1/openAlgoOrders', {'symbol': symbol}, target_env=target_env)
     if isinstance(open_algos, list):
         for ao in open_algos:
             if ao.get('algoId'):
                 send_signed_request('DELETE', '/fapi/v1/algoOrder', {'symbol': symbol, 'algoId': ao['algoId']}, target_env=target_env)
 
-    # 4. Cerrar a mercado con reduceOnly
+    # 4. Market close with reduceOnly
     params = {
         'symbol': symbol,
         'side': exit_side,

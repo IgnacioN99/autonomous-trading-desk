@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-trading_scorecard.py - Scorecard Cuantitativo y Meta-Improver de Estrategias.
-Auditoría estadística de rendimiento y calibración continua de parámetros.
+trading_scorecard.py - Quantitative Scorecard and Strategy Meta-Improver.
+Statistical performance auditing and continuous parameter calibration.
 
-Evaluación rigurosa basada en el registro empírico de operaciones:
-Audita el historial real de operaciones en logs/trades_audit.jsonl y logs/trade_insights.jsonl:
-1. Calcula métricas cuantitativas globales: Win Rate, Profit Factor, R:R realizado vs teórico, Expected Value.
-2. Desglosa rendimiento por Nivel de Confianza (Tier S vs Tier A+ vs YOLO).
-3. Agrupa las causas de pérdidas por clusters forenses.
-4. Emite recomendaciones matemáticas de auto-calibración (ajuste de colchón ATR, filtros de volumen).
+Rigorous evaluation based on empirical trade logs:
+Audits live trade history in logs/trades_audit.jsonl and logs/trade_insights.jsonl:
+1. Calculates global quantitative metrics: Win Rate, Profit Factor, realized vs theoretical R:R, Expected Value.
+2. Breaks down performance across Conviction Tiers (Tier S vs Tier A+ vs YOLO).
+3. Clusters loss causes into forensic root categories.
+4. Emits mathematical auto-calibration recommendations (ATR buffer adjustments, volume filters).
 
-Uso:
+Usage:
   python3 scripts/trading_scorecard.py [--json] [--out [path]]
 """
 
@@ -66,14 +66,12 @@ def generate_scorecard() -> dict:
     total_trades = len(trades)
     wins = []
     losses = []
-    tiers_data = {"Tier S": [], "Tier A+": [], "Tier A": [], "YOLO": [], "Otro": []}
+    tiers_data = {"Tier S": [], "Tier A+": [], "Tier A": [], "YOLO": [], "Other": []}
 
-    # Analizar trades cerrados
+    # Analyze closed trades
     for t in trades:
         pnl = t.get("realized_pnl_usdt")
-        # Si no tiene realized_pnl explícito, inferir de evento o cálculo
         if pnl is None:
-            # Si tiene sl_price y entry_price, estimar si tocó SL
             pnl = t.get("unrealized_pnl_usdt", 0.0)
 
         tier = t.get("tier", "Tier S" if t.get("leverage", 3) == 3 else "YOLO")
@@ -86,7 +84,7 @@ def generate_scorecard() -> dict:
         elif t.get("leverage", 3) >= 10:
             target_tier = "YOLO"
         else:
-            target_tier = "Otro"
+            target_tier = "Other"
 
         t_summary = {
             "symbol": t.get("symbol"),
@@ -113,23 +111,23 @@ def generate_scorecard() -> dict:
     avg_loss = (total_loss / loss_count) if loss_count > 0 else 0.0
     ev = ((win_rate / 100.0) * avg_win) - (((100 - win_rate) / 100.0) * avg_loss)
 
-    # Agrupación de causas raíz en insights
+    # Root cause clustering from insights
     cause_clusters = {}
     for i in insights:
         cause = i.get("root_cause", "GENERAL")
         cause_clusters[cause] = cause_clusters.get(cause, 0) + 1
 
-    # Calibraciones recomendadas (Meta-Improver)
+    # Meta-Improver recommendations
     recommendations = []
     if total_trades < 5:
-        recommendations.append("Muestra estadística pequeña (n < 5 trades). Continuar acumulando ejecuciones para significancia.")
+        recommendations.append("Small statistical sample (n < 5 trades). Continue gathering executions for statistical significance.")
     else:
         if win_rate < 45.0:
-            recommendations.append("Win Rate bajo (<45%). Se recomienda elevar el filtro de volumen institucional de 1.4x a 1.8x y exigir confluencia de CVD.")
+            recommendations.append("Low Win Rate (<45%). Recommend elevating institutional volume filter from 1.4x to 1.8x and requiring CVD confluence.")
         if cause_clusters.get("BTC_DUMP_CORRELATION", 0) >= 2:
-            recommendations.append("Cluster de riesgo: Múltiples pérdidas por correlación con caída de BTC. Mantener activo el Hard Gate Delta-Neutral inviolable.")
+            recommendations.append("Risk cluster: Multiple losses due to BTC downside correlation. Enforce strict inviolable Delta-Neutral Hard Gate.")
         if profit_factor > 1.8 and win_rate >= 55.0:
-            recommendations.append("Parámetros robustos (Profit Factor > 1.8). Sistema califica para escalamiento gradual de margen.")
+            recommendations.append("Robust parameters (Profit Factor > 1.8). System qualifies for gradual margin scaling.")
 
     scorecard = {
         "timestamp_utc": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
@@ -167,22 +165,22 @@ def format_scorecard_report(sc: dict) -> str:
     lines = []
     lines.append("=" * 70)
     lines.append("🏆 QUANTITATIVE TRADING SCORECARD & META-IMPROVER")
-    lines.append(f"Fecha: {sc['timestamp_utc']} | Muestra: {sc['sample_size']} trades")
+    lines.append(f"Date: {sc['timestamp_utc']} | Sample: {sc['sample_size']} trades")
     lines.append("=" * 70)
     lines.append(f"• Win Rate: {p['win_rate_pct']:.1f}% ({p['wins']}W / {p['losses']}L)")
-    lines.append(f"• Profit Factor: {p['profit_factor']:.2f} | PnL Neto: ${p['net_pnl_usdt']:+.2f} USDT")
-    lines.append(f"• Win Promedio: ${p['avg_win_usdt']:.2f} | Loss Promedio: ${p['avg_loss_usdt']:.2f}")
-    lines.append(f"• Expected Value (EV): ${p['expected_value_per_trade']:+.2f} USDT por trade")
+    lines.append(f"• Profit Factor: {p['profit_factor']:.2f} | Net PnL: ${p['net_pnl_usdt']:+.2f} USDT")
+    lines.append(f"• Average Win: ${p['avg_win_usdt']:.2f} | Average Loss: ${p['avg_loss_usdt']:.2f}")
+    lines.append(f"• Expected Value (EV): ${p['expected_value_per_trade']:+.2f} USDT per trade")
     lines.append("-" * 70)
-    lines.append("📊 RENDIMIENTO POR NIVEL DE CONFIANZA (TIERS):")
+    lines.append("📊 PERFORMANCE BY CONVICTION TIER:")
     for tier, stats in sc.get("tiers_breakdown", {}).items():
         lines.append(f"  - {tier}: {stats['count']} trades | Win Rate: {stats['win_rate']}% | PnL: ${stats['net_pnl']:+.2f} USDT")
     lines.append("-" * 70)
-    lines.append("🔬 CLUSTERS DE CAUSAS RAÍZ (Pérdidas):")
+    lines.append("🔬 LOSS ROOT CAUSE CLUSTERS:")
     for cause, cnt in sc.get("loss_cause_clusters", {}).items():
-        lines.append(f"  - {cause}: {cnt} ocurrencia(s)")
+        lines.append(f"  - {cause}: {cnt} occurrence(s)")
     lines.append("-" * 70)
-    lines.append("💡 RECOMENDACIONES DEL META-IMPROVER:")
+    lines.append("💡 META-IMPROVER RECOMMENDATIONS:")
     for rec in sc.get("meta_improver_recommendations", []):
         lines.append(f"  👉 {rec}")
     lines.append("=" * 70)

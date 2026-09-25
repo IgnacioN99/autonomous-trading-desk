@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# report_issue.sh - Reportador Nativo en Bash de GitHub Issues para Agentes
+# report_issue.sh - Native Bash GitHub Issue Reporter for Autonomous Agents
 # ==============================================================================
-# Diseñado para ejecutarse directamente desde el shell del agente (run_command)
-# con cero dependencias de Python (solo requiere bash y curl).
+# Designed to be invoked directly from the agent shell (run_command)
+# with zero Python dependencies (requires only bash and curl).
 #
-# Si Python o el entorno virtual colapsan, este script sigue funcionando
-# para reportar el incidente en https://github.com/IgnacioN99/autonomous-trading-desk/issues.
+# If Python or the virtual environment crashes, this script continues functioning
+# to report the incident directly to GitHub.
 #
-# Uso:
-#   ./scripts/report_issue.sh --title "Fallo en Binance API" --error "Error 429 Too Many Requests" --severity "HIGH"
+# Usage:
+#   ./scripts/report_issue.sh --title "Binance API Failure" --error "Error 429 Too Many Requests" --severity "HIGH"
 #   ./scripts/report_issue.sh --sync
 # ==============================================================================
 
@@ -20,13 +20,11 @@ LOGS_DIR="${BASE_DIR}/logs"
 BACKLOG_FILE="${LOGS_DIR}/issues_backlog.jsonl"
 DEFAULT_REPO="IgnacioN99/autonomous-trading-desk"
 
-# 1. Cargar variables de .env si existe y no están exportadas
+# 1. Load variables from .env if present and not exported
 if [ -f "${BASE_DIR}/.env" ]; then
     while IFS='=' read -r key val || [ -n "$key" ]; do
-        # Omitir comentarios y líneas vacías
         [[ "$key" =~ ^#.*$ ]] && continue
         [ -z "$key" ] && continue
-        # Limpiar espacios y comillas
         key="$(echo "$key" | tr -d '[:space:]')"
         val="$(echo "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^["'"'"']//' -e 's/["'"'"']$//')"
         if [ -n "$key" ] && [ -z "${!key}" ]; then
@@ -38,7 +36,7 @@ fi
 REPO="${GITHUB_REPO:-$DEFAULT_REPO}"
 TOKEN="${GITHUB_TOKEN:-}"
 
-# Valores por defecto
+# Default parameters
 TITLE=""
 ERROR_DETAIL=""
 SEVERITY="HIGH"
@@ -47,7 +45,7 @@ AGENT_NAME="autonomous_agent"
 REMEDIATION=""
 SYNC_MODE=false
 
-# Parser de argumentos
+# Argument parser
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -t|--title)
@@ -83,20 +81,20 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h|--help)
-            echo "Uso: $0 [opciones]"
+            echo "Usage: $0 [options]"
             echo ""
-            echo "Opciones:"
-            echo "  -t, --title <texto>       Título del fallo"
-            echo "  -e, --error <texto>       Detalle del error o mensaje devuelto"
-            echo "  -s, --severity <nivel>    CRITICAL | HIGH | MEDIUM | LOW (default: HIGH)"
-            echo "  -c, --category <tipo>     agent_failure | risk_gate | tool_error | infra (default: agent_failure)"
-            echo "  -a, --agent <nombre>      Nombre del agente emisor (default: autonomous_agent)"
-            echo "  -r, --remediation <texto> Solución o sugerencia"
-            echo "  --sync                    Despacha issues pendientes en el backlog local"
+            echo "Options:"
+            echo "  -t, --title <text>        Issue title describing failure"
+            echo "  -e, --error <text>        Error details or returned exception message"
+            echo "  -s, --severity <level>    CRITICAL | HIGH | MEDIUM | LOW (default: HIGH)"
+            echo "  -c, --category <type>     agent_failure | risk_gate | tool_error | infra (default: agent_failure)"
+            echo "  -a, --agent <name>        Reporting agent name (default: autonomous_agent)"
+            echo "  -r, --remediation <text>  Suggested fix or remediation step"
+            echo "  --sync                    Dispatches pending offline backlog issues"
             exit 0
             ;;
         *)
-            echo "Opción desconocida: $1"
+            echo "Unknown option: $1"
             exit 1
             ;;
     esac
@@ -105,19 +103,19 @@ done
 mkdir -p "$LOGS_DIR"
 
 # ------------------------------------------------------------------------------
-# Función: Sincronizar Backlog Offline
+# Function: Offline Backlog Sync
 # ------------------------------------------------------------------------------
 sync_backlog() {
     if [ -z "$TOKEN" ]; then
-        echo "❌ Error: GITHUB_TOKEN no está definido en el entorno ni en .env."
+        echo "❌ Error: GITHUB_TOKEN is not defined in environment or .env."
         exit 1
     fi
     if [ ! -f "$BACKLOG_FILE" ] || [ ! -s "$BACKLOG_FILE" ]; then
-        echo "✅ El backlog local está vacío. No hay issues pendientes."
+        echo "✅ Offline backlog is empty. No pending issues."
         exit 0
     fi
 
-    echo "🔄 Sincronizando issues pendientes hacia https://github.com/${REPO}/issues..."
+    echo "🔄 Syncing pending backlog issues to https://github.com/${REPO}/issues..."
     TEMP_BACKLOG="${BACKLOG_FILE}.tmp.$$"
     touch "$TEMP_BACKLOG"
 
@@ -127,7 +125,6 @@ sync_backlog() {
     while IFS= read -r line || [ -n "$line" ]; do
         [ -z "$line" ] && continue
         
-        # Extraer title y body con node/python/grep de forma segura
         item_title=$(echo "$line" | sed -n 's/.*"title": *\([^,]*\),.*/\1/p' | sed 's/^"//;s/"$//')
         
         http_code=$(curl -s -o /dev/null -w "%{http_code}" \
@@ -138,10 +135,10 @@ sync_backlog() {
             -d "$line")
 
         if [ "$http_code" = "201" ]; then
-            echo "   ✅ Publicado exitosamente: ${item_title}"
+            echo "   ✅ Successfully published: ${item_title}"
             ((count_success++))
         else
-            echo "   ❌ Error HTTP $http_code al publicar: ${item_title}"
+            echo "   ❌ HTTP $http_code error publishing: ${item_title}"
             echo "$line" >> "$TEMP_BACKLOG"
             ((count_failed++))
         fi
@@ -149,7 +146,7 @@ sync_backlog() {
     done < "$BACKLOG_FILE"
 
     mv "$TEMP_BACKLOG" "$BACKLOG_FILE"
-    echo "🏁 Sincronización finalizada: $count_success publicados, $count_failed pendientes."
+    echo "🏁 Backlog sync complete: $count_success published, $count_failed remaining."
     exit 0
 }
 
@@ -158,18 +155,17 @@ if [ "$SYNC_MODE" = true ]; then
 fi
 
 # ------------------------------------------------------------------------------
-# Validación de Entrada
+# Input Validation
 # ------------------------------------------------------------------------------
 if [ -z "$TITLE" ] || [ -z "$ERROR_DETAIL" ]; then
-    echo "❌ Error: Parámetros obligatorios faltantes (--title y --error)."
-    echo "Ejemplo: $0 --title 'Fallo en Binance API' --error 'HTTP 502 Bad Gateway'"
+    echo "❌ Error: Missing required arguments (--title and --error)."
+    echo "Example: $0 --title 'Binance API Failure' --error 'HTTP 502 Bad Gateway'"
     exit 1
 fi
 
 TIMESTAMP_UTC=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
 TARGET_ENV="${BINANCE_API_ENV:-TESTNET}"
 
-# Seleccionar emoji de severidad
 case "${SEVERITY^^}" in
     CRITICAL) SEV_BADGE="🔴 CRITICAL" ;;
     HIGH)     SEV_BADGE="🟠 HIGH" ;;
@@ -179,22 +175,22 @@ case "${SEVERITY^^}" in
 esac
 
 # ------------------------------------------------------------------------------
-# Construcción del Cuerpo en Markdown
+# Markdown Body Construction
 # ------------------------------------------------------------------------------
 MD_BODY=$(cat <<EOF
-## 🚨 Informe Autónomo de Falla de Setup Agéntico
+## 🚨 Autonomous Agent Setup Failure Report
 
-| Dimensión | Valor |
+| Dimension | Value |
 | :--- | :--- |
-| **Severidad** | **${SEV_BADGE}** |
-| **Categoría** | \`${CATEGORY}\` |
-| **Agente Emisor** | \`${AGENT_NAME}\` |
-| **Entorno** | \`${TARGET_ENV}\` |
+| **Severity** | **${SEV_BADGE}** |
+| **Category** | \`${CATEGORY}\` |
+| **Reporting Agent** | \`${AGENT_NAME}\` |
+| **Environment** | \`${TARGET_ENV}\` |
 | **Timestamp UTC** | \`${TIMESTAMP_UTC}\` |
 
 ---
 
-### 📋 Descripción del Fallo / Anomalía
+### 📋 Failure / Anomaly Description
 ${ERROR_DETAIL}
 EOF
 )
@@ -202,19 +198,18 @@ EOF
 if [ -n "$REMEDIATION" ]; then
     MD_BODY="${MD_BODY}
 
-### 💡 Remediación Sugerida
+### 💡 Suggested Remediation
 ${REMEDIATION}"
 fi
 
 MD_BODY="${MD_BODY}
 
 ---
-*Reportado nativamente vía shell bash por el harness de observabilidad de \`autonomous-trading-desk\`.*"
+*Reported natively via bash shell by the \`autonomous-trading-desk\` observability harness.*"
 
 # ------------------------------------------------------------------------------
-# Serialización JSON del Payload (Segura ante caracteres especiales)
+# JSON Payload Serialization
 # ------------------------------------------------------------------------------
-# Usamos un escape seguro en bash
 json_escape() {
     python3 -c 'import json, sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null || \
     echo -n "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a' -e 'N' -e '$!ba' -e 's/\n/\\n/g'
@@ -233,7 +228,7 @@ EOF
 )
 
 # ------------------------------------------------------------------------------
-# Envío a GitHub API o Fallback a Backlog Local
+# Dispatch to GitHub API or Enqueue in Local Backlog
 # ------------------------------------------------------------------------------
 if [ -n "$TOKEN" ]; then
     HTTP_RESPONSE=$(curl -s -w "\n%{http_code}" \
@@ -249,18 +244,18 @@ if [ -n "$TOKEN" ]; then
     if [ "$HTTP_STATUS" = "201" ]; then
         ISSUE_URL=$(echo "$RESPONSE_BODY" | grep -o '"html_url": *"[^"]*"' | head -n1 | cut -d'"' -f4)
         ISSUE_NUM=$(echo "$RESPONSE_BODY" | grep -o '"number": *[0-9]*' | head -n1 | cut -d':' -f2 | tr -d ' ')
-        echo "✅ GITHUB ISSUE CREADO EXITOSAMENTE: #${ISSUE_NUM}"
+        echo "✅ GITHUB ISSUE CREATED SUCCESSFULLY: #${ISSUE_NUM}"
         echo "   URL: ${ISSUE_URL}"
         exit 0
     else
-        echo "⚠️ Fallo al conectar con GitHub API (HTTP ${HTTP_STATUS}). Encolando en backlog local..."
+        echo "⚠️ Failed to connect to GitHub API (HTTP ${HTTP_STATUS}). Enqueueing in local backlog..."
     fi
 else
-    echo "ℹ️ GITHUB_TOKEN no detectado en .env. Encolando issue en backlog local (${BACKLOG_FILE})..."
+    echo "ℹ️ GITHUB_TOKEN not detected in .env. Enqueueing issue in local backlog (${BACKLOG_FILE})..."
 fi
 
-# Fallback: guardar en backlog local
+# Fallback: persist in local backlog
 echo "$PAYLOAD" | tr '\n' ' ' >> "$BACKLOG_FILE"
 echo "" >> "$BACKLOG_FILE"
-echo "📁 Issue guardado en el backlog local (${BACKLOG_FILE})."
-echo "   Para publicarlo cuando configures GITHUB_TOKEN: ./scripts/report_issue.sh --sync"
+echo "📁 Issue saved in local backlog (${BACKLOG_FILE})."
+echo "   To publish once GITHUB_TOKEN is configured: ./scripts/report_issue.sh --sync"

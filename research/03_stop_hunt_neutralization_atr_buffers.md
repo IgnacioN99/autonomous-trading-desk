@@ -1,23 +1,23 @@
-# Neutralización de Barridos de Liquidez (Stop Hunts) y Parámetros Cuantitativos
+# Liquidity Sweep Neutralization (Stop Hunts) & Quantitative Buffers
 
-## 1. Anatomía de un Liquidity Sweep en Criptomonedas
-Los mercados de futuros cripto son altamente asimétricos. Los creadores de mercado y algoritmos de alta frecuencia rastrean las agrupaciones de órdenes de Stop Loss ubicadas milimétricamente por debajo de soportes visibles o por encima de resistencias.
+## 1. Anatomy of a Liquidity Sweep in Cryptoassets
+Cryptocurrency derivatives markets exhibit pronounced microstructure asymmetry. Market makers and high-frequency algorithms routinely target Stop Loss clusters located mechanically beneath visible chart support or above resistance.
 
-### Por qué fallan las entradas inmediatas:
-Cuando un trader entra exactamente en la mecha de rechazo o al cierre de la vela de 15m, queda vulnerable al segundo 'barrido de confirmación' (segunda mecha que penetra unos pips adicionales para limpiar los stops tardíos).
+### Why Immediate Entries Fail:
+Entering at the exact rejection wick or on the close of the 15m candle leaves traders vulnerable to the secondary confirmation sweep (a second wick extending several pips further to trigger late stops).
 
-## 2. El Filtro del Gatillo en la Vela Siguiente (Next-Candle Confirmation Trigger)
-Basado en los estudios de Thomas Bulkowski y la microestructura de order flow:
-1. Regla de Entrada: NUNCA entrar a mercado al cierre de la vela que forma la mecha o el patrón morfológico.
-2. Gatillo Obligatorio:
-   - Para LONG: La siguiente vela debe romper el máximo absoluto de la vela del patrón (High_trigger = High_patron + 0.05%).
-   - Para SHORT: La siguiente vela debe romper el mínimo absoluto de la vela del patrón (Low_trigger = Low_patron - 0.05%).
-   - Si la siguiente vela no supera el extremo y retrocede, la orden se descarta inmediatamente, evitando el stop hunt.
+## 2. Next-Candle Confirmation Trigger Filter
+Grounded in empirical order flow microstructure and technical price action:
+1. **Entry Rule:** NEVER enter at market upon the close of the pattern formation candle.
+2. **Mandatory Trigger:**
+   - For LONG: The subsequent candle must break above the absolute high of the pattern candle ($\text{High}_{\text{trigger}} = \text{High}_{\text{pattern}} + 0.05\%$).
+   - For SHORT: The subsequent candle must break below the absolute low of the pattern candle ($\text{Low}_{\text{trigger}} = \text{Low}_{\text{pattern}} - 0.05\%$).
+   - If the subsequent candle fails to breach the extreme and pulls back, the order is immediately cancelled, neutralizing the stop hunt.
 
-## 3. Calibración Dinámica del Stop Loss con Buffer ATR
-- En lugar de colocar el Stop Loss exactamente en el mínimo/máximo de la mecha, se debe añadir un colchón de volatilidad basado en el Average True Range (ATR de 14 periodos en 15m):
+## 3. Dynamic Stop Loss Calibration via ATR Buffer
+- Rather than placing the Stop Loss exactly at the high/low of the wick, add a dynamic volatility cushion based on the Average True Range (14-period 15m ATR):
 
-SL_Long = Minimo_Mecha - (1.5 * ATR_15m)
-SL_Short = Maximo_Mecha + (1.5 * ATR_15m)
+$$\text{SL}_{\text{Long}} = \text{Wick Low} - (1.5 \times \text{ATR}_{15m})$$
+$$\text{SL}_{\text{Short}} = \text{Wick High} + (1.5 \times \text{ATR}_{15m})$$
 
-- Ajuste de Tamaño: Al ampliar el Stop Loss mediante 1.5x ATR, el número de contratos o tokens se REDUCE proporcionalmente mediante la fórmula de Kelly, garantizando que el riesgo monetario en dólares (USDT) siga siendo constante ( -  USDT).
+- **Position Size Adjustment:** Widening the Stop Loss via $1.5\times$ ATR proportionally REDUCES contract quantity, guaranteeing that total monetary risk in USDT remains exactly constant ($1.50 USDT standard loss).

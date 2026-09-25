@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-intraday_radar.py - Escáner Intradiario de Alta Confluencia para Binance Futuros.
-Especializado en timeframe de 15m y 5m para cuentas de capital acotado y rotación en el mismo día.
+intraday_radar.py - High-Confluence Intraday Scanner for Binance Futures.
+Specialized in 15m and 5m timeframes for bounded capital day trading and rotation.
 """
 
 import urllib.request
@@ -18,10 +18,10 @@ def get_top_crypto_pairs(limit=35):
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
     except Exception as e:
-        print(f"Error consultando tickers 24h: {e}", file=sys.stderr)
+        print(f"Error querying 24hr tickers: {e}", file=sys.stderr)
         return []
 
-    # Obtener exchangeInfo para filtrar estrictamente criptos puras (underlyingType == 'COIN')
+    # Query exchangeInfo to strictly filter pure crypto contracts (underlyingType == 'COIN')
     info_url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
     info_req = urllib.request.Request(info_url, headers={"User-Agent": "Mozilla/5.0"})
     try:
@@ -47,7 +47,7 @@ def get_top_crypto_pairs(limit=35):
             if sym.endswith("USDT") and not sym.startswith(("USDC", "XAU", "XAG", "EUR")):
                 valid.append(item)
 
-    # Ordenar por volumen en USDT descendente
+    # Sort by descending USDT quote volume
     valid.sort(key=lambda x: float(x.get("quoteVolume", 0)), reverse=True)
     return [x["symbol"] for x in valid[:limit]]
 
@@ -133,7 +133,7 @@ def analyze_symbol(symbol, interval="15m"):
     candle_low = lows[-1]
     candle_vol = volumes[-1]
 
-    # Candle range y mechas
+    # Candle range and wicks
     total_range = candle_high - candle_low
     if total_range <= 0:
         return None
@@ -153,14 +153,14 @@ def analyze_symbol(symbol, interval="15m"):
     emas = calculate_ema(closes, period=20)
     ema20 = emas[-1] if emas else current_price
 
-    # Volumen relativo frente a la media de 20 velas
+    # Relative volume vs 20-candle average
     avg_vol = sum(volumes[-21:-1]) / 20 if len(volumes) >= 21 else candle_vol
     vol_ratio = (candle_vol / avg_vol) if avg_vol > 0 else 1.0
 
-    # Distancia a EMA 20 en %
+    # Distance to EMA 20 in %
     dist_to_ema20_pct = ((ema20 - current_price) / current_price) * 100
 
-    # 24h High/Low de las últimas 50 velas 15m (~12.5 horas)
+    # Recent high/low across last 50 15m candles (~12.5 hours)
     recent_high = max(highs)
     recent_low = min(lows)
 
@@ -169,40 +169,40 @@ def analyze_symbol(symbol, interval="15m"):
     long_reasons = []
     short_reasons = []
 
-    # Criterio 1: RSI Extremo (Mean Reversion)
+    # Criterion 1: Extreme RSI (Mean Reversion)
     if rsi_15m < 28:
         score_long += 35
-        long_reasons.append(f"RSI 15m sobreventa extrema ({rsi_15m:.1f})")
+        long_reasons.append(f"RSI 15m extreme oversold ({rsi_15m:.1f})")
     elif rsi_15m < 35:
         score_long += 20
-        long_reasons.append(f"RSI 15m sobreventa ({rsi_15m:.1f})")
+        long_reasons.append(f"RSI 15m oversold ({rsi_15m:.1f})")
     elif rsi_15m > 72:
         score_short += 35
-        short_reasons.append(f"RSI 15m sobrecompra extrema ({rsi_15m:.1f})")
+        short_reasons.append(f"RSI 15m extreme overbought ({rsi_15m:.1f})")
     elif rsi_15m > 65:
         score_short += 20
-        short_reasons.append(f"RSI 15m sobrecompra ({rsi_15m:.1f})")
+        short_reasons.append(f"RSI 15m overbought ({rsi_15m:.1f})")
 
-    # Criterio 2: Mechas de absorción institucional (NotebookLM principle)
+    # Criterion 2: Institutional absorption wicks
     if lower_wick_ratio >= 40:
         score_long += 30
-        long_reasons.append(f"Mecha absorción compradora ({lower_wick_ratio:.0f}% de la vela)")
+        long_reasons.append(f"Buyer absorption wick ({lower_wick_ratio:.0f}% of candle)")
     elif lower_wick_ratio >= 25:
         score_long += 15
-        long_reasons.append(f"Rechazo en mínimos ({lower_wick_ratio:.0f}% mecha)")
+        long_reasons.append(f"Support rejection ({lower_wick_ratio:.0f}% lower wick)")
 
     if upper_wick_ratio >= 40:
         score_short += 30
-        short_reasons.append(f"Mecha absorción vendedora ({upper_wick_ratio:.0f}% de la vela)")
+        short_reasons.append(f"Seller absorption wick ({upper_wick_ratio:.0f}% of candle)")
     elif upper_wick_ratio >= 25:
         score_short += 15
-        short_reasons.append(f"Rechazo en máximos ({upper_wick_ratio:.0f}% mecha)")
+        short_reasons.append(f"Resistance rejection ({upper_wick_ratio:.0f}% upper wick)")
 
-    # Criterio 3: Volumen clímax
+    # Criterion 3: Volume Climax
     if vol_ratio >= 1.8:
         score_long += 20 if score_long > score_short else 0
         score_short += 20 if score_short > score_long else 0
-        reason_txt = f"Volumen clímax {vol_ratio:.1f}x la media"
+        reason_txt = f"Volume climax {vol_ratio:.1f}x average"
         if score_long >= score_short:
             long_reasons.append(reason_txt)
         else:
@@ -211,40 +211,40 @@ def analyze_symbol(symbol, interval="15m"):
         score_long += 10 if score_long > score_short else 0
         score_short += 10 if score_short > score_long else 0
 
-    # Criterio 4: Barrido de mínimos/máximos recientes
+    # Criterion 4: Sweep of recent session highs/lows
     if current_price <= recent_low * 1.008:
         score_long += 15
-        long_reasons.append("Zona de barrido de mínimos de sesión")
+        long_reasons.append("Session low liquidity sweep zone")
     if current_price >= recent_high * 0.992:
         score_short += 15
-        short_reasons.append("Zona de barrido de máximos de sesión")
+        short_reasons.append("Session high liquidity sweep zone")
 
     atr = calculate_atr(highs, lows, closes, period=14)
 
-    # Decidir dirección
+    # Determine direction
     if score_long >= 45 and score_long > score_short:
         direction = "LONG"
         confluence_score = min(score_long, 98)
         reasons = long_reasons
         entry = current_price
-        trigger_entry = candle_high * 1.0005 # Gatillo: superar el máximo de la vela de absorción
-        sl = candle_low - (1.3 * atr) # Colchón técnico ATR anti-barrido
+        trigger_entry = candle_high * 1.0005 # Trigger: break above absorption candle high
+        sl = candle_low - (1.3 * atr) # ATR anti-sweep buffer
         risk_pct = ((entry - sl) / entry) * 100
-        # Asegurar mínimo de 1.0% de holgura técnica frente a ruido
+        # Ensure minimum 1.0% technical buffer against micro-noise
         if risk_pct < 1.0:
             sl = entry * 0.988
             risk_pct = 1.2
 
-        tp1 = max(ema20, entry * (1 + risk_pct * 1.8 / 100)) # Mínimo 1.8R a EMA 20
-        tp2 = entry * (1 + risk_pct * 4.0 / 100) # 4.0R estructural
+        tp1 = max(ema20, entry * (1 + risk_pct * 1.8 / 100)) # Minimum 1.8R to EMA 20
+        tp2 = entry * (1 + risk_pct * 4.0 / 100) # 4.0R structural
         rr = (tp2 - entry) / (entry - sl) if (entry - sl) > 0 else 4.0
     elif score_short >= 45 and score_short > score_long:
         direction = "SHORT"
         confluence_score = min(score_short, 98)
         reasons = short_reasons
         entry = current_price
-        trigger_entry = candle_low * 0.9995 # Gatillo: perforar el mínimo de la vela de absorción
-        sl = candle_high + (1.3 * atr) # Colchón técnico ATR anti-barrido
+        trigger_entry = candle_low * 0.9995 # Trigger: break below absorption candle low
+        sl = candle_high + (1.3 * atr) # ATR anti-sweep buffer
         risk_pct = ((sl - entry) / entry) * 100
         if risk_pct < 1.0:
             sl = entry * 1.012
@@ -284,16 +284,16 @@ def scan_market(top_n=5, interval="15m"):
                 candidates.append(res)
         except Exception:
             continue
-        time.sleep(0.04) # rate limit suave
+        time.sleep(0.04) # gentle rate limit
 
     candidates.sort(key=lambda x: x["score"], reverse=True)
     return candidates[:top_n]
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Escáner Intradiario de Futuros")
-    parser.add_argument("--interval", type=str, default="15m", choices=["5m", "15m", "1h"], help="Timeframe de escaneo")
-    parser.add_argument("--top", type=int, default=5, help="Número de oportunidades a devolver")
-    parser.add_argument("--format", type=str, default="table", choices=["table", "json"], help="Formato de salida")
+    parser = argparse.ArgumentParser(description="Futures Intraday Scanner")
+    parser.add_argument("--interval", type=str, default="15m", choices=["5m", "15m", "1h"], help="Scanning timeframe")
+    parser.add_argument("--top", type=int, default=5, help="Number of opportunities to return")
+    parser.add_argument("--format", type=str, default="table", choices=["table", "json"], help="Output format")
     args = parser.parse_args()
 
     results = scan_market(top_n=args.top, interval=args.interval)
@@ -301,18 +301,18 @@ if __name__ == "__main__":
     if args.format == "json":
         print(json.dumps(results, indent=2))
     else:
-        print(f"\n⚡ RADAR INTRADIARIO BINANCE FUTUROS (Timeframe: {args.interval}) ⚡")
+        print(f"\n⚡ BINANCE FUTURES INTRADAY RADAR (Timeframe: {args.interval}) ⚡")
         print("=" * 80)
         if not results:
-            print("No se encontraron oportunidades con confluencia suficiente en este momento.")
+            print("No opportunities with sufficient confluence found at this moment.")
         for i, item in enumerate(results, 1):
-            tier = "Tier S (🔥 Máxima)" if item["score"] >= 75 else "Tier A (Fuerte)"
-            roe_est = round(item["risk_pct"] * item["rr"] * 3, 1) # a 3x
+            tier = "Tier S (🔥 Maximum)" if item["score"] >= 75 else "Tier A (Strong)"
+            roe_est = round(item["risk_pct"] * item["rr"] * 3, 1) # at 3x
             trigger_str = f"{item['trigger']:.4f}" if item.get("trigger") else f"{item['entry']:.4f}"
-            print(f"#{i} | {item['symbol']} - {item['direction']} | Confluencia: {item['score']}% ({tier})")
-            print(f"   • Gatillo Confirmación (Next-Candle): {trigger_str} | Precio Mercado: {item['price']}")
-            print(f"   • Stop Loss (Buffer 1.3x ATR): {item['sl']:.4f} (-{item['risk_pct']}%)")
-            print(f"   • TP1 (EMA 20 / BE): {item['tp1']:.4f} | TP2 (Estructural): {item['tp2']:.4f}")
-            print(f"   • Ratio R:R: {item['rr']}:1 | ROE Estimado (3x): +{roe_est}%")
-            print(f"   • Factores de Confluencia: {', '.join(item['reasons'])}")
+            print(f"#{i} | {item['symbol']} - {item['direction']} | Confluence: {item['score']}% ({tier})")
+            print(f"   • Next-Candle Trigger: {trigger_str} | Market Price: {item['price']}")
+            print(f"   • Stop Loss (1.3x ATR Buffer): {item['sl']:.4f} (-{item['risk_pct']}%)")
+            print(f"   • TP1 (EMA 20 / BE): {item['tp1']:.4f} | TP2 (Structural): {item['tp2']:.4f}")
+            print(f"   • R:R Ratio: {item['rr']}:1 | Estimated ROE (3x): +{roe_est}%")
+            print(f"   • Confluence Factors: {', '.join(item['reasons'])}")
             print("-" * 80)

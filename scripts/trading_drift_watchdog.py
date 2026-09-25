@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-trading_drift_watchdog.py - Sensor de Deriva y "Alfa Muerto" (Dead Alpha Watchdog).
-Monitoreo proactivo del ciclo de vida y tiempo de retención de posiciones abiertas.
+trading_drift_watchdog.py - Temporal Drift and Dead Alpha Sensor.
+Proactive lifecycle and holding-time monitoring for open positions.
 
-En trading intradía (15m/5m), una hipótesis técnica de absorción o breakout tiene un tiempo de vida útil
-(Half-Life H). Si una posición lleva más de 3 a 4 horas abierta estancada en un rango minúsculo (+/- 0.3R)
-con volumen seco, la tesis estadística original HA EXPIRADO.
+In intraday trading (15m/5m), an absorption or breakout hypothesis has a finite useful lifetime (Half-Life H).
+If a position has been open for 3 to 4 hours stagnant within a narrow range (+/- 0.3R) with dry volume,
+the original statistical thesis has EXPIRED.
 
-Mantenerla viva sólo expone capital a comisiones de financiamiento (funding fees) y volatilidad macro adversa.
-Este watchdog audita las posiciones vivas y:
-1. Detecta posiciones con 'Alfa Muerto'.
-2. Si está en ganancia leve, ciñe el SL a Break-Even de forma agresiva.
-3. Si está congelada en el punto de entrada, emite recomendación de cierre preventivo o auto-cierre (--auto-exit).
+Keeping it open exposes capital to funding fees and adverse macro shocks.
+This watchdog audits live positions and:
+1. Detects positions with 'Dead Alpha'.
+2. If slightly in profit, aggressively ratchets SL to Break-Even.
+3. If frozen at entry, issues a defensive close recommendation or triggers auto-close (--auto-exit).
 
-Uso:
+Usage:
   python3 scripts/trading_drift_watchdog.py [--env testnet|mainnet] [--max-hours 4.0] [--auto-exit]
 """
 
@@ -24,7 +24,7 @@ import json
 import datetime
 import argparse
 
-# Asegurar path local
+# Ensure local path resolution
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import execute_futures_trade as eft
 from utils.atomic_writer import read_json_safe, atomic_append_jsonl
@@ -35,17 +35,17 @@ AUDIT_LOG = os.path.join(LOGS_DIR, "trades_audit.jsonl")
 
 def audit_dead_alpha(target_env: str = "testnet", max_hours: float = 4.0, auto_exit: bool = False):
     print("=" * 70)
-    print("⏳ DEAD ALPHA & DRIFT WATCHDOG — AUDITORÍA DE DERIVA TEMPORAL")
-    print(f"Hora UTC: {datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    print("⏳ DEAD ALPHA & DRIFT WATCHDOG — TEMPORAL HOLDING AUDIT")
+    print(f"UTC Time: {datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
     print(f"Max Holding Time: {max_hours}h | Target Env: {target_env.upper()}")
     print("=" * 70)
 
-    # 1. Leer posiciones activas en Binance
+    # 1. Fetch active Binance positions
     pos_res = eft.send_signed_request("GET", "/fapi/v2/positionRisk", target_env=target_env)
     active = [p for p in pos_res if float(p.get("positionAmt", 0)) != 0] if isinstance(pos_res, list) else []
 
     if not active:
-        print("✅ CERO POSICIONES ABIERTAS: Cero deriva temporal. Cartera limpia.")
+        print("✅ ZERO OPEN POSITIONS: Zero temporal drift. Clean portfolio.")
         return {"active_count": 0, "dead_alpha_count": 0, "positions": []}
 
     state = read_json_safe(STATE_FILE, default={})
@@ -73,8 +73,8 @@ def audit_dead_alpha(target_env: str = "testnet", max_hours: float = 4.0, auto_e
         sl_price = meta.get("sl_price")
         price_diff_pct = abs(mark_p - entry_p) / entry_p * 100
 
-        # Criterio Cuantitativo de Alfa Muerto:
-        # Ha superado max_hours Y el precio no se ha movido más de 1.2% del punto de entrada (rango muerto)
+        # Quantitative Dead Alpha Criterion:
+        # Exceeded max_hours AND price has not moved more than 1.2% from entry (stagnant dead range)
         is_stagnant = price_diff_pct < 1.2 and abs(roe_pct) < 15.0
         is_overdue = elapsed_hours >= max_hours
         is_dead_alpha = is_overdue and is_stagnant
@@ -92,29 +92,29 @@ def audit_dead_alpha(target_env: str = "testnet", max_hours: float = 4.0, auto_e
             "action_taken": "NONE"
         }
 
-        print(f"\n• Posición: {sym} ({direction}) | Entrada: {entry_p} | Mark: {mark_p}")
-        print(f"  Tiempo Abierta: {elapsed_hours}h (Límite: {max_hours}h) | PnL: ${unpnl:+.2f} USDT ({roe_pct:+.1f}% ROE)")
+        print(f"\n• Position: {sym} ({direction}) | Entry: {entry_p} | Mark: {mark_p}")
+        print(f"  Holding Duration: {elapsed_hours}h (Limit: {max_hours}h) | PnL: ${unpnl:+.2f} USDT ({roe_pct:+.1f}% ROE)")
 
         if is_dead_alpha:
             dead_alpha_detected.append(item)
-            print(f"  🚨 ALERTA [DEAD ALPHA]: La tesis original ha expirado tras {elapsed_hours}h en rango estrecho ({price_diff_pct:.2f}% de movimiento).")
+            print(f"  🚨 ALERT [DEAD ALPHA]: Original thesis expired after {elapsed_hours}h in tight range ({price_diff_pct:.2f}% price movement).")
             
             if auto_exit:
-                print(f"  ⚡ DISPARANDO AUTO-EXIT: Cerrando posición a mercado para reciclar capital...")
+                print(f"  ⚡ TRIGGERING AUTO-EXIT: Closing position at market to recycle capital...")
                 close_res = eft.close_position_market(sym, target_env=target_env)
                 item["action_taken"] = "AUTO_EXIT_CLOSED"
                 item["close_result"] = close_res
-                print(f"  ✅ Posición cerrada a mercado.")
+                print(f"  ✅ Position closed at market.")
             else:
-                print(f"  ⚠️  RECOMENDACIÓN: Cerrar posición a mercado o ceñir SL a Break-Even inmediato para eliminar riesgo.")
+                print(f"  ⚠️  RECOMMENDATION: Market close or tighten SL to Break-Even immediately to eliminate risk.")
                 item["action_taken"] = "RECOMMEND_EXIT"
         else:
-            print(f"  ✅ Salud Temporal OK (Dentro del horizonte operativo o en expansión)")
+            print(f"  ✅ Temporal Health OK (Within operational horizon or trending)")
 
         results.append(item)
 
     print("\n" + "=" * 70)
-    print(f"RESUMEN: {len(active)} posición(es) evaluadas | {len(dead_alpha_detected)} con Alfa Muerto.")
+    print(f"SUMMARY: {len(active)} position(s) evaluated | {len(dead_alpha_detected)} with Dead Alpha.")
     print("=" * 70)
 
     return {
@@ -126,8 +126,8 @@ def audit_dead_alpha(target_env: str = "testnet", max_hours: float = 4.0, auto_e
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Dead Alpha & Drift Watchdog")
     parser.add_argument("--env", default="testnet", choices=["testnet", "mainnet"])
-    parser.add_argument("--max-hours", type=float, default=4.0, help="Horas máximas antes de declarar alfa muerto")
-    parser.add_argument("--auto-exit", action="store_true", help="Cierra a mercado las posiciones con alfa muerto")
+    parser.add_argument("--max-hours", type=float, default=4.0, help="Maximum holding hours before declaring dead alpha")
+    parser.add_argument("--auto-exit", action="store_true", help="Closes dead alpha positions at market")
     args = parser.parse_args()
 
     audit_dead_alpha(target_env=args.env, max_hours=args.max_hours, auto_exit=args.auto_exit)

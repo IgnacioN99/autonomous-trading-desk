@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-record_evaluation.py - Registro Atómico del Dossier de Evaluación del Subagente.
-Persistencia atómica de tokens de autorización de evaluación previa.
+record_evaluation.py - Atomic Registration of Subagent Evaluation Dossier.
+Atomic persistence of pre-execution evaluation authorization tokens.
 
-Guarda el dictamen emitido por el subagente 'isolated_market_evaluator' en logs/evaluations/latest_dossier.json.
-Este archivo actúa como Token de Autorización criptográfico/mecánico que el hook pre_trade_guard.py
-exige antes de permitir cualquier ejecución de órdenes en Binance.
+Saves the verdict emitted by the 'isolated_market_evaluator' subagent into logs/evaluations/latest_dossier.json.
+This file serves as a mechanical authorization token that the pre_trade_guard.py hook
+requires prior to permitting any order execution on Binance.
 
-Uso:
-  python3 scripts/record_evaluation.py --symbols TIAUSDT,SAGAUSDT --directions LONG,SHORT --evaluator isolated_market_evaluator --summary "Cesta delta neutral aprobada"
-  python3 scripts/record_evaluation.py --json-file ruta/dossier.json
+Usage:
+  python3 scripts/record_evaluation.py --symbols TIAUSDT,SAGAUSDT --directions LONG,SHORT --evaluator isolated_market_evaluator --summary "Delta-neutral basket approved"
+  python3 scripts/record_evaluation.py --json-file path/to/dossier.json
 """
 
 import os
@@ -27,7 +27,7 @@ EVAL_DIR = os.path.join(BASE_DIR, "logs", "evaluations")
 DOSSIER_FILE = os.path.join(EVAL_DIR, "latest_dossier.json")
 EVAL_HISTORY_FILE = os.path.join(EVAL_DIR, "evaluations_history.jsonl")
 
-TTL_SECONDS = 1200 # 20 minutos de validez máxima antes de expirar
+TTL_SECONDS = 1200 # 20 minutes maximum validity window before expiration
 
 def record_evaluation_dossier(
     approved_candidates: list,
@@ -54,10 +54,10 @@ def record_evaluation_dossier(
         "raw_payload": raw_payload or {}
     }
 
-    # Escritura atómica del latest_dossier.json
+    # Atomic write to latest_dossier.json
     atomic_write_json(DOSSIER_FILE, dossier)
 
-    # Historial persistente append-only
+    # Append-only persistent audit history
     history_record = {
         "timestamp_utc": now_utc,
         "evaluator_agent": evaluator_agent,
@@ -67,19 +67,19 @@ def record_evaluation_dossier(
     }
     atomic_append_jsonl(EVAL_HISTORY_FILE, history_record)
 
-    print(f"✅ DOSSIER DE EVALUACIÓN REGISTRADO: {len(dossier['approved_symbols'])} activo(s) aprobados.")
-    print(f"   Símbolos: {', '.join(dossier['approved_symbols'])} | Válido hasta: {datetime.datetime.fromtimestamp(dossier['valid_until_ts'], datetime.timezone.utc).strftime('%H:%M:%S UTC')}")
-    print(f"   Ubicación: {DOSSIER_FILE}")
+    print(f"✅ EVALUATION DOSSIER RECORDED: {len(dossier['approved_symbols'])} asset(s) approved.")
+    print(f"   Symbols: {', '.join(dossier['approved_symbols'])} | Valid until: {datetime.datetime.fromtimestamp(dossier['valid_until_ts'], datetime.timezone.utc).strftime('%H:%M:%S UTC')}")
+    print(f"   Location: {DOSSIER_FILE}")
     return dossier
 
 def main():
-    parser = argparse.ArgumentParser(description="Registrador de Dossier de Evaluación de Subagente")
-    parser.add_argument("--symbols", type=str, help="Lista de símbolos aprobados separados por comas (ej. TIAUSDT,SAGAUSDT)")
-    parser.add_argument("--directions", type=str, help="Direcciones correspondientes (ej. LONG,SHORT)")
-    parser.add_argument("--evaluator", type=str, default="isolated_market_evaluator", help="Nombre del subagente evaluador")
-    parser.add_argument("--summary", type=str, default="Evaluación cuantitativa aprobada", help="Resumen o tesis")
-    parser.add_argument("--status", type=str, default="APPROVED", choices=["APPROVED", "REJECTED", "NEUTRAL"], help="Veredicto")
-    parser.add_argument("--json-file", type=str, help="Cargar dossier completo desde un archivo JSON")
+    parser = argparse.ArgumentParser(description="Subagent Evaluation Dossier Recorder")
+    parser.add_argument("--symbols", type=str, help="Comma-separated list of approved symbols (e.g. TIAUSDT,SAGAUSDT)")
+    parser.add_argument("--directions", type=str, help="Corresponding directions (e.g. LONG,SHORT)")
+    parser.add_argument("--evaluator", type=str, default="isolated_market_evaluator", help="Evaluator subagent name")
+    parser.add_argument("--summary", type=str, default="Quantitative evaluation approved", help="Summary or thesis")
+    parser.add_argument("--status", type=str, default="APPROVED", choices=["APPROVED", "REJECTED", "NEUTRAL"], help="Verdict")
+    parser.add_argument("--json-file", type=str, help="Load complete dossier from a JSON file")
     args = parser.parse_args()
 
     if args.json_file and os.path.exists(args.json_file):
@@ -109,7 +109,7 @@ def main():
             status=args.status
         )
     else:
-        # Si no hay argumentos, intentar leer JSON de stdin
+        # If no arguments provided, try reading JSON from stdin
         if not sys.stdin.isatty():
             try:
                 import re
@@ -127,7 +127,7 @@ def main():
                 )
                 return
             except Exception as e:
-                print(f"Error parseando JSON de stdin: {e}", file=sys.stderr)
+                print(f"Error parsing JSON from stdin: {e}", file=sys.stderr)
         parser.print_help()
 
 if __name__ == "__main__":

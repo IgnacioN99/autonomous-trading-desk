@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-screening_pipeline.py - Pipeline Determinista de Alto Rendimiento para Inteligencia de Mercado.
-Implementa el Patrón 'Lean Evaluator':
-1. Concurrencia nativa en Python (ThreadPoolExecutor) para escaneo broad market (80+ pares),
-   microestructura institucional (CVD/OI Z-score), Stat-Arb ADF cointegrado y newsletters.
-2. Modelado de datos estricto mediante esquemas Pydantic V2 (cero pérdidas por teléfono descompuesto).
-3. Salida estructurada de ultra-baja latencia (~3.5 segundos) lista para consumo por el Agente Evaluador Aislado.
+screening_pipeline.py - High-Performance Deterministic Market Intelligence Pipeline.
+Implements the 'Lean Evaluator' Pattern:
+1. Native Python concurrency (ThreadPoolExecutor) for broad market screening (80+ pairs),
+   institutional microstructure (CVD/OI Z-score), cointegrated ADF Stat-Arb, and newsletters.
+2. Strict data modeling via Pydantic V2 schemas (zero information loss across agent boundaries).
+3. Ultra-low latency structured output (~3.5 seconds) ready for consumption by the Clean-Room Evaluator Agent.
 """
 
 import os
@@ -16,7 +16,7 @@ from typing import List, Literal, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pydantic import BaseModel, Field
 
-# Asegurar path de imports
+# Ensure import paths
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import broad_market_radar as bmr
 import microstructure_engine as me
@@ -26,7 +26,7 @@ import execute_futures_trade as eft
 import sync_session_state as sss
 
 # ==========================================
-# 1. ESQUEMAS TIPADOS PYDANTIC (CONTRATOS)
+# 1. TYPED PYDANTIC SCHEMAS (DATA CONTRACTS)
 # ==========================================
 
 class MacroContext(BaseModel):
@@ -111,11 +111,11 @@ class MarketScreeningPayload(BaseModel):
     news_catalysts_summary: List[str]
 
 # ==========================================
-# 2. PIPELINE DE EJECUCIÓN DETERMINISTA
+# 2. DETERMINISTIC EXECUTION PIPELINE
 # ==========================================
 
 def fetch_macro_btc() -> MacroContext:
-    """Consulta la microestructura y cinta de Bitcoin para validar la regla macro."""
+    """Queries Bitcoin microstructure and tape to validate macro regime."""
     try:
         btc_micro = me.get_symbol_microstructure("BTCUSDT") or {}
         btc_tape = me.get_live_aggtrades_tape("BTCUSDT") or {}
@@ -126,7 +126,7 @@ def fetch_macro_btc() -> MacroContext:
         allows_shorts = regime != "SHORT_SQUEEZE"
         warning = None
         if not allows_shorts:
-            warning = "⚠️ ALERTA MACRO: Bitcoin en Short Squeeze agresivo. Prohibido meter Shorts en altcoins."
+            warning = "⚠️ MACRO ALERT: Bitcoin in aggressive Short Squeeze. Altcoin Short orders prohibited."
 
         return MacroContext(
             btc_price=cur_price,
@@ -145,7 +145,7 @@ def fetch_macro_btc() -> MacroContext:
         return MacroContext(
             btc_price=0.0,
             btc_regime="UNKNOWN",
-            btc_regime_desc=f"Error consultando BTC: {str(e)}",
+            btc_regime_desc=f"Error querying BTC: {str(e)}",
             btc_absorption="NONE",
             btc_taker_ratio=1.0,
             btc_cvd_30v=0.0,
@@ -156,7 +156,7 @@ def fetch_macro_btc() -> MacroContext:
         )
 
 def enrich_and_size_candidate(c: dict) -> Optional[CandidateSetup]:
-    """Calcula el dimensionamiento por paridad de volatilidad y empaqueta en Pydantic."""
+    """Calculates volatility parity sizing and encapsulates into Pydantic model."""
     try:
         sym = c["symbol"]
         entry = float(c["price"])
@@ -164,7 +164,7 @@ def enrich_and_size_candidate(c: dict) -> Optional[CandidateSetup]:
         direction = c["direction"]
         lev = 3
 
-        # Calcular paridad de volatilidad ($1.50 riesgo objetivo)
+        # Calculate volatility parity ($1.50 target risk)
         sizing = qre.calculate_volatility_parity_sizing(sym, entry, sl, target_dollar_risk=1.50, leverage=lev, target_env="testnet")
         if not sizing or "error" in sizing:
             req_margin = 20.0
@@ -214,7 +214,7 @@ def enrich_and_size_candidate(c: dict) -> Optional[CandidateSetup]:
         return None
 
 def fetch_news_summary() -> List[str]:
-    """Lee y filtra de forma determinista catalizadores o menciones recientes de newsletters."""
+    """Reads and filters news catalysts or recent newsletter mentions deterministically."""
     catalysts = []
     newsletter_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fetch_newsletters.py")
     if os.path.exists(newsletter_script):
@@ -238,13 +238,13 @@ def fetch_news_summary() -> List[str]:
         except Exception:
             pass
     if not catalysts:
-        catalysts.append("Macro estable. Sin eventos de alto impacto de la Reserva Federal o CPI programados en la ventana intradía inmediata.")
+        catalysts.append("Stable macro. No high-impact Federal Reserve or CPI events scheduled in the immediate intraday window.")
     return catalysts[:5]
 
 def execute_screening_pipeline(top_pairs_count: int = 80) -> MarketScreeningPayload:
     """
-    Ejecuta el pipeline completo de screening en paralelo en Python sin ningún LLM intermedio.
-    Devuelve un objeto MarketScreeningPayload estructurado y validado.
+    Executes the full screening pipeline concurrently in Python without any intermediary LLM.
+    Returns a validated, structured MarketScreeningPayload object.
     """
     t0 = time.time()
 
@@ -261,7 +261,7 @@ def execute_screening_pipeline(top_pairs_count: int = 80) -> MarketScreeningPayl
         raw_funding = f_funding.result()
         news_data = f_news.result()
 
-    # Filtrar y tipar candidatos (top 6 con balance)
+    # Filter and type candidate setups (top 6 balanced)
     parsed_candidates: List[CandidateSetup] = []
     with ThreadPoolExecutor(max_workers=6) as c_exec:
         futures = [c_exec.submit(enrich_and_size_candidate, c) for c in raw_candidates[:10]]
@@ -270,7 +270,7 @@ def execute_screening_pipeline(top_pairs_count: int = 80) -> MarketScreeningPayl
             if res:
                 parsed_candidates.append(res)
 
-    # Sincronizar estado vivo de cartera y aplicar guardarraíl Delta-Neutral
+    # Sync live portfolio state and apply Delta-Neutral guardrail
     portfolio_ctx = None
     try:
         s_state = sss.sync_session_state()
@@ -284,8 +284,8 @@ def execute_screening_pipeline(top_pairs_count: int = 80) -> MarketScreeningPayl
             "active_symbols": [p["symbol"] for p in s_state.get("active_positions", [])]
         }
         
-        # GUARDARRAÍL DELTA-NEUTRAL:
-        # Si la cartera viva ya está cargada hacia un lado, priorizar la pata contraria de cobertura
+        # DELTA-NEUTRAL GUARDRAIL:
+        # If live portfolio is already skewed, prioritize the opposing hedging direction
         delta_bias = portfolio_ctx["delta_bias"]
         if delta_bias == "LONG_HEAVY":
             parsed_candidates.sort(key=lambda x: (x.direction == "SHORT", x.tier.startswith("Tier S"), x.confidence), reverse=True)
@@ -298,7 +298,7 @@ def execute_screening_pipeline(top_pairs_count: int = 80) -> MarketScreeningPayl
 
     top_candidates = parsed_candidates[:6]
 
-    # Pares Stat-Arb accionables o cointegrados
+    # Actionable or cointegrated Stat-Arb pairs
     stat_arb_list: List[StatArbPair] = []
     for p in raw_statarb:
         try:
@@ -332,8 +332,8 @@ def execute_screening_pipeline(top_pairs_count: int = 80) -> MarketScreeningPayl
         except Exception:
             pass
 
-    # Slot YOLO Status (Barbell Strategy Asimétrica)
-    yolo_status = "INACTIVO: Preservando capital. Ninguna memecoin supera el filtro de volumen clímax >= 2.0x ni absorción compradora >= 50%."
+    # Barbell YOLO Slot Status
+    yolo_status = "INACTIVE: Preserving capital. No memecoin exceeds climax volume >= 2.0x or buyer absorption wick >= 50%."
 
     t1 = time.time()
     latency_ms = int((t1 - t0) * 1000)
@@ -352,23 +352,23 @@ def execute_screening_pipeline(top_pairs_count: int = 80) -> MarketScreeningPayl
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Pipeline Determinista de Inteligencia de Mercado")
-    parser.add_argument("--json", action="store_true", help="Imprime el payload en formato JSON estricto")
+    parser = argparse.ArgumentParser(description="Deterministic Market Intelligence Pipeline")
+    parser.add_argument("--json", action="store_true", help="Print payload in strict JSON format")
     args = parser.parse_args()
 
     payload = execute_screening_pipeline()
     if args.json:
         print(payload.model_dump_json(indent=2))
     else:
-        print(f"⚡ PIPELINE COMPLETADO EN {payload.pipeline_latency_ms} ms ({payload.timestamp_utc})")
-        print(f"• Macro BTC: {payload.macro.btc_regime} | Precio: ${payload.macro.btc_price:,.1f} | Permite Shorts: {payload.macro.allows_alt_shorts}")
-        print(f"• Candidatos Top Calificados: {len(payload.top_candidates)}")
+        print(f"⚡ PIPELINE COMPLETED IN {payload.pipeline_latency_ms} ms ({payload.timestamp_utc})")
+        print(f"• Macro BTC: {payload.macro.btc_regime} | Price: ${payload.macro.btc_price:,.1f} | Allows Shorts: {payload.macro.allows_alt_shorts}")
+        print(f"• Top Qualified Setups: {len(payload.top_candidates)}")
         for c in payload.top_candidates:
-            print(f"  [{c.tier}] {c.symbol} ({c.direction}): Conf {c.confidence}% | Entrada {c.current_price} | SL {c.sl_price} | Margen ${c.required_margin:.1f} USDT")
-        print(f"• Pares Stat-Arb Acciónables ({len(payload.actionable_stat_arb)} analizados):")
+            print(f"  [{c.tier}] {c.symbol} ({c.direction}): Conf {c.confidence}% | Entry {c.current_price} | SL {c.sl_price} | Margin ${c.required_margin:.1f} USDT")
+        print(f"• Stat-Arb Pairs ({len(payload.actionable_stat_arb)} analyzed):")
         actionable = [p for p in payload.actionable_stat_arb if p.is_actionable]
         if actionable:
             for a in actionable:
                 print(f"  🔥 {a.pair}: Z={a.z_score:+.2f}σ, ADF p={a.adf_pvalue:.3f}, Half-Life={a.half_life_hours:.1f}h -> {a.recommendation}")
         else:
-            print("  ⚖️ Sin divergencias cointegradas extremas (|Z| >= 2.0σ con ADF p < 0.05).")
+            print("  ⚖️ No extreme cointegrated divergences (|Z| >= 2.0σ with ADF p < 0.05).")

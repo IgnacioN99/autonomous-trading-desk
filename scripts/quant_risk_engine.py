@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-quant_risk_engine.py - Motor Cuantitativo de Riesgo, Paridad de Volatilidad y Arbitraje Estadístico (Pairs Trading).
-Implementa:
-1. Paridad de Volatilidad (Sizing con Pérdida Monetaria Constante e Inversa a la Volatilidad).
-2. Fractional Kelly Empírico (Calculado a partir del historial real en ledger y anclado al capital).
-3. Pairs Trading Cointegrado Riguroso (Engle-Granger Cointegration, Augmented Dickey-Fuller (ADF),
-   y cálculo de Vida Media Ornstein-Uhlenbeck usando numpy y statsmodels).
+quant_risk_engine.py - Quantitative Risk, Volatility Parity, and Statistical Arbitrage (Pairs Trading) Engine.
+Implements:
+1. Volatility Parity (Sizing with Constant Monetary Loss Inversely Proportional to Volatility).
+2. Empirical Fractional Kelly (Derived from real ledger trade history and anchored to account capital).
+3. Rigorous Cointegrated Pairs Trading (Engle-Granger Cointegration, Augmented Dickey-Fuller (ADF),
+   and Ornstein-Uhlenbeck Half-Life calculation using numpy and statsmodels).
 """
 
 import os
@@ -21,7 +21,7 @@ from decimal import Decimal
 import numpy as np
 import statsmodels.tsa.stattools as ts
 
-# Asegurar path local
+# Ensure local path resolution
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import execute_futures_trade as eft
 
@@ -34,31 +34,31 @@ def fetch_json(url, timeout=6):
 
 def calculate_volatility_parity_sizing(symbol, entry_price, sl_price, target_dollar_risk=1.50, leverage=3, target_env="testnet"):
     """
-    Calcula el dimensionamiento exacto para que el Stop Loss cueste EXACTAMENTE target_dollar_risk (ej. $1.50 USDT).
-    - Si el activo es muy volátil (SL lejano), el tamaño nocional y margen se reducen.
-    - Si el activo es muy estable (SL cercano), el tamaño nocional se incrementa.
-    - Cumple estrictamente los filtros minNotional, lotSize y tickSize de Binance.
+    Calculates exact position sizing so that Stop Loss execution costs EXACTLY target_dollar_risk (e.g. $1.50 USDT).
+    - If the asset is highly volatile (distant SL), notional size and required margin scale down.
+    - If the asset is relatively stable (tight SL), notional size scales up.
+    - Strictly complies with Binance minNotional, lotSize, and tickSize filters.
     """
     if entry_price <= 0 or sl_price <= 0:
-        return {"error": "Precios deben ser mayores a 0."}
+        return {"error": "Prices must be strictly greater than 0."}
 
     filters = eft.get_symbol_filters(symbol, target_env=target_env)
     if not filters:
-        return {"error": f"No se encontraron filtros para {symbol}"}
+        return {"error": f"Filters not found for {symbol}"}
 
     risk_distance = abs(entry_price - sl_price)
-    risk_pct = (risk_distance / entry_price) # en fracción (ej. 0.02)
+    risk_pct = (risk_distance / entry_price) # in fraction (e.g. 0.02)
     if risk_pct <= 0:
-        return {"error": "La distancia al Stop Loss no puede ser 0."}
+        return {"error": "Stop Loss distance cannot be 0."}
 
-    # Nocional = Target Dollar Risk / Distancia al Stop Loss
+    # Notional = Target Dollar Risk / Stop Loss distance
     ideal_notional = target_dollar_risk / risk_pct
 
-    # Ajustar por minNotional de Binance (mínimo $5 USDT)
+    # Adjust for Binance minNotional ($5 USDT minimum)
     min_notional = filters.get("minNotional", 5.0)
     final_notional = max(ideal_notional, min_notional)
 
-    # Cantidad de contratos
+    # Contract quantity calculation
     raw_qty = final_notional / entry_price
     step_qty = eft.round_step(raw_qty, filters["stepSize"], filters["precision_qty"])
 
@@ -72,7 +72,7 @@ def calculate_volatility_parity_sizing(symbol, entry_price, sl_price, target_dol
     is_long = entry_price > sl_price
     direction = "LONG" if is_long else "SHORT"
 
-    # Objetivos asimétricos R:R (TP1 = 1.8R, TP2 = 4.0R) para preservar la cola derecha
+    # Asymmetric R:R targets (TP1 = 1.8R, TP2 = 4.0R) to preserve positive skewness
     tp1_price = entry_price * (1 + risk_pct * 1.8) if is_long else entry_price * (1 - risk_pct * 1.8)
     tp2_price = entry_price * (1 + risk_pct * 4.0) if is_long else entry_price * (1 - risk_pct * 4.0)
 
@@ -101,15 +101,15 @@ def calculate_volatility_parity_sizing(symbol, entry_price, sl_price, target_dol
 
 def calculate_empirical_kelly(target_env="testnet"):
     """
-    Calcula la fracción óptima de Kelly empírica basada en el historial de operaciones del ledger
-    y anclada al capital total disponible en cuenta.
+    Calculates empirical optimal Kelly fraction based on real ledger trade history
+    and anchored to available account capital.
     f* = p - (q / b)
-    donde p = win rate, q = 1 - p, b = payoff ratio (avg_win / avg_loss).
-    Exige un mínimo de N >= 30 operaciones para significancia estadística básica (MacKinnon/Kelly threshold).
+    where p = win rate, q = 1 - p, b = payoff ratio (avg_win / avg_loss).
+    Requires a minimum of N >= 30 trades for basic statistical significance (MacKinnon/Kelly threshold).
     """
     trades = eft.send_signed_request("GET", "/fapi/v1/userTrades", {"limit": 100}, target_env=target_env)
     if not isinstance(trades, list):
-        return {"error": f"Error al consultar historial de trades: {trades}"}
+        return {"error": f"Error fetching trade history: {trades}"}
 
     pnls = [float(t["realizedPnl"]) for t in trades if float(t.get("realizedPnl", 0)) != 0]
     total_closed = len(pnls)
@@ -121,7 +121,7 @@ def calculate_empirical_kelly(target_env="testnet"):
         return {
             "status": "INSUFFICIENT_DATA_CONSERVATIVE_MODE",
             "total_trades_analyzed": total_closed,
-            "message": f"Muestra reducida ({total_closed} trades < 30 requeridos para significancia estadística). Error estándar elevado. Aplicando Fractional Kelly conservador fijo: $1.50 USDT por posición (riesgo acotado).",
+            "message": f"Small sample size ({total_closed} trades < 30 required for statistical significance). High standard error. Applying conservative fixed Fractional Kelly: $1.50 USDT per position (bounded risk).",
             "recommended_dollar_risk": 1.50,
             "account_equity_usdt": round(total_equity, 2),
             "win_rate_pct": round((len([p for p in pnls if p > 0]) / total_closed * 100), 1) if total_closed > 0 else 0.0,
@@ -135,7 +135,7 @@ def calculate_empirical_kelly(target_env="testnet"):
     loss_count = len(losses)
 
     win_rate = win_count / total_closed if total_closed > 0 else 0.0
-    # Error estándar de la proporción
+    # Standard error of the proportion
     se_win_rate = math.sqrt(win_rate * (1.0 - win_rate) / total_closed) if total_closed > 0 else 0.0
 
     avg_win = sum(wins) / win_count if win_count > 0 else 0.0
@@ -144,15 +144,15 @@ def calculate_empirical_kelly(target_env="testnet"):
     payoff_b = avg_win / avg_loss if avg_loss > 0 else 1.0
     q = 1.0 - win_rate
 
-    # Fórmula de Kelly: f* = p - (q / b)
+    # Kelly formula: f* = p - (q / b)
     kelly_full = win_rate - (q / payoff_b) if payoff_b > 0 else 0.0
     kelly_quarter = max(0.0, kelly_full / 4.0)
 
     if kelly_full <= 0:
-        diagnosis = "EXPECTATIVA_NEGATIVA (Payoff ratio insuficiente o pérdidas superan ganancias). Se exige endurecer R:R >= 2.5:1 y ceñir stops estructurales."
-        recommended_risk_usdt = 1.50 # Riesgo base mínimo
+        diagnosis = "NEGATIVE_EXPECTANCY (Insufficient payoff ratio or losses exceed gains). Tighten R:R >= 2.5:1 and enforce structural stops."
+        recommended_risk_usdt = 1.50 # Minimum baseline risk
     else:
-        diagnosis = f"EXPECTATIVA_POSITIVA (Kelly Completo: {kelly_full*100:.1f}% | Quarter-Kelly: {kelly_quarter*100:.1f}%)"
+        diagnosis = f"POSITIVE_EXPECTANCY (Full Kelly: {kelly_full*100:.1f}% | Quarter-Kelly: {kelly_quarter*100:.1f}%)"
         risk_fraction = min(0.02, max(0.005, kelly_quarter))
         recommended_risk_usdt = max(1.50, round(total_equity * risk_fraction, 2))
 
@@ -175,13 +175,13 @@ def calculate_empirical_kelly(target_env="testnet"):
 
 def calculate_pair_cointegration(sym_a, sym_b, interval="1h", limit=1000):
     """
-    Calcula la cointegración rigurosa de dos activos bajo estándares econométricos institucionales:
-    1. Descarga 1000 barras de 1h (~41.6 días de histórico continuo) para evitar sesgos de micro-muestras.
-    2. Test de Cointegración Engle-Granger (ts.coint) contrastado con valores críticos asintóticos de MacKinnon (2010).
-    3. Regresión OLS para el Hedge Ratio (Beta óptimo).
-    4. Estimación del proceso Ornstein-Uhlenbeck con Corrección del Sesgo de Hurwicz para muestras finitas.
-    5. Z-Score normalizado del spread actual.
-    6. Dimensionamiento Beta-Hedged exacto para garantizar Delta-Neutralidad real (Notional_B = Notional_A * Beta).
+    Calculates rigorous cointegration of two assets under institutional econometric standards:
+    1. Fetches 1,000 continuous 1h bars (~41.6 days history) to prevent micro-sample bias.
+    2. Engle-Granger Cointegration test (ts.coint) compared against MacKinnon (2010) asymptotic critical values.
+    3. OLS regression for Hedge Ratio (optimal Beta).
+    4. Ornstein-Uhlenbeck process estimation with Hurwicz finite-sample bias correction.
+    5. Normalized Z-Score of the current spread.
+    6. Exact Beta-Hedged sizing to guarantee true Delta-Neutrality (Notional_B = Notional_A * Beta).
     """
     try:
         url_a = f"{BASE_FAPI}/fapi/v1/klines?symbol={sym_a}&interval={interval}&limit={limit}"
@@ -204,17 +204,17 @@ def calculate_pair_cointegration(sym_a, sym_b, interval="1h", limit=1000):
         log_a = np.log(closes_a)
         log_b = np.log(closes_b)
 
-        # 1. Test Engle-Granger de Cointegración con valores críticos de MacKinnon
+        # 1. Engle-Granger Cointegration test with MacKinnon critical values
         coint_stat, coint_pvalue, crit_values = ts.coint(log_a, log_b)
-        crit_5pct = float(crit_values[1]) # -3.34 aprox para 2 variables
+        crit_5pct = float(crit_values[1]) # approx -3.34 for 2 variables
 
-        # 2. OLS para Hedge Ratio (Beta de cointegración estático y rolling 10d)
+        # 2. OLS for Hedge Ratio (Static cointegration Beta and 10d rolling Beta)
         cov_matrix = np.cov(log_a, log_b)
         var_b = np.var(log_b)
         beta = float(cov_matrix[0, 1] / var_b) if var_b > 0 else 1.0
         corr = float(cov_matrix[0, 1] / np.sqrt(np.var(log_a) * var_b)) if (np.var(log_a) * var_b) > 0 else 0.0
 
-        # Beta dinámico en ventana móvil de 10 días (240 barras de 1h) - NotebookLM Pillar 1 & 4
+        # Dynamic Beta over 10-day rolling window (240 1h bars)
         window_10d = min(240, n_obs)
         log_a_roll = log_a[-window_10d:]
         log_b_roll = log_b[-window_10d:]
@@ -223,10 +223,10 @@ def calculate_pair_cointegration(sym_a, sym_b, interval="1h", limit=1000):
         beta_dynamic = float(cov_roll[0, 1] / var_b_roll) if var_b_roll > 0 else beta
         beta_drift_pct = float(abs(beta_dynamic - beta) / abs(beta) * 100.0) if beta != 0 else 0.0
 
-        # Usar beta dinámico para la serie de spread reciente
+        # Use dynamic Beta for the recent spread series
         spread = log_a - beta_dynamic * log_b
 
-        # 3. Cointegración Parcial (PCI) - Estimación de Ratio de Varianza Reversible R2_MR
+        # 3. Partial Cointegration (PCI) - Reversible Variance Ratio R2_MR estimation
         diff_spread = np.diff(spread)
         sigma_diff = float(np.var(diff_spread))
         poly_ar = np.polyfit(spread[:-1], spread[1:], 1)
@@ -235,27 +235,27 @@ def calculate_pair_cointegration(sym_a, sym_b, interval="1h", limit=1000):
         sigma_res = float(np.var(res_ar))
         r2_mr = max(0.0, min(1.0, float(1.0 - (sigma_res / sigma_diff)))) if sigma_diff > 0 else 0.0
 
-        # 4. Test ADF de Estacionariedad en el spread
+        # 4. ADF Stationarity Test on spread
         adf_result = ts.adfuller(spread, autolag='AIC')
         adf_stat = float(adf_result[0])
         adf_pvalue = float(adf_result[1])
 
-        # 5. Ornstein-Uhlenbeck Mean-Reversion con Corrección de Hurwicz
+        # 5. Ornstein-Uhlenbeck Mean-Reversion with Hurwicz Bias Correction
         # dS_t = alpha + lambda * S_{t-1} + e_t
         lag_spread = spread[:-1]
         delta_spread = spread[1:] - lag_spread
         poly = np.polyfit(lag_spread, delta_spread, 1)
         lam_raw = float(poly[0])
 
-        # Hurwicz Bias Correction: E[lam_hat - lam] ~= -(1 + 3*rho)/N donde rho = 1 + lam_raw
+        # Hurwicz Bias Correction: E[lam_hat - lam] ~= -(1 + 3*rho)/N where rho = 1 + lam_raw
         lam_corr = lam_raw + (1.0 + 3.0 * (1.0 + lam_raw)) / float(n_obs)
 
         if lam_corr < 0:
             half_life_hours = float(-np.log(2) / lam_corr)
         else:
-            half_life_hours = 999.0 # Proceso explosivo o paseo aleatorio puro
+            half_life_hours = 999.0 # Explosive process or pure random walk
 
-        # 6. Z-Score actual
+        # 6. Current Z-Score
         mean_spread = float(np.mean(spread))
         std_spread = float(np.std(spread))
 
@@ -265,16 +265,16 @@ def calculate_pair_cointegration(sym_a, sym_b, interval="1h", limit=1000):
         current_spread = float(spread[-1])
         z_score = float((current_spread - mean_spread) / std_spread)
 
-        # Filtro Riguroso Cuantitativo Institucional (MacKinnon 2010 + PCI R2_MR):
-        # - coint_pvalue < 0.05 Y coint_stat < crit_5pct (MacKinnon superado)
-        # - Ratio de Varianza Reversible PCI R2_MR >= 0.50 (elimina derivas espurias)
-        # - Vida media Hurwicz finita (3h <= Half-Life <= 72h)
-        # - Divergencia estadísticamente significativa (|Z| >= 2.0σ)
+        # Rigorous Quantitative Institutional Filter (MacKinnon 2010 + PCI R2_MR):
+        # - coint_pvalue < 0.05 AND coint_stat < crit_5pct (MacKinnon cleared)
+        # - Partial Cointegration Reversible Variance Ratio PCI R2_MR >= 0.40 (eliminates spurious drift)
+        # - Finite Hurwicz half-life (3h <= Half-Life <= 72h)
+        # - Statistically significant divergence (|Z| >= 2.0σ)
         is_cointegrated = bool(coint_pvalue < 0.05 and coint_stat < crit_5pct and r2_mr >= 0.40)
         is_mean_reverting = bool(3.0 <= half_life_hours <= 72.0)
         is_actionable = bool(is_cointegrated and is_mean_reverting and (abs(z_score) >= 2.0))
 
-        # Dimensionamiento Dynamic Beta-Neutral:
+        # Dynamic Beta-Neutral Sizing:
         base_notional_a = 20.0
         hedged_notional_b = round(base_notional_a * beta_dynamic, 2)
         hedged_margin_a = round(base_notional_a / 3.0, 2)
@@ -286,22 +286,22 @@ def calculate_pair_cointegration(sym_a, sym_b, interval="1h", limit=1000):
             if z_score >= 2.0:
                 action = "ARBITRAGE_SHORT_A_LONG_B"
                 trade_recommendation = (
-                    f"🚨 OPORTUNIDAD STAT-ARB VÁLIDA (+{z_score:.2f}σ, HL {half_life_hours:.1f}h, PCI R2={r2_mr:.2f}): "
-                    f"SHORT {sym_a} (${base_notional_a} nocional / ${hedged_margin_a} margen) + "
-                    f"LONG {sym_b} (${hedged_notional_b} nocional / ${hedged_margin_b} margen). "
-                    f"Dynamic Beta_10d: {beta_dynamic:.3f} (drift {beta_drift_pct:.1f}%) | Salida: Z=+0.50σ / Stop: Z=+3.50σ"
+                    f"🚨 VALID STAT-ARB OPPORTUNITY (+{z_score:.2f}σ, HL {half_life_hours:.1f}h, PCI R2={r2_mr:.2f}): "
+                    f"SHORT {sym_a} (${base_notional_a} notional / ${hedged_margin_a} margin) + "
+                    f"LONG {sym_b} (${hedged_notional_b} notional / ${hedged_margin_b} margin). "
+                    f"Dynamic Beta_10d: {beta_dynamic:.3f} (drift {beta_drift_pct:.1f}%) | Exit: Z=+0.50σ / Stop: Z=+3.50σ"
                 )
             elif z_score <= -2.0:
                 action = "ARBITRAGE_LONG_A_SHORT_B"
                 trade_recommendation = (
-                    f"🚨 OPORTUNIDAD STAT-ARB VÁLIDA ({z_score:.2f}σ, HL {half_life_hours:.1f}h, PCI R2={r2_mr:.2f}): "
-                    f"LONG {sym_a} (${base_notional_a} nocional / ${hedged_margin_a} margen) + "
-                    f"SHORT {sym_b} (${hedged_notional_b} nocional / ${hedged_margin_b} margen). "
-                    f"Dynamic Beta_10d: {beta_dynamic:.3f} (drift {beta_drift_pct:.1f}%) | Salida: Z=-0.50σ / Stop: Z=-3.50σ"
+                    f"🚨 VALID STAT-ARB OPPORTUNITY ({z_score:.2f}σ, HL {half_life_hours:.1f}h, PCI R2={r2_mr:.2f}): "
+                    f"LONG {sym_a} (${base_notional_a} notional / ${hedged_margin_a} margin) + "
+                    f"SHORT {sym_b} (${hedged_notional_b} notional / ${hedged_margin_b} margin). "
+                    f"Dynamic Beta_10d: {beta_dynamic:.3f} (drift {beta_drift_pct:.1f}%) | Exit: Z=-0.50σ / Stop: Z=-3.50σ"
                 )
         elif abs(z_score) >= 2.0 and not is_cointegrated:
             action = f"REJECTED_NON_COINTEGRATED (MacKinnon p={coint_pvalue:.4f}, PCI R2={r2_mr:.2f})"
-            trade_recommendation = f"⚠️ DIVERGENCIA DETECTADA ({z_score:+.2f}σ) PERO RECHAZADA: No supera MacKinnon Engle-Granger (p={coint_pvalue:.4f}) o PCI R2 insuficiente ({r2_mr:.2f} < 0.40)."
+            trade_recommendation = f"⚠️ DIVERGENCE DETECTED ({z_score:+.2f}σ) BUT REJECTED: Fails MacKinnon Engle-Granger (p={coint_pvalue:.4f}) or insufficient PCI R2 ({r2_mr:.2f} < 0.40)."
 
         return {
             "pair": f"{sym_a} / {sym_b}",
@@ -338,8 +338,8 @@ def calculate_pair_cointegration(sym_a, sym_b, interval="1h", limit=1000):
 
 def scan_coingrated_market_pairs():
     """
-    Escanea canasta de pares estructuralmente vinculados aplicando test MacKinnon Engle-Granger
-    y Ornstein-Uhlenbeck con corrección Hurwicz sobre 1000 barras continuas de 1h.
+    Screens structurally linked pair basket using MacKinnon Engle-Granger test
+    and Ornstein-Uhlenbeck with Hurwicz correction over 1,000 continuous 1h bars.
     """
     candidate_pairs = [
         ("BTCUSDT", "ETHUSDT"),    # Macro L1 Anchor
@@ -361,17 +361,17 @@ def scan_coingrated_market_pairs():
     return results
 
 if __name__ == "__main__":
-    print("🔬 ANÁLISIS CUANTITATIVO DE RIESGO & PAIRS TRADING (STAT-ARB) 🔬\n")
-    print("1. EVALUACIÓN DE KELLY EMPÍRICO:")
+    print("🔬 QUANTITATIVE RISK & PAIRS TRADING (STAT-ARB) ENGINE 🔬\n")
+    print("1. EMPIRICAL KELLY EVALUATION:")
     k = calculate_empirical_kelly()
     print(f"   Win Rate: {k.get('win_rate_pct')}% | Payoff b: {k.get('payoff_ratio_b')}")
-    print(f"   Diagnóstico: {k.get('diagnosis')}")
-    print(f"   Riesgo Dollar Sugerido: ${k.get('recommended_dollar_risk')} USDT por trade\n")
+    print(f"   Diagnosis: {k.get('diagnosis')}")
+    print(f"   Suggested Dollar Risk: ${k.get('recommended_dollar_risk')} USDT per trade\n")
 
-    print("2. ESCÁNER DE PARES COINTEGRADOS (TEST ADF + HALF-LIFE OU):")
+    print("2. COINTEGRATED PAIRS SCANNER (ADF TEST + OU HALF-LIFE):")
     pairs = scan_coingrated_market_pairs()
     for p in pairs:
-        coint_tag = "✅ COINTEGRADO" if p.get("is_cointegrated") else "❌ NO COINTEGRADO"
+        coint_tag = "✅ COINTEGRATED" if p.get("is_cointegrated") else "❌ NOT COINTEGRATED"
         print(f"• {p['pair']} ({coint_tag})")
         print(f"  Z-Score: {p['z_score']:+.2f}σ | Beta: {p['hedge_ratio_beta']} | ADF p-val: {p['adf_pvalue']} | Half-Life: {p['half_life_hours']}h")
         if p.get("recommendation"):

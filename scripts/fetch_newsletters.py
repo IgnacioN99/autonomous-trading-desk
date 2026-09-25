@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-fetch_newsletters.py - Lector de Newsletters de Gmail vía IMAP para Trading Radar.
-Optimizado para leer las etiquetas/carpetas de newsletters del usuario (ej. Newsletters/Crypto).
+fetch_newsletters.py - Gmail IMAP Newsletter Ingestion Engine for Trading Radar.
+Optimized to parse and inspect user newsletter labels/folders (e.g., Newsletters/Crypto).
 """
 
 import imaplib
@@ -50,7 +50,7 @@ class HTMLTextExtractor(HTMLParser):
         return "\n".join(clean_lines)
 
 def load_credentials():
-    # 1. Chequear .env local primero
+    # 1. Check local .env first
     if os.path.exists(LOCAL_ENV_PATH):
         try:
             with open(LOCAL_ENV_PATH, "r", encoding="utf-8") as f:
@@ -66,7 +66,7 @@ def load_credentials():
         except Exception:
             pass
 
-    # 2. Chequear config global en ~/.gemini/antigravity-cli/gmail_config.json
+    # 2. Check global config in ~/.gemini/antigravity-cli/gmail_config.json
     if os.path.exists(CONFIG_PATH):
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -77,7 +77,7 @@ def load_credentials():
         except Exception:
             pass
 
-    # 3. Chequear Variables de Entorno
+    # 3. Check Environment Variables
     user = os.environ.get("GMAIL_USER")
     password = os.environ.get("GMAIL_APP_PASSWORD")
     if user and password and "PEGA_AQUI" not in password:
@@ -155,7 +155,7 @@ def list_folders(mail):
     if status == "OK":
         for f in folders:
             decoded = f.decode("utf-8", errors="replace")
-            # formato usual: (\Flags) "/" "FolderName"
+            # standard format: (\Flags) "/" "FolderName"
             parts = decoded.split(' "/" ')
             if len(parts) == 2:
                 name = parts[1].strip('"')
@@ -169,7 +169,7 @@ def fetch_emails(folder="Newsletters/Crypto", query=None, sender=None, limit=5, 
     if not user or not password:
         print(json.dumps({
             "status": "error",
-            "message": "Credenciales válidas no encontradas. Configura .env o ~/.gemini/antigravity-cli/gmail_config.json"
+            "message": "Valid credentials not found. Configure .env or ~/.gemini/antigravity-cli/gmail_config.json"
         }, indent=2))
         sys.exit(1)
 
@@ -179,14 +179,14 @@ def fetch_emails(folder="Newsletters/Crypto", query=None, sender=None, limit=5, 
     except Exception as e:
         print(json.dumps({
             "status": "error",
-            "message": f"Error de autenticación IMAP: {str(e)}"
+            "message": f"IMAP authentication error: {str(e)}"
         }, indent=2))
         sys.exit(1)
 
     if test_only:
         print(json.dumps({
             "status": "success",
-            "message": f"Conexión exitosa a Gmail IMAP para {user}."
+            "message": f"Successful Gmail IMAP connection for {user}."
         }, indent=2))
         mail.logout()
         return
@@ -200,22 +200,22 @@ def fetch_emails(folder="Newsletters/Crypto", query=None, sender=None, limit=5, 
         mail.logout()
         return
 
-    # Formatear nombre de carpeta con comillas si contiene espacios o barras
+    # Quote folder name if it contains spaces or slashes
     folder_quoted = f'"{folder}"' if not (folder.startswith('"') and folder.endswith('"')) else folder
     status, count = mail.select(folder_quoted, readonly=True)
     if status != "OK":
-        # Intento fallback a INBOX
+        # Fallback attempt to INBOX
         status, count = mail.select("INBOX", readonly=True)
         if status != "OK":
             print(json.dumps({
                 "status": "error",
-                "message": f"No se pudo acceder a la carpeta '{folder}' ni a INBOX."
+                "message": f"Could not access folder '{folder}' nor 'INBOX'."
             }, indent=2))
             mail.logout()
             sys.exit(1)
         folder = "INBOX"
 
-    # Construir búsqueda
+    # Build search query
     search_criteria = []
     if sender:
         search_criteria.append(f'FROM "{sender}"')
@@ -231,7 +231,7 @@ def fetch_emails(folder="Newsletters/Crypto", query=None, sender=None, limit=5, 
             "folder": folder,
             "count": 0,
             "emails": [],
-            "message": f"No se encontraron correos con el filtro: {search_command} en la carpeta '{folder}'"
+            "message": f"No emails found matching criteria: {search_command} in folder '{folder}'"
         }, indent=2))
         mail.logout()
         return
@@ -254,7 +254,7 @@ def fetch_emails(folder="Newsletters/Crypto", query=None, sender=None, limit=5, 
         date_hdr = decode_mime_str(msg.get("Date", ""))
         body = extract_body(msg)
 
-        # Snippet limpio para visualización rápida
+        # Clean preview snippet
         clean_preview = " ".join(body.split())[:300]
 
         results.append({
@@ -263,19 +263,19 @@ def fetch_emails(folder="Newsletters/Crypto", query=None, sender=None, limit=5, 
             "from": from_hdr,
             "date": date_hdr,
             "snippet": clean_preview,
-            "content": body[:4000],  # Primeros 4000 caracteres para análisis de sentimiento/catalizadores
+            "content": body[:4000],  # First 4000 characters for sentiment/catalyst analysis
             "full_length": len(body)
         })
 
     mail.logout()
 
     if output_format == "md":
-        print(f"## 📬 Newsletters en `{folder}` ({len(results)} correos analizados)\n")
+        print(f"## 📬 Newsletters in `{folder}` ({len(results)} emails analyzed)\n")
         for i, em in enumerate(results, 1):
             print(f"### {i}. {em['subject']}")
-            print(f"- **De:** `{em['from']}`")
-            print(f"- **Fecha:** {em['date']}")
-            print(f"- **Extracto:** {em['snippet']}...\n")
+            print(f"- **From:** `{em['from']}`")
+            print(f"- **Date:** {em['date']}")
+            print(f"- **Snippet:** {em['snippet']}...\n")
     else:
         output = {
             "status": "success",
@@ -287,14 +287,15 @@ def fetch_emails(folder="Newsletters/Crypto", query=None, sender=None, limit=5, 
         print(json.dumps(output, ensure_ascii=False, indent=2))
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Lector de Newsletters Gmail IMAP")
-    parser.add_argument("--test", action="store_true", help="Probar autenticación")
-    parser.add_argument("--list-folders", action="store_true", help="Listar todas las etiquetas/carpetas")
-    parser.add_argument("--folder", type=str, default="Newsletters/Crypto", help="Carpeta a consultar (default: Newsletters/Crypto)")
-    parser.add_argument("--sender", type=str, default="", help="Filtrar por remitente")
-    parser.add_argument("--query", type=str, default="", help="Buscar texto específico")
-    parser.add_argument("--limit", type=int, default=5, help="Cantidad de correos a traer")
-    parser.add_argument("--format", type=str, choices=["json", "md"], default="json", help="Formato de salida (json o md)")
+    parser = argparse.ArgumentParser(description="Gmail IMAP Newsletter Reader")
+    parser.add_argument("--test", action="store_true", help="Test IMAP authentication")
+    parser.add_argument("--list-folders", action="store_true", help="List all mailbox labels/folders")
+    parser.add_argument("--folder", type=str, default="Newsletters/Crypto", help="Folder/label to inspect (default: Newsletters/Crypto)")
+    parser.add_argument("--sender", type=str, default="", help="Filter by sender email")
+    parser.add_argument("--query", type=str, default="", help="Search specific text query")
+    parser.add_argument("--limit", type=int, default=5, help="Number of emails to fetch")
+    parser.add_argument("--format", type=str, choices=["json", "md"], default="json", help="Output format (json or md)")
     args = parser.parse_args()
 
     fetch_emails(folder=args.folder, query=args.query, sender=args.sender, limit=args.limit, test_only=args.test, list_all_folders=args.list_folders, output_format=args.format)
+

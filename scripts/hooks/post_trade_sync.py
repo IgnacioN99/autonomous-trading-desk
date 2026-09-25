@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-post_trade_sync.py - Hook PostToolUse para sincronización determinista de cartera.
-Actualización reactiva del estado local tras cada ejecución en el exchange.
+post_trade_sync.py - PostToolUse Hook for deterministic portfolio synchronization.
+Reactive local state update following each exchange execution.
 
-Si un comando ejecutó una operación de trading (apertura, cierre o break-even),
-este hook ejecuta en segundo plano `sync_session_state.py` para asegurar que
-el Ground Truth (session_state.json) esté permanentemente fresco.
+If an executed command mutated trading positions (open, close, or break-even ratchet),
+this hook asynchronously runs `sync_session_state.py` to guarantee that
+Ground Truth (session_state.json) remains permanently fresh.
 
 Contract:
-  Input (stdin): JSON con metadata del paso.
+  Input (stdin): JSON with step metadata.
   Output (stdout): {}
 """
 
@@ -42,17 +42,16 @@ def main():
                 "night_cutoff_loop"
             ]
 
-            # Solo sincronizar si el comando ejecutado alteró posiciones de trading
+            # Trigger sync only if command altered trading positions
             if any(kw in command_line for kw in trading_keywords):
                 base_dir = find_workspace_root()
                 sync_script = os.path.join(base_dir, "scripts", "sync_session_state.py")
-                # Ejecutar de forma no bloqueante o con timeout rápido
                 subprocess.run([sys.executable, sync_script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
 
     except Exception:
         pass
 
-    # El contrato de PostToolUse siempre espera un objeto JSON vacío en stdout
+    # PostToolUse contract expects an empty JSON object on stdout
     print(json.dumps({}))
 
 if __name__ == "__main__":

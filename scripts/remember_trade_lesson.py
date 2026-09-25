@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-remember_trade_lesson.py - Ledger de Memoria Inmutable de Lecciones de Trading.
-Registro append-only de lecciones operativas sin dependencias externas.
+remember_trade_lesson.py - Immutable Memory Ledger for Trading Lessons.
+Append-only operational lessons ledger with zero external dependencies.
 
-ESTRICTAMENTE APPEND-ONLY:
-Cada aprendizaje operativo se graba en logs/trade_insights.jsonl.
-Para invalidar o actualizar una lección, NUNCA se edita ni borra el historial previo;
-se appendea un 'tombstone' ({"id": "...", "superseded": true}).
+STRICTLY APPEND-ONLY:
+Operational learning records are written to logs/trade_insights.jsonl.
+To invalidate or update a lesson, NEVER edit or delete past history;
+append a tombstone ({"id": "...", "superseded": true}).
 
-Uso:
+Usage:
   python3 scripts/remember_trade_lesson.py add --symbol HBARUSDT --dir LONG --outcome STOPPED_OUT --loss 1.68 --cause BTC_DUMP --insight "..." --tags macro,altcoins
   python3 scripts/remember_trade_lesson.py list [--tag macro]
   python3 scripts/remember_trade_lesson.py prune --id <id>
@@ -85,13 +85,13 @@ def add_insight(symbol: str, direction: str, outcome: str, loss_usdt: float, roo
         "superseded": False
     }
     append_record(record)
-    print(f"✅ Lección registrada exitosamente [{insight_id}]: {record['insight']}")
+    print(f"✅ Lesson recorded successfully [{insight_id}]: {record['insight']}")
     return record
 
 def prune_insight(target_id: str):
     file_path = get_insights_path()
     if not os.path.exists(file_path):
-        print("❌ El archivo de insights no existe.")
+        print("❌ Insights file does not exist.")
         return False
         
     tombstone = {
@@ -101,7 +101,7 @@ def prune_insight(target_id: str):
         "note": "Tombstone appended via remember_trade_lesson.py"
     }
     append_record(tombstone)
-    print(f"🪦 Tombstone appendeado para [{target_id}]. La lección ha sido invalidada sin reescribir el historial.")
+    print(f"🪦 Tombstone appended for [{target_id}]. Lesson has been invalidated without rewriting history.")
     return True
 
 def list_insights(tag_filter=None):
@@ -110,15 +110,15 @@ def list_insights(tag_filter=None):
         insights = [i for i in insights if tag_filter.lower() in [t.lower() for t in i.get("tags", [])]]
         
     if not insights:
-        print("ℹ️  No hay lecciones registradas" + (f" con el tag '{tag_filter}'" if tag_filter else "") + ".")
+        print("ℹ️  No recorded lessons" + (f" with tag '{tag_filter}'" if tag_filter else "") + ".")
         return
         
-    print(f"\n🧠 MEMORIA COMPROMETIDA ({len(insights)} lecciones activas):")
+    print(f"\n🧠 COMMITTED MEMORY ({len(insights)} active lessons):")
     print("-" * 75)
     for i in insights:
         tags_str = f" [{', '.join(i.get('tags', []))}]" if i.get("tags") else ""
         loss_str = f" (-${i.get('loss_usdt')} USDT)" if i.get("loss_usdt") else ""
-        print(f"• [{i.get('id')}] ({i.get('symbol')} {i.get('direction')}{loss_str}) Causa: {i.get('root_cause')}")
+        print(f"• [{i.get('id')}] ({i.get('symbol')} {i.get('direction')}{loss_str}) Cause: {i.get('root_cause')}")
         print(f"  👉 \"{i.get('insight')}\"{tags_str}")
     print("-" * 75 + "\n")
 

@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-exchange_adapter.py - Capa de Abstracción y Adaptadores de Exchanges.
-Patrón de diseño Adapter para soporte multi-exchange desacoplado.
+exchange_adapter.py - Exchange Abstraction Layer & Concrete Adapters.
+Adapter design pattern for decoupled multi-exchange support.
 
-Define un contrato unificado e independiente del exchange (ExchangeAdapter) para:
-- Consulta de posiciones activas y precios
-- Ejecución de órdenes de mercado y límite
-- Colocación y verificación de Stop Loss algorítmico
-- Cancelación masiva y cierre de emergencia
+Defines a unified, exchange-agnostic contract (ExchangeAdapter) for:
+- Active positions and ticker price queries
+- Market and limit order placement
+- Algorithmic Stop Loss placement and verification
+- Emergency closing and batch cancellation
 
-Permite alternar entre Binance Testnet, Binance Mainnet o futuros exchanges (Hyperliquid/Bybit)
-sin tener que modificar ni una sola línea de lógica en los evaluadores o screeners.
+Allows switching between Binance Testnet, Binance Mainnet, or future exchanges (Hyperliquid/Bybit)
+without modifying logic in evaluators or screening pipelines.
 """
 
 import os
@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import execute_futures_trade as eft
 
 class BaseExchangeAdapter(abc.ABC):
-    """Contrato abstracto para cualquier exchange de futuros perp."""
+    """Abstract contract for any perpetual futures exchange."""
 
     @abc.abstractmethod
     def get_ticker_price(self, symbol: str) -> float:
@@ -49,7 +49,7 @@ class BaseExchangeAdapter(abc.ABC):
         pass
 
 class BinanceFuturesAdapter(BaseExchangeAdapter):
-    """Adaptador concreto para Binance USDⓈ-M Futures (Testnet y Mainnet)."""
+    """Concrete adapter for Binance USDⓈ-M Futures (Testnet and Mainnet)."""
 
     def __init__(self, target_env: str = "testnet"):
         self.target_env = target_env.lower()
@@ -86,16 +86,16 @@ class BinanceFuturesAdapter(BaseExchangeAdapter):
         return eft.close_position_market(symbol, target_env=self.target_env)
 
 def get_exchange_adapter(exchange_name: str = "binance", target_env: str = "testnet") -> BaseExchangeAdapter:
-    """Fábrica de adaptadores."""
+    """Adapter factory."""
     if exchange_name.lower() == "binance":
         return BinanceFuturesAdapter(target_env=target_env)
     else:
-        raise ValueError(f"Exchange no soportado: {exchange_name}")
+        raise ValueError(f"Unsupported exchange: {exchange_name}")
 
 if __name__ == "__main__":
     adapter = get_exchange_adapter("binance", "testnet")
     btc_p = adapter.get_ticker_price("BTCUSDT")
     positions = adapter.get_active_positions()
-    print(f"✅ Adapter conectado a Binance Futures ({adapter.target_env.upper()}):")
+    print(f"✅ Adapter connected to Binance Futures ({adapter.target_env.upper()}):")
     print(f"   BTC Price: ${btc_p:,.2f}")
-    print(f"   Posiciones Vivas: {len(positions)}")
+    print(f"   Live Positions: {len(positions)}")

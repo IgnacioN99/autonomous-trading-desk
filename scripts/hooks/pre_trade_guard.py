@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-pre_trade_guard.py - Hook PreToolUse para el runtime agéntico.
-Harness de seguridad determinista pre-ejecución y validación programática de riesgos.
+pre_trade_guard.py - PreToolUse Hook for the agentic runtime.
+Deterministic pre-execution safety harness and programmatic risk verification.
 
-Intercepta run_command y call_mcp_tool antes de su ejecución para aplicar compuertas mecánicas (Hard Gates):
-1. COMPUERTA EVALUADOR AISLADO (Clean-Room Evaluation Gate):
-   Prohíbe terminantemente ejecutar trades en el chat principal sin un dossier previo emitido
-   por el subagente 'isolated_market_evaluator' en los últimos 20 minutos (logs/evaluations/latest_dossier.json).
-2. COMPUERTA DELTA-NEUTRAL:
-   Bloquea físicamente órdenes Long en LONG_HEAVY o Shorts en SHORT_HEAVY.
-3. EXCEPCIÓN DE RIESGO:
-   Órdenes de cierre, reducción de riesgo, move_to_breakeven o curación de huérfanas se autorizan DE INMEDIATO.
+Intercepts run_command and call_mcp_tool prior to execution to enforce mechanical hard gates:
+1. CLEAN-ROOM EVALUATION GATE:
+   Strictly prohibits executing trades directly in the primary chat without a prior dossier
+   issued by the 'isolated_market_evaluator' subagent within the last 20 minutes (logs/evaluations/latest_dossier.json).
+2. DELTA-NEUTRAL GATE:
+   Physically blocks Long orders when portfolio is LONG_HEAVY or Short orders when SHORT_HEAVY.
+3. RISK REDUCTION EXCEPTION:
+   Position closes, risk reduction, move_to_breakeven, or orphan heals are authorized IMMEDIATELY.
 
-Latencia objetivo: < 15ms.
+Target latency: < 15ms.
 """
 
 import os
@@ -22,7 +22,7 @@ import time
 import re
 
 def is_risk_reducing_action(cmd_or_name: str, args_dict: dict = None) -> bool:
-    """Verifica si la acción reduce o elimina riesgo (JAMÁS deben ser bloqueadas)."""
+    """Verifies whether an action reduces or eliminates risk (NEVER blocked)."""
     text = (cmd_or_name + " " + json.dumps(args_dict or {})).lower()
     reducing_signals = [
         "close_position", "move_to_breakeven", "cancel", "audit_orphan",
@@ -31,7 +31,7 @@ def is_risk_reducing_action(cmd_or_name: str, args_dict: dict = None) -> bool:
     return any(sig in text for sig in reducing_signals)
 
 def extract_target_symbol(cmd: str, args_dict: dict = None) -> str:
-    """Extrae el símbolo objetivo de los argumentos o de la línea de comandos."""
+    """Extracts target symbol from tool arguments or shell command line."""
     if args_dict:
         if "symbol" in args_dict:
             return str(args_dict["symbol"]).upper().strip()
@@ -47,7 +47,6 @@ def extract_target_symbol(cmd: str, args_dict: dict = None) -> str:
                 except Exception:
                     pass
 
-    # Regex en la línea de comando
     m = re.search(r"--symbol\s+([A-Za-z0-9_]+)", cmd)
     if m:
         return m.group(1).upper().strip()
@@ -78,29 +77,32 @@ def main():
         command_line = args.get("CommandLine", "")
 
         # -------------------------------------------------------------
-        # 1. FILTRO DE HERRAMIENTAS DE TRADING
+        # 1. IDENTIFY TARGET: Is this an execution attempt?
         # -------------------------------------------------------------
         is_trading_command = False
         if tool_name == "run_command":
-            trading_keywords = ["execute_futures_trade", "deploy_futures_trade"]
-            is_trading_command = any(kw in command_line for kw in trading_keywords)
+            if any(script in command_line for script in ["execute_futures_trade.py", "deploy_fresh_basket.py", "deploy_"]):
+                is_trading_command = True
         elif tool_name == "call_mcp_tool":
+            server_name = args.get("ServerName", "")
             mcp_tool_name = args.get("ToolName", "")
-            is_trading_command = ("deploy_futures_trade" in mcp_tool_name or "execute_futures_trade" in mcp_tool_name)
+            if server_name in ["binance", "crypto_radar"]:
+                if any(kw in mcp_tool_name.lower() for kw in ["neworder", "deploy_futures_trade", "placeorder"]):
+                    is_trading_command = True
 
         if not is_trading_command:
             print(json.dumps({"decision": "allow"}))
             return
 
         # -------------------------------------------------------------
-        # 2. INVARIANTE: NUNCA BLOQUEAR ACCIONES QUE REDUCEN RIESGO
+        # 2. INVARIANT: NEVER BLOCK RISK-REDUCING ACTIONS
         # -------------------------------------------------------------
         if is_risk_reducing_action(command_line, args):
-            print(json.dumps({"decision": "allow", "reason": "Acción de reducción de riesgo / salida autorizada."}))
+            print(json.dumps({"decision": "allow", "reason": "Risk-reducing action / exit authorized."}))
             return
 
         # -------------------------------------------------------------
-        # 3. COMPUERTA 1: EVALUADOR AISLADO OBLIGATORIO (CLEAN-ROOM HARNESS GATE)
+        # 3. GATE 1: MANDATORY CLEAN-ROOM EVALUATOR (HARNESS GATE)
         # -------------------------------------------------------------
         base_dir = find_workspace_root()
         dossier_file = os.path.join(base_dir, "logs", "evaluations", "latest_dossier.json")
@@ -125,31 +127,30 @@ def main():
 
             if not is_valid_dossier:
                 deny_msg = (
-                    "🚨 ACCIÓN BLOQUEADA POR PRE-TOOL-USE HOOK (Hard Gate - Evaluador Aislado Obligatorio):\n"
-                    "Está terminantemente PROHIBIDO ejecutar órdenes directamente en el chat principal sin evaluación previa.\n"
-                    "El modelo principal NO debe tomar decisiones inline ni saltarse la arquitectura multi-agente.\n\n"
-                    "👉 ACCIÓN EXIGIDA:\n"
-                    "1. Invoca al subagente 'isolated_market_evaluator' mediante invoke_subagent, pasándole el brief determinista generado por 'python3 scripts/prime_evaluator_brief.py'.\n"
-                    "2. El subagente evaluador debe emitir el Master Dossier y guardarlo mediante 'python3 scripts/record_evaluation.py'.\n"
-                    "3. Solo tras contar con un dossier 'APPROVED' fresco (< 20 min) podrás proceder a la ejecución."
+                    "🚨 ACTION BLOCKED BY PRE-TOOL-USE HOOK (Hard Gate - Clean-Room Evaluator Required):\n"
+                    "Executing orders directly in primary chat without prior clean-room evaluation is STRICTLY PROHIBITED.\n"
+                    "The primary agent MUST NOT make inline trade decisions or bypass the multi-agent harness.\n\n"
+                    "👉 REQUIRED ACTION:\n"
+                    "1. Invoke subagent 'isolated_market_evaluator' via invoke_subagent, providing the deterministic brief from 'python3 scripts/prime_evaluator_brief.py'.\n"
+                    "2. The evaluator subagent must emit the Master Dossier and persist it via 'python3 scripts/record_evaluation.py'.\n"
+                    "3. Only with a fresh 'APPROVED' dossier (< 20 min) may execution proceed."
                 )
                 print(json.dumps({"decision": "deny", "reason": deny_msg}))
                 return
 
-            # Verificar si el símbolo específico fue aprobado por el evaluador
             approved_symbols = dossier_data.get("approved_symbols", []) if dossier_data else []
             if target_sym and approved_symbols and target_sym not in approved_symbols:
                 deny_msg = (
-                    f"🚨 ACCIÓN BLOQUEADA POR PRE-TOOL-USE HOOK:\n"
-                    f"El activo '{target_sym}' NO fue aprobado en el dossier del subagente evaluador ({dossier_data.get('evaluator_agent')}).\n"
-                    f"Activos aprobados: {', '.join(approved_symbols)}.\n"
-                    "Por disciplina cuantitativa, queda prohibido operar activos fuera del dossier validado."
+                    f"🚨 ACTION BLOCKED BY PRE-TOOL-USE HOOK:\n"
+                    f"Asset '{target_sym}' was NOT approved in the evaluator dossier ({dossier_data.get('evaluator_agent')}).\n"
+                    f"Approved assets: {', '.join(approved_symbols)}.\n"
+                    "By quantitative discipline, trading assets outside the validated dossier is prohibited."
                 )
                 print(json.dumps({"decision": "deny", "reason": deny_msg}))
                 return
 
         # -------------------------------------------------------------
-        # 4. COMPUERTA 2: DELTA-NEUTRAL & GESTIÓN DE CARTERA
+        # 4. GATE 2: DELTA-NEUTRAL & PORTFOLIO MANAGEMENT
         # -------------------------------------------------------------
         has_bypass_delta = ("--bypass-delta-gate" in command_line or args.get("bypass_delta_gate") is True)
         if not has_bypass_delta:
@@ -162,7 +163,6 @@ def main():
                     is_long_attempt = bool(re.search(r"['\"]?LONG['\"]?", command_line, re.IGNORECASE)) or "--dir LONG" in command_line.upper() or "BUY" in command_line.upper()
                     is_short_attempt = bool(re.search(r"['\"]?SHORT['\"]?", command_line, re.IGNORECASE)) or "--dir SHORT" in command_line.upper()
                     
-                    # Chequear en args de MCP si aplica
                     if tool_name == "call_mcp_tool":
                         raw_args = args.get("Arguments", {})
                         if isinstance(raw_args, str):
@@ -181,29 +181,29 @@ def main():
 
                     if delta_bias == "LONG_HEAVY" and is_long_attempt and not is_short_attempt:
                         reason_msg = (
-                            "🚨 BLOQUEADO POR PRE-TOOL-USE HOOK (Hard Gate Delta-Neutral): "
-                            f"La cartera está en desbalance alcista (Delta: +${portfolio.get('net_notional_delta_usdt', 0):.2f} USDT / LONG_HEAVY). "
-                            "Queda terminantemente prohibido abrir más Longs sin cobertura Short."
+                            "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Delta-Neutral Hard Gate): "
+                            f"Portfolio is bullishly unbalanced (Delta: +${portfolio.get('net_notional_delta_usdt', 0):.2f} USDT / LONG_HEAVY). "
+                            "Opening additional Longs without Short hedging is strictly prohibited."
                         )
                         print(json.dumps({"decision": "deny", "reason": reason_msg}))
                         return
 
                     elif delta_bias == "SHORT_HEAVY" and is_short_attempt and not is_long_attempt:
                         reason_msg = (
-                            "🚨 BLOQUEADO POR PRE-TOOL-USE HOOK (Hard Gate Delta-Neutral): "
-                            f"La cartera está en desbalance bajista (Delta: -${abs(portfolio.get('net_notional_delta_usdt', 0)):.2f} USDT / SHORT_HEAVY). "
-                            "Queda terminantemente prohibido abrir más Shorts sin cobertura Long."
+                            "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Delta-Neutral Hard Gate): "
+                            f"Portfolio is bearishly unbalanced (Delta: -${abs(portfolio.get('net_notional_delta_usdt', 0)):.2f} USDT / SHORT_HEAVY). "
+                            "Opening additional Shorts without Long hedging is strictly prohibited."
                         )
                         print(json.dumps({"decision": "deny", "reason": reason_msg}))
                         return
                 except Exception:
                     pass
 
-        # Si pasa todas las compuertas con éxito
-        print(json.dumps({"decision": "allow", "reason": "Compuertas mecánicas y validación de subagente SUPERADAS con éxito."}))
+        # All gates passed successfully
+        print(json.dumps({"decision": "allow", "reason": "Mechanical hard gates and subagent validation PASSED successfully."}))
 
     except Exception as e:
-        # En caso de error interno, fail OPEN para no colgar el workspace pero emitiendo advertencia
+        # In case of internal error, fail OPEN with warning to avoid deadlocking workspace
         print(json.dumps({"decision": "allow", "reason": f"Hook warning: {str(e)}"}))
 
 if __name__ == "__main__":

@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-trade_telemetry.py - Telemetría Cuantitativa de Trading: Clasificación de 'Shocks' vs. 'Varianza Normal'.
-Clasificación forense de atribución de pérdidas y varianza del modelo.
+trade_telemetry.py - Quantitative Trading Telemetry: 'Shocks' vs. 'Normal Variance' Classification.
+Forensic loss attribution and model variance classification.
 
-En finanzas cuantitativas, evaluar un modelo asumiendo que todas las pérdidas provienen de la misma
-distribución matemática destruye el Criterio de Kelly. Si una pérdida de -$1.50 ocurre porque BTC
-sufrió un flash crash de -$4,000 en 15m por un shock regulatorio, NO es un fallo de la estrategia técnica.
+In quantitative finance, evaluating a model assuming all losses stem from the same
+mathematical distribution invalidates the Kelly Criterion. If a -$1.50 loss occurs because
+BTC suffered an unexpected -$4,000 flash crash in 15m from a regulatory shock, it is NOT an inherent technical strategy failure.
 
-Este módulo clasifica cada cierre y evento en:
-- NORMAL_VARIANCE: Pérdida o ganancia dentro del comportamiento estocástico normal del activo.
-- MACRO_SHOCK: Evento exógeno extraordinario (liquidaciones en cascada de BTC, listing de CME, exploit).
-- EXECUTION_BOUNCE: Fallo de fricción o rechazo de ejecución (slippage gap, minNotional).
+This module classifies each exit and event into:
+- NORMAL_VARIANCE: Loss or gain within normal stochastic asset price behavior.
+- MACRO_SHOCK: Extraordinary exogenous event (BTC liquidation cascade, CME listing announcement, exploit).
+- EXECUTION_BOUNCE: Friction or execution rejection failure (slippage gap, minNotional).
 
-Uso:
-  python3 scripts/trade_telemetry.py record-exit --symbol TRXUSDT --pnl -1.05 --exit-type SL --class NORMAL_VARIANCE --note "Tocado SL por debilidad local"
-  python3 scripts/trade_telemetry.py record-shock --type BTC_LIQUIDATION_CASCADE --note "BTC cayó de $86.2k a $83.8k en 45m"
+Usage:
+  python3 scripts/trade_telemetry.py record-exit --symbol TRXUSDT --pnl -1.05 --exit-type SL --class NORMAL_VARIANCE --note "Hit SL due to local market weakness"
+  python3 scripts/trade_telemetry.py record-shock --type BTC_LIQUIDATION_CASCADE --note "BTC dropped from $86.2k to $83.8k in 45m"
   python3 scripts/trade_telemetry.py summary
 """
 
@@ -55,7 +55,7 @@ def record_trade_exit(
         "note": note.strip()
     }
     atomic_append_jsonl(TELEMETRY_FILE, event)
-    print(f"📡 Telemetría registrada: {symbol} [{exit_type}] -> PnL: ${pnl_usdt:+.2f} ({classification})")
+    print(f"📡 Telemetry recorded: {symbol} [{exit_type}] -> PnL: ${pnl_usdt:+.2f} ({classification})")
     return event
 
 def record_macro_shock(shock_type: str, impacted_symbols: List[str] = None, note: str = "") -> dict:
@@ -69,12 +69,12 @@ def record_macro_shock(shock_type: str, impacted_symbols: List[str] = None, note
         "note": note.strip()
     }
     atomic_append_jsonl(TELEMETRY_FILE, event)
-    print(f"🚨 Macro Shock registrado: {shock_type} — {note}")
+    print(f"🚨 Macro Shock recorded: {shock_type} — {note}")
     return event
 
 def generate_telemetry_summary():
     if not os.path.exists(TELEMETRY_FILE):
-        print("ℹ️  No hay registros de telemetría aún.")
+        print("ℹ️  No telemetry records found yet.")
         return
 
     exits = []
@@ -96,17 +96,17 @@ def generate_telemetry_summary():
     shock_exits = [e for e in exits if e.get("classification") == "MACRO_SHOCK"]
 
     print("\n" + "=" * 70)
-    print("📊 REPORTE DE TELEMETRÍA CUANTITATIVA (Shocks vs Varianza)")
+    print("📊 QUANTITATIVE TELEMETRY REPORT (Shocks vs Normal Variance)")
     print("=" * 70)
-    print(f"Total Operaciones Registradas: {len(exits)}")
-    print(f"• Varianza Normal: {len(normal_exits)} trades | PnL acumulado: ${sum(e['pnl_usdt'] for e in normal_exits):+.2f} USDT")
-    print(f"• Macro Shocks Exógenos: {len(shock_exits)} trades | PnL afectado: ${sum(e['pnl_usdt'] for e in shock_exits):+.2f} USDT")
-    print(f"• Macro Shocks del Sistema: {len(shocks)} eventos")
+    print(f"Total Logged Trades: {len(exits)}")
+    print(f"• Normal Variance: {len(normal_exits)} trades | Cumulative PnL: ${sum(e['pnl_usdt'] for e in normal_exits):+.2f} USDT")
+    print(f"• Exogenous Macro Shocks: {len(shock_exits)} trades | Impacted PnL: ${sum(e['pnl_usdt'] for e in shock_exits):+.2f} USDT")
+    print(f"• Systemic Macro Shocks: {len(shocks)} events")
 
     if normal_exits:
         normal_wins = [e for e in normal_exits if e["pnl_usdt"] > 0]
         normal_wr = (len(normal_wins) / len(normal_exits)) * 100
-        print(f"🏆 Win Rate Puro (Aislado de Shocks): {normal_wr:.1f}%")
+        print(f"🏆 Pure Win Rate (Isolated from Shocks): {normal_wr:.1f}%")
 
     print("=" * 70 + "\n")
 

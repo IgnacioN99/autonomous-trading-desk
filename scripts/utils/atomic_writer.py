@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-atomic_writer.py - Escritura Atómica y Protección de Concurrencia para Ledgers.
-Persistencia transaccional sin colisiones mediante reemplazo atómico POSIX.
+atomic_writer.py - Atomic Writing and Concurrency Protection for Ledgers.
+Transactional collision-free persistence via POSIX atomic file replacement.
 
-Garantiza que ningún archivo JSON o JSONL crítico (session_state.json, trades_audit.jsonl)
-se corrompa si múltiples subagentes, hooks o loops intentan leer o escribir simultáneamente.
-Utiliza 'write-to-temp-then-atomic-replace' a nivel de sistema operativo (POSIX os.replace).
+Guarantees that no critical JSON or JSONL file (session_state.json, trades_audit.jsonl)
+gets corrupted when multiple subagents, hooks, or loops attempt concurrent reads or writes.
+Utilizes 'write-to-temp-then-atomic-replace' at OS kernel level (POSIX os.replace).
 """
 
 import os
@@ -17,14 +17,14 @@ from typing import Any, Dict, Optional
 
 def atomic_write_json(filepath: str, data: Any, indent: int = 2) -> bool:
     """
-    Escribe datos en un archivo JSON de forma 100% atómica.
-    Crea un archivo temporal en el mismo directorio y ejecuta os.replace.
+    Writes data to a JSON file in a 100% atomic manner.
+    Creates a temporary file in the same directory and executes os.replace.
     """
     filepath = os.path.abspath(filepath)
     dirname = os.path.dirname(filepath)
     os.makedirs(dirname, exist_ok=True)
     
-    # Crear archivo temporal en el MISMO directorio para garantizar que esté en el mismo filesystem/mount
+    # Create temporary file in the SAME directory to guarantee identical filesystem/mount
     prefix = f".{os.path.basename(filepath)}.tmp_"
     try:
         with tempfile.NamedTemporaryFile("w", dir=dirname, prefix=prefix, delete=False, encoding="utf-8") as tf:
@@ -33,7 +33,7 @@ def atomic_write_json(filepath: str, data: Any, indent: int = 2) -> bool:
             os.fsync(tf.fileno())
             temp_name = tf.name
             
-        # Reemplazo atómico a nivel de kernel de OS
+        # Atomic replacement at OS kernel level
         os.replace(temp_name, filepath)
         return True
     except Exception as e:
@@ -42,11 +42,11 @@ def atomic_write_json(filepath: str, data: Any, indent: int = 2) -> bool:
                 os.remove(temp_name)
             except Exception:
                 pass
-        raise IOError(f"Fallo en escritura atómica para {filepath}: {e}")
+        raise IOError(f"Atomic write failure for {filepath}: {e}")
 
 def atomic_append_jsonl(filepath: str, record: Dict[str, Any]) -> bool:
     """
-    Appendea un registro a un archivo JSON Lines de forma segura y consistente.
+    Appends a record to a JSON Lines file safely and consistently.
     """
     filepath = os.path.abspath(filepath)
     dirname = os.path.dirname(filepath)
@@ -64,7 +64,7 @@ def atomic_append_jsonl(filepath: str, record: Dict[str, Any]) -> bool:
 
 def read_json_safe(filepath: str, default: Optional[Any] = None, retries: int = 3, delay: float = 0.05) -> Any:
     """
-    Lee un archivo JSON con reintentos para mitigar colisiones transitorias de lectura/escritura.
+    Reads a JSON file with retries to mitigate transient read/write race conditions.
     """
     if not os.path.exists(filepath):
         return default
