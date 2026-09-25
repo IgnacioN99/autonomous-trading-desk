@@ -1,0 +1,13 @@
+# Core HTTP & Exchange Connectivity
+requests>=2.31.0
+python-dotenv>=1.0.0
+pydantic>=2.5.0
+
+# Quantitative Modeling, Cointegration & Microstructure
+numpy>=1.24.0
+scipy>=1.11.0
+pandas>=2.0.0
+statsmodels>=0.14.0
+
+# Optional: Enhanced Math & Optimization
+pykalman>=0.9.7; python_version < '3.13'

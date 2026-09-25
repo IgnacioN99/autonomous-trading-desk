@@ -1,0 +1,84 @@
+# =================================================================
+# CREDENTIALS & SECRETS (STRICT - ZERO LEAK POLICY)
+# =================================================================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.secret
+gmail_config.json
+
+# =================================================================
+# RUNTIME TELEMETRY & LOGS (Preserve directory structure via .gitkeep)
+# =================================================================
+logs/*.json
+logs/*.jsonl
+logs/evaluations/*
+!logs/.gitkeep
+!logs/evaluations/.gitkeep
+
+# Ephemeral batch outputs
+batch_results.json
+fresh_basket_results.json
+skills-lock.json
+
+# =================================================================
+# LOCAL AGENT ARTIFACTS & PERSONAL SEARCH TOOLS
+# =================================================================
+.agents/scripts/
+.agents/skills/*
+!.agents/skills/trade-execution-planner/
+!.agents/skills/trade-execution-planner/**
+
+# =================================================================
+# ONE-OFF DEPLOYMENT BATCHES & LOCAL OPERATIONAL SESSIONS
+# =================================================================
+scripts/deploy_*_batch.py
+scripts/deploy_fresh_basket.py
+docs/flujo_operativo_*.md
+
+
+# =================================================================
+# PYTHON & BYTECODE
+# =================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# =================================================================
+# VIRTUAL ENVIRONMENTS
+# =================================================================
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# =================================================================
+# IDE & OPERATING SYSTEM
+# =================================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

@@ -1,0 +1,29 @@
+{
+  "trading-safety-guard": {
+    "enabled": true,
+    "PreToolUse": [
+      {
+        "matcher": "run_command|call_mcp_tool",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 scripts/hooks/pre_trade_guard.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "run_command|call_mcp_tool",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 scripts/hooks/post_trade_sync.py",
+            "timeout": 12
+          }
+        ]
+      }
+    ]
+  }
+}
