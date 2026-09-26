@@ -14,6 +14,7 @@ gmail_config.json
 # =================================================================
 logs/*.json
 logs/*.jsonl
+logs/*.md
 logs/evaluations/*
 !logs/.gitkeep
 !logs/evaluations/.gitkeep
@@ -21,6 +22,7 @@ logs/evaluations/*
 # Ephemeral batch outputs
 batch_results.json
 fresh_basket_results.json
+review_output.md
 skills-lock.json
 
 # =================================================================
