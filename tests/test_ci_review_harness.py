@@ -119,6 +119,19 @@ class TestCIReviewHarness(unittest.TestCase):
             self.assertFalse(success)
             self.assertIn("CHANGES REQUESTED", msg)
 
+    def test_hook_is_pr_creation_or_push(self):
+        from scripts.hooks.post_pr_review_hook import is_pr_creation_or_push
+        # True cases
+        self.assertTrue(is_pr_creation_or_push("gh pr create --title 'feat'"))
+        self.assertTrue(is_pr_creation_or_push("git push -u origin feat/multi-agent-pr-review"))
+        self.assertTrue(is_pr_creation_or_push("git push origin fix/some-bug"))
+        
+        # False cases
+        self.assertFalse(is_pr_creation_or_push("git push origin main"))
+        self.assertFalse(is_pr_creation_or_push("git status"))
+        self.assertFalse(is_pr_creation_or_push("python3 scripts/ci/run_pr_audit.py"))
+        self.assertFalse(is_pr_creation_or_push(""))
+
 
 if __name__ == "__main__":
     unittest.main()
