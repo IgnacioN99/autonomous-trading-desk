@@ -45,9 +45,14 @@ def invoke_auditor(prompt: str) -> str:
     api_key = os.getenv("GEMINI_API_KEY")
     if api_key:
         print("  -> Usando Gemini REST API directa (Cloud CI mode)...")
-        # Try gemini-2.5-flash or gemini-2.5-pro
-        model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+        models_to_try = [
+            os.getenv("GEMINI_MODEL", "").strip(),
+            "gemini-2.0-flash",
+            "gemini-1.5-flash",
+            "gemini-1.5-pro",
+        ]
+        models_to_try = [m for m in models_to_try if m]
+
         data = {
             "contents": [
                 {
@@ -61,26 +66,36 @@ def invoke_auditor(prompt: str) -> str:
                 "maxOutputTokens": 8192
             }
         }
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(data).encode("utf-8"),
-            headers={"Content-Type": "application/json"}
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=90) as response:
-                res_json = json.loads(response.read().decode("utf-8"))
-                candidates = res_json.get("candidates", [])
-                if candidates:
-                    parts = candidates[0].get("content", {}).get("parts", [])
-                    if parts:
-                        return parts[0].get("text", "").strip()
-        except Exception as e:
-            print(f"Error invocando Gemini API: {e}")
-            raise
+        encoded_data = json.dumps(data).encode("utf-8")
+
+        for model_name in models_to_try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+            req = urllib.request.Request(
+                url,
+                data=encoded_data,
+                headers={"Content-Type": "application/json"}
+            )
+            try:
+                print(f"  -> Consultando modelo '{model_name}'...")
+                with urllib.request.urlopen(req, timeout=90) as response:
+                    res_json = json.loads(response.read().decode("utf-8"))
+                    candidates = res_json.get("candidates", [])
+                    if candidates:
+                        parts = candidates[0].get("content", {}).get("parts", [])
+                        if parts:
+                            print(f"  -> Respuesta recibida exitosamente de '{model_name}'.")
+                            return parts[0].get("text", "").strip()
+            except urllib.error.HTTPError as e:
+                err_body = e.read().decode("utf-8", errors="ignore")
+                print(f"  Aviso: HTTP {e.code} con '{model_name}': {err_body[:200]}")
+                continue
+            except Exception as e:
+                print(f"  Aviso: Excepción con '{model_name}': {e}")
+                continue
 
     raise RuntimeError(
         "No se pudo invocar el auditor: no se encontró 'agy' en PATH "
-        "ni se proveyó una variable de entorno 'GEMINI_API_KEY' válida."
+        "ni se pudo obtener respuesta válida con GEMINI_API_KEY."
     )
 
 
