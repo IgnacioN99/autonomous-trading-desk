@@ -35,9 +35,9 @@ jobs:
           # If tests fail, fail immediately without consuming agent tokens
           pytest tests/ -v || python3 -m unittest discover tests/ -v
 
-      - name: Install Antigravity CLI (agy)
+      - name: Setup Antigravity CLI or API Fallback
         run: |
-          curl -fsSL https://antigravity.google/install.sh | bash
+          curl -fsSL https://antigravity.google/install.sh | bash || echo "Antigravity CLI install skipped, using direct Gemini API fallback"
           echo "$HOME/.local/bin" >> $GITHUB_PATH
 
       - name: Run Multi-Specialist PR Audit

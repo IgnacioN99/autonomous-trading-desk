@@ -17,8 +17,71 @@ Master PR Audit Orchestrator for Antigravity Trading Desk.
 import os
 import sys
 import json
+import shutil
+import urllib.request
 import subprocess
 from pathlib import Path
+
+
+def invoke_auditor(prompt: str) -> str:
+    """Invokes the auditor agent via agy CLI (local) or direct Gemini API (cloud CI)."""
+    # 1. Prefer local agy CLI if installed and available in PATH
+    if shutil.which("agy"):
+        agy_cmd = [
+            "agy",
+            "-p", prompt,
+            "--dangerously-skip-permissions",
+            "--effort", "high",
+        ]
+        try:
+            print("  -> Usando Antigravity CLI ('agy') local...")
+            res = subprocess.run(agy_cmd, capture_output=True, text=True, check=True)
+            if res.stdout.strip():
+                return res.stdout.strip()
+        except Exception as e:
+            print(f"  Aviso: agy falló ({e}), intentando fallback a API...")
+
+    # 2. Fallback to Gemini REST API (Standard library, 0 dependencies)
+    api_key = os.getenv("GEMINI_API_KEY")
+    if api_key:
+        print("  -> Usando Gemini REST API directa (Cloud CI mode)...")
+        # Try gemini-2.5-flash or gemini-2.5-pro
+        model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+        data = {
+            "contents": [
+                {
+                    "parts": [
+                        {"text": prompt}
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.1,
+                "maxOutputTokens": 8192
+            }
+        }
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(data).encode("utf-8"),
+            headers={"Content-Type": "application/json"}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=90) as response:
+                res_json = json.loads(response.read().decode("utf-8"))
+                candidates = res_json.get("candidates", [])
+                if candidates:
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    if parts:
+                        return parts[0].get("text", "").strip()
+        except Exception as e:
+            print(f"Error invocando Gemini API: {e}")
+            raise
+
+    raise RuntimeError(
+        "No se pudo invocar el auditor: no se encontró 'agy' en PATH "
+        "ni se proveyó una variable de entorno 'GEMINI_API_KEY' válida."
+    )
 
 
 def run_command(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
@@ -138,27 +201,11 @@ def main():
         print("Diff vacío. Finalizando.")
         sys.exit(0)
 
-    # Step 3: Build prompt and invoke agy
+    # Step 3: Build prompt and invoke auditor agent
     print(f"[3/4] Invocando al Agente Orquestador con {len(manifest['required_reviewers'])} revisores...")
     prompt = build_orchestrator_prompt(manifest, diff)
 
-    agy_cmd = [
-        "agy",
-        "-p", prompt,
-        "--dangerously-skip-permissions",
-        "--effort", "high",
-    ]
-
-    try:
-        res = subprocess.run(agy_cmd, capture_output=True, text=True, check=True)
-        review_text = res.stdout.strip()
-    except subprocess.CalledProcessError as e:
-        print(f"Error invocando agy: {e.stderr}")
-        # Fallback if agy is not authenticated in offline test mode: generate structured template
-        review_text = (
-            f"# Informe de Auditoría de Pull Request (Local Evaluation)\n\n"
-            f"**Error invocando agy CLI en este entorno:** {e.stderr[:300]}\n"
-        )
+    review_text = invoke_auditor(prompt)
 
     with open(report_file, "w", encoding="utf-8") as f:
         f.write(review_text)
