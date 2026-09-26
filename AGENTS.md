@@ -30,8 +30,10 @@ Whenever the user asks to analyze, screen the market, evaluate, or plan a tradin
 
 1. **Phase 1: Grounded Intelligence & Market Screening**
    - Consult your quantitative research notebooks (e.g. via NotebookLM) to ground strategies in mathematical principles:
-     1. `"Bitcoin Volatility & Market Microstructure"` (`<YOUR_NOTEBOOKLM_NOTEBOOK_ID_1>`): Bitcoin microstructure (CVD, Open Interest, absorption wicks, Kelly sizing, volatility parity).
-     2. `"Rate Arbitrage & Crypto Volatility Modeling"` (`<YOUR_NOTEBOOKLM_NOTEBOOK_ID_2>`): Layer-1 dynamic cointegration (Engle-Granger MacKinnon, Johansen, Ornstein-Uhlenbeck half-life), Delta-Neutral Funding Rate arbitrage, and econometric liquidation cascade modeling.
+     1. `"Bitcoin Volatility & Market Microstructure"` (`6036d55e-82e2-4924-a4a8-67d105a6f7cc`): Bitcoin microstructure (CVD, Open Interest, absorption wicks, Kelly sizing, volatility parity).
+     2. `"Rate Arbitrage & Crypto Volatility Modeling"` (`b19c24de-519d-4e6e-a1e3-49fa0e3704e6`): Layer-1 dynamic cointegration (Engle-Granger MacKinnon, Johansen, Ornstein-Uhlenbeck half-life), Delta-Neutral Funding Rate arbitrage, and econometric liquidation cascade modeling.
+     3. `"Anthropic Agentic Systems & Evaluator-Optimizer Workflows"` (`9bf5952c-43c4-46b5-964c-d709ad5d7c71`): Multi-agent orchestration, tool use error response engineering, parallel request decomposition, and MCP client/server contracts.
+     4. `"Ingeniería de Prompts y Arquitectura Agéntica de Producción"` (`fb995c39-49ea-459a-b648-7112ed690cf5`): Guía canónica de prompts, delimitación XML jerárquica, optimización KV-cache y negative few-shots.
    - Ingest fresh news, newsletters, and macro/crypto catalysts: execute `python3 scripts/fetch_newsletters.py --folder "<YOUR_NEWSLETTERS_FOLDER>"` (or MCP tool `crypto_radar:get_crypto_newsletters`) to inspect tagged crypto emails (Glassnode, Blockworks, etc.) and reject late-stage euphoria or avoid entering right before scheduled high-impact events.
    - Screen liquid Binance Futures contracts concurrently across 80+ pairs (15m/5m/1h via `python3 scripts/broad_market_radar.py` or MCP tools), targeting volume absorption wicks, RSI extremes, and distance to EMA 20.
    - **Dual-Engine Operational Framework:**

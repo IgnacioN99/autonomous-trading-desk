@@ -1,0 +1,39 @@
+name: CI Verification & Quality Gates
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-verify:
+    name: Deterministic Unit Tests & Code Integrity
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Python Dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run Syntax & Bytecode Compilation Check
+        run: |
+          # Verifies no syntax errors across scripts and test files
+          python3 -m compileall scripts/ tests/
+
+      - name: Execute Deterministic Unit Tests
+        run: |
+          # 100% deterministic suite (triage, verification gate, and safety checks)
+          python3 -m unittest discover tests/ -v
