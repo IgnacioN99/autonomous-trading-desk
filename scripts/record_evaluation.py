@@ -70,6 +70,16 @@ def record_evaluation_dossier(
     print(f"✅ EVALUATION DOSSIER RECORDED: {len(dossier['approved_symbols'])} asset(s) approved.")
     print(f"   Symbols: {', '.join(dossier['approved_symbols'])} | Valid until: {datetime.datetime.fromtimestamp(dossier['valid_until_ts'], datetime.timezone.utc).strftime('%H:%M:%S UTC')}")
     print(f"   Location: {DOSSIER_FILE}")
+
+    # Auto-register unapproved/disqualified candidates into shadow tracking
+    try:
+        import shadow_tracker
+        shadow_count = shadow_tracker.register_from_evaluation()
+        if shadow_count > 0:
+            print(f"👻 SHADOW TRACKER: {shadow_count} candidate(s) enrolled into counterfactual efficacy auditing.")
+    except Exception:
+        pass
+
     return dossier
 
 def main():

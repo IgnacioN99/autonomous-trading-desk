@@ -184,6 +184,18 @@ def run_doctor(target_env: str = "testnet", auto_heal: bool = False) -> int:
         warnings.append("session_state.json does not exist yet. Run `sync_session_state.py`.")
         print("⚠️  [STATE LEDGER] session_state.json does not exist. Run `sync_session_state.py`.")
 
+    # 6. Shadow Desk Counterfactual Audit
+    try:
+        import shadow_tracker
+        shadow_metrics = shadow_tracker.calculate_efficacy_metrics()
+        active_shadows = shadow_metrics.get("active_shadow_trades", 0)
+        resolved_shadows = shadow_metrics.get("total_resolved", 0)
+        fer = shadow_metrics.get("filter_efficacy_ratio_pct", 0.0)
+        saved = shadow_metrics.get("capital_saved_usdt", 0.0)
+        print(f"👻 [SHADOW DESK] {active_shadows} unexecuted candidate(s) under counterfactual monitoring | Resolved: {resolved_shadows} (FER: {fer}% | Saved: +${saved} USDT)")
+    except Exception:
+        pass
+
     elapsed = round(time.time() - start_time, 2)
     print("=" * 65)
     print(f"DIAGNOSTIC COMPLETED IN {elapsed}s")
