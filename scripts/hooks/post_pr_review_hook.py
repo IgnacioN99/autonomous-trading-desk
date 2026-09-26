@@ -110,37 +110,20 @@ def main():
                     f"   Lanzando agente orquestador de auditoría...\n"
                 )
 
-                # Run PR audit in background or synchronous subshell
-                run_res = subprocess.run(
+                # Launch PR audit in background to ensure hook responds in < 15ms
+                subprocess.Popen(
                     [sys.executable, audit_script, "origin/main", report_out],
                     cwd=root,
-                    capture_output=True,
-                    text=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
                 )
 
-                log_event["exit_code"] = run_res.returncode
-                log_event["stdout_summary"] = run_res.stdout[-300:] if run_res.stdout else ""
-                log_event["stderr_summary"] = run_res.stderr[-300:] if run_res.stderr else ""
-
-                if run_res.returncode == 0:
-                    sys.stderr.write(
-                        f"✅ [POST-TOOL HOOK] Auditoría completada con éxito. Reporte: {report_out}\n"
-                    )
-                else:
-                    sys.stderr.write(
-                        f"⚠️ [POST-TOOL HOOK] Auditoría finalizó con observaciones/bloqueo (código {run_res.returncode}).\n"
-                    )
-
-                # Try posting comment via gh if available and PR exists
-                try:
-                    subprocess.run(
-                        ["gh", "pr", "comment", "--body-file", report_out],
-                        cwd=root,
-                        capture_output=True,
-                        timeout=15,
-                    )
-                except Exception:
-                    pass
+                sys.stderr.write(
+                    f"✅ [POST-TOOL HOOK] Auditoría multi-agente despachada en background.\n"
+                    f"   El informe se guardará en: {report_out}\n"
+                )
+                log_event["status"] = "dispatched_async"
 
             # Record event in ledger
             events_file = os.path.join(logs_dir, "pr_hook_events.jsonl")
