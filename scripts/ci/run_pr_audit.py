@@ -47,9 +47,10 @@ def invoke_auditor(prompt: str) -> str:
         print("  -> Usando Gemini REST API directa (Cloud CI mode)...")
         models_to_try = [
             os.getenv("GEMINI_MODEL", "").strip(),
+            "gemini-3.8-flash",
+            "gemini-3.8-pro",
+            "gemini-3.5-flash",
             "gemini-2.0-flash",
-            "gemini-1.5-flash",
-            "gemini-1.5-pro",
         ]
         models_to_try = [m for m in models_to_try if m]
 
