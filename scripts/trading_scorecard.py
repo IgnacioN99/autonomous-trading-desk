@@ -151,7 +151,8 @@ def generate_scorecard() -> dict:
             } for k, v in tiers_data.items() if len(v) > 0
         },
         "loss_cause_clusters": cause_clusters,
-        "meta_improver_recommendations": recommendations
+        "meta_improver_recommendations": recommendations,
+        "shadow_desk": (lambda: (__import__('shadow_tracker').calculate_efficacy_metrics() if os.path.exists(os.path.join(LOGS_DIR, "shadow_trades.jsonl")) else {}))()
     }
 
     os.makedirs(LOGS_DIR, exist_ok=True)
@@ -183,6 +184,17 @@ def format_scorecard_report(sc: dict) -> str:
     lines.append("💡 META-IMPROVER RECOMMENDATIONS:")
     for rec in sc.get("meta_improver_recommendations", []):
         lines.append(f"  👉 {rec}")
+    
+    if sc.get("shadow_desk"):
+        sd = sc["shadow_desk"]
+        lines.append("-" * 70)
+        lines.append("👻 SHADOW DESK — COUNTERFACTUAL FILTER EFFICACY:")
+        lines.append(f"  • Monitored Setups: {sd.get('active_shadow_trades', 0)} active | {sd.get('total_resolved', 0)} resolved")
+        lines.append(f"  • Filter Efficacy Ratio (FER): {sd.get('filter_efficacy_ratio_pct', 0.0)}% (TN: {sd.get('true_negatives', 0)} | FN: {sd.get('false_negatives', 0)})")
+        lines.append(f"  • Capital Saved: +${sd.get('capital_saved_usdt', 0.0)} USDT | Missed Alpha: -${sd.get('missed_alpha_usdt', 0.0)} USDT")
+        net_fe = sd.get('net_filter_edge_usdt', 0.0)
+        lines.append(f"  • Net Filter Edge: {net_fe:+.2f} USDT")
+
     lines.append("=" * 70)
     return "\n".join(lines)
 

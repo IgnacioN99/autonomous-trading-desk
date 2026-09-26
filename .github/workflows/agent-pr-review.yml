@@ -1,0 +1,62 @@
+name: Antigravity Multi-Agent PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  agent-audit:
+    name: Quantitative Multi-Agent Risk & Code Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Full history needed for git diff against origin/main
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Python Dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest ruff
+
+      - name: Fast-fail Deterministic Unit Tests
+        run: |
+          # If tests fail, fail immediately without consuming agent tokens
+          pytest tests/ -v || python3 -m unittest discover tests/ -v
+
+      - name: Install Antigravity CLI (agy)
+        run: |
+          curl -fsSL https://antigravity.google/install.sh | bash
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Run Multi-Specialist PR Audit
+        id: run_audit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          # Executes deterministic triage, dispatches required specialists, and verifies coverage
+          python3 scripts/ci/run_pr_audit.py origin/main review_output.md
+
+      - name: Publish Review Comment to Pull Request
+        if: always() && steps.run_audit.outcome != 'skipped'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [ -f review_output.md ]; then
+            gh pr comment "$PR_NUMBER" --body-file review_output.md
+          else
+            echo "No review report file generated."
+          fi
