@@ -34,6 +34,11 @@ SHADOW_RESOLVED_FILE = os.path.join(LOGS_DIR, "shadow_resolved.jsonl")
 DOSSIER_FILE = os.path.join(LOGS_DIR, "evaluations", "latest_dossier.json")
 BRIEF_FILE = os.path.join(LOGS_DIR, "primed_brief.json")
 
+# Intraday Desk Constraints & Statistical Hygiene
+MAX_TRIGGER_WAIT_SECONDS = 5400    # 90 min max to breach trigger (matches limit cancellation rule)
+MAX_INTRADAY_HOLD_SECONDS = 14400  # 4 hours max intraday holding duration (matches Dead Alpha watchdog)
+ROLLING_WINDOW_SIZE = 30           # Sample size for rolling FER calculation
+
 def load_jsonl(filepath: str) -> List[dict]:
     if not os.path.exists(filepath):
         return []
@@ -242,7 +247,14 @@ def audit_shadow_trades() -> dict:
 
             # 1. State: PENDING_TRIGGER
             if status == "PENDING_TRIGGER":
-                if direction == "LONG" and k_high >= trigger_p:
+                reg_ts = t.get("registered_at_ts", now_ts)
+                if (k_open_time - reg_ts) > MAX_TRIGGER_WAIT_SECONDS:
+                    status = "RESOLVED"
+                    outcome = "EXPIRED_UNTRIGGERED"
+                    classification = "EXPIRED"
+                    simulated_pnl = 0.0
+                    break
+                elif direction == "LONG" and k_high >= trigger_p:
                     status = "ACTIVE"
                     t["activated_at_ts"] = k_open_time
                     t["activated_at_utc"] = datetime.datetime.fromtimestamp(k_open_time, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -260,38 +272,51 @@ def audit_shadow_trades() -> dict:
                 highest_p = max(highest_p, k_high)
                 lowest_p = min(lowest_p, k_low)
 
-                if direction == "LONG":
-                    # Check SL hit
-                    if k_low <= sl_p:
-                        status = "RESOLVED"
-                        outcome = "STOP_LOSS_HIT"
-                        classification = "TRUE_NEGATIVE"
-                        simulated_pnl = -risk_dollar # Filter saved us this loss!
-                        break
-                    # Check TP1 hit
-                    elif k_high >= tp1_p:
-                        status = "RESOLVED"
-                        outcome = "TP1_HIT"
-                        classification = "FALSE_NEGATIVE"
-                        # Standard TP1 is ~1.8R
-                        simulated_pnl = risk_dollar * 1.8 # Missed profit
-                        break
-                elif direction == "SHORT":
-                    if k_high >= sl_p:
-                        status = "RESOLVED"
-                        outcome = "STOP_LOSS_HIT"
-                        classification = "TRUE_NEGATIVE"
-                        simulated_pnl = -risk_dollar
-                        break
-                    elif k_low <= tp1_p:
-                        status = "RESOLVED"
-                        outcome = "TP1_HIT"
-                        classification = "FALSE_NEGATIVE"
-                        simulated_pnl = risk_dollar * 1.8
-                        break
+                # Check SL hit
+                if direction == "LONG" and k_low <= sl_p:
+                    status = "RESOLVED"
+                    outcome = "STOP_LOSS_HIT"
+                    classification = "TRUE_NEGATIVE"
+                    simulated_pnl = -risk_dollar
+                    break
+                elif direction == "SHORT" and k_high >= sl_p:
+                    status = "RESOLVED"
+                    outcome = "STOP_LOSS_HIT"
+                    classification = "TRUE_NEGATIVE"
+                    simulated_pnl = -risk_dollar
+                    break
 
-        # Check Expiration (>24 hours)
-        if status in ["PENDING_TRIGGER", "ACTIVE"] and (now_ts - t["registered_at_ts"]) > 86400:
+                # Check TP1 hit
+                if direction == "LONG" and k_high >= tp1_p:
+                    status = "RESOLVED"
+                    outcome = "TP1_HIT"
+                    classification = "FALSE_NEGATIVE"
+                    simulated_pnl = risk_dollar * 1.8
+                    break
+                elif direction == "SHORT" and k_low <= tp1_p:
+                    status = "RESOLVED"
+                    outcome = "TP1_HIT"
+                    classification = "FALSE_NEGATIVE"
+                    simulated_pnl = risk_dollar * 1.8
+                    break
+
+                # Check Intraday Dead Alpha Timeout (Max 4.0 Hours Holding Horizon)
+                act_ts = t.get("activated_at_ts", k_open_time)
+                if (k_open_time - act_ts) >= MAX_INTRADAY_HOLD_SECONDS:
+                    status = "RESOLVED"
+                    ret_pct = ((k_close - trigger_p) / trigger_p) if direction == "LONG" else ((trigger_p - k_close) / trigger_p)
+                    d_sl = abs(trigger_p - sl_p) / trigger_p if trigger_p > 0 else 0.02
+                    est_notional = (risk_dollar / d_sl) if d_sl > 0 else (risk_dollar * 20.0)
+                    sim_pnl = round(est_notional * ret_pct, 2)
+                    sim_pnl = max(-risk_dollar, min(risk_dollar * 1.8, sim_pnl))
+
+                    outcome = "INTRADAY_TIMEOUT_PROFIT" if sim_pnl >= 0 else "INTRADAY_TIMEOUT_LOSS"
+                    classification = "TIMEOUT_CLOSED"
+                    simulated_pnl = sim_pnl
+                    break
+
+        # Fallback Check Expiration (>24 hours)
+        if status in ["PENDING_TRIGGER", "ACTIVE"] and (now_ts - t.get("registered_at_ts", now_ts)) > 86400:
             status = "RESOLVED"
             outcome = "EXPIRED"
             classification = "EXPIRED"
@@ -336,14 +361,16 @@ def audit_shadow_trades() -> dict:
         "total_resolved": len(load_jsonl(SHADOW_RESOLVED_FILE))
     }
 
-def calculate_efficacy_metrics() -> dict:
-    """Calculates Filter Efficacy Ratio and financial impact."""
+def calculate_efficacy_metrics(rolling_window: int = ROLLING_WINDOW_SIZE) -> dict:
+    """Calculates Filter Efficacy Ratio (FER) all-time, clean intraday (<=4h), and rolling window."""
     resolved = load_jsonl(SHADOW_RESOLVED_FILE)
     active = load_jsonl(SHADOW_TRADES_FILE)
 
+    # 1. All-time global metrics
     tn_count = sum(1 for r in resolved if r.get("classification") == "TRUE_NEGATIVE")
     fn_count = sum(1 for r in resolved if r.get("classification") == "FALSE_NEGATIVE")
-    expired_count = sum(1 for r in resolved if r.get("classification") == "EXPIRED")
+    expired_count = sum(1 for r in resolved if r.get("classification") in ["EXPIRED", "EXPIRED_UNTRIGGERED"])
+    timeout_count = sum(1 for r in resolved if r.get("classification") == "TIMEOUT_CLOSED")
 
     total_conclusive = tn_count + fn_count
     fer = (tn_count / total_conclusive * 100) if total_conclusive > 0 else 0.0
@@ -352,16 +379,51 @@ def calculate_efficacy_metrics() -> dict:
     missed_alpha_usdt = sum(r.get("simulated_pnl_usdt", 0) for r in resolved if r.get("classification") == "FALSE_NEGATIVE")
     net_filter_edge = capital_saved_usdt - missed_alpha_usdt
 
+    # 2. Clean intraday metrics (<= 4.0h horizon)
+    intraday_records = [
+        r for r in resolved
+        if r.get("classification") in ["TRUE_NEGATIVE", "FALSE_NEGATIVE"]
+        and ((r.get("resolved_at_ts", 0) - (r.get("activated_at_ts") or r.get("registered_at_ts", 0))) <= MAX_INTRADAY_HOLD_SECONDS + 300)
+    ]
+    i_tn = sum(1 for r in intraday_records if r.get("classification") == "TRUE_NEGATIVE")
+    i_fn = sum(1 for r in intraday_records if r.get("classification") == "FALSE_NEGATIVE")
+    i_conc = i_tn + i_fn
+    intraday_fer = (i_tn / i_conc * 100) if i_conc > 0 else 0.0
+    i_saved = sum(abs(r.get("simulated_pnl_usdt", 1.5)) for r in intraday_records if r.get("classification") == "TRUE_NEGATIVE")
+    i_missed = sum(r.get("simulated_pnl_usdt", 0) for r in intraday_records if r.get("classification") == "FALSE_NEGATIVE")
+    intraday_net_edge = i_saved - i_missed
+
+    # 3. Rolling window metrics (last N resolved records)
+    recent_slice = resolved[-rolling_window:] if len(resolved) > rolling_window else resolved
+    r_tn = sum(1 for r in recent_slice if r.get("classification") == "TRUE_NEGATIVE")
+    r_fn = sum(1 for r in recent_slice if r.get("classification") == "FALSE_NEGATIVE")
+    r_conc = r_tn + r_fn
+    rolling_fer = (r_tn / r_conc * 100) if r_conc > 0 else 0.0
+    r_saved = sum(abs(r.get("simulated_pnl_usdt", 1.5)) for r in recent_slice if r.get("classification") == "TRUE_NEGATIVE")
+    r_missed = sum(r.get("simulated_pnl_usdt", 0) for r in recent_slice if r.get("classification") == "FALSE_NEGATIVE")
+    rolling_net_edge = r_saved - r_missed
+
     return {
         "active_shadow_trades": len(active),
         "total_resolved": len(resolved),
         "true_negatives": tn_count,
         "false_negatives": fn_count,
         "expired": expired_count,
+        "timeouts": timeout_count,
         "filter_efficacy_ratio_pct": round(fer, 1),
         "capital_saved_usdt": round(capital_saved_usdt, 2),
         "missed_alpha_usdt": round(missed_alpha_usdt, 2),
         "net_filter_edge_usdt": round(net_filter_edge, 2),
+        "intraday_conclusive_count": i_conc,
+        "intraday_fer_pct": round(intraday_fer, 1),
+        "intraday_capital_saved_usdt": round(i_saved, 2),
+        "intraday_missed_alpha_usdt": round(i_missed, 2),
+        "intraday_net_edge_usdt": round(intraday_net_edge, 2),
+        "rolling_window_size": len(recent_slice),
+        "rolling_fer_pct": round(rolling_fer, 1),
+        "rolling_capital_saved_usdt": round(r_saved, 2),
+        "rolling_missed_alpha_usdt": round(r_missed, 2),
+        "rolling_net_edge_usdt": round(rolling_net_edge, 2),
         "active_trades": active,
         "recent_resolved": resolved[-5:]
     }
@@ -372,9 +434,9 @@ def print_shadow_dashboard():
     print("👻 SHADOW DESK — COUNTERFACTUAL FILTER EFFICACY AUDITOR")
     print(f"Timestamp: {datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
     print("=" * 80)
-    print(f"📊 SUMMARY METRICS:")
+    print(f"📊 SUMMARY METRICS (ALL-TIME):")
     print(f"  • Active Shadow Trades:  {m['active_shadow_trades']}")
-    print(f"  • Total Resolved Trades:  {m['total_resolved']} (TN: {m['true_negatives']} | FN: {m['false_negatives']} | Expired: {m['expired']})")
+    print(f"  • Total Resolved Trades:  {m['total_resolved']} (TN: {m['true_negatives']} | FN: {m['false_negatives']} | Timeouts: {m['timeouts']} | Expired: {m['expired']})")
     
     fer_color = "🟢" if m["filter_efficacy_ratio_pct"] >= 70 else ("🟡" if m["filter_efficacy_ratio_pct"] >= 50 else "🔴")
     print(f"  • Filter Efficacy Ratio:  {fer_color} {m['filter_efficacy_ratio_pct']}% (Target: > 70%)")
@@ -382,6 +444,19 @@ def print_shadow_dashboard():
     print(f"  • Missed Alpha (TP Perdido):  -${m['missed_alpha_usdt']} USDT")
     net_str = f"+${m['net_filter_edge_usdt']}" if m['net_filter_edge_usdt'] >= 0 else f"-${abs(m['net_filter_edge_usdt'])}"
     print(f"  • Net Filter Advantage:   {net_str} USDT")
+    print("-" * 80)
+    print(f"⚡ INTRADAY CLEAN HORIZON (<= 4.0 Hours Holding):")
+    i_color = "🟢" if m["intraday_fer_pct"] >= 70 else ("🟡" if m["intraday_fer_pct"] >= 50 else "🔴")
+    print(f"  • Intraday Conclusive:    {m['intraday_conclusive_count']} setups")
+    print(f"  • Intraday Clean FER:     {i_color} {m['intraday_fer_pct']}%")
+    i_net_str = f"+${m['intraday_net_edge_usdt']}" if m['intraday_net_edge_usdt'] >= 0 else f"-${abs(m['intraday_net_edge_usdt'])}"
+    print(f"  • Intraday Clean Edge:    {i_net_str} USDT (Saved: +${m['intraday_capital_saved_usdt']} | Missed: -${m['intraday_missed_alpha_usdt']})")
+    print("-" * 80)
+    print(f"🔄 ROLLING WINDOW (Last {m['rolling_window_size']} Setups):")
+    r_color = "🟢" if m["rolling_fer_pct"] >= 70 else ("🟡" if m["rolling_fer_pct"] >= 50 else "🔴")
+    print(f"  • Rolling FER:            {r_color} {m['rolling_fer_pct']}%")
+    r_net_str = f"+${m['rolling_net_edge_usdt']}" if m['rolling_net_edge_usdt'] >= 0 else f"-${abs(m['rolling_net_edge_usdt'])}"
+    print(f"  • Rolling Net Edge:       {r_net_str} USDT")
     print("-" * 80)
 
     if m["active_trades"]:
@@ -397,7 +472,7 @@ def print_shadow_dashboard():
         print("-" * 80)
         print("🏁 RECENT RESOLUTIONS:")
         for r in m["recent_resolved"]:
-            tag = "✅ TRUE NEGATIVE (Saved Loss)" if r["classification"] == "TRUE_NEGATIVE" else "⚠️ FALSE NEGATIVE (Missed Profit)"
+            tag = "✅ TRUE NEGATIVE (Saved Loss)" if r["classification"] == "TRUE_NEGATIVE" else ("⚠️ FALSE NEGATIVE (Missed Profit)" if r["classification"] == "FALSE_NEGATIVE" else f"ℹ️ {r.get('classification')}")
             print(f"  • {r['symbol']} ({r['direction']}): {tag} | Outcome: {r['outcome']} | PnL: ${r['simulated_pnl_usdt']} USDT | Reason: {r['rejection_reason']}")
     print("=" * 80)
 
