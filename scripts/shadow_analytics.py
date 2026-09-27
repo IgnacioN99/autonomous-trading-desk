@@ -41,7 +41,7 @@ def run_calibration_analysis(resolved: List[Dict[str, Any]]) -> Dict[str, Any]:
     for r in resolved:
         vr = r.get("vol_ratio", 0.0)
         c = r.get("classification")
-        saved = 1.50 if c == "TRUE_NEGATIVE" else 0.0
+        saved = abs(r.get("simulated_pnl_usdt", 1.50)) if c == "TRUE_NEGATIVE" else 0.0
         missed = r.get("simulated_pnl_usdt", 2.70) if c == "FALSE_NEGATIVE" else 0.0
 
         if vr <= 0.25:
