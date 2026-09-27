@@ -189,6 +189,34 @@ def sync_session_state(target_env: str = "testnet") -> dict:
         portfolio_delta_bias = "DELTA_BALANCED"
         delta_advice = "⚖️ DELTA-NEUTRAL EQUILIBRIUM: Balanced portfolio with bounded directional exposure (Δ ≈ 0)."
 
+    # 7. Shadow Desk Telemetry & Counterfactual Metrics
+    shadow_summary = {
+        "active_shadow_trades": 0,
+        "total_resolved": 0,
+        "true_negatives": 0,
+        "false_negatives": 0,
+        "filter_efficacy_ratio_pct": 0.0,
+        "capital_saved_usdt": 0.0,
+        "missed_alpha_usdt": 0.0,
+        "net_filter_edge_usdt": 0.0
+    }
+    try:
+        import shadow_tracker
+        shadow_metrics = shadow_tracker.calculate_efficacy_metrics()
+        if shadow_metrics:
+            shadow_summary = {
+                "active_shadow_trades": shadow_metrics.get("active_shadow_trades", 0),
+                "total_resolved": shadow_metrics.get("total_resolved", 0),
+                "true_negatives": shadow_metrics.get("true_negatives", 0),
+                "false_negatives": shadow_metrics.get("false_negatives", 0),
+                "filter_efficacy_ratio_pct": shadow_metrics.get("filter_efficacy_ratio_pct", 0.0),
+                "capital_saved_usdt": shadow_metrics.get("capital_saved_usdt", 0.0),
+                "missed_alpha_usdt": shadow_metrics.get("missed_alpha_usdt", 0.0),
+                "net_filter_edge_usdt": shadow_metrics.get("net_filter_edge_usdt", 0.0)
+            }
+    except Exception:
+        pass
+
     # Package consolidated state
     state = {
         "last_updated_utc": now_utc,
@@ -216,7 +244,8 @@ def sync_session_state(target_env: str = "testnet") -> dict:
             "gross_realized_pnl_usdt": round(today_realized_pnl, 4),
             "commissions_usdt": round(today_commissions, 4),
             "net_realized_pnl_usdt": round(net_realized_today, 4)
-        }
+        },
+        "shadow_desk_summary": shadow_summary
     }
 
     # Save to atomic file with kernel-level replace
@@ -260,6 +289,14 @@ def format_markdown_summary(state: dict) -> str:
             sl_icon = "✅" if p.get("sl_algo_verified") else "🚨 ORPHAN"
             tp_str = f"{p.get('tp1_price', 'N/A')} / {p.get('tp2_price', 'N/A')}"
             lines.append(f"| **{p['symbol']}** | {p['direction']} {p['leverage']}x | {p['entry_price']} | {p['mark_price']} | {p['unrealized_pnl_usdt']:+.2f} | {p['roe_pct']:+.1f}% | ${p['margin_usdt']:.2f} | {sl_icon} {p.get('sl_price', 'N/A')} | {tp_str} |")
+
+    sh = state.get("shadow_desk_summary")
+    if sh and sh.get("total_resolved", 0) > 0:
+        lines.append("")
+        lines.append(f"### 👻 Shadow Desk Counterfactuals (FER: {sh['filter_efficacy_ratio_pct']}%)")
+        lines.append(f"* **Resolved Filter Audits:** {sh['total_resolved']} (✅ Dodged Losses / TN: {sh['true_negatives']} | ⚠️ Missed Alpha / FN: {sh['false_negatives']})")
+        lines.append(f"* **Capital Saved (Avoided SLs):** **+${sh['capital_saved_usdt']:.2f} USDT** | **Missed Alpha (TP1s):** -${sh['missed_alpha_usdt']:.2f} USDT")
+        lines.append(f"* **Net Filter Edge:** **{'+' if sh['net_filter_edge_usdt'] >= 0 else ''}${sh['net_filter_edge_usdt']:.2f} USDT** (Monitoring {sh.get('active_shadow_trades', 0)} active setups)")
 
     return "\n".join(lines)
 
