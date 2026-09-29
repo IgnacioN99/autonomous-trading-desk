@@ -265,16 +265,27 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
     return True, None
 
 def execute_complete_trade(symbol, direction, leverage, margin_usdt, sl_price, tp1_price, tp2_price, target_env='testnet', trigger_price=None, order_type='MARKET', limit_price=None, bypass_delta_gate=False):
-    # Dynamic Guardrail for PROD (capped at 35% of total account equity)
-    account_equity = 100.0
+    # Dynamic Guardrail: margin capped at max_margin_ratio (30%) of total account equity
+    is_prod = target_env.lower() != 'testnet'
     try:
         import quant_risk_engine as qre
         account_equity = qre.get_account_equity(target_env)
+    except Exception as e:
+        if is_prod:
+            return {"success": False, "hard_gate_rejection": True,
+                    "error": f"FAIL-CLOSED: Cannot verify account equity for PROD ({e}). Order blocked."}
+        account_equity = 10000.0  # Safe testnet sandbox fallback
+
+    try:
+        import user_profile as up
+        max_margin_ratio = up.load_user_profile().get("max_margin_ratio", 0.30)
     except Exception:
-        pass
-    max_prod_margin = max(account_equity * 0.35, 30.0)
-    if target_env.lower() == 'prod' and margin_usdt > max_prod_margin:
-        return {"success": False, "error": f"GUARDRAIL: Margin of {margin_usdt} USDT exceeds maximum allowed cap of {max_prod_margin:.2f} USDT on REAL network."}
+        max_margin_ratio = 0.30
+
+    max_prod_margin = account_equity * max_margin_ratio
+    if is_prod and margin_usdt > max_prod_margin:
+        return {"success": False, "hard_gate_rejection": True,
+                "error": f"GUARDRAIL: Margin of {margin_usdt} USDT exceeds max cap of {max_prod_margin:.2f} USDT ({max_margin_ratio*100:.0f}% equity) on REAL network."}
 
     filters = get_symbol_filters(symbol, target_env=target_env)
     if not filters:

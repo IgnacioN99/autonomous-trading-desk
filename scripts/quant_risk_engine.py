@@ -86,7 +86,9 @@ def calculate_dynamic_equity_sizing(
             risk_pct_equity = 0.005
 
     equity = get_account_equity(target_env=target_env)
-    target_dollar_risk = max(equity * risk_pct_equity, 1.50)
+    # Strict fractional risk: exactly risk_pct_equity of equity.
+    # No artificial floor — Binance minNotional ($5) is enforced downstream in calculate_volatility_parity_sizing.
+    target_dollar_risk = equity * risk_pct_equity
 
     sizing = calculate_volatility_parity_sizing(
         symbol=symbol,

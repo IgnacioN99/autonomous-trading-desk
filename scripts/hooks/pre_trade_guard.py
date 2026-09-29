@@ -212,8 +212,10 @@ def main():
         print(json.dumps({"decision": "allow", "reason": "Mechanical hard gates and subagent validation PASSED successfully."}))
 
     except Exception as e:
-        # In case of internal error, fail OPEN with warning to avoid deadlocking workspace
-        print(json.dumps({"decision": "allow", "reason": f"Hook warning: {str(e)}"}))
+        # FAIL-CLOSED: Any internal hook error blocks execution — never silently allow
+        sys.stderr.write(f"[PRE-TRADE-GUARD INTERNAL ERROR] {str(e)}\n")
+        print(json.dumps({"decision": "deny",
+                          "reason": f"🚨 FAIL-CLOSED: Pre-trade guard internal error ({str(e)}). Cannot verify safety — order blocked."}))
 
 if __name__ == "__main__":
     main()

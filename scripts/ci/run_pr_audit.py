@@ -26,16 +26,16 @@ from pathlib import Path
 def invoke_auditor(prompt: str) -> str:
     """Invokes the auditor agent via agy CLI (local) or direct Gemini API (cloud CI)."""
     # 1. Prefer local agy CLI if installed and available in PATH
-    if shutil.which("agy"):
-        agy_cmd = [
-            "agy",
-            "-p", prompt,
-            "--dangerously-skip-permissions",
-            "--effort", "high",
-        ]
+    model = os.getenv("AGY_REVIEW_MODEL", "claude-sonnet-4-6")
+    agy_path = shutil.which("agy") or os.path.expanduser("~/.local/bin/agy")
+    if os.path.isfile(agy_path):
+        agy_cmd = [agy_path, "-p", prompt, "--dangerously-skip-permissions", "--model", model]
+        # --effort is only supported for Gemini models
+        if not model.startswith("claude"):
+            agy_cmd += ["--effort", "high"]
         try:
-            print("  -> Usando Antigravity CLI ('agy') local...")
-            res = subprocess.run(agy_cmd, capture_output=True, text=True, check=True)
+            print(f"  -> Usando Antigravity CLI ('{agy_path}') con modelo '{model}'...")
+            res = subprocess.run(agy_cmd, capture_output=True, text=True, check=True, timeout=300)
             if res.stdout.strip():
                 return res.stdout.strip()
         except Exception as e:
