@@ -114,12 +114,12 @@ def get_crypto_newsletters(limit: int = 5, sender: str = "") -> str:
         return f"Error querying newsletters: {str(e)}"
 
 @server.tool(description="Calculates exact position sizing, contract quantities, and liquidation distance for bounded-capital accounts under Fractional Kelly risk management.")
-def calculate_position_sizing(entry_price: float, stop_loss_price: float, margin_usdt: float = 20.0, leverage: int = 3) -> str:
+def calculate_position_sizing(entry_price: float, stop_loss_price: float, margin_usdt: float = 100.0, leverage: int = 3) -> str:
     """
     Parameters:
     - entry_price: Planned entry price.
     - stop_loss_price: Technical Stop Loss price level.
-    - margin_usdt: Allocated margin (default $20 USDT).
+    - margin_usdt: Allocated margin (default $100 USDT).
     - leverage: Leverage multiplier (2x or 3x).
     """
     if entry_price <= 0 or stop_loss_price <= 0:
@@ -145,14 +145,17 @@ def calculate_position_sizing(entry_price: float, stop_loss_price: float, margin
 • Estimated Liquidation Price: {liq_price:.4f} (Stop Loss at {stop_loss_price:.4f} protects capital well in advance)
 """
 
-@server.tool(description="Screens memecoins and hyper-volatile assets (PEPE, WIF, BONK, DOGE, NEIRO) to find high-conviction YOLO Moonshot opportunities with isolated risk ($10 USDT, 10x-15x).")
+@server.tool(description="Screens memecoins and hyper-volatile assets (PEPE, WIF, BONK, DOGE, NEIRO, PENGU, BOME, MOODENG) to find high-conviction YOLO Moonshot opportunities with isolated risk ($10 USDT, 10x-15x).")
 def scan_yolo_moonshot(leverage: int = 15, margin_usdt: float = 10.0) -> str:
     """
     Parameters:
     - leverage: Aggressive leverage (10x to 15x). Default: 15x.
     - margin_usdt: Bounded micro-capital to risk (default: $10 USDT Isolated).
     """
-    memes = ["1000PEPEUSDT", "DOGEUSDT", "WIFUSDT", "1000BONKUSDT", "1000SHIBUSDT", "FLOKIUSDT", "POPCATUSDT", "NEIROUSDT"]
+    memes = [
+        "1000PEPEUSDT", "DOGEUSDT", "WIFUSDT", "1000BONKUSDT", "1000SHIBUSDT",
+        "FLOKIUSDT", "POPCATUSDT", "NEIROUSDT", "PENGUUSDT", "BOMEUSDT", "MOODENGUSDT"
+    ]
     best = None
 
     for sym in memes:
@@ -246,13 +249,13 @@ MEME CONFLUENCE (HARDENED FILTERS):
 • ⚠️ PROTECTION RULE: Do not move SL to Break-Even prematurely; only move to BE after TP1 execution (+75% ROE) to absorb microstructural noise."""
 
 @server.tool(description="Executes a complete Binance Futures position (Testnet or Prod) with isolated margin, leverage, trigger validation or conditional/limit entry, verified algo Stop Loss, and asymmetric Take Profits (30% TP1 / 70% TP2) with Reduce-Only.")
-def deploy_futures_trade(symbol: str, direction: str, leverage: int = 3, margin_usdt: float = 20.0, sl_price: float = 0.0, tp1_price: float = 0.0, tp2_price: float = 0.0, target_env: str = "testnet", trigger_price: float = 0.0, order_type: str = "MARKET", limit_price: float = 0.0) -> str:
+def deploy_futures_trade(symbol: str, direction: str, leverage: int = 3, margin_usdt: float = 100.0, sl_price: float = 0.0, tp1_price: float = 0.0, tp2_price: float = 0.0, target_env: str = "testnet", trigger_price: float = 0.0, order_type: str = "MARKET", limit_price: float = 0.0) -> str:
     """
     Parameters:
     - symbol: Trading pair (e.g. 'EIGENUSDT', 'ETHUSDT').
     - direction: 'LONG' or 'SHORT'.
     - leverage: Leverage multiplier (e.g. 3 for standard, 10-15 for YOLO).
-    - margin_usdt: Committed margin (default: 20.0 USDT).
+    - margin_usdt: Committed margin (default: 100.0 USDT).
     - sl_price: Technical Stop Loss price level.
     - tp1_price: Take Profit 1 price level (30% of position, fees locked, move to free-trade).
     - tp2_price: Take Profit 2 price level (70% remaining, capturing positive right-tail).

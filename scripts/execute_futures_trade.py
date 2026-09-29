@@ -237,9 +237,15 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
             except Exception as e:
                 pass
 
-    # 2. Maximum Monetary Risk Gate (Capped Risk - Relaxed up to $50 in testnet for sandbox testing)
+    # 2. Maximum Monetary Risk Gate (Dynamic 2.5% of equity cap, allowing 2.0% risk sizing)
     potential_dollar_loss = abs(cur_price - sl_price) * total_qty
-    max_allowed_loss = 50.0 if is_testnet else (4.0 if leverage >= 10 else 2.50)
+    account_equity = 10000.0 if is_testnet else 100.0
+    try:
+        import quant_risk_engine as qre
+        account_equity = qre.get_account_equity(target_env)
+    except Exception:
+        pass
+    max_allowed_loss = max(account_equity * 0.025, 250.0) if is_testnet else max(account_equity * 0.025, 5.0)
     if potential_dollar_loss > max_allowed_loss:
         return False, f"MECHANICAL HARD GATE REJECTION: Monetary risk exceeds allowed cap (${potential_dollar_loss:.2f} > ${max_allowed_loss:.2f} USDT). Adjust margin or position size."
 
@@ -252,10 +258,16 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
     return True, None
 
 def execute_complete_trade(symbol, direction, leverage, margin_usdt, sl_price, tp1_price, tp2_price, target_env='testnet', trigger_price=None, order_type='MARKET', limit_price=None, bypass_delta_gate=False):
-    # Guardrail for PROD
-    MAX_PROD_MARGIN = 25.0
-    if target_env.lower() == 'prod' and margin_usdt > MAX_PROD_MARGIN:
-        return {"success": False, "error": f"GUARDRAIL: Margin of {margin_usdt} USDT exceeds maximum allowed cap of {MAX_PROD_MARGIN} USDT on REAL network."}
+    # Dynamic Guardrail for PROD (capped at 35% of total account equity)
+    account_equity = 100.0
+    try:
+        import quant_risk_engine as qre
+        account_equity = qre.get_account_equity(target_env)
+    except Exception:
+        pass
+    max_prod_margin = max(account_equity * 0.35, 30.0)
+    if target_env.lower() == 'prod' and margin_usdt > max_prod_margin:
+        return {"success": False, "error": f"GUARDRAIL: Margin of {margin_usdt} USDT exceeds maximum allowed cap of {max_prod_margin:.2f} USDT on REAL network."}
 
     filters = get_symbol_filters(symbol, target_env=target_env)
     if not filters:
