@@ -237,17 +237,24 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
             except Exception as e:
                 pass
 
-    # 2. Maximum Monetary Risk Gate (Dynamic 2.5% of equity cap, allowing 2.0% risk sizing)
+    # 2. Maximum Monetary Risk Gate (Dynamic equity cap, fail-closed)
     potential_dollar_loss = abs(cur_price - sl_price) * total_qty
-    account_equity = 10000.0 if is_testnet else 100.0
     try:
         import quant_risk_engine as qre
         account_equity = qre.get_account_equity(target_env)
-    except Exception:
-        pass
-    max_allowed_loss = max(account_equity * 0.025, 250.0) if is_testnet else max(account_equity * 0.025, 5.0)
+    except Exception as e:
+        if is_testnet:
+            account_equity = 10000.0  # Safe sandbox fallback
+        else:
+            return False, f"MECHANICAL HARD GATE REJECTION: FAIL-CLOSED — Cannot verify account equity for PROD ({e}). Order blocked."
+
+    # Cap = 2.5% of equity (allows 2.0% user risk + 0.5% buffer for tick rounding)
+    # PROD minimum floor: $5 USDT; Testnet: proportional only (no inflated $250 floor)
+    max_allowed_loss = account_equity * 0.025
+    if not is_testnet:
+        max_allowed_loss = max(max_allowed_loss, 5.0)
     if potential_dollar_loss > max_allowed_loss:
-        return False, f"MECHANICAL HARD GATE REJECTION: Monetary risk exceeds allowed cap (${potential_dollar_loss:.2f} > ${max_allowed_loss:.2f} USDT). Adjust margin or position size."
+        return False, f"MECHANICAL HARD GATE REJECTION: Monetary risk exceeds allowed cap (${potential_dollar_loss:.2f} > ${max_allowed_loss:.2f} USDT, equity: ${account_equity:.2f}). Adjust margin or position size."
 
     # 3. Financial Friction and Fee Gate (Relaxed in testnet for testing)
     if tp1_price and not is_testnet:

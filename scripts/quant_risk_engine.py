@@ -124,16 +124,16 @@ def calculate_volatility_parity_sizing(symbol, entry_price, sl_price, target_dol
     - Strictly complies with Binance minNotional, lotSize, and tickSize filters.
     """
     if entry_price <= 0 or sl_price <= 0:
-        return {"error": "Prices must be strictly greater than 0."}
+        return {"error": f"INVALID_PRICE_INPUT: entry_price ({entry_price}) and sl_price ({sl_price}) must be positive floats > 0. Fetch the current market ticker to correct."}
 
     filters = eft.get_symbol_filters(symbol, target_env=target_env)
     if not filters:
-        return {"error": f"Filters not found for {symbol}"}
+        return {"error": f"EXCHANGE_INFO_UNAVAILABLE: Filters not found for {symbol}. Verify the symbol exists on Binance Futures via exchangeInformation."}
 
     risk_distance = abs(entry_price - sl_price)
     risk_pct = (risk_distance / entry_price) # in fraction (e.g. 0.02)
     if risk_pct <= 0:
-        return {"error": "Stop Loss distance cannot be 0."}
+        return {"error": f"ZERO_SL_DISTANCE: entry_price ({entry_price}) and sl_price ({sl_price}) are identical. Provide distinct prices to define risk distance."}
 
     # Notional = Target Dollar Risk / Stop Loss distance
     ideal_notional = target_dollar_risk / risk_pct
@@ -190,16 +190,16 @@ def calculate_fixed_margin_sizing(symbol, entry_price, sl_price, margin_usdt=100
     Dollar risk varies dynamically based on distance to Stop Loss.
     """
     if entry_price <= 0 or sl_price <= 0:
-        return {"error": "Prices must be strictly greater than 0."}
+        return {"error": f"INVALID_PRICE_INPUT: entry_price ({entry_price}) and sl_price ({sl_price}) must be positive floats > 0. Fetch the current market ticker to correct."}
 
     filters = eft.get_symbol_filters(symbol, target_env=target_env)
     if not filters:
-        return {"error": f"Filters not found for {symbol}"}
+        return {"error": f"EXCHANGE_INFO_UNAVAILABLE: Filters not found for {symbol}. Verify the symbol exists on Binance Futures via exchangeInformation."}
 
     risk_distance = abs(entry_price - sl_price)
     risk_pct = (risk_distance / entry_price)  # fraction
     if risk_pct <= 0:
-        return {"error": "Stop Loss distance cannot be 0."}
+        return {"error": f"ZERO_SL_DISTANCE: entry_price ({entry_price}) and sl_price ({sl_price}) are identical. Provide distinct prices to define risk distance."}
 
     target_notional = margin_usdt * leverage
     min_notional = filters.get("minNotional", 5.0)
