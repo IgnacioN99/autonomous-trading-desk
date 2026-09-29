@@ -28,7 +28,7 @@ CONFIG_DIR = os.path.join(BASE_DIR, "config")
 PROFILE_FILE = os.path.join(CONFIG_DIR, "user_profile.json")
 
 DEFAULT_PROFILE = {
-    "profile_completed": True,
+    "profile_completed": False,
     "risk_pct_equity": 0.005,           # 0.5% default risk per trade (e.g. $50 on $10k, $5 on $1k)
     "max_margin_ratio": 0.30,          # Maximum 30% of equity per position
     "max_open_positions": 3,           # Maximum concurrent active positions
@@ -43,13 +43,23 @@ DEFAULT_PROFILE = {
 }
 
 def load_user_profile() -> Dict[str, Any]:
-    """Loads the user profile from config/user_profile.json or returns default."""
+    """Loads the user profile from config/user_profile.json or defaults."""
     os.makedirs(CONFIG_DIR, exist_ok=True)
     if os.path.exists(PROFILE_FILE):
         try:
             with open(PROFILE_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                # Merge with defaults for any missing keys
+                profile = dict(DEFAULT_PROFILE)
+                profile.update(data)
+                return profile
+        except Exception:
+            pass
+    # Fallback to example template if present
+    example_file = PROFILE_FILE + ".example"
+    if os.path.exists(example_file):
+        try:
+            with open(example_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
                 profile = dict(DEFAULT_PROFILE)
                 profile.update(data)
                 return profile
@@ -119,12 +129,31 @@ def interactive_terminal_onboarding():
     c3 = input("Selecciona [1/2]: ").strip()
     current["yolo_slot_enabled"] = (c3 == "2")
 
+    # 4. Apalancamiento Estándar
+    print("\n4. ¿Qué apalancamiento deseas utilizar para operaciones estándar?")
+    print("   [1] 2x (Conservador / Swing: buffer ~45% a liquidación, menor ruido intradía)")
+    print("   [2] 3x (Recomendado / Intradía óptimo: equilibrio entre margen y riesgo, buffer ~30%)")
+    print("   [3] 5x (Agresivo / Intradía activo: menor margen requerido, mayor sensibilidad a mechas)")
+    print(f"   (Actual: {current.get('leverage_standard', 3)}x)")
+    c4 = input("Selecciona [1/2/3]: ").strip()
+    lev_map = {"1": 2, "2": 3, "3": 5}
+    if c4 in lev_map:
+        current["leverage_standard"] = lev_map[c4]
+    else:
+        try:
+            val = int(c4.replace("x", ""))
+            if 1 <= val <= 20:
+                current["leverage_standard"] = val
+        except Exception:
+            pass
+
     save_user_profile(current)
     print("\n" + "=" * 65)
     print(f"✅ PERFIL GUARDADO EXITOSAMENTE en config/user_profile.json")
     print(f"• Riesgo por trade: {current['risk_pct_equity']*100:.2f}% de tu balance total")
     print(f"• Modo nocturno: {current['overnight_mode']}")
     print(f"• Slot YOLO: {'ACTIVADO' if current['yolo_slot_enabled'] else 'DESACTIVADO'}")
+    print(f"• Apalancamiento estándar: {current['leverage_standard']}x")
     print("=" * 65)
 
 if __name__ == "__main__":

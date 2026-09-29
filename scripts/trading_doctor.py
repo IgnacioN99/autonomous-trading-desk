@@ -114,8 +114,13 @@ def run_doctor(target_env: str = "testnet", auto_heal: bool = False) -> int:
         import user_profile as up
         profile = up.load_user_profile()
         risk_pct = profile.get("risk_pct_equity", 0.005) * 100
-        ok_items.append(f"User Profile calibrated (Risk: {risk_pct:.2f}% equity, Mode: {profile.get('operating_mode')})")
-        print(f"✅ [USER PROFILE] Calibrated: {risk_pct:.2f}% risk per trade ({profile.get('operating_mode')})")
+        is_completed = profile.get("profile_completed", False)
+        if is_completed:
+            ok_items.append(f"User Profile calibrated (Risk: {risk_pct:.2f}% equity, Mode: {profile.get('operating_mode')})")
+            print(f"✅ [USER PROFILE] Calibrated: {risk_pct:.2f}% risk per trade ({profile.get('operating_mode')})")
+        else:
+            warnings.append(f"User Profile onboarding pending (running on {risk_pct:.2f}% defaults)")
+            print(f"ℹ️  [USER PROFILE] Default profile active ({risk_pct:.2f}% equity). Run 'python3 scripts/user_profile.py --setup' to calibrate.")
     except Exception as e:
         warnings.append(f"User profile error: {e}")
         print(f"⚠️  [USER PROFILE] Could not load profile: {e}")
