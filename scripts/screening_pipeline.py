@@ -166,13 +166,14 @@ def enrich_and_size_candidate(c: dict) -> Optional[CandidateSetup]:
 
         # Calculate dynamic equity sizing (default 0.5% equity risk per trade, or user profile)
         sizing = qre.calculate_dynamic_equity_sizing(sym, entry, sl, risk_pct_equity=None, leverage=lev, target_env="testnet")
-        if not sizing or "error" in sizing:
-            sizing = qre.calculate_fixed_margin_sizing(sym, entry, sl, margin_usdt=100.0, leverage=lev, target_env="testnet")
+        if not sizing or "error" in sizing or sizing.get("step_qty", 0.0) <= 0.0:
+            logger.warning(f"Sizing inválido o no cuantizable para {sym}: {sizing.get('error') if sizing else 'Empty sizing'}")
+            return None
 
-        req_margin = sizing.get("required_margin", 100.0)
-        step_qty = sizing.get("step_qty", 0.0)
-        actual_notional = sizing.get("actual_notional", 300.0)
-        risk_dollar = sizing.get("actual_dollar_risk", 10.0)
+        req_margin = sizing["required_margin"]
+        step_qty = sizing["step_qty"]
+        actual_notional = sizing["actual_notional"]
+        risk_dollar = sizing["actual_dollar_risk"]
 
         micro = c.get("micro") or {}
         tape = me.get_live_aggtrades_tape(sym) or {}

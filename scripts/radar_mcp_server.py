@@ -150,8 +150,15 @@ def scan_yolo_moonshot(leverage: int = 15, margin_usdt: float = 10.0) -> str:
     """
     Parameters:
     - leverage: Aggressive leverage (10x to 15x). Default: 15x.
-    - margin_usdt: Bounded micro-capital to risk (default: $10 USDT Isolated).
+    - margin_usdt: Bounded micro-capital to risk (default: dynamically calculated from user profile, e.g. 0.5% equity).
     """
+    try:
+        from user_profile import get_yolo_margin
+        if margin_usdt == 10.0:
+            margin_usdt = get_yolo_margin(target_env="testnet")
+    except Exception:
+        pass
+
     memes = [
         "1000PEPEUSDT", "DOGEUSDT", "WIFUSDT", "1000BONKUSDT", "1000SHIBUSDT",
         "FLOKIUSDT", "POPCATUSDT", "NEIROUSDT", "PENGUUSDT", "BOMEUSDT", "MOODENGUSDT"

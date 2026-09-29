@@ -33,7 +33,8 @@ DEFAULT_PROFILE = {
     "max_margin_ratio": 0.30,          # Maximum 30% of equity per position
     "max_open_positions": 3,           # Maximum concurrent active positions
     "operating_mode": "BALANCED_DELTA_NEUTRAL", # BALANCED_DELTA_NEUTRAL | CONSERVATIVE | AGGRESSIVE
-    "yolo_slot_enabled": False,        # Barbell memecoin moonshot slot (10x-15x, $10 margin)
+    "yolo_slot_enabled": False,        # Barbell memecoin moonshot slot (10x-15x, $10 margin or 0.5% equity)
+    "yolo_equity_pct": 0.005,          # 0.5% default margin for YOLO moonshots (e.g. $50 on $10k)
     "overnight_mode": "ZERO_OVERNIGHT_RISK", # ZERO_OVERNIGHT_RISK | SWING_STRUCTURAL_STOP
     "leverage_standard": 3,
     "leverage_yolo": 15,
@@ -41,6 +42,17 @@ DEFAULT_PROFILE = {
     "created_at_utc": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
     "updated_at_utc": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
 }
+
+def get_yolo_margin(target_env="testnet") -> float:
+    """Calculates YOLO margin based on yolo_equity_pct (default 0.5% of total equity)."""
+    prof = load_user_profile()
+    yolo_pct = float(prof.get("yolo_equity_pct", 0.005))
+    try:
+        from quant_risk_engine import get_account_equity
+        equity = get_account_equity(target_env=target_env)
+    except Exception:
+        equity = 10000.0 if str(target_env).lower() == "testnet" else 100.0
+    return round(max(equity * yolo_pct, 5.0), 2)
 
 def load_user_profile() -> Dict[str, Any]:
     """Loads the user profile from config/user_profile.json or defaults."""

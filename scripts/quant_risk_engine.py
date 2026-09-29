@@ -33,27 +33,37 @@ def fetch_json(url, timeout=6):
         return json.loads(resp.read().decode())
 
 def get_account_equity(target_env="testnet") -> float:
-    """Fetches total wallet balance/equity from session_state.json or Binance ledger."""
+    """Fetches total wallet balance/equity from session_state.json or Binance ledger with strict environment matching."""
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     state_file = os.path.join(base_dir, "logs", "session_state.json")
+    target_env_clean = str(target_env).strip().lower()
+
     if os.path.exists(state_file):
         try:
             with open(state_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                bal = float(data.get("operating_balance", {}).get("total_wallet_balance_usdt", 0))
-                if bal > 0:
-                    return bal
+                state_env = str(data.get("target_env", data.get("environment", ""))).strip().lower()
+                # Strict environment matching: do not use testnet balance in prod
+                if state_env == target_env_clean:
+                    bal = float(data.get("operating_balance", {}).get("total_wallet_balance_usdt", 0))
+                    if bal > 0:
+                        return bal
         except Exception:
             pass
+
+    # Direct ledger query via Binance REST API
     try:
-        res = eft.send_signed_request("GET", "/fapi/v2/balance", target_env=target_env)
+        res = eft.send_signed_request("GET", "/fapi/v2/balance", target_env=target_env_clean)
         if isinstance(res, list):
             for b in res:
                 if b.get("asset") == "USDT":
-                    return float(b.get("balance", 10000.0))
-    except Exception:
-        pass
-    return 10000.0 if str(target_env).lower() == "testnet" else 100.0
+                    bal = float(b.get("balance", 0.0))
+                    if bal > 0:
+                        return bal
+    except Exception as e:
+        print(f"Warning: Failed to fetch balance from REST API: {e}", file=sys.stderr)
+
+    raise RuntimeError(f"FAIL-CLOSED: Imposible sincronizar equity contable para el entorno '{target_env_clean}'.")
 
 def calculate_dynamic_equity_sizing(
     symbol, entry_price, sl_price, risk_pct_equity=None, leverage=3, target_env="testnet", max_margin_ratio=0.30
