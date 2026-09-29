@@ -82,7 +82,7 @@ def main():
         is_trading_command = False
         if tool_name == "run_command":
             cmd_stripped = command_line.strip()
-            if not any(cmd_stripped.startswith(p) for p in ["git ", "grep ", "cat ", "ls ", "find ", "diff "]):
+            if not any(cmd_stripped.startswith(p) for p in ["git ", "gh ", "grep ", "cat ", "ls ", "find ", "diff "]):
                 if any(script in command_line for script in ["execute_futures_trade.py", "deploy_fresh_basket.py", "deploy_"]):
                     is_trading_command = True
         elif tool_name == "call_mcp_tool":
