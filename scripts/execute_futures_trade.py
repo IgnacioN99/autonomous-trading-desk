@@ -206,22 +206,33 @@ def send_mcp_gateway_request(method, endpoint, params=None):
             mcp_args['quantity'] = float(params['quantity'])
         if 'price' in params:
             mcp_args['price'] = float(params['price'])
+        if 'stopPrice' in params:
+            mcp_args['stopPrice'] = float(params['stopPrice'])
         if 'timeInForce' in params and params['type'] in ['LIMIT', 'STOP', 'TAKE_PROFIT']:
             mcp_args['timeInForce'] = params['timeInForce']
         if 'reduceOnly' in params:
             mcp_args['reduceOnly'] = str(params['reduceOnly']).lower()
+        if 'closePosition' in params:
+            mcp_args['closePosition'] = str(params['closePosition']).lower()
         return call_binance_mcp('futures_usds.newOrder', mcp_args)
 
     # 11. Place Algo Stop Loss
     if endpoint == '/fapi/v1/algoOrder' and method.upper() == 'POST':
         trig_p = float(params.get('triggerPrice') or params.get('stopPrice', 0))
+        close_pos = str(params.get('closePosition', 'true')).lower()
         mcp_args = {
             'symbol': params['symbol'],
             'side': params['side'],
             'type': 'STOP_MARKET',
-            'price': trig_p,
-            'reduceOnly': 'true'
+            'stopPrice': trig_p,
+            'closePosition': close_pos
         }
+        if close_pos != 'true':
+            if 'quantity' in params:
+                mcp_args['quantity'] = float(params['quantity'])
+            if 'reduceOnly' in params:
+                mcp_args['reduceOnly'] = str(params['reduceOnly']).lower()
+
         res = call_binance_mcp('futures_usds.newOrder', mcp_args)
         if isinstance(res, dict) and 'orderId' in res:
             res['algoId'] = res['orderId']

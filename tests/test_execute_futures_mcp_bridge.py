@@ -133,6 +133,27 @@ class TestExecuteFuturesMCPBridge(unittest.TestCase):
         })
         self.assertEqual(res["orderId"], 99999)
 
+    @patch("execute_futures_trade.call_binance_mcp")
+    def test_send_mcp_gateway_request_algo_stop_loss(self, mock_mcp):
+        mock_mcp.return_value = {"orderId": 88888, "status": "NEW"}
+        algo_params = {
+            "symbol": "BTCUSDT",
+            "side": "SELL",
+            "type": "STOP_MARKET",
+            "triggerPrice": 81500.0,
+            "closePosition": "true"
+        }
+        res = eft.send_mcp_gateway_request("POST", "/fapi/v1/algoOrder", params=algo_params)
+        mock_mcp.assert_called_once_with("futures_usds.newOrder", {
+            "symbol": "BTCUSDT",
+            "side": "SELL",
+            "type": "STOP_MARKET",
+            "stopPrice": 81500.0,
+            "closePosition": "true"
+        })
+        self.assertEqual(res["orderId"], 88888)
+        self.assertEqual(res["algoId"], 88888)
+
 
 if __name__ == "__main__":
     unittest.main()
