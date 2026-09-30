@@ -59,7 +59,7 @@ def is_risk_reducing_action(cmd_or_name: str, args_dict: dict = None) -> bool:
             return True
 
         mcp_tool = str(args_dict.get("ToolName", "")).lower()
-        if any(kw in mcp_tool for kw in ["cancel", "deleteorder", "closeposition", "algoorder"]):
+        if any(kw in mcp_tool for kw in ["cancel", "deleteorder", "closeposition"]):
             return True
 
     # 2. Check command line string
@@ -223,13 +223,15 @@ def main():
         elif tool_name == "call_mcp_tool":
             server_name = args.get("ServerName", "")
             mcp_tool_name = args.get("ToolName", "")
+            tool_lower = mcp_tool_name.lower()
             if server_name == "binance":
-                if mcp_tool_name in ["futures_usds.newOrder", "margin.marginAccountNewOrder"]:
-                    is_trading_command = True
-                elif mcp_tool_name == "futures_usds.changeInitialLeverage":
+                if any(kw in tool_lower for kw in ["neworder", "algoorder", "placeorder", "createorder"]) or mcp_tool_name in ["futures_usds.newOrder", "margin.marginAccountNewOrder"]:
+                    if not any(safe_kw in tool_lower for safe_kw in ["cancel", "delete", "query", "get", "list", "info"]):
+                        is_trading_command = True
+                elif "changeinitialleverage" in tool_lower:
                     is_leverage_command = True
             elif server_name == "crypto_radar":
-                if any(kw in mcp_tool_name.lower() for kw in ["deploy_futures_trade", "placeorder"]):
+                if any(kw in tool_lower for kw in ["deploy_futures_trade", "placeorder", "new_order"]):
                     is_trading_command = True
 
         if not is_trading_command and not is_leverage_command:
@@ -320,12 +322,19 @@ def main():
                 print(json.dumps({"decision": "deny", "reason": deny_msg}))
                 return
 
-            approved_symbols = dossier_data.get("approved_symbols", []) if dossier_data else []
-            if target_sym and approved_symbols and target_sym not in approved_symbols:
+            approved_symbols = [s.upper() for s in dossier_data.get("approved_symbols", [])] if dossier_data else []
+            if not target_sym:
+                print(json.dumps({
+                    "decision": "deny",
+                    "reason": "🚨 FAIL-CLOSED: No fue posible extraer determinísticamente el símbolo objetivo de la orden."
+                }))
+                return
+
+            if not approved_symbols or target_sym not in approved_symbols:
                 deny_msg = (
                     f"🚨 ACTION BLOCKED BY PRE-TOOL-USE HOOK:\n"
-                    f"Asset '{target_sym}' was NOT approved in the evaluator dossier ({dossier_data.get('evaluator_agent')}).\n"
-                    f"Approved assets: {', '.join(approved_symbols)}.\n"
+                    f"Asset '{target_sym}' was NOT approved in the evaluator dossier ({dossier_data.get('evaluator_agent', 'isolated_market_evaluator')}).\n"
+                    f"Approved assets: {', '.join(approved_symbols) if approved_symbols else 'NONE'}.\n"
                     "By quantitative discipline, trading assets outside the validated dossier is prohibited."
                 )
                 print(json.dumps({"decision": "deny", "reason": deny_msg}))
@@ -375,8 +384,18 @@ def main():
                         )
                         print(json.dumps({"decision": "deny", "reason": reason_msg}))
                         return
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(json.dumps({
+                        "decision": "deny",
+                        "reason": f"🚨 FAIL-CLOSED: Error crítico al verificar Delta-Neutral Gate contra session_state.json ({str(e)}). Orden bloqueada."
+                    }))
+                    return
+            else:
+                print(json.dumps({
+                    "decision": "deny",
+                    "reason": "🚨 FAIL-CLOSED: session_state.json no existe. Imposible auditar delta de la cartera antes de ejecutar orden."
+                }))
+                return
 
         # All gates passed successfully
         print(json.dumps({"decision": "allow", "reason": "Mechanical hard gates and subagent validation PASSED successfully."}))

@@ -508,8 +508,85 @@ class TestBinanceMCPGuard(unittest.TestCase):
         res = post_trade_sync.handle_post_trade_sync(payload)
         self.assertFalse(res["order_placed"])
         self.assertFalse(res["synced"])
-        mock_subprocess.assert_not_called()
+    def test_unapproved_asset_rejection_empty_approved_list(self):
+        """Verifies order is rejected fail-closed if dossier has empty approved_symbols list."""
+        self._write_dossier([])  # Empty approved list
+        self._write_session_state(delta_bias="NEUTRAL", net_delta=0.0)
+
+        payload = {
+            "toolCall": {
+                "name": "call_mcp_tool",
+                "args": {
+                    "ServerName": "binance",
+                    "ToolName": "futures_usds.newOrder",
+                    "Arguments": {"symbol": "BTCUSDT", "side": "BUY", "type": "MARKET", "quantity": "0.01"}
+                }
+            }
+        }
+        res = self._run_guard(payload)
+        self.assertEqual(res.get("decision"), "deny")
+        self.assertIn("Asset 'BTCUSDT' was NOT approved", res.get("reason", ""))
+
+    def test_unapproved_asset_rejection_missing_symbol(self):
+        """Verifies order is rejected fail-closed if target symbol cannot be extracted."""
+        self._write_dossier([{"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3}])
+        self._write_session_state(delta_bias="NEUTRAL", net_delta=0.0)
+
+        payload = {
+            "toolCall": {
+                "name": "call_mcp_tool",
+                "args": {
+                    "ServerName": "binance",
+                    "ToolName": "futures_usds.newOrder",
+                    "Arguments": {"side": "BUY", "type": "MARKET", "quantity": "0.01"}
+                }
+            }
+        }
+        res = self._run_guard(payload)
+        self.assertEqual(res.get("decision"), "deny")
+        self.assertIn("No fue posible extraer determinísticamente el símbolo objetivo", res.get("reason", ""))
+
+    def test_algoorder_not_unconditional_risk_reducing(self):
+        """Verifies tool calls with 'algoorder' in name require explicit reduceOnly or closePosition flag."""
+        # Unapproved symbol, no dossier
+        self._write_session_state(delta_bias="NEUTRAL", net_delta=0.0)
+
+        payload = {
+            "toolCall": {
+                "name": "call_mcp_tool",
+                "args": {
+                    "ServerName": "binance",
+                    "ToolName": "futures_usds.newAlgoOrder",
+                    "Arguments": {"symbol": "BTCUSDT", "side": "BUY", "quantity": "0.01"}
+                }
+            }
+        }
+        res = self._run_guard(payload)
+        # Without reduceOnly, this must NOT be automatically allowed
+        self.assertEqual(res.get("decision"), "deny")
+
+    def test_delta_gate_fail_closed_on_corrupt_session_state(self):
+        """Verifies order is blocked fail-closed if session_state.json is corrupt or unreadable."""
+        self._write_dossier([{"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3}])
+        # Write corrupted JSON to session_state
+        with open(self.state_path, "w", encoding="utf-8") as f:
+            f.write("{corrupt_json: invalid}")
+
+        payload = {
+            "toolCall": {
+                "name": "call_mcp_tool",
+                "args": {
+                    "ServerName": "binance",
+                    "ToolName": "futures_usds.newOrder",
+                    "Arguments": {"symbol": "BTCUSDT", "side": "BUY", "type": "MARKET", "quantity": "0.01"}
+                }
+            }
+        }
+        res = self._run_guard(payload)
+        self.assertEqual(res.get("decision"), "deny")
+        self.assertIn("FAIL-CLOSED", res.get("reason", ""))
 
 
 if __name__ == "__main__":
     unittest.main()
+
