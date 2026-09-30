@@ -10,6 +10,12 @@
 gmail_config.json
 
 # =================================================================
+# USER PREFERENCES & PROFILES (LOCAL DECISIONS STAY LOCAL)
+# =================================================================
+config/user_profile.json
+!config/user_profile.json.example
+
+# =================================================================
 # RUNTIME TELEMETRY & LOGS (Preserve directory structure via .gitkeep)
 # =================================================================
 logs/*.json
@@ -84,3 +90,4 @@ venv.bak/
 *.swo
 .DS_Store
 Thumbs.db
+.playwright-mcp/

@@ -1,0 +1,15 @@
+{
+  "profile_completed": false,
+  "risk_pct_equity": 0.005,
+  "max_margin_ratio": 0.30,
+  "max_open_positions": 3,
+  "operating_mode": "BALANCED_DELTA_NEUTRAL",
+  "yolo_slot_enabled": false,
+  "yolo_equity_pct": 0.005,
+  "overnight_mode": "ZERO_OVERNIGHT_RISK",
+  "leverage_standard": 3,
+  "leverage_yolo": 15,
+  "experience_level": "INTERMEDIATE",
+  "created_at_utc": "2026-09-29 00:00:00 UTC",
+  "updated_at_utc": "2026-09-29 00:00:00 UTC"
+}

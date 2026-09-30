@@ -39,27 +39,38 @@ def verify_review(manifest_path: str, report_path: str) -> tuple[bool, str]:
     approved_reviewers = []
 
     for rev in required_reviewers:
-        # Regex to locate the reviewer's section header
+        # --- Format 1: Standard section header (original Gemini format) ---
         header_pat = rf"###\s*Veredicto:\s*{re.escape(rev)}"
         match = re.search(header_pat, report, re.IGNORECASE)
-        if not match:
-            missing_reviewers.append(rev)
+        if match:
+            section_start = match.start()
+            next_section = re.search(r"###\s*Veredicto:", report[section_start + 10:])
+            section_end = (section_start + 10 + next_section.start()) if next_section else len(report)
+            section_text = report[section_start:section_end]
+            if re.search(r"\[APROBADO\]", section_text, re.IGNORECASE):
+                approved_reviewers.append(rev)
+            elif re.search(r"\[CAMBIOS\s*REQUERIDOS\]", section_text, re.IGNORECASE):
+                rejected_reviewers.append(rev)
+            else:
+                missing_reviewers.append(f"{rev} (Estado no concluyente)")
             continue
 
-        # Extract content of this reviewer section up to next section or end
-        section_start = match.start()
-        next_section = re.search(r"###\s*Veredicto:", report[section_start + 10:])
-        section_end = (section_start + 10 + next_section.start()) if next_section else len(report)
-        section_text = report[section_start:section_end]
+        # --- Format 2: Markdown table row (Claude-style output) ---
+        # Matches: | `agentic_harness` | ... APROBADO ... | or | ✅ APROBADO |
+        table_pat = rf"\|\s*`?{re.escape(rev)}`?\s*\|([^\n]+)"
+        table_match = re.search(table_pat, report, re.IGNORECASE)
+        if table_match:
+            row_text = table_match.group(1)
+            if re.search(r"APROBADO", row_text, re.IGNORECASE):
+                approved_reviewers.append(rev)
+            elif re.search(r"CAMBIOS\s*REQUERIDOS|REQUERIDOS", row_text, re.IGNORECASE):
+                rejected_reviewers.append(rev)
+            else:
+                missing_reviewers.append(f"{rev} (Estado no concluyente en tabla)")
+            continue
 
-        # Check for status
-        if re.search(r"\[APROBADO\]", section_text, re.IGNORECASE):
-            approved_reviewers.append(rev)
-        elif re.search(r"\[CAMBIOS\s*REQUERIDOS\]", section_text, re.IGNORECASE):
-            rejected_reviewers.append(rev)
-        else:
-            # If no clear status tag is found, treat as missing/incomplete
-            missing_reviewers.append(f"{rev} (Estado no concluyente)")
+        # --- Not found in any format ---
+        missing_reviewers.append(rev)
 
     print("=== Mechanical Review Verification Gate ===")
     print(f"Total Required Reviewers: {len(required_reviewers)}")

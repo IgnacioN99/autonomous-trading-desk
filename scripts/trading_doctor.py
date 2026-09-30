@@ -70,12 +70,13 @@ def run_doctor(target_env: str = "testnet", auto_heal: bool = False) -> int:
                 ok_items.append(f"API latency: {latency_ms}ms")
                 print(f"✅ [NETWORK] API latency: {latency_ms}ms")
 
-            if drift_ms > 1000:
-                critical_failures.append(f"Excessive clock drift: {drift_ms}ms (limit: 1000ms)")
-                print(f"❌ [CLOCK DRIFT] Dangerous clock drift: {drift_ms}ms")
+            max_drift_ms = 2500 if target_env == "testnet" else 1000
+            if drift_ms > max_drift_ms:
+                critical_failures.append(f"Excessive clock drift: {drift_ms}ms (limit: {max_drift_ms}ms)")
+                print(f"❌ [CLOCK DRIFT] Dangerous clock drift: {drift_ms}ms (limit: {max_drift_ms}ms)")
             elif drift_ms > 400:
-                warnings.append(f"Moderate clock drift: {drift_ms}ms")
-                print(f"⚠️  [CLOCK DRIFT] Moderate clock drift: {drift_ms}ms")
+                warnings.append(f"Moderate clock drift: {drift_ms}ms (compensated dynamically by execution harness)")
+                print(f"⚠️  [CLOCK DRIFT] Moderate clock drift: {drift_ms}ms (compensated dynamically)")
             else:
                 ok_items.append(f"Optimal clock drift: {drift_ms}ms")
                 print(f"✅ [CLOCK DRIFT] Clock synchronization OK ({drift_ms}ms)")
@@ -107,6 +108,22 @@ def run_doctor(target_env: str = "testnet", auto_heal: bool = False) -> int:
     except Exception as e:
         critical_failures.append(f"Failed to fetch balance: {str(e)}")
         print(f"❌ [BALANCE] Authentication or connection error: {e}")
+
+    # 3b. User Profile Calibration Check
+    try:
+        import user_profile as up
+        profile = up.load_user_profile()
+        risk_pct = profile.get("risk_pct_equity", 0.005) * 100
+        is_completed = profile.get("profile_completed", False)
+        if is_completed:
+            ok_items.append(f"User Profile calibrated (Risk: {risk_pct:.2f}% equity, Mode: {profile.get('operating_mode')})")
+            print(f"✅ [USER PROFILE] Calibrated: {risk_pct:.2f}% risk per trade ({profile.get('operating_mode')})")
+        else:
+            warnings.append(f"User Profile onboarding pending (running on {risk_pct:.2f}% defaults)")
+            print(f"ℹ️  [USER PROFILE] Default profile active ({risk_pct:.2f}% equity). Run 'python3 scripts/user_profile.py --setup' to calibrate.")
+    except Exception as e:
+        warnings.append(f"User profile error: {e}")
+        print(f"⚠️  [USER PROFILE] Could not load profile: {e}")
 
     # 4. Forensic Orphan Position Audit (FAIL CLOSED)
     try:

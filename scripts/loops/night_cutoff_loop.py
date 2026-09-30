@@ -103,9 +103,11 @@ def run_night_cutoff(target_env: str = "testnet", auto_ratchet: bool = True):
             created_ms = o.get("time", now_ms)
             age_min = (now_ms - created_ms) / (1000 * 60)
 
-            # If symbol has no live position or order is > 90m old
-            if sym not in active_symbols or age_min > 90:
-                print(f"   • Cancelling orphan order #{order_id} on {sym} (age: {age_min:.0f}m, type: {o.get('type')})")
+            # If symbol has no live position, or is an unfilled entry order > 90m old:
+            is_reduce_only = o.get("reduceOnly", False)
+            if sym not in active_symbols or (not is_reduce_only and age_min > 90):
+                order_desc = "orphan (no position)" if sym not in active_symbols else f"stale entry limit ({age_min:.0f}m)"
+                print(f"   • Cancelling {order_desc} order #{order_id} on {sym} (type: {o.get('type')})")
                 eft.send_signed_request("DELETE", "/fapi/v1/order", {"symbol": sym, "orderId": order_id}, target_env=target_env)
                 cancelled_count += 1
 

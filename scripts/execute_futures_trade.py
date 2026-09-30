@@ -237,11 +237,28 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
             except Exception as e:
                 pass
 
-    # 2. Maximum Monetary Risk Gate (Capped Risk - Relaxed up to $50 in testnet for sandbox testing)
+    # 2. Maximum Monetary Risk Gate (Dynamic equity cap, fail-closed)
     potential_dollar_loss = abs(cur_price - sl_price) * total_qty
-    max_allowed_loss = 50.0 if is_testnet else (4.0 if leverage >= 10 else 2.50)
+    try:
+        import quant_risk_engine as qre
+        account_equity = qre.get_account_equity(target_env)
+    except Exception as e:
+        if is_testnet:
+            account_equity = 10000.0  # Safe sandbox fallback
+        else:
+            return False, f"MECHANICAL HARD GATE REJECTION: FAIL-CLOSED — Cannot verify account equity for PROD ({e}). Order blocked."
+
+    # Mechanical Monetary Risk Gate: Strict capital preservation cap
+    # PROD must strictly enforce desk risk ceilings ($2.50 buffer for standard / $4.00 for YOLO)
+    if is_testnet:
+        max_allowed_loss = max(account_equity * 0.025, 50.0)
+    else:
+        # Dynamic equity risk (e.g. 0.5%) strictly bounded by desk absolute hard caps ($1.50 / $3.75)
+        desk_abs_cap = 3.75 if leverage >= 10 else 1.50
+        max_allowed_loss = min(account_equity * 0.025, desk_abs_cap)
+
     if potential_dollar_loss > max_allowed_loss:
-        return False, f"MECHANICAL HARD GATE REJECTION: Monetary risk exceeds allowed cap (${potential_dollar_loss:.2f} > ${max_allowed_loss:.2f} USDT). Adjust margin or position size."
+        return False, f"MECHANICAL HARD GATE REJECTION: Monetary risk exceeds allowed cap (${potential_dollar_loss:.2f} > ${max_allowed_loss:.2f} USDT, cap: ${max_allowed_loss:.2f} USDT). Adjust margin or position size."
 
     # 3. Financial Friction and Fee Gate (Relaxed in testnet for testing)
     if tp1_price and not is_testnet:
@@ -252,10 +269,27 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
     return True, None
 
 def execute_complete_trade(symbol, direction, leverage, margin_usdt, sl_price, tp1_price, tp2_price, target_env='testnet', trigger_price=None, order_type='MARKET', limit_price=None, bypass_delta_gate=False):
-    # Guardrail for PROD
-    MAX_PROD_MARGIN = 25.0
-    if target_env.lower() == 'prod' and margin_usdt > MAX_PROD_MARGIN:
-        return {"success": False, "error": f"GUARDRAIL: Margin of {margin_usdt} USDT exceeds maximum allowed cap of {MAX_PROD_MARGIN} USDT on REAL network."}
+    # Dynamic Guardrail: margin capped at max_margin_ratio (30%) of total account equity
+    is_prod = target_env.lower() != 'testnet'
+    try:
+        import quant_risk_engine as qre
+        account_equity = qre.get_account_equity(target_env)
+    except Exception as e:
+        if is_prod:
+            return {"success": False, "hard_gate_rejection": True,
+                    "error": f"FAIL-CLOSED: Cannot verify account equity for PROD ({e}). Order blocked."}
+        account_equity = 10000.0  # Safe testnet sandbox fallback
+
+    try:
+        import user_profile as up
+        max_margin_ratio = up.load_user_profile().get("max_margin_ratio", 0.30)
+    except Exception:
+        max_margin_ratio = 0.30
+
+    max_prod_margin = account_equity * max_margin_ratio
+    if is_prod and margin_usdt > max_prod_margin:
+        return {"success": False, "hard_gate_rejection": True,
+                "error": f"GUARDRAIL: Margin of {margin_usdt} USDT exceeds max cap of {max_prod_margin:.2f} USDT ({max_margin_ratio*100:.0f}% equity) on REAL network."}
 
     filters = get_symbol_filters(symbol, target_env=target_env)
     if not filters:

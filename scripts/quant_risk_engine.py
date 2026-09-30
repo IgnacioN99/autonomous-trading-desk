@@ -32,6 +32,92 @@ def fetch_json(url, timeout=6):
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode())
 
+def get_account_equity(target_env="testnet") -> float:
+    """Fetches total wallet balance/equity from session_state.json or Binance ledger with strict environment matching."""
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    state_file = os.path.join(base_dir, "logs", "session_state.json")
+    target_env_clean = str(target_env).strip().lower()
+
+    if os.path.exists(state_file):
+        try:
+            with open(state_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                state_env = str(data.get("target_env", data.get("environment", ""))).strip().lower()
+                # Strict environment matching: do not use testnet balance in prod
+                if state_env == target_env_clean:
+                    bal = float(data.get("operating_balance", {}).get("total_wallet_balance_usdt", 0))
+                    if bal > 0:
+                        return bal
+        except Exception:
+            pass
+
+    # Direct ledger query via Binance REST API
+    try:
+        res = eft.send_signed_request("GET", "/fapi/v2/balance", target_env=target_env_clean)
+        if isinstance(res, list):
+            for b in res:
+                if b.get("asset") == "USDT":
+                    bal = float(b.get("balance", 0.0))
+                    if bal > 0:
+                        return bal
+    except Exception as e:
+        print(f"Warning: Failed to fetch balance from REST API: {e}", file=sys.stderr)
+
+    raise RuntimeError(f"FAIL-CLOSED: Imposible sincronizar equity contable para el entorno '{target_env_clean}'.")
+
+def calculate_dynamic_equity_sizing(
+    symbol, entry_price, sl_price, risk_pct_equity=None, leverage=3, target_env="testnet", max_margin_ratio=0.30
+):
+    """
+    Calculates position sizing so that Stop Loss execution costs EXACTLY risk_pct_equity (default 0.5% = 0.005) of total equity.
+    - Dynamically scales with account size:
+      * $100 account  -> ~$0.50 USDT risk (at 0.5%)
+      * $1,000 account -> ~$5.00 USDT risk (at 0.5%)
+      * $10,000 account -> ~$50.00 USDT risk (at 0.5%)
+    - Integrates with config/user_profile.json to respect individual risk tolerance.
+    - Includes a safety ceiling capping required margin at max_margin_ratio (default 30%) of equity,
+      ensuring no single position saturates account margin.
+    """
+    if risk_pct_equity is None:
+        try:
+            import user_profile as up
+            risk_pct_equity = up.get_risk_pct_equity()
+        except Exception:
+            risk_pct_equity = 0.005
+
+    equity = get_account_equity(target_env=target_env)
+    # Strict fractional risk: exactly risk_pct_equity of equity.
+    # No artificial floor — Binance minNotional ($5) is enforced downstream in calculate_volatility_parity_sizing.
+    target_dollar_risk = equity * risk_pct_equity
+
+    sizing = calculate_volatility_parity_sizing(
+        symbol=symbol,
+        entry_price=entry_price,
+        sl_price=sl_price,
+        target_dollar_risk=target_dollar_risk,
+        leverage=leverage,
+        target_env=target_env
+    )
+    if not sizing or "error" in sizing:
+        return sizing
+
+    # Safety margin cap: maximum 30% of total equity allocated to one position
+    max_margin_usdt = equity * max_margin_ratio
+    if sizing.get("required_margin", 0) > max_margin_usdt:
+        filters = eft.get_symbol_filters(symbol, target_env=target_env)
+        sizing["required_margin"] = round(max_margin_usdt, 2)
+        sizing["actual_notional"] = round(max_margin_usdt * leverage, 2)
+        if filters:
+            raw_qty = sizing["actual_notional"] / entry_price
+            sizing["step_qty"] = eft.round_step(raw_qty, filters["stepSize"], filters["precision_qty"])
+            risk_pct = abs(entry_price - sl_price) / entry_price
+            sizing["actual_dollar_risk"] = round(sizing["actual_notional"] * risk_pct, 2)
+            sizing["target_dollar_risk"] = round(sizing["actual_dollar_risk"], 2)
+
+    sizing["account_equity"] = round(equity, 2)
+    sizing["risk_pct_equity"] = risk_pct_equity
+    return sizing
+
 def calculate_volatility_parity_sizing(symbol, entry_price, sl_price, target_dollar_risk=1.50, leverage=3, target_env="testnet"):
     """
     Calculates exact position sizing so that Stop Loss execution costs EXACTLY target_dollar_risk (e.g. $1.50 USDT).
@@ -40,16 +126,16 @@ def calculate_volatility_parity_sizing(symbol, entry_price, sl_price, target_dol
     - Strictly complies with Binance minNotional, lotSize, and tickSize filters.
     """
     if entry_price <= 0 or sl_price <= 0:
-        return {"error": "Prices must be strictly greater than 0."}
+        return {"error": f"INVALID_PRICE_INPUT: entry_price ({entry_price}) and sl_price ({sl_price}) must be positive floats > 0. Fetch the current market ticker to correct."}
 
     filters = eft.get_symbol_filters(symbol, target_env=target_env)
     if not filters:
-        return {"error": f"Filters not found for {symbol}"}
+        return {"error": f"EXCHANGE_INFO_UNAVAILABLE: Filters not found for {symbol}. Verify the symbol exists on Binance Futures via exchangeInformation."}
 
     risk_distance = abs(entry_price - sl_price)
     risk_pct = (risk_distance / entry_price) # in fraction (e.g. 0.02)
     if risk_pct <= 0:
-        return {"error": "Stop Loss distance cannot be 0."}
+        return {"error": f"ZERO_SL_DISTANCE: entry_price ({entry_price}) and sl_price ({sl_price}) are identical. Provide distinct prices to define risk distance."}
 
     # Notional = Target Dollar Risk / Stop Loss distance
     ideal_notional = target_dollar_risk / risk_pct
@@ -342,13 +428,16 @@ def scan_coingrated_market_pairs():
     and Ornstein-Uhlenbeck with Hurwicz correction over 1,000 continuous 1h bars.
     """
     candidate_pairs = [
-        ("BTCUSDT", "ETHUSDT"),    # Macro L1 Anchor
-        ("SOLUSDT", "AVAXUSDT"),   # High-Throughput Alt L1s
-        ("SUIUSDT", "APTUSDT"),    # Move VM L1s
-        ("NEARUSDT", "APTUSDT"),   # Sharded / Parallel Alt L1s
-        ("LINKUSDT", "ETHUSDT"),   # Core DeFi Infrastructure vs Host L1
-        ("DOTUSDT", "ATOMUSDT"),   # Modular Cross-Chain L0/L1
-        ("ARBUSDT", "OPUSDT")      # Ethereum L2 Rollups
+        ("BTCUSDT", "ETHUSDT"),       # Macro L1 Anchor
+        ("SOLUSDT", "AVAXUSDT"),      # High-Throughput Alt L1s
+        ("SUIUSDT", "APTUSDT"),       # Move VM L1s
+        ("NEARUSDT", "APTUSDT"),      # Sharded / Parallel Alt L1s
+        ("LINKUSDT", "ETHUSDT"),      # Core DeFi Infrastructure vs Host L1
+        ("DOTUSDT", "ATOMUSDT"),      # Modular Cross-Chain L0/L1
+        ("ARBUSDT", "OPUSDT"),        # Ethereum L2 Rollups
+        ("LDOUSDT", "ENAUSDT"),       # DeFi Staking & Synthetic Dollar (p=0.0093, HL=39h)
+        ("DOGEUSDT", "1000SHIBUSDT"), # High-Beta Meme Market Spread (p=0.0074, HL=17h)
+        ("ETHUSDT", "SOLUSDT")        # Top Smart Contract L1 Benchmark (p=0.0436, HL=70h)
     ]
 
     results = []

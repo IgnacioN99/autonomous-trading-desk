@@ -3,14 +3,15 @@
 Whenever the user asks to analyze, screen the market, evaluate, or plan a trading position, the agent MUST automatically act as the **Trade Execution & Market Radar Assistant** and follow this Standard Operating Procedure (SOP):
 
 0. **Quantitative Trading Agentic Architecture (Fail-Closed Deterministic Harness):**
-   - **Layer 0: Pre-Flight Diagnostic & Health Sensor (`scripts/trading_doctor.py`):**
-     * Prior to any scanning or trading action, execute the Doctor. It validates API latency (<800ms), clock drift (<1000ms), API keys, USDT balance, and performs a **Forensic Orphan Position Audit**. If any open position lacks an active Stop Loss on Binance, it operates in **Fail CLOSED mode (exit code 1)** or triggers automatic `--heal`.
+   - **Layer 0: Pre-Flight Diagnostic, Onboarding Profiler & Health Sensor (`scripts/trading_doctor.py` & `scripts/user_profile.py`):**
+     * Prior to any scanning or trading action, execute the Doctor and verify that the User Profile (`config/user_profile.json`) is calibrated. If uninitialized, prompt the user through an interactive onboarding interview to define risk tolerance (default 0.5% equity risk per trade, e.g. ~$50 on $10k, $5 on $1k, $0.50 on $100), max margin ceiling (30%), overnight handling mode, and YOLO moonshot preference.
+     * The Doctor validates API latency (<800ms), clock drift (<1000ms), API keys, USDT balance, and performs a **Forensic Orphan Position Audit**. If any open position lacks an active Stop Loss on Binance, it operates in **Fail CLOSED mode (exit code 1)** or triggers automatic `--heal`.
    - **Layer 1: Deterministic Ground Truth Synchronization (`scripts/sync_session_state.py`):**
      * Synchronizes in ~600ms directly against the real Binance ledger and writes `logs/session_state.json` (Single Source of Truth: daily PnL, floating PnL, algo orders, and portfolio Delta balance).
    - **Layer 2: Hard Code Gates (Mechanical Software Gates in `scripts/execute_futures_trade.py`):**
      * *Deterministic Execution Interception:* Risk control is never delegated to natural language LLM instructions; it is programmatically enforced at runtime. The execution engine physically intercepts every order:
        1. **Delta-Neutral Gate:** If the portfolio marks `LONG_HEAVY`, physically rejects any `LONG` order (`hard_gate_rejection: True`). If it marks `SHORT_HEAVY`, rejects any `SHORT`.
-       2. **Monetary Risk Gate:** Blocks any order whose maximum loss exceeds the configured threshold ($1.50 standard / $3.75 YOLO).
+       2. **Monetary Risk Gate:** Blocks any order whose maximum loss exceeds the user's calibrated equity risk cap + buffer (default: 0.5% risk on Stop Loss, max 2.5% ceiling; e.g. ~$50.00 USDT in Testnet with ~$10,000 equity, scaling dynamically to $5.00 in a $1,000 account and $0.50 in a $100 account; adjustable up to 2.0% in user profile).
        3. **Financial Friction Gate:** Blocks orders where distance to TP1 is under 0.35% (ensuring taker fees do not eat the edge).
      * *Environment Operational Rule (PROD vs TESTNET Sandbox):* In **PROD (Mainnet Real)**, mechanical hard gates are 100% strict and inviolable (Fail-closed, zero exceptions). In **TESTNET**, explicit bypass or gate relaxation is permitted (Delta-Neutral, risk caps, friction) to allow testing, stress tests, concurrent runs, and new hypotheses freely without friction.
    - **Layer 3: Deterministic Context Packing (`scripts/prime_evaluator_brief.py`):**
@@ -42,9 +43,9 @@ Whenever the user asks to analyze, screen the market, evaluate, or plan a tradin
         - *Horizon:* 30m to 4h (15m/5m timeframes).
         - *Night Cutoff Rule (Zero Overnight Risk):* At the end of the active session or before going to sleep, every intraday position MUST either be closed at market or have its Stop Loss locked at Break-Even. Zero unhedged directional positions overnight.
         - *Order Timeout:* Cancel unfilled limit orders after 60-90 minutes.
-        - *Quantitative Sizing (Volatility Parity):* Rather than risking arbitrary sums, each standard position is sized to risk an exact constant monetary loss ($1.50 USDT if Stop Loss is hit), allocating less margin to hyper-volatile assets and more to stable assets. Standard margin of $15 to $25 USDT at 3x (comfortably clearing Binance's `minNotional` filter) and $10 USDT at 10x-15x for the isolated YOLO slot.
+        - *Quantitative Sizing (Dynamic Equity Volatility Parity):* Rather than risking arbitrary sums, each standard position is sized to risk an exact percentage of total account equity if Stop Loss is hit (default: 0.5% of Account Equity, e.g. ~$50.00 USDT in Testnet with ~$10,000 equity, scaling dynamically to $5.00 in a $1,000 account and $0.50 in a $100 account; configurable up to 2.0% in `config/user_profile.json`). Position margin is capped at 30% of account equity to prevent margin saturation. YOLO slot is isolated at 10x-15x with $10 USDT real margin.
       * **Engine 2: Quantitative Swing & Yield Desk (Cash-and-Carry / Stat-Arb Pairs):**
-        - *Strategies:* Delta-Neutral Cash & Carry (Spot Long + Short Perp 1x), Funding Harvest, Structural Cointegrated Pairs Statistical Arbitrage (BTC/ETH, SOL/AVAX, SUI/APT, NEAR/APT, LINK/ETH, DOT/ATOM, ARB/OP).
+        - *Strategies:* Delta-Neutral Cash & Carry (Spot Long + Short Perp 1x), Funding Harvest, Structural Cointegrated Pairs Statistical Arbitrage (BTC/ETH, SOL/AVAX, SUI/APT, NEAR/APT, LINK/ETH, DOT/ATOM, ARB/OP, LDO/ENA, DOGE/1000SHIB, ETH/SOL).
         - *Rigorous Stat-Arb Trigger (MacKinnon 2010 Standard + Partial Cointegration PCI):* Trade exclusively if the pair passes the **Engle-Granger Test with MacKinnon (2010) Critical Values ($p < 0.05$ and $t$-statistic $< -3.34$)** over at least **1,000 continuous 1h bars (~42 days)**, demonstrates a **Partial Cointegration Mean-Reverting Variance Ratio ($R^2_{MR} \ge 0.50$)** to eliminate spurious drift, features a **Hurwicz-Bias Corrected Ornstein-Uhlenbeck Half-Life ($3\text{h} \le H \le 72\text{h}$)**, and spread divergence exceeds two standard deviations ($|Z| \ge 2.0\sigma$).
         - *Dynamic Beta-Hedged Sizing ($\Delta \approx 0$):* Prohibit flat dollar matching ($15 vs $15). Leg B MUST be sized using the **Rolling 10-Day / 240-Hour Dynamic Beta ($\beta_{t, 10d}$)**:
           $$\text{Notional}_B = \text{Notional}_A \times \beta_{t, 10d}$$
@@ -63,7 +64,7 @@ Whenever the user asks to analyze, screen the market, evaluate, or plan a tradin
    - **True Delta-Neutral Portfolio Architecture ($\Delta \approx 0$):** Balance the basket taking into account individual asset betas relative to BTC ($\sum w_i \beta_{i/BTC} \approx 0$), combining exhaustion shorts with support longs or cointegrated spreads.
    - **Barbell YOLO Moonshot Slot (Strict Asymmetric Convexity):**
      * **Barbell Philosophy (Nassim Taleb):** 90% of capital allocated to rigorous quantitative and Stat-Arb strategies, and 10% strictly ring-fenced for convex moonshots.
-     * **Objective:** Capture explosive breakout runs (+50% to +150% ROE) in memecoins (PEPE, WIF, BONK, DOGE, NEIRO) at 10x to 15x leverage.
+     * **Objective:** Capture explosive breakout runs (+50% to +150% ROE) in memecoins (PEPE, WIF, BONK, DOGE, NEIRO, PENGU, BOME, MOODENG) at 10x to 15x leverage.
      * **Mandatory Hardened Quantitative Filters:** Climax volume $\ge 2.0\times$ moving average OR buyer absorption wick $\ge 50\%$. If no memecoin meets this threshold, **the YOLO slot must remain empty** (never force trades).
      * **Right-Tail Skewness Preservation (Zero Truncation):** On 15x memecoins, **do NOT move Stop Loss to Break-Even prematurely** to prevent premature whipsawing by 5m microstructure noise. Stop Loss is ratcheted to Break-Even only after **TP1 (+75% ROE)** is filled, letting positive convexity run.
      * **Isolated Risk Control:** Strict capital limit ($10 USDT real margin) and **mandatory Isolated Margin** so maximum loss is programmatically capped by software (maximum -$3.75 USDT) with zero contagion to the main balance.
@@ -79,7 +80,7 @@ Whenever the user asks to analyze, screen the market, evaluate, or plan a tradin
    - **Technical Execution Engine (`execute_futures_trade.py` / `crypto_radar:deploy_futures_trade`):**
      * Margin: Mandatory Isolated
      * Leverage: 3x for standard, 15x for YOLO
-     * Size: $20 USDT margin (standard) / $10 USDT (YOLO)
+     * Size: $100 USDT margin (standard) / $10 USDT (YOLO)
      * Order 1: Entry with Technical Trigger Validation (or conditional `STOP_MARKET` / `LIMIT` to optimize taker fees)
      * Order 2: Stop Loss Algo Order with `closePosition: true` and dynamic adjusted buffer $\text{ATR}^*_t$:
        $$\text{ATR}^*_t = \text{ATR}_t \times \left(1 + \gamma_1 \frac{\text{Spread}_t}{\text{Spread}_{\text{median}}} + \gamma_2 \frac{|F_t - S_t|}{S_t} + \gamma_3 \mathbb{I}_{\{\text{cascade}\}}\right)$$

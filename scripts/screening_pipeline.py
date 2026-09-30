@@ -164,18 +164,16 @@ def enrich_and_size_candidate(c: dict) -> Optional[CandidateSetup]:
         direction = c["direction"]
         lev = 3
 
-        # Calculate volatility parity ($1.50 target risk)
-        sizing = qre.calculate_volatility_parity_sizing(sym, entry, sl, target_dollar_risk=1.50, leverage=lev, target_env="testnet")
-        if not sizing or "error" in sizing:
-            req_margin = 20.0
-            step_qty = 0.0
-            actual_notional = 60.0
-            risk_dollar = 1.50
-        else:
-            req_margin = sizing["required_margin"]
-            step_qty = sizing["step_qty"]
-            actual_notional = sizing["actual_notional"]
-            risk_dollar = sizing["actual_dollar_risk"]
+        # Calculate dynamic equity sizing (default 0.5% equity risk per trade, or user profile)
+        sizing = qre.calculate_dynamic_equity_sizing(sym, entry, sl, risk_pct_equity=None, leverage=lev, target_env="testnet")
+        if not sizing or "error" in sizing or sizing.get("step_qty", 0.0) <= 0.0:
+            logger.warning(f"Sizing inválido o no cuantizable para {sym}: {sizing.get('error') if sizing else 'Empty sizing'}")
+            return None
+
+        req_margin = sizing["required_margin"]
+        step_qty = sizing["step_qty"]
+        actual_notional = sizing["actual_notional"]
+        risk_dollar = sizing["actual_dollar_risk"]
 
         micro = c.get("micro") or {}
         tape = me.get_live_aggtrades_tape(sym) or {}

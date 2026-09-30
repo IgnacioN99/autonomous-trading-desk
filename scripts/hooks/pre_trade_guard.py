@@ -81,8 +81,17 @@ def main():
         # -------------------------------------------------------------
         is_trading_command = False
         if tool_name == "run_command":
-            if any(script in command_line for script in ["execute_futures_trade.py", "deploy_fresh_basket.py", "deploy_"]):
-                is_trading_command = True
+            # Decompose chained commands (&&, ;, ||, |) to prevent prefix-based bypass
+            subcmds = re.split(r'(&&|;|\|\||\|)', command_line)
+            for subcmd in subcmds:
+                subcmd_clean = subcmd.strip()
+                if not subcmd_clean or subcmd_clean in ["&&", ";", "||", "|"]:
+                    continue
+                if any(subcmd_clean.startswith(p) for p in ["git ", "gh ", "grep ", "cat ", "ls ", "find ", "diff ", "python3 -m py_compile "]):
+                    continue
+                if any(script in subcmd_clean for script in ["execute_futures_trade.py", "deploy_fresh_basket.py", "deploy_"]):
+                    is_trading_command = True
+                    break
         elif tool_name == "call_mcp_tool":
             server_name = args.get("ServerName", "")
             mcp_tool_name = args.get("ToolName", "")
@@ -203,8 +212,10 @@ def main():
         print(json.dumps({"decision": "allow", "reason": "Mechanical hard gates and subagent validation PASSED successfully."}))
 
     except Exception as e:
-        # In case of internal error, fail OPEN with warning to avoid deadlocking workspace
-        print(json.dumps({"decision": "allow", "reason": f"Hook warning: {str(e)}"}))
+        # FAIL-CLOSED: Any internal hook error blocks execution — never silently allow
+        sys.stderr.write(f"[PRE-TRADE-GUARD INTERNAL ERROR] {str(e)}\n")
+        print(json.dumps({"decision": "deny",
+                          "reason": f"🚨 FAIL-CLOSED: Pre-trade guard internal error ({str(e)}). Cannot verify safety — order blocked."}))
 
 if __name__ == "__main__":
     main()
