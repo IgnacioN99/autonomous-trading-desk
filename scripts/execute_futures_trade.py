@@ -253,8 +253,8 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
     if is_testnet:
         max_allowed_loss = max(account_equity * 0.025, 50.0)
     else:
-        # Dynamic equity risk (e.g. 0.5%) capped strictly by absolute loss limits
-        desk_abs_cap = 4.0 if leverage >= 10 else 2.50
+        # Dynamic equity risk (e.g. 0.5%) strictly bounded by desk absolute hard caps ($1.50 / $3.75)
+        desk_abs_cap = 3.75 if leverage >= 10 else 1.50
         max_allowed_loss = min(account_equity * 0.025, desk_abs_cap)
 
     if potential_dollar_loss > max_allowed_loss:

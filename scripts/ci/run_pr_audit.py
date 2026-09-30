@@ -170,7 +170,7 @@ def build_orchestrator_prompt(manifest: dict, diff: str) -> str:
         "</negative_constraints>",
         "",
         "<code_diff_to_audit>",
-        diff[:30000] if len(diff) > 30000 else diff,  # Safeguard length
+        diff[:150000] if len(diff) > 150000 else diff,  # Safeguard length (support complete PR diffs without truncation)
         "</code_diff_to_audit>",
         "",
         "<output_contract>",
