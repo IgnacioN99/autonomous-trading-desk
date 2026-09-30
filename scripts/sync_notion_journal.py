@@ -204,10 +204,13 @@ def reconcile_notion(api_key: str, db_id: str, dry_run: bool = False, target_env
                     update_payload["properties"][status_prop_name] = {p_type: {"name": new_status}}
                 if pnl_prop_name:
                     update_payload["properties"][pnl_prop_name] = {"number": round(pnl, 4)}
+                if "Entorno" in props_meta:
+                    env_label = "REAL" if str(target_env).lower() in ["prod", "mainnet", "production"] else "TESTNET"
+                    update_payload["properties"]["Entorno"] = {"select": {"name": env_label}}
 
                 upd_res = notion_api_request(f"pages/{page_id}", method="PATCH", data=update_payload, api_key=api_key)
                 if "error" not in upd_res:
-                    print(f"   ✅ Actualizado en Notion -> Estado: '{new_status}', PnL: {pnl:+.4f} USDT")
+                    print(f"   ✅ Actualizado en Notion -> Estado: '{new_status}', PnL: {pnl:+.4f} USDT, Entorno: '{env_label}'")
                     updated_count += 1
                 else:
                     print(f"   ❌ Fallo al actualizar página {page_id}: {upd_res.get('error')}")

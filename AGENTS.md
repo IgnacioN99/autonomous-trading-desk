@@ -5,7 +5,7 @@ Whenever the user asks to analyze, screen the market, evaluate, or plan a tradin
 0. **Quantitative Trading Agentic Architecture (Fail-Closed Deterministic Harness):**
    - **Layer 0: Pre-Flight Diagnostic, Onboarding Profiler & Health Sensor (`scripts/trading_doctor.py` & `scripts/user_profile.py`):**
      * Prior to any scanning or trading action, execute the Doctor and verify that the User Profile (`config/user_profile.json`) is calibrated. If uninitialized, prompt the user through an interactive onboarding interview to define risk tolerance (default 0.5% equity risk per trade, e.g. ~$50 on $10k, $5 on $1k, $0.50 on $100), max margin ceiling (30%), overnight handling mode, and YOLO moonshot preference.
-     * The Doctor validates API latency (<800ms), clock drift (<1000ms), API keys, USDT balance, and performs a **Forensic Orphan Position Audit**. If any open position lacks an active Stop Loss on Binance, it operates in **Fail CLOSED mode (exit code 1)** or triggers automatic `--heal`.
+     * The Doctor validates API latency (<800ms), clock drift (<1000ms), credentials (supporting both Binance MCP OAuth Agentic Gateway with isolated sub-account sandboxing and standard HMAC API Keys), USDT balance, and performs a **Forensic Orphan Position Audit**. If any open position lacks an active Stop Loss on Binance, it operates in **Fail CLOSED mode (exit code 1)** or triggers automatic `--heal`.
    - **Layer 1: Deterministic Ground Truth Synchronization (`scripts/sync_session_state.py`):**
      * Synchronizes in ~600ms directly against the real Binance ledger and writes `logs/session_state.json` (Single Source of Truth: daily PnL, floating PnL, algo orders, and portfolio Delta balance).
    - **Layer 2: Hard Code Gates (Mechanical Software Gates in `scripts/execute_futures_trade.py`):**
@@ -36,6 +36,9 @@ Whenever the user asks to analyze, screen the market, evaluate, or plan a tradin
      3. `"Anthropic Agentic Systems & Evaluator-Optimizer Workflows"` (`9bf5952c-43c4-46b5-964c-d709ad5d7c71`): Multi-agent orchestration, tool use error response engineering, parallel request decomposition, and MCP client/server contracts.
      4. `"Ingeniería de Prompts y Arquitectura Agéntica de Producción"` (`fb995c39-49ea-459a-b648-7112ed690cf5`): Guía canónica de prompts, delimitación XML jerárquica, optimización KV-cache y negative few-shots.
    - Ingest fresh news, newsletters, and macro/crypto catalysts: execute `python3 scripts/fetch_newsletters.py --folder "<YOUR_NEWSLETTERS_FOLDER>"` (or MCP tool `crypto_radar:get_crypto_newsletters`) to inspect tagged crypto emails (Glassnode, Blockworks, etc.) and reject late-stage euphoria or avoid entering right before scheduled high-impact events.
+   - **Market Rank & Institutional Flow Screening (Binance Skills Integration):**
+     * **Capital Inflow & Hype Radar (`crypto-market-rank`):** Screen tokens with highest smart-money net inflows, trending social hype, and top trader positioning to identify where institutional liquidity is clustering prior to technical chart filtering.
+     * **Smart Money & Whale Orderflow Confluence (`binance-wallet-tracker` & `trading-signal`):** Verify on-chain accumulation/distribution patterns and discrete whale buy/sell signals on key assets to back up technical absorption wicks ($\ge 60\%$) and Order Flow Imbalance.
    - Screen liquid Binance Futures contracts concurrently across 80+ pairs (15m/5m/1h via `python3 scripts/broad_market_radar.py` or MCP tools), targeting volume absorption wicks, RSI extremes, and distance to EMA 20.
    - **Dual-Engine Operational Framework:**
       * **Engine 1: Disciplined Pure Intraday (Day Trading Desk):**
@@ -66,6 +69,7 @@ Whenever the user asks to analyze, screen the market, evaluate, or plan a tradin
      * **Barbell Philosophy (Nassim Taleb):** 90% of capital allocated to rigorous quantitative and Stat-Arb strategies, and 10% strictly ring-fenced for convex moonshots.
      * **Objective:** Capture explosive breakout runs (+50% to +150% ROE) in memecoins (PEPE, WIF, BONK, DOGE, NEIRO, PENGU, BOME, MOODENG) at 10x to 15x leverage.
      * **Mandatory Hardened Quantitative Filters:** Climax volume $\ge 2.0\times$ moving average OR buyer absorption wick $\ge 50\%$. If no memecoin meets this threshold, **the YOLO slot must remain empty** (never force trades).
+     * **Narrative & Launchpad Acceleration (`meme-rush`):** Cross-check memecoin candidates with real-time launchpad lifecycle and AI hot topics (`topic-rush` / `meme-rush`) to guarantee active speculative momentum and capital inflow velocity before entering.
      * **Right-Tail Skewness Preservation (Zero Truncation):** On 15x memecoins, **do NOT move Stop Loss to Break-Even prematurely** to prevent premature whipsawing by 5m microstructure noise. Stop Loss is ratcheted to Break-Even only after **TP1 (+75% ROE)** is filled, letting positive convexity run.
      * **Isolated Risk Control:** Strict capital limit ($10 USDT real margin) and **mandatory Isolated Margin** so maximum loss is programmatically capped by software (maximum -$3.75 USDT) with zero contagion to the main balance.
 

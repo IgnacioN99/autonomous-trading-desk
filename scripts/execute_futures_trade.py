@@ -55,12 +55,213 @@ def load_env(target_env=None):
 
     return config
 
+def get_mcp_oauth_token(cfg: dict = None):
+    """Retrieves official Binance Agentic OAuth token if authenticated via MCP."""
+    if cfg:
+        token = cfg.get('BINANCE_MCP_OAUTH_TOKEN') or cfg.get('BINANCE_OAUTH_TOKEN')
+        if token and token.strip():
+            return token.strip()
+
+    env_token = os.environ.get('BINANCE_MCP_OAUTH_TOKEN') or os.environ.get('BINANCE_OAUTH_TOKEN')
+    if env_token and env_token.strip():
+        return env_token.strip()
+
+    # Fallback to loading prod.env if cfg not passed
+    try:
+        loaded_cfg = load_env(target_env='prod')
+        token = loaded_cfg.get('BINANCE_MCP_OAUTH_TOKEN') or loaded_cfg.get('BINANCE_OAUTH_TOKEN')
+        if token and token.strip():
+            return token.strip()
+    except Exception:
+        pass
+
+    custom_path = (cfg.get('BINANCE_MCP_OAUTH_PATH') if cfg else None) or os.environ.get('BINANCE_MCP_OAUTH_PATH')
+    candidate_paths = [custom_path] if custom_path else []
+    candidate_paths.extend([
+        os.path.expanduser('~/.gemini/antigravity/mcp_oauth_tokens.json'),
+        os.path.expanduser('~/.config/antigravity/mcp_oauth_tokens.json')
+    ])
+
+    for p in candidate_paths:
+        if p and os.path.exists(p):
+            try:
+                with open(p, 'r', encoding='utf-8') as f:
+                    d = json.load(f)
+                    tok = d.get('https://agent.binance.com/mcp/agentic', {}).get('token', {}).get('access_token')
+                    if tok:
+                        return tok
+            except Exception:
+                continue
+    return None
+
+def call_binance_mcp(tool_name: str, args: dict = None):
+    """Executes official Binance MCP tools via the agent.binance.com JSON-RPC gateway."""
+    token = get_mcp_oauth_token()
+    if not token:
+        return {"error": "Binance MCP OAuth token not found in ~/.gemini/antigravity/mcp_oauth_tokens.json or BINANCE_MCP_OAUTH_TOKEN"}
+
+    payload = {
+        "jsonrpc": "2.0",
+        "id": int(time.time() * 1000),
+        "method": "tools/call",
+        "params": {
+            "name": tool_name,
+            "arguments": args or {}
+        }
+    }
+    req = urllib.request.Request(
+        "https://agent.binance.com/mcp/agentic",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        },
+        data=json.dumps(payload).encode("utf-8")
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            content = data.get("result", {}).get("content", [{}])[0].get("text", "")
+            if content.startswith("[") or content.startswith("{"):
+                try:
+                    return json.loads(content)
+                except Exception:
+                    pass
+            return content
+    except Exception as e:
+        return {"error": f"MCP Gateway Error: {str(e)}"}
+
+def send_mcp_gateway_request(method, endpoint, params=None):
+    """Routes Binance Futures requests directly to the Binance Agentic MCP gateway."""
+    if params is None:
+        params = {}
+    
+    # 1. Balance
+    if endpoint in ['/fapi/v2/balance', '/fapi/v3/balance']:
+        return call_binance_mcp('futures_usds.futuresAccountBalanceV3')
+
+    # 2. Position Risk
+    if endpoint in ['/fapi/v2/positionRisk', '/fapi/v1/positionRisk']:
+        pos_data = call_binance_mcp('futures_usds.positionInformationV2')
+        if isinstance(pos_data, list) and params.get('symbol'):
+            return [p for p in pos_data if p.get('symbol') == params['symbol']]
+        return pos_data
+
+    # 3. Open Orders
+    if endpoint == '/fapi/v1/openOrders':
+        return call_binance_mcp('futures_usds.currentAllOpenOrders', {'symbol': params.get('symbol')} if params.get('symbol') else {})
+
+    # 4. Open Algo Orders (Stop Loss / Take Profit triggers)
+    if endpoint == '/fapi/v1/openAlgoOrders':
+        orders = call_binance_mcp('futures_usds.currentAllOpenOrders', {'symbol': params.get('symbol')} if params.get('symbol') else {})
+        if isinstance(orders, list):
+            algos = []
+            for o in orders:
+                if o.get('type') in ['STOP_MARKET', 'STOP', 'TAKE_PROFIT_MARKET', 'TAKE_PROFIT']:
+                    algos.append({
+                        'algoId': o.get('orderId'),
+                        'symbol': o.get('symbol'),
+                        'side': o.get('side'),
+                        'triggerPrice': float(o.get('stopPrice', 0)),
+                        'orderType': o.get('type'),
+                        'closePosition': o.get('closePosition', False) or o.get('reduceOnly', False)
+                    })
+            return algos
+        return orders
+
+    # 5. Leverage
+    if endpoint == '/fapi/v1/leverage' and method.upper() == 'POST':
+        return call_binance_mcp('futures_usds.changeInitialLeverage', {'symbol': params['symbol'], 'leverage': int(params['leverage'])})
+
+    # 6. Margin Type
+    if endpoint == '/fapi/v1/marginType' and method.upper() == 'POST':
+        return call_binance_mcp('futures_usds.changeMarginType', {'symbol': params['symbol'], 'marginType': params['marginType']})
+
+    # 7. Cancel Single Order
+    if endpoint == '/fapi/v1/order' and method.upper() == 'DELETE':
+        return call_binance_mcp('futures_usds.cancelOrder', {'symbol': params['symbol'], 'orderId': int(params['orderId'])})
+
+    # 8. Cancel Algo Order
+    if endpoint == '/fapi/v1/algoOrder' and method.upper() == 'DELETE':
+        order_id = params.get('algoId') or params.get('orderId')
+        return call_binance_mcp('futures_usds.cancelOrder', {'symbol': params['symbol'], 'orderId': int(order_id)})
+
+    # 9. Cancel All Open Orders
+    if endpoint == '/fapi/v1/allOpenOrders' and method.upper() == 'DELETE':
+        open_orders = call_binance_mcp('futures_usds.currentAllOpenOrders', {'symbol': params.get('symbol')} if params.get('symbol') else {})
+        canceled = []
+        if isinstance(open_orders, list):
+            for o in open_orders:
+                c_res = call_binance_mcp('futures_usds.cancelOrder', {'symbol': o['symbol'], 'orderId': int(o['orderId'])})
+                canceled.append(c_res)
+        return canceled
+
+    # 10. Place New Order
+    if endpoint == '/fapi/v1/order' and method.upper() == 'POST':
+        mcp_args = {
+            'symbol': params['symbol'],
+            'side': params['side'],
+            'type': params['type']
+        }
+        if 'quantity' in params:
+            mcp_args['quantity'] = float(params['quantity'])
+        if 'price' in params:
+            mcp_args['price'] = float(params['price'])
+        if 'stopPrice' in params:
+            mcp_args['stopPrice'] = float(params['stopPrice'])
+        if 'timeInForce' in params and params['type'] in ['LIMIT', 'STOP', 'TAKE_PROFIT']:
+            mcp_args['timeInForce'] = params['timeInForce']
+        if 'reduceOnly' in params:
+            mcp_args['reduceOnly'] = str(params['reduceOnly']).lower()
+        if 'closePosition' in params:
+            mcp_args['closePosition'] = str(params['closePosition']).lower()
+        return call_binance_mcp('futures_usds.newOrder', mcp_args)
+
+    # 11. Place Algo Stop Loss
+    if endpoint == '/fapi/v1/algoOrder' and method.upper() == 'POST':
+        trig_p = float(params.get('triggerPrice') or params.get('stopPrice', 0))
+        close_pos = str(params.get('closePosition', 'true')).lower()
+        mcp_args = {
+            'symbol': params['symbol'],
+            'side': params['side'],
+            'type': 'STOP_MARKET',
+            'stopPrice': trig_p,
+            'closePosition': close_pos
+        }
+        if close_pos != 'true':
+            if 'quantity' in params:
+                mcp_args['quantity'] = float(params['quantity'])
+            if 'reduceOnly' in params:
+                mcp_args['reduceOnly'] = str(params['reduceOnly']).lower()
+
+        res = call_binance_mcp('futures_usds.newOrder', mcp_args)
+        if isinstance(res, dict) and 'orderId' in res:
+            res['algoId'] = res['orderId']
+        return res
+
+    # Public fallbacks: time, ticker, exchangeInfo
+    public_url = f"https://fapi.binance.com{endpoint}"
+    if params:
+        qs = urllib.parse.urlencode(params)
+        public_url = f"{public_url}?{qs}"
+    try:
+        req = urllib.request.Request(public_url, headers={'User-Agent': 'BinanceAgentic/1.0'}, method=method.upper())
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read().decode('utf-8'))
+    except Exception as e:
+        return {"error": f"Public fallback error: {str(e)}"}
+
 def get_client_config(target_env='testnet'):
     cfg = load_env(target_env=target_env)
     env = (target_env or 'testnet').lower()
     norm_env = 'prod' if env in ['prod', 'mainnet', 'production'] else 'testnet'
     
     if norm_env == 'prod':
+        auth_mode = str(cfg.get('BINANCE_AUTH_MODE', '')).strip().lower()
+        mcp_token = get_mcp_oauth_token(cfg)
+        # If explicitly MCP mode OR OAuth token is present, use MCP Agentic Gateway
+        if auth_mode == 'mcp' or (mcp_token and not cfg.get('BINANCE_PROD_API_KEY')):
+            return "MCP_OAUTH_ACTIVE", mcp_token or "mcp_token", "https://fapi.binance.com"
+
         api_key = cfg.get('BINANCE_PROD_API_KEY') or cfg.get('BINANCE_API_KEY', '')
         secret_key = cfg.get('BINANCE_PROD_SECRET_KEY') or cfg.get('BINANCE_SECRET_KEY', '')
         base_url = cfg.get('BINANCE_FUTURES_BASE_URL') or 'https://fapi.binance.com'
@@ -98,6 +299,9 @@ def send_signed_request(method, endpoint, params=None, target_env='testnet', ret
     api_key, secret_key, base_url = get_client_config(target_env)
     if not api_key:
         return {"error": "Binance credentials not configured in .env"}
+
+    if api_key == "MCP_OAUTH_ACTIVE":
+        return send_mcp_gateway_request(method, endpoint, params=params)
 
     if params is None:
         params = {}
