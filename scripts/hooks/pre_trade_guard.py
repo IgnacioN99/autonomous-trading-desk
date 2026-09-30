@@ -87,7 +87,7 @@ def main():
                 subcmd_clean = subcmd.strip()
                 if not subcmd_clean or subcmd_clean in ["&&", ";", "||", "|"]:
                     continue
-                if any(subcmd_clean.startswith(p) for p in ["git ", "gh ", "grep ", "cat ", "ls ", "find ", "diff "]):
+                if any(subcmd_clean.startswith(p) for p in ["git ", "gh ", "grep ", "cat ", "ls ", "find ", "diff ", "python3 -m py_compile "]):
                     continue
                 if any(script in subcmd_clean for script in ["execute_futures_trade.py", "deploy_fresh_basket.py", "deploy_"]):
                     is_trading_command = True

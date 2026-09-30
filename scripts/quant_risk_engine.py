@@ -216,6 +216,12 @@ def calculate_fixed_margin_sizing(symbol, entry_price, sl_price, margin_usdt=100
     actual_margin = actual_notional / leverage
     actual_dollar_risk = actual_notional * risk_pct
 
+    # Volatility Parity Guard: in production, dollar risk must strictly respect desk ceilings ($2.50 max)
+    if str(target_env).lower() != "testnet" and actual_dollar_risk > 2.50:
+        return {
+            "error": f"VOLATILITY_PARITY_BREACH: Fixed margin yields ${actual_dollar_risk:.2f} risk, exceeding the $2.50 PROD risk cap. Use calculate_dynamic_equity_sizing instead."
+        }
+
     is_long = entry_price > sl_price
     direction = "LONG" if is_long else "SHORT"
 

@@ -248,13 +248,17 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
         else:
             return False, f"MECHANICAL HARD GATE REJECTION: FAIL-CLOSED — Cannot verify account equity for PROD ({e}). Order blocked."
 
-    # Cap = 2.5% of equity (allows 2.0% user risk + 0.5% buffer for tick rounding)
-    # PROD minimum floor: $5 USDT; Testnet: proportional only (no inflated $250 floor)
-    max_allowed_loss = account_equity * 0.025
-    if not is_testnet:
-        max_allowed_loss = max(max_allowed_loss, 5.0)
+    # Mechanical Monetary Risk Gate: Strict capital preservation cap
+    # PROD must strictly enforce desk risk ceilings ($2.50 buffer for standard / $4.00 for YOLO)
+    if is_testnet:
+        max_allowed_loss = max(account_equity * 0.025, 50.0)
+    else:
+        # Dynamic equity risk (e.g. 0.5%) capped strictly by absolute loss limits
+        desk_abs_cap = 4.0 if leverage >= 10 else 2.50
+        max_allowed_loss = min(account_equity * 0.025, desk_abs_cap)
+
     if potential_dollar_loss > max_allowed_loss:
-        return False, f"MECHANICAL HARD GATE REJECTION: Monetary risk exceeds allowed cap (${potential_dollar_loss:.2f} > ${max_allowed_loss:.2f} USDT, equity: ${account_equity:.2f}). Adjust margin or position size."
+        return False, f"MECHANICAL HARD GATE REJECTION: Monetary risk exceeds allowed cap (${potential_dollar_loss:.2f} > ${max_allowed_loss:.2f} USDT, cap: ${max_allowed_loss:.2f} USDT). Adjust margin or position size."
 
     # 3. Financial Friction and Fee Gate (Relaxed in testnet for testing)
     if tp1_price and not is_testnet:
