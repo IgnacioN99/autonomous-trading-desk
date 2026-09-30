@@ -16,9 +16,12 @@ import urllib.request
 import json
 from decimal import Decimal, ROUND_DOWN
 
-def load_env():
-    env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env')
+def load_env(target_env=None):
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     config = {}
+
+    # 1. Base .env file if present
+    env_path = os.path.join(base_dir, '.env')
     if os.path.exists(env_path):
         with open(env_path, 'r', encoding='utf-8') as f:
             for line in f:
@@ -26,18 +29,49 @@ def load_env():
                 if line and not line.startswith('#') and '=' in line:
                     k, v = line.split('=', 1)
                     config[k.strip()] = v.strip().strip('"').strip("'")
+
+    # 2. Environment-specific configuration file (config/environments/{env}.env or ENV_FILE)
+    env_file = os.environ.get('ENV_FILE')
+    effective_env = (target_env or os.environ.get('BINANCE_API_ENV') or config.get('BINANCE_API_ENV', 'testnet')).lower()
+    norm_env = 'prod' if effective_env in ['prod', 'mainnet', 'production'] else 'testnet'
+
+    if not env_file:
+        cand = os.path.join(base_dir, 'config', 'environments', f'{norm_env}.env')
+        if os.path.exists(cand):
+            env_file = cand
+
+    if env_file and os.path.exists(env_file):
+        with open(env_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    k, v = line.split('=', 1)
+                    config[k.strip()] = v.strip().strip('"').strip("'")
+
+    # 3. Environment variables from os.environ take highest precedence
+    for k, v in os.environ.items():
+        if k.startswith(('BINANCE_', 'LIVE_TRADING_', 'GMAIL_', 'NOTION_', 'GITHUB_')) or k in ['ENV', 'TARGET_ENV', 'BINANCE_API_ENV']:
+            config[k] = v
+
     return config
 
 def get_client_config(target_env='testnet'):
-    cfg = load_env()
-    api_key = cfg.get('BINANCE_API_KEY', '')
-    secret_key = cfg.get('BINANCE_SECRET_KEY', '')
-    env = target_env.lower()
+    cfg = load_env(target_env=target_env)
+    env = (target_env or 'testnet').lower()
+    norm_env = 'prod' if env in ['prod', 'mainnet', 'production'] else 'testnet'
+    
+    if norm_env == 'prod':
+        api_key = cfg.get('BINANCE_PROD_API_KEY') or cfg.get('BINANCE_API_KEY', '')
+        secret_key = cfg.get('BINANCE_PROD_SECRET_KEY') or cfg.get('BINANCE_SECRET_KEY', '')
+        base_url = cfg.get('BINANCE_FUTURES_BASE_URL') or 'https://fapi.binance.com'
+    else:
+        api_key = cfg.get('BINANCE_TESTNET_API_KEY') or cfg.get('BINANCE_API_KEY', '')
+        secret_key = cfg.get('BINANCE_TESTNET_SECRET_KEY') or cfg.get('BINANCE_SECRET_KEY', '')
+        base_url = cfg.get('BINANCE_FUTURES_BASE_URL') or 'https://testnet.binancefuture.com'
     
     if not api_key or 'PEGA_AQUI' in api_key:
         return None, None, None
         
-    base_url = 'https://testnet.binancefuture.com' if env == 'testnet' else 'https://fapi.binance.com'
     return api_key, secret_key, base_url
 
 _SERVER_OFFSET = {}
@@ -271,6 +305,14 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
 def execute_complete_trade(symbol, direction, leverage, margin_usdt, sl_price, tp1_price, tp2_price, target_env='testnet', trigger_price=None, order_type='MARKET', limit_price=None, bypass_delta_gate=False):
     # Dynamic Guardrail: margin capped at max_margin_ratio (30%) of total account equity
     is_prod = target_env.lower() != 'testnet'
+    if is_prod:
+        cfg = load_env(target_env=target_env)
+        if str(cfg.get('LIVE_TRADING_ARMED', '')).strip().lower() != 'true':
+            return {
+                "success": False,
+                "hard_gate_rejection": True,
+                "error": "FAIL-CLOSED: Environment is PROD but LIVE_TRADING_ARMED is not 'true'. Live trading execution is disarmed."
+            }
     try:
         import quant_risk_engine as qre
         account_equity = qre.get_account_equity(target_env)

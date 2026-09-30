@@ -306,6 +306,7 @@ def format_markdown_summary(state: dict) -> str:
     return "\n".join(lines)
 
 if __name__ == "__main__":
-    env = sys.argv[1] if len(sys.argv) > 1 else "testnet"
+    default_env = os.environ.get("BINANCE_API_ENV", "testnet").lower()
+    env = sys.argv[1] if len(sys.argv) > 1 else default_env
     state = sync_session_state(target_env=env)
     print(format_markdown_summary(state))

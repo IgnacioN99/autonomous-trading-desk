@@ -41,15 +41,29 @@ def run_doctor(target_env: str = "testnet", auto_heal: bool = False) -> int:
     ok_items = []
 
     # 1. API Configuration & Credentials
+    cfg = eft.load_env(target_env=target_env)
     api_key, secret_key, base_url = eft.get_client_config(target_env=target_env)
     if not api_key or not secret_key:
-        critical_failures.append("API credentials not found or invalid in .env")
-        print("❌ [API KEYS] Missing credentials or placeholder in .env")
+        critical_failures.append(f"API credentials not found or invalid in environment config for {target_env.upper()}")
+        print(f"❌ [API KEYS] Missing credentials or placeholder in environment config for {target_env.upper()}")
         return 1
     else:
         masked_key = f"{api_key[:6]}...{api_key[-4:]}" if len(api_key) > 10 else "***"
         ok_items.append(f"Credentials detected for {target_env.upper()} ({masked_key})")
         print(f"✅ [API KEYS] Credentials OK ({target_env.upper()})")
+
+    # Safety Flag verification for PROD
+    norm_env = "prod" if str(target_env).lower() in ["prod", "mainnet", "production"] else "testnet"
+    if norm_env == "prod":
+        is_armed = str(cfg.get("LIVE_TRADING_ARMED", "")).strip().lower() == "true"
+        if not is_armed:
+            critical_failures.append("LIVE_TRADING_ARMED=true is required for PROD/MAINNET live trading.")
+            print("❌ [SAFETY FLAG] LIVE_TRADING_ARMED is not 'true'. Live execution disarmed.")
+        else:
+            ok_items.append("LIVE_TRADING_ARMED=true verified for PROD.")
+            print("✅ [SAFETY FLAG] LIVE_TRADING_ARMED=true verified (PROD ARMED)")
+    else:
+        print("ℹ️  [SAFETY FLAG] Sandbox mode (Testnet). LIVE_TRADING_ARMED flag not required.")
 
     # 2. Network Latency & Clock Drift
     try:
@@ -237,7 +251,7 @@ def run_doctor(target_env: str = "testnet", auto_heal: bool = False) -> int:
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Trading Doctor - Pre-flight Health Check")
-    parser.add_argument("--env", default="testnet", choices=["testnet", "mainnet"], help="Target execution environment")
+    parser.add_argument("--env", default="testnet", choices=["testnet", "mainnet", "prod"], help="Target execution environment")
     parser.add_argument("--heal", action="store_true", help="Auto-heal orphan positions by placing emergency SL")
     args = parser.parse_args()
 
