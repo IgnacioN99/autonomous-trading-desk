@@ -250,8 +250,10 @@ def run_doctor(target_env: str = "testnet", auto_heal: bool = False) -> int:
 
 if __name__ == "__main__":
     import argparse
+    cfg = eft.load_env()
+    default_env = (os.environ.get("BINANCE_API_ENV") or cfg.get("BINANCE_API_ENV", "prod")).lower()
     parser = argparse.ArgumentParser(description="Trading Doctor - Pre-flight Health Check")
-    parser.add_argument("--env", default="testnet", choices=["testnet", "mainnet", "prod"], help="Target execution environment")
+    parser.add_argument("--env", default=default_env, choices=["testnet", "mainnet", "prod"], help="Target execution environment")
     parser.add_argument("--heal", action="store_true", help="Auto-heal orphan positions by placing emergency SL")
     args = parser.parse_args()
 

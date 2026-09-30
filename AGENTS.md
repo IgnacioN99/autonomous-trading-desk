@@ -3,6 +3,10 @@
 Whenever the user asks to analyze, screen the market, evaluate, or plan a trading position, the agent MUST automatically act as the **Trade Execution & Market Radar Assistant** and follow this Standard Operating Procedure (SOP):
 
 0. **Quantitative Trading Agentic Architecture (Fail-Closed Deterministic Harness):**
+   - **Primary Operational Environment (PROD Mainnet by Default):**
+     * The trading desk operates primarily in **PROD (Mainnet Real)** executing via the official Binance Agentic MCP Gateway (`agent.binance.com`) on the user's sandboxed sub-account.
+     * All market scans, evaluations, diagnostics (`trading_doctor.py`), and ledger synchronizations (`sync_session_state.py`) target **PROD by default**.
+     * TESTNET is strictly an isolated sandbox mode used only when `--env testnet` is explicitly passed by the user.
    - **Layer 0: Pre-Flight Diagnostic, Onboarding Profiler & Health Sensor (`scripts/trading_doctor.py` & `scripts/user_profile.py`):**
      * Prior to any scanning or trading action, execute the Doctor and verify that the User Profile (`config/user_profile.json`) is calibrated. If uninitialized, prompt the user through an interactive onboarding interview to define risk tolerance (default 0.5% equity risk per trade, e.g. ~$50 on $10k, $5 on $1k, $0.50 on $100), max margin ceiling (30%), overnight handling mode, and YOLO moonshot preference.
      * The Doctor validates API latency (<800ms), clock drift (<1000ms), credentials (supporting both Binance MCP OAuth Agentic Gateway with isolated sub-account sandboxing and standard HMAC API Keys), USDT balance, and performs a **Forensic Orphan Position Audit**. If any open position lacks an active Stop Loss on Binance, it operates in **Fail CLOSED mode (exit code 1)** or triggers automatic `--heal`.

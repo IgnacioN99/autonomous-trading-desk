@@ -312,7 +312,8 @@ if __name__ == "__main__":
     parser.add_argument("--env", default=None, help="Target execution environment (--env)")
     args = parser.parse_args()
 
-    default_env = os.environ.get("BINANCE_API_ENV", "testnet").lower()
+    cfg = eft.load_env()
+    default_env = (os.environ.get("BINANCE_API_ENV") or cfg.get("BINANCE_API_ENV", "prod")).lower()
     target_env = args.env or args.env_pos or default_env
     state = sync_session_state(target_env=target_env)
     print(format_markdown_summary(state))
