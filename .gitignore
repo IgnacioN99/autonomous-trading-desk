@@ -4,6 +4,8 @@
 .env
 .env.*
 !.env.example
+config/environments/*.env
+!config/environments/*.example
 *.pem
 *.key
 *.secret

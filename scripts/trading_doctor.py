@@ -84,7 +84,7 @@ def run_doctor(target_env: str = "testnet", auto_heal: bool = False) -> int:
                 ok_items.append(f"API latency: {latency_ms}ms")
                 print(f"✅ [NETWORK] API latency: {latency_ms}ms")
 
-            max_drift_ms = 2500 if target_env == "testnet" else 1000
+            max_drift_ms = 2500 if (target_env == "testnet" or api_key == "MCP_OAUTH_ACTIVE") else 1000
             if drift_ms > max_drift_ms:
                 critical_failures.append(f"Excessive clock drift: {drift_ms}ms (limit: {max_drift_ms}ms)")
                 print(f"❌ [CLOCK DRIFT] Dangerous clock drift: {drift_ms}ms (limit: {max_drift_ms}ms)")

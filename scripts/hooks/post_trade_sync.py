@@ -80,7 +80,7 @@ def handle_post_trade_sync(payload: dict) -> dict:
         ]
         if any(kw in command_line for kw in trading_keywords):
             order_placed = True
-            if "execute_futures_trade.py" in command_line and "--close" not in command_line and "close_position_market" not in command_line:
+            if "execute_futures_trade" in command_line and "--close" not in command_line and "close_position_market" not in command_line:
                 is_opening = True
 
     result = {
