@@ -26,16 +26,23 @@ from pathlib import Path
 def invoke_auditor(prompt: str) -> str:
     """Invokes the auditor agent via agy CLI (local) or direct Gemini API (cloud CI)."""
     # 1. Prefer local agy CLI if installed and available in PATH
-    model = os.getenv("AGY_REVIEW_MODEL", "claude-sonnet-4-6")
+    model = os.getenv("AGY_REVIEW_MODEL", "gemini-3.8-flash-medium")
     agy_path = shutil.which("agy") or os.path.expanduser("~/.local/bin/agy")
     if os.path.isfile(agy_path):
         agy_cmd = [agy_path, "-p", prompt, "--dangerously-skip-permissions", "--model", model]
-        # --effort is only supported for Gemini models
-        if not model.startswith("claude"):
+        # Set effort parameter appropriately
+        if "medium" in model:
+            agy_cmd += ["--effort", "medium"]
+        elif "high" in model:
             agy_cmd += ["--effort", "high"]
+        elif "low" in model:
+            agy_cmd += ["--effort", "low"]
+        elif not model.startswith("claude"):
+            agy_cmd += ["--effort", "medium"]
+
         try:
             print(f"  -> Usando Antigravity CLI ('{agy_path}') con modelo '{model}'...")
-            res = subprocess.run(agy_cmd, capture_output=True, text=True, check=True, timeout=300)
+            res = subprocess.run(agy_cmd, capture_output=True, text=True, check=True, timeout=600)
             if res.stdout.strip():
                 return res.stdout.strip()
         except Exception as e:
@@ -231,6 +238,19 @@ def main():
     print("[4/4] Verificando cobertura mecánica del reporte...")
     verify_cmd = [sys.executable, "scripts/ci/verify_review.py", str(manifest_path), report_file]
     verify_res = subprocess.run(verify_cmd)
+
+    # Post comment to GitHub PR if available
+    try:
+        if shutil.which("gh"):
+            gh_res = subprocess.run(["gh", "pr", "view", "--json", "number"], capture_output=True, text=True)
+            if gh_res.returncode == 0 and gh_res.stdout.strip():
+                pr_num = json.loads(gh_res.stdout).get("number")
+                if pr_num:
+                    print(f"[GITHUB] Publicando informe de auditoría en PR #{pr_num}...")
+                    subprocess.run(["gh", "pr", "comment", str(pr_num), "--body-file", report_file], check=True)
+                    print(f"✅ [GITHUB] Informe publicado exitosamente en PR #{pr_num}.")
+    except Exception as e:
+        print(f"Aviso GitHub: No se pudo publicar el comentario en el PR: {e}")
     
     if verify_res.returncode != 0:
         print("❌ FALLO DE AUDITORÍA: El reporte no cumplió con las verificaciones mecánicas.")
