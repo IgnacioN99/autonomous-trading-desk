@@ -237,6 +237,7 @@ class TestSafeIssueReporting(unittest.TestCase):
         env["GITHUB_REPO"] = ""
         res = subprocess.run(
             [
+                "bash",
                 script_path,
                 "--title", "Test Anomaly ghp_abcdef1234567890abcdef",
                 "--error", "Failed with balance $9999.00 USDT and secret_token1234567890",

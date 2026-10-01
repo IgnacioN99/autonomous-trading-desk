@@ -173,7 +173,21 @@ class TestDynamicEquityRiskGate(unittest.TestCase):
             "portfolio_exposure": {"delta_bias": "NEUTRAL"}
         })
 
-        with patch("builtins.open", mock_open(read_data=valid_state)):
+        log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        state_file = os.path.join(log_dir, "session_state.json")
+        orig_content = None
+        if os.path.exists(state_file):
+            try:
+                with open(state_file, "r", encoding="utf-8") as f:
+                    orig_content = f.read()
+            except Exception:
+                pass
+
+        try:
+            with open(state_file, "w", encoding="utf-8") as f:
+                f.write(valid_state)
+
             # Loss of $10.00 exceeds $6.25 cap -> rejected
             ok, reason = eft.check_mechanical_gates(
                 direction="LONG",
@@ -201,6 +215,15 @@ class TestDynamicEquityRiskGate(unittest.TestCase):
             )
             self.assertTrue(ok_valid)
             self.assertIsNone(reason_valid)
+        finally:
+            if orig_content is not None:
+                with open(state_file, "w", encoding="utf-8") as f:
+                    f.write(orig_content)
+            elif os.path.exists(state_file):
+                try:
+                    os.remove(state_file)
+                except Exception:
+                    pass
 
 
 class TestAutoDestructAndFailSafe(unittest.TestCase):
