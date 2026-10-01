@@ -16,6 +16,8 @@ gmail_config.json
 # =================================================================
 config/user_profile.json
 !config/user_profile.json.example
+config/user_context.json
+!config/user_context.json.example
 
 # =================================================================
 # RUNTIME TELEMETRY & LOGS (Preserve directory structure via .gitkeep)

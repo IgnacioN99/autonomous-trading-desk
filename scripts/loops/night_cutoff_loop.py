@@ -30,12 +30,23 @@ import execute_futures_trade as eft
 import dynamic_exit_manager as dem
 from utils.env_resolver import resolve_env
 
-def run_night_cutoff(target_env: str = None, auto_ratchet: bool = True):
+def run_night_cutoff(target_env: str = None, auto_ratchet: bool = True, overnight_mode: str = None):
     target_env = resolve_env(target_env)
+
+    try:
+        import user_profile as up
+        prof = up.load_user_profile()
+    except Exception:
+        prof = {}
+
+    if not overnight_mode:
+        overnight_mode = prof.get("overnight_mode", "ZERO_OVERNIGHT_RISK")
+
     print("=" * 70)
     print("🌙 NIGHT CUTOFF LOOP — OVERNIGHT RISK SHIELDING PROTOCOL")
     print(f"UTC Time: {datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
     print(f"Target Environment: {target_env.upper()}")
+    print(f"Overnight Mode: {overnight_mode}")
     print("=" * 70)
 
     # 1. Fetch active positions from Binance
@@ -45,7 +56,7 @@ def run_night_cutoff(target_env: str = None, auto_ratchet: bool = True):
     if not active:
         print("✅ ZERO OPEN POSITIONS: Portfolio 100% clean. Zero overnight risk.")
     else:
-        print(f"🛡️  AUDITING {len(active)} LIVE POSITION(S):")
+        print(f"🛡️  AUDITING {len(active)} LIVE POSITION(S) [Mode: {overnight_mode}]:")
         for p in active:
             sym = p["symbol"]
             amt = float(p["positionAmt"])
@@ -59,7 +70,18 @@ def run_night_cutoff(target_env: str = None, auto_ratchet: bool = True):
             print(f"\n   • {sym} ({direction} {abs(amt):.3f} @ {entry_p:.5f})")
             print(f"     Current Mark: {mark_p:.5f} | Floating PnL: ${unpnl:+.2f} USDT ({roe_pct:+.1f}% ROE)")
 
-            # Verify active Stop Loss
+            # Mode 1: CLOSE_ALL_AT_MARKET -> Close 100% of positions at market
+            if overnight_mode == "CLOSE_ALL_AT_MARKET":
+                print(f"     🚪 CLOSE_ALL_AT_MARKET mode: Closing {sym} at market to eliminate overnight exposure...")
+                close_res = eft.close_position_market(sym, target_env=target_env)
+                if close_res.get("success"):
+                    print(f"     ✅ Position {sym} successfully closed at market.")
+                else:
+                    print(f"     ❌ Failed to close {sym} at market: {close_res.get('error')}")
+                continue
+
+            # For SWING_STRUCTURAL_STOP and ZERO_OVERNIGHT_RISK:
+            # First, verify active Stop Loss
             algos = eft.send_signed_request("GET", "/fapi/v1/openAlgoOrders", {"symbol": sym}, target_env=target_env)
             active_sl = [a for a in algos if a.get("orderType") in ["STOP_MARKET", "STOP"]] if isinstance(algos, list) else []
 
@@ -71,25 +93,48 @@ def run_night_cutoff(target_env: str = None, auto_ratchet: bool = True):
                 sl_rounded = eft.round_price(emergency_sl, filters["tickSize"], filters["precision_price"])
                 eft.place_algo_stop_loss(sym, exit_side, sl_rounded, target_env=target_env)
                 print(f"     ✅ Emergency Stop Loss placed at {sl_rounded}")
+                sl_price = float(sl_rounded)
             else:
                 sl_price = float(active_sl[0].get("triggerPrice", 0))
                 print(f"     🛡️ Confirmed active Stop Loss at: {sl_price:.5f}")
 
-                # If position is in substantial profit, ratchet to True Net Break-Even
-                if roe_pct >= 5.0 and auto_ratchet:
-                    fee_buffer = 0.002
-                    target_be = entry_p * (1.0 + fee_buffer) if direction == "LONG" else entry_p * (1.0 - fee_buffer)
-                    filters = eft.get_symbol_filters(sym, target_env=target_env)
-                    be_rounded = eft.round_price(target_be, filters["tickSize"], filters["precision_price"])
+            # Ratchet winning positions to True Net Break-Even (+0.2% fee buffer)
+            ratcheted_to_be = False
+            fee_buffer = 0.002
+            target_be = entry_p * (1.0 + fee_buffer) if direction == "LONG" else entry_p * (1.0 - fee_buffer)
+            filters = eft.get_symbol_filters(sym, target_env=target_env)
+            be_rounded = eft.round_price(target_be, filters["tickSize"], filters["precision_price"])
 
-                    is_better = (be_rounded > sl_price) if direction == "LONG" else (be_rounded < sl_price)
-                    if is_better:
-                        print(f"     📈 Position in profit (+{roe_pct:.1f}% ROE). Ratcheting to True Net Break-Even...")
-                        be_res = eft.move_sl_to_breakeven(sym, target_env=target_env)
-                        if be_res.get("success"):
-                            print(f"     ✅ SL Shielded to Break-Even at {be_rounded} (+0.2% fees covered). ZERO RISK.")
-                        else:
-                            print(f"     ⚠️  Warning tightening SL: {be_res.get('error')}")
+            is_already_at_be = (sl_price >= be_rounded) if direction == "LONG" else (sl_price <= be_rounded)
+            if is_already_at_be:
+                ratcheted_to_be = True
+
+            if roe_pct >= 5.0 and auto_ratchet and not is_already_at_be:
+                is_better = (be_rounded > sl_price) if direction == "LONG" else (be_rounded < sl_price)
+                if is_better:
+                    print(f"     📈 Position in profit (+{roe_pct:.1f}% ROE). Ratcheting to True Net Break-Even...")
+                    be_res = eft.move_sl_to_breakeven(sym, target_env=target_env)
+                    if be_res.get("success"):
+                        print(f"     ✅ SL Shielded to Break-Even at {be_rounded} (+0.2% fees covered). ZERO RISK.")
+                        ratcheted_to_be = True
+                    else:
+                        print(f"     ⚠️  Warning tightening SL: {be_res.get('error')}")
+
+            # Mode 2: SWING_STRUCTURAL_STOP -> Allow positions with verified SL to remain open
+            if overnight_mode == "SWING_STRUCTURAL_STOP":
+                print(f"     🌊 SWING_STRUCTURAL_STOP mode: Position {sym} permitted overnight with verified SL at {sl_price:.5f}.")
+
+            # Mode 3: ZERO_OVERNIGHT_RISK -> Ratchet winning to True Net BE and close unhedged directional positions
+            elif overnight_mode == "ZERO_OVERNIGHT_RISK":
+                if not ratcheted_to_be:
+                    print(f"     ⚠️ Position {sym} not at Break-Even (ROE: {roe_pct:.1f}%). ZERO_OVERNIGHT_RISK requires closing unhedged positions...")
+                    close_res = eft.close_position_market(sym, target_env=target_env)
+                    if close_res.get("success"):
+                        print(f"     ✅ Unhedged position {sym} closed at market (Zero Overnight Risk guaranteed).")
+                    else:
+                        print(f"     ❌ Failed to close {sym} at market: {close_res.get('error')}")
+                else:
+                    print(f"     🛡️ Position {sym} is safely locked at True Net Break-Even. Zero unhedged overnight risk.")
 
     # 2. Cleanup orphan limit orders
     print("\n🧹 ORPHAN LIMIT ORDERS CLEANUP:")
@@ -135,6 +180,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Night Cutoff Loop - Zero Overnight Risk")
     parser.add_argument("--env", default=default_env, help="Target execution environment (prod/testnet)")
     parser.add_argument("--auto-ratchet", action="store_true", default=True)
+    parser.add_argument("--overnight-mode", dest="overnight_mode", choices=["ZERO_OVERNIGHT_RISK", "CLOSE_ALL_AT_MARKET", "SWING_STRUCTURAL_STOP"], default=None, help="Override overnight mode from profile")
     args = parser.parse_args()
 
-    run_night_cutoff(target_env=args.env, auto_ratchet=args.auto_ratchet)
+    run_night_cutoff(target_env=args.env, auto_ratchet=args.auto_ratchet, overnight_mode=args.overnight_mode)

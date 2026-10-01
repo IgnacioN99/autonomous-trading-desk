@@ -2,7 +2,7 @@
 name: trade-execution-planner
 description: >
   Crypto trade execution planner, market radar, and risk manager. Grounded in
-  quantitative volatility research (e.g. via NotebookLM: <YOUR_NOTEBOOKLM_NOTEBOOK_ID_1>).
+  quantitative volatility research (configured via config/user_context.json or local research notebooks).
   Screens the live Binance Futures market, ingests news/catalysts, presents a ranked
   TOP opportunities list by probability/confluence, and assists in selecting,
   deploying with zero-error Binance fields, and syncing to the Notion Trading Journal.
@@ -20,8 +20,8 @@ Activate whenever the user:
 - Wants execution parameters for Binance Futures and synchronization with Notion.
 
 ## Phase 1: Grounded Research & Market Screening
-1. Consult quantitative research notebooks (e.g. via NotebookLM: `<YOUR_NOTEBOOKLM_NOTEBOOK_ID_1>`) for mathematical rules on candlestick absorption wicks, Spot CVD divergence, Open Interest washouts, and Kelly / Volatility Parity sizing.
-2. Ingest fresh newsletters & macro catalysts: run `python3 scripts/fetch_newsletters.py --folder "<YOUR_NEWSLETTERS_FOLDER>"` to ingest research feeds (Glassnode, Blockworks, etc.) and reject late-stage euphoria or avoid entering right before scheduled high-impact events.
+1. Consult quantitative research notebooks (configured via `config/user_context.json` or local research files in `research/`) for mathematical rules on candlestick absorption wicks, Spot CVD divergence, Open Interest washouts, and Kelly / Volatility Parity sizing.
+2. Ingest fresh newsletters & macro catalysts: run `python3 scripts/fetch_newsletters.py` (reads folder from `config/user_context.json`, `NEWSLETTERS_FOLDER` env var, or `--folder`) to ingest research feeds (Glassnode, Blockworks, etc.) and reject late-stage euphoria or avoid entering right before scheduled high-impact events.
 3. Screen top liquid Binance Futures pairs (RSI, distance to 24h lows/highs, volume wicks, EMA 20/50).
 
 ## Phase 2: TOP 5-6 Opportunities Ranking
@@ -49,5 +49,5 @@ Generate a clear, ranked table with 5 to 6 setups ordered by confluence and prob
 
 ## Phase 4: Notion Journal Sync
 Sync the chosen position to Notion:
-- Database: `Trading Journal - Futures` (`collection://<YOUR_NOTION_COLLECTION_ID>`).
+- Database: `Trading Journal - Futures` (Notion database ID configured in `config/user_context.json` or `.env`; see `docs/notion_setup_guide.md`).
 - Include all parameters, strategy notes, and execution status (`Open` or `Pending`).

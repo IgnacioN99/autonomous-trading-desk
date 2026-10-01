@@ -276,16 +276,24 @@ def validate_dossier(dossier_data: dict, now_ts: int) -> Tuple[bool, str, int]:
     return True, "Dossier valid and approved.", effective_expiry
 
 
-def check_leverage_gate(symbol: str, requested_leverage: int, base_dir: str) -> Tuple[bool, str]:
+def check_leverage_gate(symbol: str, requested_leverage: int, base_dir: str, user_prof: dict = None) -> Tuple[bool, str]:
     """
-    Validates leverage changes against standard limits (<= 3x) or approved YOLO status.
+    Validates leverage changes against standard limits (read from user_profile.get("leverage_standard", 3)) or approved YOLO status.
     """
-    if requested_leverage <= 3:
-        return True, "Standard leverage (<= 3x) authorized."
+    if user_prof is None:
+        try:
+            import user_profile as up
+            user_prof = up.load_user_profile()
+        except Exception:
+            user_prof = {}
+
+    std_lev = int(user_prof.get("leverage_standard", 3))
+    if requested_leverage <= std_lev:
+        return True, f"Standard leverage (<= {std_lev}x) authorized."
 
     dossier_file = os.path.join(base_dir, "logs", "evaluations", "latest_dossier.json")
     if not os.path.exists(dossier_file):
-        return False, f"🚨 BLOCKED BY PRE-TOOL-USE HOOK (Leverage Gate): Requested leverage ({requested_leverage}x > 3x) exceeds standard ceiling and no evaluation dossier exists."
+        return False, f"🚨 BLOCKED BY PRE-TOOL-USE HOOK (Leverage Gate): Requested leverage ({requested_leverage}x > {std_lev}x) exceeds standard ceiling and no evaluation dossier exists."
 
     try:
         with open(dossier_file, "r", encoding="utf-8") as f:
@@ -301,6 +309,10 @@ def check_leverage_gate(symbol: str, requested_leverage: int, base_dir: str) -> 
     approved_symbols = [s.upper() for s in dossier_data.get("approved_symbols", [])]
     if symbol and symbol.upper() not in approved_symbols:
         return False, f"🚨 BLOCKED BY PRE-TOOL-USE HOOK (Leverage Gate): Asset '{symbol}' is not approved in evaluation dossier."
+
+    # Verify YOLO slot enabled in user profile
+    if not user_prof.get("yolo_slot_enabled", False):
+        return False, f"🚨 BLOCKED BY PRE-TOOL-USE HOOK (Leverage Gate): Requested leverage ({requested_leverage}x > {std_lev}x) requires YOLO status, but YOLO moonshot slot is disabled in user profile."
 
     # Verify YOLO authorization
     is_yolo_authorized = False
@@ -331,7 +343,7 @@ def check_leverage_gate(symbol: str, requested_leverage: int, base_dir: str) -> 
     else:
         return False, (
             f"🚨 BLOCKED BY PRE-TOOL-USE HOOK (Leverage Gate): "
-            f"Requested leverage ({requested_leverage}x > 3x) for '{symbol}' is not authorized as a YOLO moonshot in the evaluation dossier."
+            f"Requested leverage ({requested_leverage}x > {std_lev}x) for '{symbol}' is not authorized as a YOLO moonshot in the evaluation dossier."
         )
 
 
@@ -479,6 +491,13 @@ def main() -> int:
         except ValueError as ve:
             return emit_decision("deny", reason=f"🚨 FAIL-CLOSED (Environment Resolution): {str(ve)}", code=2)
 
+        # Load user profile safely
+        try:
+            import user_profile as up
+            user_prof = up.load_user_profile()
+        except Exception:
+            user_prof = {}
+
         # -------------------------------------------------------------
         # 3. LEVERAGE GATE
         # -------------------------------------------------------------
@@ -493,7 +512,7 @@ def main() -> int:
                     code=2
                 )
 
-            allowed, reason = check_leverage_gate(target_sym, requested_lev, base_dir)
+            allowed, reason = check_leverage_gate(target_sym, requested_lev, base_dir, user_prof=user_prof)
             if allowed:
                 return emit_decision("allow", reason=reason)
             else:
@@ -520,7 +539,67 @@ def main() -> int:
             has_bypass_delta = False
 
         # -------------------------------------------------------------
-        # 5. GATE 1: MANDATORY CLEAN-ROOM EVALUATOR (HARNESS GATE)
+        # 5. USER PROFILE GATES: AUTONOMOUS TIER S & YOLO SLOT
+        # -------------------------------------------------------------
+        # Check Autonomous Tier S execution gate in PROD
+        if is_prod and not user_prof.get("autonomous_execution_tier_s", False):
+            is_confirmed = False
+            if re.search(r"--(?:confirmed|user[-_]confirmed)\b", command_line, re.IGNORECASE):
+                is_confirmed = True
+            elif args.get("confirmed") is True or mcp_args.get("confirmed") is True:
+                is_confirmed = True
+            elif args.get("user_confirmed") is True or mcp_args.get("user_confirmed") is True:
+                is_confirmed = True
+
+            if not is_confirmed:
+                return emit_decision(
+                    "deny",
+                    reason=(
+                        "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Autonomous Execution Disabled):\n"
+                        "Autonomous Tier S execution is disabled in user profile (autonomous_execution_tier_s=False).\n"
+                        "Human confirmation is required in PROD before opening new positions.\n"
+                        "👉 Add '--confirmed' flag or enable autonomous execution via 'python3 scripts/user_profile.py --set-autonomous-tier-s true'."
+                    ),
+                    code=2
+                )
+
+        # Check leverage ceiling and YOLO slot
+        std_lev = int(user_prof.get("leverage_standard", 3))
+        is_yolo_trade = False
+        if "--is-yolo" in command_line or args.get("is_yolo") is True or mcp_args.get("is_yolo") is True:
+            is_yolo_trade = True
+
+        trade_lev = 3
+        if "--leverage" in command_line:
+            m_lev = re.search(r"--leverage(?:\s+|=)(\d+)", command_line)
+            if m_lev:
+                try:
+                    trade_lev = int(m_lev.group(1))
+                except Exception:
+                    pass
+        elif "leverage" in mcp_args:
+            try:
+                trade_lev = int(mcp_args["leverage"])
+            except Exception:
+                pass
+        elif "leverage" in args:
+            try:
+                trade_lev = int(args["leverage"])
+            except Exception:
+                pass
+
+        if trade_lev > std_lev:
+            is_yolo_trade = True
+
+        if is_yolo_trade and not user_prof.get("yolo_slot_enabled", False):
+            return emit_decision(
+                "deny",
+                reason="🚨 BLOCKED BY PRE-TOOL-USE HOOK (YOLO Slot Disabled): YOLO moonshot slot is disabled in user profile.",
+                code=2
+            )
+
+        # -------------------------------------------------------------
+        # 6. GATE 1: MANDATORY CLEAN-ROOM EVALUATOR (HARNESS GATE)
         # -------------------------------------------------------------
         dossier_file = os.path.join(base_dir, "logs", "evaluations", "latest_dossier.json")
 
@@ -577,6 +656,21 @@ def main() -> int:
                     ),
                     code=2
                 )
+
+            # Check if approved candidate requires YOLO slot
+            for cand in dossier_data.get("approved_candidates", []):
+                if str(cand.get("symbol", "")).upper() == target_sym:
+                    cand_yolo = cand.get("is_yolo")
+                    tier = str(cand.get("tier", "")).lower()
+                    strat = str(cand.get("strategy", "")).lower()
+                    if cand_yolo is True or str(cand_yolo).lower() == "true" or "yolo" in tier or "yolo" in strat:
+                        if not user_prof.get("yolo_slot_enabled", False):
+                            return emit_decision(
+                                "deny",
+                                reason="🚨 BLOCKED BY PRE-TOOL-USE HOOK (YOLO Slot Disabled): Candidate requires YOLO moonshot slot, which is disabled in user profile.",
+                                code=2
+                            )
+                    break
 
         # -------------------------------------------------------------
         # 6. GATE 2: DELTA-NEUTRAL & SESSION STATE AUDIT
@@ -641,6 +735,27 @@ def main() -> int:
                 return emit_decision(
                     "deny",
                     reason=f"🚨 FAIL-CLOSED: session_state.json está OBSOLETO ({age_seconds}s > 300s). Re-sincronice el estado de sesión.",
+                    code=2
+                )
+
+            # Max open positions check from user profile
+            max_open_positions = int(user_prof.get("max_open_positions", 3))
+            portfolio = state.get("portfolio_exposure", {})
+            total_active = portfolio.get("total_active_positions")
+            if total_active is None:
+                total_active = len(state.get("active_positions", []))
+            try:
+                total_active = int(total_active)
+            except Exception:
+                total_active = 0
+
+            if total_active >= max_open_positions:
+                return emit_decision(
+                    "deny",
+                    reason=(
+                        f"🚨 BLOCKED BY PRE-TOOL-USE HOOK (Max Open Positions Gate): "
+                        f"Active positions ({total_active}) reached or exceeded maximum limit ({max_open_positions}) configured in user profile."
+                    ),
                     code=2
                 )
 

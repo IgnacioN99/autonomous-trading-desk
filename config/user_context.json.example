@@ -1,0 +1,16 @@
+{
+  "notebooklm": {
+    "bitcoin_microstructure_notebook_id": "your-notebook-uuid-here",
+    "stat_arb_notebook_id": "your-notebook-uuid-here",
+    "agentic_systems_notebook_id": "your-notebook-uuid-here",
+    "prompt_engineering_notebook_id": "your-notebook-uuid-here"
+  },
+  "newsletters": {
+    "folder": "Newsletters/Crypto",
+    "gmail_user": "your_email@gmail.com"
+  },
+  "notion": {
+    "collection_id": "your_notion_collection_id_here",
+    "database_id": "your_notion_database_id_here"
+  }
+}

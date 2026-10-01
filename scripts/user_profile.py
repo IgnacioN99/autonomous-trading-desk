@@ -33,9 +33,10 @@ DEFAULT_PROFILE = {
     "max_margin_ratio": 0.30,          # Maximum 30% of equity per position
     "max_open_positions": 3,           # Maximum concurrent active positions
     "operating_mode": "BALANCED_DELTA_NEUTRAL", # BALANCED_DELTA_NEUTRAL | CONSERVATIVE | AGGRESSIVE
+    "autonomous_execution_tier_s": False, # Cold start: autonomous execution disabled by default; requires explicit opt-in
     "yolo_slot_enabled": False,        # Barbell memecoin moonshot slot (10x-15x, $10 margin or 0.5% equity)
     "yolo_equity_pct": 0.005,          # 0.5% default margin for YOLO moonshots (e.g. $50 on $10k)
-    "overnight_mode": "ZERO_OVERNIGHT_RISK", # ZERO_OVERNIGHT_RISK | SWING_STRUCTURAL_STOP
+    "overnight_mode": "ZERO_OVERNIGHT_RISK", # ZERO_OVERNIGHT_RISK | CLOSE_ALL_AT_MARKET | SWING_STRUCTURAL_STOP
     "leverage_standard": 3,
     "leverage_yolo": 15,
     "experience_level": "INTERMEDIATE",# BEGINNER | INTERMEDIATE | ADVANCED_QUANT
@@ -129,10 +130,16 @@ def interactive_terminal_onboarding():
 
     # 2. Gestión Nocturna
     print("\n2. ¿Cómo prefieres gestionar las posiciones abiertas durante la noche (22:00 UTC)?")
-    print("   [1] Cero Riesgo Nocturno (Ratchetear a Break-Even obligatorio o cerrar)")
-    print("   [2] Swing Estructural (Permitir posiciones abiertas con Stop Loss estructural)")
-    c2 = input("Selecciona [1/2]: ").strip()
-    current["overnight_mode"] = "ZERO_OVERNIGHT_RISK" if c2 != "2" else "SWING_STRUCTURAL_STOP"
+    print("   [1] Cero Riesgo Nocturno (ZERO_OVERNIGHT_RISK - Ratchetear a Break-Even obligatorio o cerrar)")
+    print("   [2] Cerrar Todo al Mercado (CLOSE_ALL_AT_MARKET - Liquidar 100% de posiciones a las 22:00 UTC)")
+    print("   [3] Swing Estructural (SWING_STRUCTURAL_STOP - Permitir posiciones con Stop Loss estructural)")
+    c2 = input("Selecciona [1/2/3]: ").strip()
+    if c2 == "2":
+        current["overnight_mode"] = "CLOSE_ALL_AT_MARKET"
+    elif c2 == "3":
+        current["overnight_mode"] = "SWING_STRUCTURAL_STOP"
+    else:
+        current["overnight_mode"] = "ZERO_OVERNIGHT_RISK"
 
     # 3. Slot YOLO Memecoins
     print("\n3. ¿Deseas activar el slot Barbell YOLO (10x-15x en memecoins con clímax, máx $10 margin)?")
@@ -159,6 +166,13 @@ def interactive_terminal_onboarding():
         except Exception:
             pass
 
+    # 5. Ejecución Autónoma Tier S
+    print("\n5. ¿Deseas activar la ejecución autónoma inmediata para oportunidades Tier S?")
+    print("   [1] No (Recomendado / Seguro: Requiere confirmación humana en chat antes de desplegar)")
+    print("   [2] Sí (Fast-Track: Ejecución y blindaje autónomo inmediato en setups Tier S aprobados)")
+    c5 = input("Selecciona [1/2]: ").strip()
+    current["autonomous_execution_tier_s"] = (c5 == "2")
+
     save_user_profile(current)
     print("\n" + "=" * 65)
     print(f"✅ PERFIL GUARDADO EXITOSAMENTE en config/user_profile.json")
@@ -166,6 +180,7 @@ def interactive_terminal_onboarding():
     print(f"• Modo nocturno: {current['overnight_mode']}")
     print(f"• Slot YOLO: {'ACTIVADO' if current['yolo_slot_enabled'] else 'DESACTIVADO'}")
     print(f"• Apalancamiento estándar: {current['leverage_standard']}x")
+    print(f"• Ejecución autónoma Tier S: {'ACTIVADA (Fast-Track)' if current.get('autonomous_execution_tier_s') else 'DESACTIVADA (Requiere confirmación humana)'}")
     print("=" * 65)
 
 if __name__ == "__main__":
@@ -173,15 +188,36 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="User Profile & Onboarding Engine")
     parser.add_argument("--setup", action="store_true", help="Run interactive terminal onboarding")
     parser.add_argument("--set-risk", type=float, help="Set risk percent equity (e.g. 0.005 or 0.5)")
+    parser.add_argument("--set-autonomous-tier-s", choices=["true", "false", "True", "False"], help="Set autonomous execution Tier S")
+    parser.add_argument("--set-overnight-mode", choices=["ZERO_OVERNIGHT_RISK", "CLOSE_ALL_AT_MARKET", "SWING_STRUCTURAL_STOP"], help="Set overnight mode")
+    parser.add_argument("--set-max-positions", type=int, help="Set max open positions limit")
+    parser.add_argument("--set-yolo", choices=["true", "false", "True", "False"], help="Enable/disable YOLO moonshot slot")
+    parser.add_argument("--set-leverage-standard", type=int, help="Set standard leverage limit")
     parser.add_argument("--show", action="store_true", help="Show current profile")
     args = parser.parse_args()
 
+    updates = {}
     if args.setup:
         interactive_terminal_onboarding()
-    elif args.set_risk is not None:
-        val = args.set_risk / 100.0 if args.set_risk > 0.05 else args.set_risk
-        save_user_profile({"risk_pct_equity": val})
-        print(f"✅ Risk updated to {val*100:.2f}% of equity.")
-    elif args.show or len(sys.argv) == 1:
-        prof = load_user_profile()
-        print(json.dumps(prof, indent=2))
+    else:
+        if args.set_risk is not None:
+            val = args.set_risk / 100.0 if args.set_risk > 0.05 else args.set_risk
+            updates["risk_pct_equity"] = val
+        if args.set_autonomous_tier_s is not None:
+            updates["autonomous_execution_tier_s"] = args.set_autonomous_tier_s.lower() == "true"
+        if args.set_overnight_mode is not None:
+            updates["overnight_mode"] = args.set_overnight_mode
+        if args.set_max_positions is not None:
+            updates["max_open_positions"] = int(args.set_max_positions)
+        if args.set_yolo is not None:
+            updates["yolo_slot_enabled"] = args.set_yolo.lower() == "true"
+        if args.set_leverage_standard is not None:
+            updates["leverage_standard"] = int(args.set_leverage_standard)
+
+        if updates:
+            save_user_profile(updates)
+            print(f"✅ Profile updated: {updates}")
+
+        if args.show or (len(sys.argv) == 1 and not updates):
+            prof = load_user_profile()
+            print(json.dumps(prof, indent=2))

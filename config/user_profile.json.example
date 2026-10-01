@@ -4,6 +4,7 @@
   "max_margin_ratio": 0.30,
   "max_open_positions": 3,
   "operating_mode": "BALANCED_DELTA_NEUTRAL",
+  "autonomous_execution_tier_s": false,
   "yolo_slot_enabled": false,
   "yolo_equity_pct": 0.005,
   "overnight_mode": "ZERO_OVERNIGHT_RISK",

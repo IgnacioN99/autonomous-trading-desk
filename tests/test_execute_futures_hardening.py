@@ -128,7 +128,8 @@ class TestLeverageCeilingGates(unittest.TestCase):
         self.assertIsNone(reason)
 
     @patch("quant_risk_engine.get_account_equity", return_value=10000.0)
-    def test_standard_leverage_up_to_5x_allowed(self, mock_eq):
+    @patch("user_profile.load_user_profile", return_value={"leverage_standard": 5, "max_open_positions": 5, "yolo_slot_enabled": True})
+    def test_standard_leverage_up_to_5x_allowed(self, mock_prof, mock_eq):
         for lev in [1, 2, 3, 5]:
             ok, reason = eft.check_mechanical_gates(
                 direction="LONG",
