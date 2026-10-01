@@ -6,7 +6,7 @@
 # with zero Python dependencies (requires only bash and curl).
 #
 # If Python or the virtual environment crashes, this script continues functioning
-# to report the incident directly to GitHub.
+# to report the incident directly to GitHub or safely enqueue in local backlog.
 #
 # Usage:
 #   ./scripts/report_issue.sh --title "Binance API Failure" --error "Error 429 Too Many Requests" --severity "HIGH"
@@ -18,7 +18,28 @@ set -e
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOGS_DIR="${BASE_DIR}/logs"
 BACKLOG_FILE="${LOGS_DIR}/issues_backlog.jsonl"
-DEFAULT_REPO="IgnacioN99/autonomous-trading-desk"
+
+derive_repo() {
+    if [ -n "${GITHUB_REPO:-}" ]; then
+        echo "$GITHUB_REPO"
+        return
+    fi
+    if command -v git >/dev/null 2>&1; then
+        local remote_url
+        remote_url=$(git -C "$BASE_DIR" config --get remote.origin.url 2>/dev/null || true)
+        if [ -n "$remote_url" ]; then
+            if echo "$remote_url" | grep -qi "github.com"; then
+                local parsed
+                parsed=$(echo "$remote_url" | sed -E -e 's#(https?://[^/]+/|git@[^:]+:)##' -e 's#\.git$##')
+                if [ -n "$parsed" ]; then
+                    echo "$parsed"
+                    return
+                fi
+            fi
+        fi
+    fi
+    echo ""
+}
 
 # 1. Load variables from .env if present and not exported
 if [ -f "${BASE_DIR}/.env" ]; then
@@ -33,7 +54,7 @@ if [ -f "${BASE_DIR}/.env" ]; then
     done < "${BASE_DIR}/.env"
 fi
 
-REPO="${GITHUB_REPO:-$DEFAULT_REPO}"
+REPO="${GITHUB_REPO:-$(derive_repo)}"
 TOKEN="${GITHUB_TOKEN:-}"
 
 # Default parameters
@@ -90,6 +111,7 @@ while [[ $# -gt 0 ]]; do
             echo "  -c, --category <type>     agent_failure | risk_gate | tool_error | infra (default: agent_failure)"
             echo "  -a, --agent <name>        Reporting agent name (default: autonomous_agent)"
             echo "  -r, --remediation <text>  Suggested fix or remediation step"
+            echo "  --repo <owner/repo>       Target GitHub repository (derived dynamically if omitted)"
             echo "  --sync                    Dispatches pending offline backlog issues"
             exit 0
             ;;
@@ -106,6 +128,10 @@ mkdir -p "$LOGS_DIR"
 # Function: Offline Backlog Sync
 # ------------------------------------------------------------------------------
 sync_backlog() {
+    if [ -z "$REPO" ]; then
+        echo "❌ Error: GITHUB_REPO is not configured and cannot be derived from git remote."
+        exit 1
+    fi
     if [ -z "$TOKEN" ]; then
         echo "❌ Error: GITHUB_TOKEN is not defined in environment or .env."
         exit 1
@@ -124,9 +150,9 @@ sync_backlog() {
 
     while IFS= read -r line || [ -n "$line" ]; do
         [ -z "$line" ] && continue
-        
+
         item_title=$(echo "$line" | sed -n 's/.*"title": *\([^,]*\),.*/\1/p' | sed 's/^"//;s/"$//')
-        
+
         http_code=$(curl -s -o /dev/null -w "%{http_code}" \
             -X POST "https://api.github.com/repos/${REPO}/issues" \
             -H "Authorization: Bearer ${TOKEN}" \
@@ -163,6 +189,30 @@ if [ -z "$TITLE" ] || [ -z "$ERROR_DETAIL" ]; then
     exit 1
 fi
 
+# ------------------------------------------------------------------------------
+# Telemetry Sanitization
+# ------------------------------------------------------------------------------
+sanitize_telemetry() {
+    local text="$1"
+    # Redact GitHub Tokens
+    text=$(echo "$text" | sed -E 's/ghp_[A-Za-z0-9_]{20,}/[REDACTED_GH_TOKEN]/g')
+    text=$(echo "$text" | sed -E 's/github_pat_[A-Za-z0-9_]{20,}/[REDACTED_GH_PAT]/g')
+    # Redact Notion Tokens
+    text=$(echo "$text" | sed -E 's/(secret_|ntn_)[A-Za-z0-9_]{20,}/[REDACTED_NOTION_TOKEN]/g')
+    # Redact Bearer Tokens
+    text=$(echo "$text" | sed -E 's/(Bearer[[:space:]]+)[A-Za-z0-9\-._~+/]+=*/\1[REDACTED_TOKEN]/gI')
+    # Redact API Keys / Passwords
+    text=$(echo "$text" | sed -E 's/(api[_-]?key|secret[_-]?key|password|app[_-]?password)[[:space:]]*[:=][[:space:]]*["\x27]?[A-Za-z0-9/+=._-]{8,}["\x27]?/\1=[REDACTED]/gI')
+    # Redact balances and dollar amounts
+    text=$(echo "$text" | sed -E 's/\$[[:space:]]*[0-9]+(\.[0-9]+)?/[REDACTED_USD]/g')
+    text=$(echo "$text" | sed -E 's/[0-9]+(\.[0-9]+)?[[:space:]]*(USDT|USD)/[REDACTED_AMT] USDT/gI')
+    echo "$text"
+}
+
+CLEAN_TITLE=$(sanitize_telemetry "$TITLE")
+CLEAN_ERROR=$(sanitize_telemetry "$ERROR_DETAIL")
+CLEAN_REMEDIATION=$(sanitize_telemetry "$REMEDIATION")
+
 TIMESTAMP_UTC=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
 TARGET_ENV="${BINANCE_API_ENV:-TESTNET}"
 
@@ -191,15 +241,15 @@ MD_BODY=$(cat <<EOF
 ---
 
 ### 📋 Failure / Anomaly Description
-${ERROR_DETAIL}
+${CLEAN_ERROR}
 EOF
 )
 
-if [ -n "$REMEDIATION" ]; then
+if [ -n "$CLEAN_REMEDIATION" ]; then
     MD_BODY="${MD_BODY}
 
 ### 💡 Suggested Remediation
-${REMEDIATION}"
+${CLEAN_REMEDIATION}"
 fi
 
 MD_BODY="${MD_BODY}
@@ -215,7 +265,7 @@ json_escape() {
     echo -n "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a' -e 'N' -e '$!ba' -e 's/\n/\\n/g'
 }
 
-JSON_TITLE=$(echo -n "$TITLE" | json_escape 2>/dev/null || echo "\"$TITLE\"")
+JSON_TITLE=$(echo -n "$CLEAN_TITLE" | json_escape 2>/dev/null || echo "\"$CLEAN_TITLE\"")
 JSON_BODY=$(echo -n "$MD_BODY" | json_escape 2>/dev/null || echo "\"$MD_BODY\"")
 
 PAYLOAD=$(cat <<EOF
@@ -230,7 +280,7 @@ EOF
 # ------------------------------------------------------------------------------
 # Dispatch to GitHub API or Enqueue in Local Backlog
 # ------------------------------------------------------------------------------
-if [ -n "$TOKEN" ]; then
+if [ -n "$TOKEN" ] && [ -n "$REPO" ]; then
     HTTP_RESPONSE=$(curl -s -w "\n%{http_code}" \
         -X POST "https://api.github.com/repos/${REPO}/issues" \
         -H "Authorization: Bearer ${TOKEN}" \
@@ -250,6 +300,8 @@ if [ -n "$TOKEN" ]; then
     else
         echo "⚠️ Failed to connect to GitHub API (HTTP ${HTTP_STATUS}). Enqueueing in local backlog..."
     fi
+elif [ -z "$REPO" ]; then
+    echo "ℹ️ GITHUB_REPO not configured or detectable from git remote. Enqueueing issue in local backlog (${BACKLOG_FILE})..."
 else
     echo "ℹ️ GITHUB_TOKEN not detected in .env. Enqueueing issue in local backlog (${BACKLOG_FILE})..."
 fi
@@ -258,4 +310,4 @@ fi
 echo "$PAYLOAD" | tr '\n' ' ' >> "$BACKLOG_FILE"
 echo "" >> "$BACKLOG_FILE"
 echo "📁 Issue saved in local backlog (${BACKLOG_FILE})."
-echo "   To publish once GITHUB_TOKEN is configured: ./scripts/report_issue.sh --sync"
+echo "   To publish once GITHUB_TOKEN and GITHUB_REPO are configured: ./scripts/report_issue.sh --sync"

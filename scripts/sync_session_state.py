@@ -49,11 +49,14 @@ def load_audit_metadata() -> Dict[str, dict]:
             pass
     return meta
 
-def sync_session_state(target_env: str = "testnet") -> dict:
+def sync_session_state(target_env: str = None) -> dict:
     """
     Synchronizes directly against the Binance Futures ledger (Mainnet/Testnet)
     and generates the structured session state.
     """
+    if target_env is None:
+        cfg = eft.load_env()
+        target_env = (os.environ.get("BINANCE_API_ENV") or cfg.get("BINANCE_API_ENV", "prod")).lower()
     os.makedirs(LOGS_DIR, exist_ok=True)
     audit_meta = load_audit_metadata()
     now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -64,7 +67,54 @@ def sync_session_state(target_env: str = "testnet") -> dict:
     btc_price = float(btc_ticker.get("price", 0.0)) if isinstance(btc_ticker, dict) else 0.0
 
     # 2. Active Ledger Positions
-    pos_res = eft.send_signed_request("GET", "/fapi/v2/positionRisk", target_env=target_env)
+    try:
+        pos_res = eft.send_signed_request("GET", "/fapi/v2/positionRisk", target_env=target_env)
+    except Exception as e:
+        pos_res = {"error": str(e)}
+
+    # Finding 6: If positionRisk API call returns an error dict, exception, or non-list,
+    # DO NOT write session_state.json with 0 positions and DELTA_BALANCED.
+    if not isinstance(pos_res, list) or (isinstance(pos_res, dict) and ("code" in pos_res or "error" in pos_res or "msg" in pos_res)):
+        err_msg = f"Failed to fetch positionRisk from ledger: {pos_res}"
+        error_state = {
+            "is_valid": False,
+            "error": err_msg,
+            "last_updated_ts": now_ts,
+            "last_updated_utc": now_utc,
+            "target_env": target_env,
+            "macro_btc": {
+                "price_usdt": btc_price
+            },
+            "portfolio_exposure": {
+                "total_active_positions": 0,
+                "long_notional_usdt": 0.0,
+                "short_notional_usdt": 0.0,
+                "net_notional_delta_usdt": 0.0,
+                "delta_bias": "UNKNOWN",
+                "delta_advice": f"🚨 LEDGER SYNC FAILED: {err_msg}",
+                "total_floating_pnl_usdt": 0.0
+            },
+            "active_positions": [],
+            "active_sl_algo_orders": [],
+            "active_tp_limit_orders": [],
+            "closed_today_summary": {
+                "closed_trades_count": 0,
+                "wins": 0,
+                "losses": 0,
+                "win_rate_pct": 0.0,
+                "gross_realized_pnl_usdt": 0.0,
+                "commissions_usdt": 0.0,
+                "net_realized_pnl_usdt": 0.0
+            }
+        }
+        try:
+            from utils.atomic_writer import atomic_write_json
+            atomic_write_json(STATE_FILE, error_state)
+        except Exception:
+            with open(STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(error_state, f, indent=2, ensure_ascii=False)
+        return error_state
+
     active_positions = []
     long_notional = 0.0
     short_notional = 0.0
@@ -224,6 +274,8 @@ def sync_session_state(target_env: str = "testnet") -> dict:
 
     # Package consolidated state
     state = {
+        "is_valid": True,
+        "last_updated_ts": now_ts,
         "last_updated_utc": now_utc,
         "target_env": target_env,
         "macro_btc": {
@@ -265,6 +317,14 @@ def sync_session_state(target_env: str = "testnet") -> dict:
 
 def format_markdown_summary(state: dict) -> str:
     """Generates a compact Markdown report for direct consumption by any agent."""
+    if not state.get("is_valid", True):
+        return (
+            f"# 🚨 SESSION & PORTFOLIO STATE SYNC ERROR ({state.get('last_updated_utc', 'N/A')})\n\n"
+            f"**Status:** `INVALID` | **Env:** {str(state.get('target_env', 'UNKNOWN')).upper()}\n"
+            f"**Error:** {state.get('error', 'Ledger synchronization failed')}\n\n"
+            f"⚠️ Trading gates are FAIL-CLOSED until a valid session state is synchronized."
+        )
+
     exp = state["portfolio_exposure"]
     closed = state["closed_today_summary"]
     btc = state["macro_btc"]

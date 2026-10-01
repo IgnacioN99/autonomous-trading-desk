@@ -49,6 +49,23 @@ class HTMLTextExtractor(HTMLParser):
         clean_lines = [line for line in lines if line]
         return "\n".join(clean_lines)
 
+PROMPT_INJECTION_PATTERNS = [
+    re.compile(r'(?i)\bignore\s+(all\s+)?(previous|prior)\s+instructions\b'),
+    re.compile(r'(?i)\bdisregard\s+(all\s+)?(previous|prior)\s+instructions\b'),
+    re.compile(r'(?i)\b(system|developer|assistant|human)\s*:'),
+    re.compile(r'(?i)<\s*/?\s*(system|instruction|prompt)\s*>'),
+    re.compile(r'(?i)\byou\s+are\s+now\s+(a|an|in)\b'),
+]
+
+def sanitize_untrusted_text(text: str) -> str:
+    """Strips or defangs potential prompt injection overrides from untrusted external text."""
+    if not text:
+        return ""
+    sanitized = text
+    for pattern in PROMPT_INJECTION_PATTERNS:
+        sanitized = pattern.sub("[REDACTED_INJECTION_ATTEMPT]", sanitized)
+    return sanitized
+
 def load_credentials():
     # 1. Check local .env first
     if os.path.exists(LOCAL_ENV_PATH):
@@ -256,15 +273,18 @@ def fetch_emails(folder="Newsletters/Crypto", query=None, sender=None, limit=5, 
 
         # Clean preview snippet
         clean_preview = " ".join(body.split())[:300]
+        sanitized_preview = sanitize_untrusted_text(clean_preview)
+        sanitized_body = sanitize_untrusted_text(body[:4000])
 
         results.append({
-            "id": mid.decode(),
-            "subject": subject,
-            "from": from_hdr,
+            "id": mid.decode() if isinstance(mid, bytes) else str(mid),
+            "subject": sanitize_untrusted_text(subject),
+            "from": sanitize_untrusted_text(from_hdr),
             "date": date_hdr,
-            "snippet": clean_preview,
-            "content": body[:4000],  # First 4000 characters for sentiment/catalyst analysis
-            "full_length": len(body)
+            "snippet": f"<untrusted_newsletter_data>{sanitized_preview}</untrusted_newsletter_data>",
+            "content": f"<untrusted_newsletter_data>\n{sanitized_body}\n</untrusted_newsletter_data>",
+            "full_length": len(body),
+            "untrusted_external_content": True
         })
 
     mail.logout()
@@ -282,6 +302,7 @@ def fetch_emails(folder="Newsletters/Crypto", query=None, sender=None, limit=5, 
             "folder": folder,
             "count": len(results),
             "query_used": search_command,
+            "untrusted_external_content": True,
             "emails": results
         }
         print(json.dumps(output, ensure_ascii=False, indent=2))

@@ -33,18 +33,19 @@ Generate a clear, ranked table with 5 to 6 setups ordered by confluence and prob
   * Mean Reversion (1h RSI < 25 + volume absorption wick)
   * Pullback to Support / S-R Retest (order limit on confirmed support)
   * Breakout & Retest (volume breakout above 4h resistance)
-- **Levels:** Entry, Stop Loss, TP1 (50% size / EMA 20), TP2 (50% size / Structural target)
-- **Sizing & Returns:** $20 USDT margin, 3x for majors / 2x for low-caps, R:R ≥ 2:1, ROE %.
+- **Levels:** Entry, Stop Loss, TP1 (30% size at +1.8R to lock fees / free-trade), TP2 (70% size at +4.0R structural target)
+- **Sizing & Returns:** Standard dynamic equity sizing (default $100 USDT margin, 0.5% dynamic equity risk, 3x leverage) / YOLO moonshot slot ($10 USDT margin, 15x leverage), R:R ≥ 3:1.
 
 ## Phase 3: User Selection & Zero-Error Deployment
-1. The user selects which setup(s) to trade from the TOP ranking.
+1. The user selects which setup(s) to trade from the TOP ranking (or Tier S setups trigger autonomous fast-track execution).
 2. Provide the field-by-field checklist for Binance Futures:
-   - Margin: Isolated
-   - Leverage: 3x or 2x
+   - Margin: Mandatory Isolated
+   - Leverage: 3x for standard / 15x for YOLO
+   - Size: $100 USDT margin (standard) / $10 USDT margin (YOLO)
    - Currency unit: USDT vs Token check
-   - Order 1: Entry + SL
-   - Order 2: TP1 Limit with `Reduce-Only: Checked`
-   - Order 3: TP2 Limit with `Reduce-Only: Checked`
+   - Order 1: Entry + SL (Algo Order with `closePosition: true`)
+   - Order 2: TP1 (30% size at +1.8R) Limit with `Reduce-Only: Checked`
+   - Order 3: TP2 (70% size at +4.0R) Limit with `Reduce-Only: Checked`
 
 ## Phase 4: Notion Journal Sync
 Sync the chosen position to Notion:

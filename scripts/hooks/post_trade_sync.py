@@ -94,13 +94,20 @@ def handle_post_trade_sync(payload: dict) -> dict:
         return result
 
     base_dir = find_workspace_root()
-    target_env = os.environ.get("BINANCE_API_ENV", "testnet").lower()
+    scripts_dir = os.path.join(base_dir, "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    try:
+        from utils.env_resolver import resolve_env
+        target_env = resolve_env(base_dir=base_dir)
+    except Exception:
+        target_env = os.environ.get("BINANCE_API_ENV", "testnet").lower()
 
     # 1. Trigger session state sync
     sync_script = os.path.join(base_dir, "scripts", "sync_session_state.py")
     if os.path.exists(sync_script):
         try:
-            subprocess.run([sys.executable, sync_script, target_env], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+            subprocess.run([sys.executable, sync_script, "--env", target_env], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
             result["synced"] = True
         except Exception as e:
             sys.stderr.write(f"[POST-TRADE-SYNC ERROR] Sync failed: {e}\n")

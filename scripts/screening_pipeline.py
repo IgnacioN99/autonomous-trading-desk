@@ -12,6 +12,7 @@ import os
 import sys
 import json
 import time
+import re
 from typing import List, Literal, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pydantic import BaseModel, Field
@@ -109,6 +110,7 @@ class MarketScreeningPayload(BaseModel):
     top_funding_arbitrage: Optional[List[dict]] = None
     yolo_slot_status: str
     news_catalysts_summary: List[str]
+    untrusted_external_content: bool = True
 
 # ==========================================
 # 2. DETERMINISTIC EXECUTION PIPELINE
@@ -155,7 +157,7 @@ def fetch_macro_btc() -> MacroContext:
             allows_alt_shorts=True
         )
 
-def enrich_and_size_candidate(c: dict) -> Optional[CandidateSetup]:
+def enrich_and_size_candidate(c: dict, target_env: Optional[str] = None) -> Optional[CandidateSetup]:
     """Calculates volatility parity sizing and encapsulates into Pydantic model."""
     try:
         sym = c["symbol"]
@@ -164,8 +166,12 @@ def enrich_and_size_candidate(c: dict) -> Optional[CandidateSetup]:
         direction = c["direction"]
         lev = 3
 
+        if target_env is None:
+            cfg = eft.load_env()
+            target_env = (os.environ.get("BINANCE_API_ENV") or cfg.get("BINANCE_API_ENV", "prod")).lower()
+
         # Calculate dynamic equity sizing (default 0.5% equity risk per trade, or user profile)
-        sizing = qre.calculate_dynamic_equity_sizing(sym, entry, sl, risk_pct_equity=None, leverage=lev, target_env="testnet")
+        sizing = qre.calculate_dynamic_equity_sizing(sym, entry, sl, risk_pct_equity=None, leverage=lev, target_env=target_env)
         if not sizing or "error" in sizing or sizing.get("step_qty", 0.0) <= 0.0:
             logger.warning(f"Sizing inválido o no cuantizable para {sym}: {sizing.get('error') if sizing else 'Empty sizing'}")
             return None
@@ -211,6 +217,23 @@ def enrich_and_size_candidate(c: dict) -> Optional[CandidateSetup]:
     except Exception:
         return None
 
+PROMPT_INJECTION_PATTERNS = [
+    re.compile(r'(?i)\bignore\s+(all\s+)?(previous|prior)\s+instructions\b'),
+    re.compile(r'(?i)\bdisregard\s+(all\s+)?(previous|prior)\s+instructions\b'),
+    re.compile(r'(?i)\b(system|developer|assistant|human)\s*:'),
+    re.compile(r'(?i)<\s*/?\s*(system|instruction|prompt)\s*>'),
+    re.compile(r'(?i)\byou\s+are\s+now\s+(a|an|in)\b'),
+]
+
+def sanitize_untrusted_text(text: str) -> str:
+    """Strips or defangs potential prompt injection overrides from untrusted external text."""
+    if not text:
+        return ""
+    sanitized = text
+    for pattern in PROMPT_INJECTION_PATTERNS:
+        sanitized = pattern.sub("[REDACTED_INJECTION_ATTEMPT]", sanitized)
+    return sanitized
+
 def fetch_news_summary() -> List[str]:
     """Reads and filters news catalysts or recent newsletter mentions deterministically."""
     catalysts = []
@@ -228,23 +251,30 @@ def fetch_news_summary() -> List[str]:
                         subj = em.get("subject", "").strip()
                         date_str = em.get("date", "").split(" +")[0].strip()
                         if subj:
-                            catalysts.append(f"[{sender} | {date_str}] {subj}")
+                            clean_subj = sanitize_untrusted_text(subj)
+                            clean_sender = sanitize_untrusted_text(sender)
+                            catalysts.append(f"<untrusted_newsletter_data>[{clean_sender} | {date_str}] {clean_subj}</untrusted_newsletter_data>")
                 except Exception:
                     for line in res.stdout.strip().split("\n"):
                         if line.strip() and not line.startswith("===") and "{" not in line:
-                            catalysts.append(line.strip())
+                            clean_line = sanitize_untrusted_text(line.strip())
+                            catalysts.append(f"<untrusted_newsletter_data>{clean_line}</untrusted_newsletter_data>")
         except Exception:
             pass
     if not catalysts:
-        catalysts.append("Stable macro. No high-impact Federal Reserve or CPI events scheduled in the immediate intraday window.")
+        catalysts.append("<untrusted_newsletter_data>Stable macro. No high-impact Federal Reserve or CPI events scheduled in the immediate intraday window.</untrusted_newsletter_data>")
     return catalysts[:5]
 
-def execute_screening_pipeline(top_pairs_count: int = 80) -> MarketScreeningPayload:
+def execute_screening_pipeline(top_pairs_count: int = 80, target_env: Optional[str] = None) -> MarketScreeningPayload:
     """
     Executes the full screening pipeline concurrently in Python without any intermediary LLM.
     Returns a validated, structured MarketScreeningPayload object.
     """
     t0 = time.time()
+
+    if target_env is None:
+        cfg = eft.load_env()
+        target_env = (os.environ.get("BINANCE_API_ENV") or cfg.get("BINANCE_API_ENV", "prod")).lower()
 
     with ThreadPoolExecutor(max_workers=5) as executor:
         f_macro = executor.submit(fetch_macro_btc)
@@ -262,7 +292,7 @@ def execute_screening_pipeline(top_pairs_count: int = 80) -> MarketScreeningPayl
     # Filter and type candidate setups (top 6 balanced)
     parsed_candidates: List[CandidateSetup] = []
     with ThreadPoolExecutor(max_workers=6) as c_exec:
-        futures = [c_exec.submit(enrich_and_size_candidate, c) for c in raw_candidates[:10]]
+        futures = [c_exec.submit(enrich_and_size_candidate, c, target_env) for c in raw_candidates[:10]]
         for fut in as_completed(futures):
             res = fut.result()
             if res:
@@ -271,7 +301,7 @@ def execute_screening_pipeline(top_pairs_count: int = 80) -> MarketScreeningPayl
     # Sync live portfolio state and apply Delta-Neutral guardrail
     portfolio_ctx = None
     try:
-        s_state = sss.sync_session_state()
+        s_state = sss.sync_session_state(target_env=target_env)
         p_exp = s_state.get("portfolio_exposure", {})
         portfolio_ctx = {
             "total_active_positions": p_exp.get("total_active_positions", 0),
@@ -345,16 +375,18 @@ def execute_screening_pipeline(top_pairs_count: int = 80) -> MarketScreeningPayl
         actionable_stat_arb=stat_arb_list,
         top_funding_arbitrage=raw_funding,
         yolo_slot_status=yolo_status,
-        news_catalysts_summary=news_data
+        news_catalysts_summary=news_data,
+        untrusted_external_content=True
     )
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Deterministic Market Intelligence Pipeline")
     parser.add_argument("--json", action="store_true", help="Print payload in strict JSON format")
+    parser.add_argument("--env", default=None, help="Target execution environment (prod/testnet)")
     args = parser.parse_args()
 
-    payload = execute_screening_pipeline()
+    payload = execute_screening_pipeline(target_env=args.env)
     if args.json:
         print(payload.model_dump_json(indent=2))
     else:

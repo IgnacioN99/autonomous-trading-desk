@@ -71,7 +71,10 @@ class TestBinanceMCPGuard(unittest.TestCase):
             json.dump(dossier, f)
 
     def _write_session_state(self, delta_bias="NEUTRAL", net_delta=0.0):
+        now_ts = int(time.time())
         state = {
+            "is_valid": True,
+            "last_updated_ts": now_ts,
             "last_updated_utc": "2026-09-30 16:00:00 UTC",
             "target_env": "testnet",
             "portfolio_exposure": {
@@ -102,10 +105,10 @@ class TestBinanceMCPGuard(unittest.TestCase):
             sys.stdout = stdout_backup
 
     # -------------------------------------------------------------------------
-    # 1. INTERCEPTION OF BINANCE MCP NEW ORDER (BUY & SELL)
+    # 1. INTERCEPTION OF OPENING ORDERS VIA APPROVED CHOKE POINT (BUY & SELL)
     # -------------------------------------------------------------------------
     def test_intercept_binance_new_order_buy_and_sell(self):
-        """Verifies futures_usds.newOrder is intercepted and allowed under neutral conditions."""
+        """Verifies deploy_futures_trade is intercepted and allowed under neutral conditions."""
         self._write_dossier([
             {"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3},
             {"symbol": "ETHUSDT", "direction": "SHORT", "leverage": 3}
@@ -117,9 +120,9 @@ class TestBinanceMCPGuard(unittest.TestCase):
             "toolCall": {
                 "name": "call_mcp_tool",
                 "args": {
-                    "ServerName": "binance",
-                    "ToolName": "futures_usds.newOrder",
-                    "Arguments": {"symbol": "BTCUSDT", "side": "BUY", "type": "MARKET", "quantity": "0.01"}
+                    "ServerName": "crypto_radar",
+                    "ToolName": "deploy_futures_trade",
+                    "Arguments": {"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3}
                 }
             }
         }
@@ -131,9 +134,9 @@ class TestBinanceMCPGuard(unittest.TestCase):
             "toolCall": {
                 "name": "call_mcp_tool",
                 "args": {
-                    "ServerName": "binance",
-                    "ToolName": "futures_usds.newOrder",
-                    "Arguments": {"symbol": "ETHUSDT", "side": "SELL", "type": "MARKET", "quantity": "0.1"}
+                    "ServerName": "crypto_radar",
+                    "ToolName": "deploy_futures_trade",
+                    "Arguments": {"symbol": "ETHUSDT", "direction": "SHORT", "leverage": 3}
                 }
             }
         }
@@ -152,9 +155,9 @@ class TestBinanceMCPGuard(unittest.TestCase):
             "toolCall": {
                 "name": "call_mcp_tool",
                 "args": {
-                    "ServerName": "binance",
-                    "ToolName": "futures_usds.newOrder",
-                    "Arguments": {"symbol": "BTCUSDT", "side": "BUY", "type": "MARKET", "quantity": "0.01"}
+                    "ServerName": "crypto_radar",
+                    "ToolName": "deploy_futures_trade",
+                    "Arguments": {"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3}
                 }
             }
         }
@@ -175,9 +178,9 @@ class TestBinanceMCPGuard(unittest.TestCase):
             "toolCall": {
                 "name": "call_mcp_tool",
                 "args": {
-                    "ServerName": "binance",
-                    "ToolName": "futures_usds.newOrder",
-                    "Arguments": {"symbol": "ETHUSDT", "side": "SELL", "type": "MARKET", "quantity": "0.1"}
+                    "ServerName": "crypto_radar",
+                    "ToolName": "deploy_futures_trade",
+                    "Arguments": {"symbol": "ETHUSDT", "direction": "SHORT", "leverage": 3}
                 }
             }
         }
@@ -200,9 +203,9 @@ class TestBinanceMCPGuard(unittest.TestCase):
             "toolCall": {
                 "name": "call_mcp_tool",
                 "args": {
-                    "ServerName": "binance",
-                    "ToolName": "futures_usds.newOrder",
-                    "Arguments": {"symbol": "ETHUSDT", "side": "SELL", "type": "MARKET", "quantity": "0.1"}
+                    "ServerName": "crypto_radar",
+                    "ToolName": "deploy_futures_trade",
+                    "Arguments": {"symbol": "ETHUSDT", "direction": "SHORT", "leverage": 3}
                 }
             }
         }
@@ -215,9 +218,9 @@ class TestBinanceMCPGuard(unittest.TestCase):
             "toolCall": {
                 "name": "call_mcp_tool",
                 "args": {
-                    "ServerName": "binance",
-                    "ToolName": "futures_usds.newOrder",
-                    "Arguments": {"symbol": "BTCUSDT", "side": "BUY", "type": "MARKET", "quantity": "0.01"}
+                    "ServerName": "crypto_radar",
+                    "ToolName": "deploy_futures_trade",
+                    "Arguments": {"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3}
                 }
             }
         }
@@ -326,9 +329,9 @@ class TestBinanceMCPGuard(unittest.TestCase):
             "toolCall": {
                 "name": "call_mcp_tool",
                 "args": {
-                    "ServerName": "binance",
-                    "ToolName": "futures_usds.newOrder",
-                    "Arguments": {"symbol": "SOLUSDT", "side": "BUY", "type": "MARKET", "quantity": "1.0"}
+                    "ServerName": "crypto_radar",
+                    "ToolName": "deploy_futures_trade",
+                    "Arguments": {"symbol": "SOLUSDT", "direction": "LONG", "leverage": 3}
                 }
             }
         }
@@ -405,9 +408,9 @@ class TestBinanceMCPGuard(unittest.TestCase):
                 "toolCall": {
                     "name": "call_mcp_tool",
                     "args": {
-                        "ServerName": "binance",
-                        "ToolName": "futures_usds.newOrder",
-                        "Arguments": {"symbol": "BTCUSDT", "side": "BUY", "quantity": "0.01"},
+                        "ServerName": "crypto_radar",
+                        "ToolName": "deploy_futures_trade",
+                        "Arguments": {"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3},
                         "bypass_eval_gate": True
                     }
                 }
@@ -420,10 +423,7 @@ class TestBinanceMCPGuard(unittest.TestCase):
     # 9. MARGIN ACCOUNT NEW ORDER ENFORCEMENT
     # -------------------------------------------------------------------------
     def test_margin_account_new_order_enforces_gates(self):
-        """Verifies margin.marginAccountNewOrder is guarded with identical rules."""
-        self._write_session_state(delta_bias="LONG_HEAVY", net_delta=200.0)
-        self._write_dossier([{"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3}])
-
+        """Verifies margin.marginAccountNewOrder direct write calls are denied by choke point enforcement."""
         payload = {
             "toolCall": {
                 "name": "call_mcp_tool",
@@ -436,7 +436,7 @@ class TestBinanceMCPGuard(unittest.TestCase):
         }
         res = self._run_guard(payload)
         self.assertEqual(res.get("decision"), "deny")
-        self.assertIn("Delta-Neutral Hard Gate", res.get("reason", ""))
+        self.assertIn("Choke Point Enforcement", res.get("reason", ""))
 
     # -------------------------------------------------------------------------
     # 10. POST-TRADE SYNC MCP EVENT DETECTION & TRIGGERS
@@ -517,9 +517,9 @@ class TestBinanceMCPGuard(unittest.TestCase):
             "toolCall": {
                 "name": "call_mcp_tool",
                 "args": {
-                    "ServerName": "binance",
-                    "ToolName": "futures_usds.newOrder",
-                    "Arguments": {"symbol": "BTCUSDT", "side": "BUY", "type": "MARKET", "quantity": "0.01"}
+                    "ServerName": "crypto_radar",
+                    "ToolName": "deploy_futures_trade",
+                    "Arguments": {"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3}
                 }
             }
         }
@@ -536,9 +536,9 @@ class TestBinanceMCPGuard(unittest.TestCase):
             "toolCall": {
                 "name": "call_mcp_tool",
                 "args": {
-                    "ServerName": "binance",
-                    "ToolName": "futures_usds.newOrder",
-                    "Arguments": {"side": "BUY", "type": "MARKET", "quantity": "0.01"}
+                    "ServerName": "crypto_radar",
+                    "ToolName": "deploy_futures_trade",
+                    "Arguments": {"direction": "LONG", "leverage": 3}
                 }
             }
         }
@@ -576,9 +576,9 @@ class TestBinanceMCPGuard(unittest.TestCase):
             "toolCall": {
                 "name": "call_mcp_tool",
                 "args": {
-                    "ServerName": "binance",
-                    "ToolName": "futures_usds.newOrder",
-                    "Arguments": {"symbol": "BTCUSDT", "side": "BUY", "type": "MARKET", "quantity": "0.01"}
+                    "ServerName": "crypto_radar",
+                    "ToolName": "deploy_futures_trade",
+                    "Arguments": {"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3}
                 }
             }
         }

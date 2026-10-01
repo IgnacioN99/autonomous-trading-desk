@@ -28,8 +28,10 @@ import hashlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import execute_futures_trade as eft
+from utils.env_resolver import resolve_env, is_prod_environment
 
-def run_doctor(target_env: str = "testnet", auto_heal: bool = False) -> int:
+def run_doctor(target_env: str = None, auto_heal: bool = False) -> int:
+    target_env = resolve_env(target_env)
     start_time = time.time()
     print("=" * 65)
     print("🩺 TRADING DOCTOR — PRE-FLIGHT SYSTEM DIAGNOSTIC")
@@ -53,8 +55,7 @@ def run_doctor(target_env: str = "testnet", auto_heal: bool = False) -> int:
         print(f"✅ [API KEYS] Credentials OK ({target_env.upper()})")
 
     # Safety Flag verification for PROD
-    norm_env = "prod" if str(target_env).lower() in ["prod", "mainnet", "production"] else "testnet"
-    if norm_env == "prod":
+    if is_prod_environment(target_env):
         is_armed = str(cfg.get("LIVE_TRADING_ARMED", "")).strip().lower() == "true"
         if not is_armed:
             critical_failures.append("LIVE_TRADING_ARMED=true is required for PROD/MAINNET live trading.")
@@ -250,10 +251,9 @@ def run_doctor(target_env: str = "testnet", auto_heal: bool = False) -> int:
 
 if __name__ == "__main__":
     import argparse
-    cfg = eft.load_env()
-    default_env = (os.environ.get("BINANCE_API_ENV") or cfg.get("BINANCE_API_ENV", "prod")).lower()
+    default_env = resolve_env()
     parser = argparse.ArgumentParser(description="Trading Doctor - Pre-flight Health Check")
-    parser.add_argument("--env", default=default_env, choices=["testnet", "mainnet", "prod"], help="Target execution environment")
+    parser.add_argument("--env", default=default_env, help="Target execution environment (prod/testnet)")
     parser.add_argument("--heal", action="store_true", help="Auto-heal orphan positions by placing emergency SL")
     args = parser.parse_args()
 

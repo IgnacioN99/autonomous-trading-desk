@@ -6,6 +6,7 @@ Supports Testnet and Prod, strict filter calculations, symmetric orders, and ver
 
 import os
 import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import time
 import math
 import subprocess
@@ -14,7 +15,19 @@ import hashlib
 import urllib.parse
 import urllib.request
 import json
+import logging
 from decimal import Decimal, ROUND_DOWN
+
+logger = logging.getLogger("execute_futures_trade")
+
+try:
+    from utils.env_resolver import resolve_env
+except ImportError:
+    try:
+        from scripts.utils.env_resolver import resolve_env
+    except ImportError:
+        def resolve_env(env=None):
+            return str(env).lower() if env else os.environ.get('BINANCE_API_ENV', 'testnet').lower()
 
 def load_env(target_env=None):
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -33,7 +46,7 @@ def load_env(target_env=None):
     # 2. Environment-specific configuration file (config/environments/{env}.env or ENV_FILE)
     env_file = os.environ.get('ENV_FILE')
     effective_env = (target_env or os.environ.get('BINANCE_API_ENV') or config.get('BINANCE_API_ENV', 'testnet')).lower()
-    norm_env = 'prod' if effective_env in ['prod', 'mainnet', 'production'] else 'testnet'
+    norm_env = resolve_env(effective_env)
 
     if not env_file:
         cand = os.path.join(base_dir, 'config', 'environments', f'{norm_env}.env')
@@ -66,39 +79,91 @@ def get_mcp_oauth_token(cfg: dict = None):
     if env_token and env_token.strip():
         return env_token.strip()
 
+    # Check BINANCE_MCP_OAUTH_PATH as explicit override path before fallback paths or defaults
+    custom_path = (cfg.get('BINANCE_MCP_OAUTH_PATH') if cfg else None) or os.environ.get('BINANCE_MCP_OAUTH_PATH')
+    if custom_path and os.path.exists(custom_path):
+        try:
+            with open(custom_path, 'r', encoding='utf-8') as f:
+                content = f.read().strip()
+                if content.startswith('{'):
+                    d = json.loads(content)
+                    tok = (
+                        d.get('https://agent.binance.com/mcp/agentic', {}).get('token', {}).get('access_token')
+                        or d.get('token', {}).get('access_token')
+                        or d.get('access_token')
+                    )
+                    if tok:
+                        return tok
+                elif content:
+                    return content
+        except Exception as e:
+            logger.warning(f"Failed to read token from BINANCE_MCP_OAUTH_PATH ({custom_path}): {e}")
+
     # Fallback to loading prod.env if cfg not passed
     try:
         loaded_cfg = load_env(target_env='prod')
         token = loaded_cfg.get('BINANCE_MCP_OAUTH_TOKEN') or loaded_cfg.get('BINANCE_OAUTH_TOKEN')
         if token and token.strip():
             return token.strip()
+        custom_from_loaded = loaded_cfg.get('BINANCE_MCP_OAUTH_PATH')
+        if custom_from_loaded and os.path.exists(custom_from_loaded):
+            with open(custom_from_loaded, 'r', encoding='utf-8') as f:
+                content = f.read().strip()
+                if content.startswith('{'):
+                    d = json.loads(content)
+                    tok = (
+                        d.get('https://agent.binance.com/mcp/agentic', {}).get('token', {}).get('access_token')
+                        or d.get('token', {}).get('access_token')
+                        or d.get('access_token')
+                    )
+                    if tok:
+                        return tok
+                elif content:
+                    return content
     except Exception:
         pass
 
-    custom_path = (cfg.get('BINANCE_MCP_OAUTH_PATH') if cfg else None) or os.environ.get('BINANCE_MCP_OAUTH_PATH')
-    candidate_paths = [custom_path] if custom_path else []
-    candidate_paths.extend([
+    fallback_paths = [
         os.path.expanduser('~/.gemini/antigravity/mcp_oauth_tokens.json'),
         os.path.expanduser('~/.config/antigravity/mcp_oauth_tokens.json')
-    ])
+    ]
 
-    for p in candidate_paths:
+    for p in fallback_paths:
         if p and os.path.exists(p):
             try:
                 with open(p, 'r', encoding='utf-8') as f:
                     d = json.load(f)
-                    tok = d.get('https://agent.binance.com/mcp/agentic', {}).get('token', {}).get('access_token')
+                    tok = (
+                        d.get('https://agent.binance.com/mcp/agentic', {}).get('token', {}).get('access_token')
+                        or d.get('token', {}).get('access_token')
+                        or d.get('access_token')
+                    )
                     if tok:
                         return tok
             except Exception:
                 continue
     return None
 
-def call_binance_mcp(tool_name: str, args: dict = None):
+def call_binance_mcp(tool_name: str, args: dict = None, session_id: str = None):
     """Executes official Binance MCP tools via the agent.binance.com JSON-RPC gateway."""
     token = get_mcp_oauth_token()
     if not token:
-        return {"error": "Binance MCP OAuth token not found in ~/.gemini/antigravity/mcp_oauth_tokens.json or BINANCE_MCP_OAUTH_TOKEN"}
+        err_dict = {
+            "error": "Binance MCP OAuth token not found in ~/.gemini/antigravity/mcp_oauth_tokens.json or BINANCE_MCP_OAUTH_TOKEN",
+            "isError": True
+        }
+        logger.error(err_dict["error"])
+        return err_dict
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream"
+    }
+
+    mcp_session_id = session_id or os.environ.get("MCP_SESSION_ID") or os.environ.get("BINANCE_MCP_SESSION_ID")
+    if mcp_session_id:
+        headers["Mcp-Session-Id"] = str(mcp_session_id).strip()
 
     payload = {
         "jsonrpc": "2.0",
@@ -111,24 +176,50 @@ def call_binance_mcp(tool_name: str, args: dict = None):
     }
     req = urllib.request.Request(
         "https://agent.binance.com/mcp/agentic",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json"
-        },
+        headers=headers,
         data=json.dumps(payload).encode("utf-8")
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-            content = data.get("result", {}).get("content", [{}])[0].get("text", "")
-            if content.startswith("[") or content.startswith("{"):
+            if "error" in data:
+                err_msg = str(data["error"])
+                logger.error(f"Binance MCP Gateway JSON-RPC error: {err_msg}")
+                return {"error": err_msg, "isError": True, "raw": data["error"]}
+
+            result_obj = data.get("result", {})
+            if isinstance(result_obj, dict) and result_obj.get("isError"):
+                content_text = ""
+                content_list = result_obj.get("content", [])
+                if isinstance(content_list, list) and content_list:
+                    content_text = content_list[0].get("text", "")
+                err_msg = content_text or "MCP tool execution failed"
+                logger.error(f"Binance MCP tool returned error: {err_msg}")
+                return {"error": err_msg, "isError": True, "raw": result_obj}
+
+            content = result_obj.get("content", [{}])[0].get("text", "") if isinstance(result_obj, dict) else ""
+            if isinstance(content, str) and (content.startswith("[") or content.startswith("{")):
                 try:
-                    return json.loads(content)
+                    parsed = json.loads(content)
+                    if isinstance(parsed, dict) and parsed.get("code") and parsed.get("code") < 0:
+                        logger.error(f"Binance API returned error inside MCP: {parsed}")
+                        return {"error": parsed.get("msg", str(parsed)), "isError": True, "code": parsed.get("code"), "raw": parsed}
+                    return parsed
                 except Exception:
                     pass
             return content
+    except urllib.error.HTTPError as he:
+        try:
+            err_body = he.read().decode("utf-8")
+        except Exception:
+            err_body = str(he)
+        err_msg = f"MCP Gateway HTTP {he.code}: {err_body}"
+        logger.error(err_msg)
+        return {"error": err_msg, "isError": True, "http_code": he.code}
     except Exception as e:
-        return {"error": f"MCP Gateway Error: {str(e)}"}
+        err_msg = f"MCP Gateway Error: {str(e)}"
+        logger.error(err_msg)
+        return {"error": err_msg, "isError": True}
 
 def send_mcp_gateway_request(method, endpoint, params=None):
     """Routes Binance Futures requests directly to the Binance Agentic MCP gateway."""
@@ -152,21 +243,22 @@ def send_mcp_gateway_request(method, endpoint, params=None):
 
     # 4. Open Algo Orders (Stop Loss / Take Profit triggers)
     if endpoint == '/fapi/v1/openAlgoOrders':
-        orders = call_binance_mcp('futures_usds.currentAllOpenOrders', {'symbol': params.get('symbol')} if params.get('symbol') else {})
-        if isinstance(orders, list):
-            algos = []
-            for o in orders:
-                if o.get('type') in ['STOP_MARKET', 'STOP', 'TAKE_PROFIT_MARKET', 'TAKE_PROFIT']:
-                    algos.append({
-                        'algoId': o.get('orderId'),
-                        'symbol': o.get('symbol'),
-                        'side': o.get('side'),
-                        'triggerPrice': float(o.get('stopPrice', 0)),
-                        'orderType': o.get('type'),
-                        'closePosition': o.get('closePosition', False) or o.get('reduceOnly', False)
+        algos = call_binance_mcp('futures_usds.currentAllAlgoOpenOrders', {'symbol': params.get('symbol')} if params.get('symbol') else {})
+        if isinstance(algos, list):
+            res_list = []
+            for a in algos:
+                o_type = a.get('orderType') or a.get('type')
+                if o_type in ['STOP_MARKET', 'STOP', 'TAKE_PROFIT_MARKET', 'TAKE_PROFIT', 'TRAILING_STOP_MARKET'] or 'stopPrice' in a or 'triggerPrice' in a:
+                    res_list.append({
+                        'algoId': a.get('algoId') or a.get('orderId'),
+                        'symbol': a.get('symbol'),
+                        'side': a.get('side'),
+                        'triggerPrice': float(a.get('triggerPrice') or a.get('stopPrice') or 0),
+                        'orderType': o_type,
+                        'closePosition': bool(a.get('closePosition', False) or a.get('reduceOnly', False))
                     })
-            return algos
-        return orders
+            return res_list
+        return algos
 
     # 5. Leverage
     if endpoint == '/fapi/v1/leverage' and method.upper() == 'POST':
@@ -183,7 +275,7 @@ def send_mcp_gateway_request(method, endpoint, params=None):
     # 8. Cancel Algo Order
     if endpoint == '/fapi/v1/algoOrder' and method.upper() == 'DELETE':
         order_id = params.get('algoId') or params.get('orderId')
-        return call_binance_mcp('futures_usds.cancelOrder', {'symbol': params['symbol'], 'orderId': int(order_id)})
+        return call_binance_mcp('futures_usds.cancelAlgoOrder', {'algoId': int(order_id)})
 
     # 9. Cancel All Open Orders
     if endpoint == '/fapi/v1/allOpenOrders' and method.upper() == 'DELETE':
@@ -197,6 +289,8 @@ def send_mcp_gateway_request(method, endpoint, params=None):
 
     # 10. Place New Order
     if endpoint == '/fapi/v1/order' and method.upper() == 'POST':
+        if params.get('type') in ['STOP_MARKET', 'TAKE_PROFIT_MARKET', 'STOP', 'TAKE_PROFIT']:
+            return send_mcp_gateway_request('POST', '/fapi/v1/algoOrder', params)
         mcp_args = {
             'symbol': params['symbol'],
             'side': params['side'],
@@ -216,22 +310,23 @@ def send_mcp_gateway_request(method, endpoint, params=None):
             mcp_args['closePosition'] = str(params['closePosition']).lower()
         return call_binance_mcp('futures_usds.newOrder', mcp_args)
 
-    # 11. Place Algo Stop Loss
+    # 11. Place Algo Stop Loss / Conditional Order
     if endpoint == '/fapi/v1/algoOrder' and method.upper() == 'POST':
         trig_p = float(params.get('triggerPrice') or params.get('stopPrice', 0))
         close_pos = str(params.get('closePosition', 'true')).lower()
+        order_type = params.get('type', 'STOP_MARKET')
         mcp_args = {
             'symbol': params['symbol'],
             'side': params['side'],
-            'type': 'STOP_MARKET',
+            'type': order_type,
             'stopPrice': trig_p,
             'closePosition': close_pos
         }
         if close_pos != 'true':
             if 'quantity' in params:
                 mcp_args['quantity'] = float(params['quantity'])
-            if 'reduceOnly' in params:
-                mcp_args['reduceOnly'] = str(params['reduceOnly']).lower()
+            if 'reduceOnly' in params and str(params['reduceOnly']).lower() == 'true':
+                mcp_args['reduceOnly'] = 'true'
 
         res = call_binance_mcp('futures_usds.newOrder', mcp_args)
         if isinstance(res, dict) and 'orderId' in res:
@@ -250,10 +345,9 @@ def send_mcp_gateway_request(method, endpoint, params=None):
     except Exception as e:
         return {"error": f"Public fallback error: {str(e)}"}
 
-def get_client_config(target_env='testnet'):
-    cfg = load_env(target_env=target_env)
-    env = (target_env or 'testnet').lower()
-    norm_env = 'prod' if env in ['prod', 'mainnet', 'production'] else 'testnet'
+def get_client_config(target_env=None):
+    norm_env = resolve_env(target_env)
+    cfg = load_env(target_env=norm_env)
     
     if norm_env == 'prod':
         auth_mode = str(cfg.get('BINANCE_AUTH_MODE', '')).strip().lower()
@@ -295,7 +389,8 @@ def get_server_time_offset(base_url, force_refresh=False):
             _SERVER_OFFSET[base_url] = {'offset': 0, 'time': now}
     return _SERVER_OFFSET.get(base_url, {}).get('offset', 0)
 
-def send_signed_request(method, endpoint, params=None, target_env='testnet', retry_count=0):
+def send_signed_request(method, endpoint, params=None, target_env=None, retry_count=0):
+    target_env = resolve_env(target_env)
     api_key, secret_key, base_url = get_client_config(target_env)
     if not api_key:
         return {"error": "Binance credentials not configured in .env"}
@@ -341,7 +436,8 @@ def send_signed_request(method, endpoint, params=None, target_env='testnet', ret
     except Exception as e:
         return {"error": str(e)}
 
-def get_symbol_filters(symbol, target_env='testnet'):
+def get_symbol_filters(symbol, target_env=None):
+    target_env = resolve_env(target_env)
     res = send_signed_request('GET', '/fapi/v1/exchangeInfo', target_env=target_env)
     for s in res.get('symbols', []):
         if s['symbol'] == symbol:
@@ -371,12 +467,14 @@ def round_price(val, step, prec):
     rounded = (d_val / d_step).quantize(Decimal('1'), rounding=ROUND_DOWN) * d_step
     return float(f"{rounded:.{prec}f}")
 
-def setup_margin_and_leverage(symbol, leverage, target_env='testnet'):
+def setup_margin_and_leverage(symbol, leverage, target_env=None):
+    target_env = resolve_env(target_env)
     lev_res = send_signed_request('POST', '/fapi/v1/leverage', {'symbol': symbol, 'leverage': leverage}, target_env=target_env)
     margin_res = send_signed_request('POST', '/fapi/v1/marginType', {'symbol': symbol, 'marginType': 'ISOLATED'}, target_env=target_env)
     return lev_res, margin_res
 
-def place_algo_stop_loss(symbol, exit_side, sl_price, target_env='testnet'):
+def place_algo_stop_loss(symbol, exit_side, sl_price, target_env=None):
+    target_env = resolve_env(target_env)
     params = {
         'algoType': 'CONDITIONAL',
         'symbol': symbol,
@@ -386,7 +484,7 @@ def place_algo_stop_loss(symbol, exit_side, sl_price, target_env='testnet'):
         'closePosition': 'true'
     }
     res = send_signed_request('POST', '/fapi/v1/algoOrder', params, target_env=target_env)
-    if isinstance(res, dict) and 'algoId' in res:
+    if isinstance(res, dict) and ('algoId' in res or 'orderId' in res):
         return res
     profile = 'testnet' if target_env == 'testnet' else 'prod'
     cmd = [
@@ -400,40 +498,45 @@ def place_algo_stop_loss(symbol, exit_side, sl_price, target_env='testnet'):
         '--recv-window', '60000',
         '--profile', profile
     ]
-    res_cli = subprocess.run(cmd, capture_output=True, text=True)
     try:
+        res_cli = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
         parsed = json.loads(res_cli.stdout)
-        if 'algoId' in parsed:
+        if isinstance(parsed, dict) and ('algoId' in parsed or 'orderId' in parsed):
             return parsed
-    except Exception:
+    except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
         pass
     return res
 
-def verify_algo_stop_loss(symbol, exit_side, sl_price=None, target_env='testnet'):
+def verify_algo_stop_loss(symbol, exit_side, sl_price=None, target_env=None):
     """
     Verifies that the Algo Stop Loss order actually exists and is active on the exchange.
+    Ensures that if sl_price is specified, True is ONLY returned if the price matches within 3% tolerance.
     """
+    target_env = resolve_env(target_env)
     try:
         algos = send_signed_request('GET', '/fapi/v1/openAlgoOrders', {'symbol': symbol}, target_env=target_env)
         if isinstance(algos, list):
             for ao in algos:
-                if ao.get('orderType') in ['STOP_MARKET', 'STOP'] and ao.get('side') == exit_side:
+                o_type = ao.get('orderType') or ao.get('type')
+                if o_type in ['STOP_MARKET', 'STOP'] and ao.get('side') == exit_side:
                     if sl_price is not None:
-                        trig = float(ao.get('triggerPrice', 0))
+                        trig = float(ao.get('triggerPrice') or ao.get('stopPrice') or 0)
                         if trig > 0 and abs(trig - float(sl_price)) / trig < 0.03:
                             return True, ao
-                    return True, ao
+                    else:
+                        return True, ao
         return False, None
     except Exception as e:
         return False, str(e)
 
-def log_emergency_abort(symbol, direction, qty, sl_p, sl_order, abort_exit, target_env='testnet'):
+def log_emergency_abort(symbol, direction, qty, sl_p, sl_order, abort_exit, target_env=None):
+    target_env = resolve_env(target_env)
     log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'logs')
     os.makedirs(log_dir, exist_ok=True)
     record = {
         'timestamp': int(time.time()),
         'symbol': symbol,
-        'direction': direction.upper(),
+        'direction': str(direction).upper(),
         'event': 'CRITICAL_FAILSAFE_ABORT',
         'quantity': qty,
         'target_sl_price': sl_p,
@@ -446,36 +549,167 @@ def log_emergency_abort(symbol, direction, qty, sl_p, sl_order, abort_exit, targ
     with open(os.path.join(log_dir, 'trades_audit.jsonl'), 'a', encoding='utf-8') as f:
         f.write(json.dumps(record) + "\n")
 
-def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty, leverage, bypass_delta_gate=False, target_env='testnet', bypass_all_gates=False):
+def emergency_abort_market_close(symbol, exit_side, total_qty, target_env=None):
+    """
+    Executes atomic failsafe auto-destruct to immediately eliminate unhedged exposure.
+    Cancels all open orders and algo orders, then executes a reduce-only MARKET order.
+    Verifies response and retries up to 3 times with progressive backoff if not confirmed.
+    """
+    target_env = resolve_env(target_env)
+
+    # 1. Cancel all open standard orders
+    try:
+        send_signed_request('DELETE', '/fapi/v1/allOpenOrders', {'symbol': symbol}, target_env=target_env)
+    except Exception as e:
+        print(f"⚠️ Warning canceling open orders during abort: {e}", file=sys.stderr)
+
+    # 2. Cancel all open algo orders
+    try:
+        open_algos = send_signed_request('GET', '/fapi/v1/openAlgoOrders', {'symbol': symbol}, target_env=target_env)
+        if isinstance(open_algos, list):
+            for ao in open_algos:
+                aid = ao.get('algoId') or ao.get('orderId')
+                if aid:
+                    send_signed_request('DELETE', '/fapi/v1/algoOrder', {'symbol': symbol, 'algoId': aid}, target_env=target_env)
+    except Exception as e:
+        print(f"⚠️ Warning canceling algo orders during abort: {e}", file=sys.stderr)
+
+    abort_params = {
+        'symbol': symbol,
+        'side': exit_side,
+        'type': 'MARKET',
+        'quantity': total_qty,
+        'reduceOnly': 'true'
+    }
+
+    last_res = None
+    confirmed = False
+    max_retries = 3
+    backoffs = [0.3, 0.6, 1.0]
+
+    for attempt in range(max_retries):
+        try:
+            abort_res = send_signed_request('POST', '/fapi/v1/order', abort_params, target_env=target_env)
+            last_res = abort_res
+            if isinstance(abort_res, dict):
+                status = str(abort_res.get('status', '')).upper()
+                has_order_id = 'orderId' in abort_res
+                has_error = 'code' in abort_res or 'error' in abort_res
+                if has_order_id and not has_error and (status in ['FILLED', 'NEW', 'PARTIALLY_FILLED'] or not status):
+                    confirmed = True
+                    break
+        except Exception as e:
+            last_res = {"error": str(e)}
+
+        if attempt < max_retries - 1:
+            time.sleep(backoffs[attempt])
+
+    if not confirmed:
+        err_msg = f"🚨 CRITICAL ALARM: Emergency auto-destruct liquidation FAILED for {symbol} ({exit_side} {total_qty}) after {max_retries} attempts! Response: {last_res}"
+        print(err_msg, file=sys.stderr)
+        try:
+            log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'logs')
+            os.makedirs(log_dir, exist_ok=True)
+            with open(os.path.join(log_dir, 'emergency_aborts.jsonl'), 'a', encoding='utf-8') as f:
+                f.write(json.dumps({
+                    'timestamp': int(time.time()),
+                    'symbol': symbol,
+                    'event': 'CRITICAL_AUTO_DESTRUCT_FAILED',
+                    'response': last_res,
+                    'target_env': target_env
+                }) + "\n")
+        except Exception:
+            pass
+
+    return {
+        "success": confirmed,
+        "confirmed": confirmed,
+        "symbol": symbol,
+        "side": exit_side,
+        "quantity": total_qty,
+        "order": last_res,
+        "retries": attempt + 1
+    }
+
+def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty, leverage, bypass_delta_gate=False, target_env=None, bypass_all_gates=False, is_yolo=False):
     """
     Mechanical Software Gates (Deterministic Precondition Validation).
     Verifies mathematical invariants and physically prevents execution if risk rules are violated.
     In TESTNET, free bypass of gates is permitted for testing, experiments, and stress tests.
     In PROD, gates are strict and inviolable.
     """
+    target_env = resolve_env(target_env)
+    is_testnet = str(target_env).lower() == 'testnet'
+    is_long = str(direction).upper() == 'LONG'
+
+    # Gate bypass protection: in PROD, gate bypasses are strictly forbidden
+    if not is_testnet and (bypass_all_gates or bypass_delta_gate):
+        return False, "MECHANICAL HARD GATE REJECTION: Gate bypass flags are strictly forbidden in PROD."
+
     if bypass_all_gates:
         return True, None
 
-    is_testnet = str(target_env).lower() == 'testnet'
-    is_long = direction.upper() == 'LONG'
-    
-    # 1. Delta-Neutral Gate (Permits bypass in testnet for open sandbox testing)
+    # --- GATE 0: Leverage Ceiling Gate (Finding 8) ---
+    # Absolute ceiling: 15x under any circumstances
+    if leverage > 15:
+        return False, f"MECHANICAL HARD GATE REJECTION: Leverage {leverage}x exceeds absolute desk ceiling of 15x."
+
+    if leverage < 1:
+        return False, f"MECHANICAL HARD GATE REJECTION: Invalid leverage {leverage}x. Must be >= 1x."
+
+    # Standard leverage limit: if not marked as YOLO, cap leverage at max 5x (or user profile leverage_standard, default 3x)
+    if not is_yolo:
+        std_cap = 5
+        try:
+            import user_profile as up
+            prof = up.load_user_profile()
+            prof_std = int(prof.get("leverage_standard", 3))
+            std_cap = max(5, prof_std)
+        except Exception:
+            std_cap = 5
+
+        if leverage > std_cap:
+            return False, f"MECHANICAL HARD GATE REJECTION: Leverage {leverage}x exceeds standard limit ({std_cap}x). Set --is-yolo for leverage > {std_cap}x."
+
+    # --- GATE 1: Delta-Neutral Gate (Finding 6: Fail-Closed & Staleness Check) ---
     if not bypass_delta_gate and not is_testnet:
         log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'logs')
         state_file = os.path.join(log_dir, 'session_state.json')
-        if os.path.exists(state_file):
-            try:
-                with open(state_file, 'r', encoding='utf-8') as f:
-                    state_data = json.load(f)
-                    delta_bias = state_data.get('portfolio_exposure', {}).get('delta_bias') or state_data.get('portfolio_delta_bias', 'NEUTRAL')
-                    if delta_bias == 'LONG_HEAVY' and is_long:
-                        return False, "MECHANICAL HARD GATE REJECTION: Portfolio is in LONG_HEAVY state (+Delta imbalanced). Opening additional Longs is strictly prohibited. Short hedge or neutral portfolio required."
-                    elif delta_bias == 'SHORT_HEAVY' and not is_long:
-                        return False, "MECHANICAL HARD GATE REJECTION: Portfolio is in SHORT_HEAVY state (-Delta imbalanced). Opening additional Shorts is strictly prohibited. Long hedge or neutral portfolio required."
-            except Exception as e:
-                pass
+        if not os.path.exists(state_file):
+            return False, "MECHANICAL HARD GATE REJECTION: FAIL-CLOSED — session_state.json does not exist. Cannot verify portfolio delta in PROD. Order blocked."
+        try:
+            with open(state_file, 'r', encoding='utf-8') as f:
+                state_data = json.load(f)
+        except Exception as e:
+            return False, f"MECHANICAL HARD GATE REJECTION: FAIL-CLOSED — session_state.json is corrupt ({e}). Order blocked."
 
-    # 2. Maximum Monetary Risk Gate (Dynamic equity cap, fail-closed)
+        if not isinstance(state_data, dict):
+            return False, "MECHANICAL HARD GATE REJECTION: FAIL-CLOSED — session_state.json is malformed. Order blocked."
+
+        # Check validity
+        if state_data.get("is_valid") is not True or "error" in state_data:
+            err_msg = state_data.get("error", "session_state marked invalid")
+            return False, f"MECHANICAL HARD GATE REJECTION: FAIL-CLOSED — session_state.json is INVALID ({err_msg}). Order blocked."
+
+        # Check staleness (5 minutes = 300s limit)
+        now_ts = int(time.time())
+        last_updated_ts = state_data.get("last_updated_ts", 0)
+        try:
+            last_updated_ts = int(last_updated_ts)
+        except Exception:
+            last_updated_ts = 0
+
+        age_seconds = now_ts - last_updated_ts if last_updated_ts > 0 else (now_ts - int(os.path.getmtime(state_file)))
+        if last_updated_ts <= 0 or age_seconds > 300:
+            return False, f"MECHANICAL HARD GATE REJECTION: FAIL-CLOSED — session_state.json is STALE ({age_seconds}s > 300s limit in PROD). Re-sync session state before trading."
+
+        delta_bias = state_data.get('portfolio_exposure', {}).get('delta_bias') or state_data.get('portfolio_delta_bias', 'NEUTRAL')
+        if delta_bias == 'LONG_HEAVY' and is_long:
+            return False, "MECHANICAL HARD GATE REJECTION: Portfolio is in LONG_HEAVY state (+Delta imbalanced). Opening additional Longs is strictly prohibited. Short hedge or neutral portfolio required."
+        elif delta_bias == 'SHORT_HEAVY' and not is_long:
+            return False, "MECHANICAL HARD GATE REJECTION: Portfolio is in SHORT_HEAVY state (-Delta imbalanced). Opening additional Shorts is strictly prohibited. Long hedge or neutral portfolio required."
+
+    # --- GATE 2: Dynamic Equity Risk Gate (Finding 13) ---
     potential_dollar_loss = abs(cur_price - sl_price) * total_qty
     try:
         import quant_risk_engine as qre
@@ -486,19 +720,27 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
         else:
             return False, f"MECHANICAL HARD GATE REJECTION: FAIL-CLOSED — Cannot verify account equity for PROD ({e}). Order blocked."
 
-    # Mechanical Monetary Risk Gate: Strict capital preservation cap
-    # PROD must strictly enforce desk risk ceilings ($2.50 buffer for standard / $4.00 for YOLO)
+    # Load risk percentage from user profile (default 0.005 = 0.5%)
+    try:
+        import user_profile as up
+        user_prof = up.load_user_profile()
+        raw_risk = float(user_prof.get("risk_pct_equity", 0.005))
+    except Exception:
+        raw_risk = 0.005
+
+    # Normalize risk fraction: e.g. 0.005 -> 0.005; 0.5 -> 0.005; 1.0 -> 0.01
+    risk_fraction = raw_risk if raw_risk <= 0.05 else (raw_risk / 100.0)
+
+    # Dynamic risk ceiling = account_equity * (risk_pct_equity / 100) * 1.25 buffer
     if is_testnet:
-        max_allowed_loss = max(account_equity * 0.025, 50.0)
+        max_allowed_loss = max(account_equity * risk_fraction * 1.25, 50.0)
     else:
-        # Dynamic equity risk (e.g. 0.5%) strictly bounded by desk absolute hard caps ($1.50 / $3.75)
-        desk_abs_cap = 3.75 if leverage >= 10 else 1.50
-        max_allowed_loss = min(account_equity * 0.025, desk_abs_cap)
+        max_allowed_loss = account_equity * risk_fraction * 1.25
 
     if potential_dollar_loss > max_allowed_loss:
-        return False, f"MECHANICAL HARD GATE REJECTION: Monetary risk exceeds allowed cap (${potential_dollar_loss:.2f} > ${max_allowed_loss:.2f} USDT, cap: ${max_allowed_loss:.2f} USDT). Adjust margin or position size."
+        return False, f"MECHANICAL HARD GATE REJECTION: Monetary risk exceeds allowed cap (${potential_dollar_loss:.2f} > ${max_allowed_loss:.2f} USDT, equity: ${account_equity:.2f}, risk fraction: {risk_fraction*100:.2f}% + buffer). Adjust margin or position size."
 
-    # 3. Financial Friction and Fee Gate (Relaxed in testnet for testing)
+    # --- GATE 3: Financial Friction and Fee Gate ---
     if tp1_price and not is_testnet:
         profit_pct_tp1 = abs(tp1_price - cur_price) / cur_price
         if profit_pct_tp1 < 0.0035:
@@ -506,9 +748,24 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
 
     return True, None
 
-def execute_complete_trade(symbol, direction, leverage, margin_usdt, sl_price, tp1_price, tp2_price, target_env='testnet', trigger_price=None, order_type='MARKET', limit_price=None, bypass_delta_gate=False):
-    # Dynamic Guardrail: margin capped at max_margin_ratio (30%) of total account equity
-    is_prod = target_env.lower() != 'testnet'
+def execute_complete_trade(
+    symbol,
+    direction,
+    leverage=3,
+    margin_usdt=100.0,
+    sl_price=None,
+    tp1_price=None,
+    tp2_price=None,
+    target_env=None,
+    trigger_price=None,
+    order_type='MARKET',
+    limit_price=None,
+    bypass_delta_gate=False,
+    is_yolo=False,
+    bypass_eval_gate=False
+):
+    target_env = resolve_env(target_env)
+    is_prod = str(target_env).lower() != 'testnet'
     if is_prod:
         cfg = load_env(target_env=target_env)
         if str(cfg.get('LIVE_TRADING_ARMED', '')).strip().lower() != 'true':
@@ -547,9 +804,17 @@ def execute_complete_trade(symbol, direction, leverage, margin_usdt, sl_price, t
     if cur_price <= 0:
         return {"success": False, "error": "Could not fetch current market price"}
 
-    is_long = direction.upper() == 'LONG'
+    is_long = str(direction).upper() == 'LONG'
     entry_side = 'BUY' if is_long else 'SELL'
     exit_side = 'SELL' if is_long else 'BUY'
+
+    # Fallback / default SL and TP calculations if not provided or 0
+    if sl_price is None or float(sl_price) <= 0:
+        sl_price = cur_price * (1.0 - 0.02) if is_long else cur_price * (1.0 + 0.02)
+    if tp1_price is None or float(tp1_price) <= 0:
+        tp1_price = cur_price * (1.0 + 0.03) if is_long else cur_price * (1.0 - 0.03)
+    if tp2_price is None or float(tp2_price) <= 0:
+        tp2_price = cur_price * (1.0 + 0.06) if is_long else cur_price * (1.0 - 0.06)
 
     # 2. Calculate exact token quantity
     notional_target = margin_usdt * leverage
@@ -564,7 +829,10 @@ def execute_complete_trade(symbol, direction, leverage, margin_usdt, sl_price, t
         return {"success": False, "error": f"Quantity {total_qty} lower than minimum allowed {filters['minQty']}"}
 
     # 3. MECHANICAL HARD GATES VERIFICATION
-    gate_ok, gate_err = check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty, leverage, bypass_delta_gate=bypass_delta_gate, target_env=target_env)
+    gate_ok, gate_err = check_mechanical_gates(
+        direction, cur_price, sl_price, tp1_price, total_qty, leverage,
+        bypass_delta_gate=bypass_delta_gate, target_env=target_env, is_yolo=is_yolo
+    )
     if not gate_ok:
         return {"success": False, "hard_gate_rejection": True, "error": gate_err}
 
@@ -604,19 +872,21 @@ def execute_complete_trade(symbol, direction, leverage, margin_usdt, sl_price, t
                     'side': entry_side,
                     'type': 'STOP_MARKET',
                     'stopPrice': trigger_p,
-                    'quantity': total_qty
+                    'quantity': total_qty,
+                    'closePosition': 'false'
                 }
                 cond_order = send_signed_request('POST', '/fapi/v1/order', entry_params, target_env=target_env)
-                if 'orderId' in cond_order:
+                order_id = cond_order.get('algoId') or cond_order.get('orderId') if isinstance(cond_order, dict) else None
+                if order_id:
                     return {
                         "success": True,
                         "conditional_entry": True,
-                        "orderId": cond_order['orderId'],
+                        "orderId": order_id,
                         "symbol": symbol,
-                        "direction": direction.upper(),
+                        "direction": str(direction).upper(),
                         "trigger_price": trigger_p,
                         "cur_price": cur_price,
-                        "message": f"Conditional STOP_MARKET order placed at {trigger_p}. Will trigger upon institutional wick breakout."
+                        "message": f"Conditional STOP_MARKET order placed at {trigger_p}. Will trigger upon institutional wick breakout. SL/TP deferred to fill."
                     }
                 else:
                     return {"success": False, "error": f"Failed to place conditional order: {cond_order}"}
@@ -646,130 +916,151 @@ def execute_complete_trade(symbol, direction, leverage, margin_usdt, sl_price, t
         }
 
     entry_order = send_signed_request('POST', '/fapi/v1/order', entry_params, target_env=target_env)
-    if 'orderId' not in entry_order:
+    if not isinstance(entry_order, dict) or 'orderId' not in entry_order:
         return {"success": False, "error": f"Entry order failed: {entry_order}"}
+
+    # Protection against premature reduceOnly orders on resting LIMIT orders (Finding 9)
+    if order_type.upper() == 'LIMIT' and entry_order.get('status') == 'NEW':
+        return {
+            "success": True,
+            "pending_limit_entry": True,
+            "orderId": entry_order.get('orderId'),
+            "symbol": symbol,
+            "direction": str(direction).upper(),
+            "limit_price": lim_p,
+            "quantity": total_qty,
+            "status": "NEW",
+            "message": f"LIMIT order placed at {lim_p} (order ID: {entry_order.get('orderId')}). TP reduce-only orders deferred until fill to prevent -2022 rejection."
+        }
 
     actual_entry_price = float(entry_order.get('avgPrice', cur_price))
     if actual_entry_price == 0:
         actual_entry_price = cur_price
 
-    # 9. Execute Hard Stop Loss (Algo Order, closePosition=true, reduceOnly=true)
-    sl_order = place_algo_stop_loss(symbol, exit_side, sl_p, target_env=target_env)
-    sl_verified, sl_info = verify_algo_stop_loss(symbol, exit_side, sl_p, target_env=target_env)
+    # ATOMIC POST-ENTRY HARDENING: Position is now live on the books.
+    # Enclose in try/except to guarantee emergency auto-destruct on ANY failure.
+    try:
+        # 9. Execute Hard Stop Loss (Algo Order, closePosition=true, reduceOnly=true)
+        sl_order = place_algo_stop_loss(symbol, exit_side, sl_p, target_env=target_env)
+        sl_verified, sl_info = verify_algo_stop_loss(symbol, exit_side, sl_p, target_env=target_env)
 
-    # Progressive retries (up to 3 attempts in ~2.8s) to absorb Mainnet indexing latency
-    if not sl_verified:
-        for retry_delay in [0.8, 1.0, 1.2]:
-            time.sleep(retry_delay)
-            if isinstance(sl_order, dict) and "error" in sl_order:
-                sl_order = place_algo_stop_loss(symbol, exit_side, sl_p, target_env=target_env)
-            sl_verified, sl_info = verify_algo_stop_loss(symbol, exit_side, sl_p, target_env=target_env)
-            if sl_verified:
-                break
+        # Progressive retries (up to 3 attempts in ~2.8s) to absorb Mainnet indexing latency
+        if not sl_verified:
+            for retry_delay in [0.8, 1.0, 1.2]:
+                time.sleep(retry_delay)
+                if isinstance(sl_order, dict) and ("error" in sl_order or "code" in sl_order):
+                    sl_order = place_algo_stop_loss(symbol, exit_side, sl_p, target_env=target_env)
+                sl_verified, sl_info = verify_algo_stop_loss(symbol, exit_side, sl_p, target_env=target_env)
+                if sl_verified:
+                    break
 
-    # ATOMIC AUTO-DESTRUCT / FAIL-SAFE PROTOCOL:
-    # If Stop Loss is NOT verified after 3 attempts (~2.8s), ABORT IMMEDIATELY
-    if not sl_verified:
-        send_signed_request('DELETE', '/fapi/v1/allOpenOrders', {'symbol': symbol}, target_env=target_env)
-        abort_exit = send_signed_request('POST', '/fapi/v1/order', {
+        # ATOMIC AUTO-DESTRUCT / FAIL-SAFE PROTOCOL:
+        # If Stop Loss is NOT verified after retries, ABORT IMMEDIATELY
+        if not sl_verified:
+            abort_exit = emergency_abort_market_close(symbol, exit_side, total_qty, target_env=target_env)
+            log_emergency_abort(symbol, direction, total_qty, sl_p, sl_order, abort_exit, target_env)
+            return {
+                "success": False,
+                "emergency_abort": True,
+                "symbol": symbol,
+                "error": f"CRITICAL FAIL-SAFE TRIGGERED: Stop Loss could not be confirmed after 3 attempts ({sl_order}). Position closed at MARKET immediately to eliminate unhedged exposure.",
+                "abort_exit": abort_exit
+            }
+
+        # 10. Execute TP1 (LIMIT, 30% position, Reduce-Only)
+        tp1_params = {
             'symbol': symbol,
             'side': exit_side,
-            'type': 'MARKET',
-            'quantity': total_qty,
+            'type': 'LIMIT',
+            'price': tp1_p,
+            'quantity': tp1_qty,
+            'timeInForce': 'GTC',
             'reduceOnly': 'true'
-        }, target_env=target_env)
-        log_emergency_abort(symbol, direction, total_qty, sl_p, sl_order, abort_exit, target_env)
+        }
+        tp1_order = send_signed_request('POST', '/fapi/v1/order', tp1_params, target_env=target_env)
+
+        # 11. Execute TP2 (LIMIT, 70% position remaining, Reduce-Only)
+        tp2_params = {
+            'symbol': symbol,
+            'side': exit_side,
+            'type': 'LIMIT',
+            'price': tp2_p,
+            'quantity': tp2_qty,
+            'timeInForce': 'GTC',
+            'reduceOnly': 'true'
+        }
+        tp2_order = send_signed_request('POST', '/fapi/v1/order', tp2_params, target_env=target_env)
+
+        # Log to local audit ledger with canonical provenance and atomic writing
+        log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'logs')
+        os.makedirs(log_dir, exist_ok=True)
+        audit_file = os.path.join(log_dir, 'trades_audit.jsonl')
+        
+        record = {
+            'timestamp': int(time.time()),
+            'symbol': symbol,
+            'direction': str(direction).upper(),
+            'leverage': leverage,
+            'entry_price': actual_entry_price,
+            'total_qty': total_qty,
+            'sl_price': sl_p,
+            'sl_verified': True,
+            'sl_algo_id': sl_info.get('algoId') if sl_info else (sl_order.get('algoId') if isinstance(sl_order, dict) else None),
+            'tp1_price': tp1_p,
+            'tp2_price': tp2_p,
+            'entry_order_id': entry_order.get('orderId'),
+            'sl_order': sl_order,
+            'tp1_order_id': tp1_order.get('orderId') if isinstance(tp1_order, dict) else None,
+            'tp2_order_id': tp2_order.get('orderId') if isinstance(tp2_order, dict) else None,
+            'target_env': target_env
+        }
+
+        try:
+            from provenance_stamp import stamp_trade_record
+            from utils.atomic_writer import atomic_append_jsonl
+            record = stamp_trade_record(
+                record,
+                evaluator="isolated_market_evaluator",
+                strategy="microstructure_wick_reversion",
+                sizing_model=f"volatility_parity_margin_{margin_usdt}"
+            )
+            atomic_append_jsonl(audit_file, record)
+        except Exception:
+            with open(audit_file, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(record) + "\n")
+
+        return {
+            "success": True,
+            "symbol": symbol,
+            "direction": str(direction).upper(),
+            "leverage": leverage,
+            "entry_price": actual_entry_price,
+            "total_qty": total_qty,
+            "entry_order_id": entry_order.get('orderId'),
+            "sl_price": sl_p,
+            "sl_algo_order": sl_info or sl_order,
+            "tp1_price": tp1_p,
+            "tp1_qty": tp1_qty,
+            "tp1_order_id": tp1_order.get('orderId') if isinstance(tp1_order, dict) else None,
+            "tp2_price": tp2_p,
+            "tp2_qty": tp2_qty,
+            "tp2_order_id": tp2_order.get('orderId') if isinstance(tp2_order, dict) else None,
+            "notional": total_qty * actual_entry_price,
+            "real_margin": (total_qty * actual_entry_price) / leverage
+        }
+    except Exception as exc:
+        abort_exit = emergency_abort_market_close(symbol, exit_side, total_qty, target_env=target_env)
+        log_emergency_abort(symbol, direction, total_qty, sl_p, str(exc), abort_exit, target_env)
         return {
             "success": False,
             "emergency_abort": True,
             "symbol": symbol,
-            "error": f"CRITICAL FAIL-SAFE TRIGGERED: Stop Loss could not be confirmed after 3 attempts ({sl_order}). Position closed at MARKET immediately (order {abort_exit.get('orderId')}) to eliminate unhedged exposure.",
+            "error": f"CRITICAL POST-ENTRY EXCEPTION ({exc}). Emergency auto-destruct executed at MARKET.",
             "abort_exit": abort_exit
         }
 
-    # 10. Execute TP1 (LIMIT, 30% position, Reduce-Only)
-    tp1_params = {
-        'symbol': symbol,
-        'side': exit_side,
-        'type': 'LIMIT',
-        'price': tp1_p,
-        'quantity': tp1_qty,
-        'timeInForce': 'GTC',
-        'reduceOnly': 'true'
-    }
-    tp1_order = send_signed_request('POST', '/fapi/v1/order', tp1_params, target_env=target_env)
-
-    # 11. Execute TP2 (LIMIT, 70% position remaining, Reduce-Only)
-    tp2_params = {
-        'symbol': symbol,
-        'side': exit_side,
-        'type': 'LIMIT',
-        'price': tp2_p,
-        'quantity': tp2_qty,
-        'timeInForce': 'GTC',
-        'reduceOnly': 'true'
-    }
-    tp2_order = send_signed_request('POST', '/fapi/v1/order', tp2_params, target_env=target_env)
-
-    # Log to local audit ledger with canonical provenance and atomic writing
-    log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'logs')
-    os.makedirs(log_dir, exist_ok=True)
-    audit_file = os.path.join(log_dir, 'trades_audit.jsonl')
-    
-    record = {
-        'timestamp': int(time.time()),
-        'symbol': symbol,
-        'direction': direction.upper(),
-        'leverage': leverage,
-        'entry_price': actual_entry_price,
-        'total_qty': total_qty,
-        'sl_price': sl_p,
-        'sl_verified': True,
-        'sl_algo_id': sl_info.get('algoId') if sl_info else sl_order.get('algoId'),
-        'tp1_price': tp1_p,
-        'tp2_price': tp2_p,
-        'entry_order_id': entry_order.get('orderId'),
-        'sl_order': sl_order,
-        'tp1_order_id': tp1_order.get('orderId'),
-        'tp2_order_id': tp2_order.get('orderId'),
-        'target_env': target_env
-    }
-
-    try:
-        from provenance_stamp import stamp_trade_record
-        from utils.atomic_writer import atomic_append_jsonl
-        record = stamp_trade_record(
-            record,
-            evaluator="isolated_market_evaluator",
-            strategy="microstructure_wick_reversion",
-            sizing_model=f"volatility_parity_margin_{margin_usdt}"
-        )
-        atomic_append_jsonl(audit_file, record)
-    except Exception:
-        with open(audit_file, 'a', encoding='utf-8') as f:
-            f.write(json.dumps(record) + "\n")
-
-    return {
-        "success": True,
-        "symbol": symbol,
-        "direction": direction.upper(),
-        "leverage": leverage,
-        "entry_price": actual_entry_price,
-        "total_qty": total_qty,
-        "entry_order_id": entry_order.get('orderId'),
-        "sl_price": sl_p,
-        "sl_algo_order": sl_info or sl_order,
-        "tp1_price": tp1_p,
-        "tp1_qty": tp1_qty,
-        "tp1_order_id": tp1_order.get('orderId'),
-        "tp2_price": tp2_p,
-        "tp2_qty": tp2_qty,
-        "tp2_order_id": tp2_order.get('orderId'),
-        "notional": total_qty * actual_entry_price,
-        "real_margin": (total_qty * actual_entry_price) / leverage
-    }
-
-def move_sl_to_breakeven(symbol, target_env='testnet'):
+def move_sl_to_breakeven(symbol, target_env=None):
+    target_env = resolve_env(target_env)
     pos_res = send_signed_request('GET', '/fapi/v2/positionRisk', {'symbol': symbol}, target_env=target_env)
     active = [p for p in pos_res if float(p.get('positionAmt', 0)) != 0] if isinstance(pos_res, list) else []
     if not active:
@@ -822,7 +1113,8 @@ def move_sl_to_breakeven(symbol, target_env='testnet'):
         "algo_order": new_sl
     }
 
-def get_positions_summary(target_env='testnet'):
+def get_positions_summary(target_env=None):
+    target_env = resolve_env(target_env)
     pos_res = send_signed_request('GET', '/fapi/v2/positionRisk', target_env=target_env)
     if not isinstance(pos_res, list):
         return f"Error querying positions: {pos_res}"
@@ -846,12 +1138,13 @@ def get_positions_summary(target_env='testnet'):
         lines.append(f"  Liquidation Price: {float(p.get('liquidationPrice', 0)):.4f}\n")
     return "\n".join(lines)
 
-def audit_orphan_positions(target_env='testnet', auto_heal=False):
+def audit_orphan_positions(target_env=None, auto_heal=False):
     """
     Exhaustively audits all active positions in the account.
     Detects 'orphan' / 'naked' positions (without verified Algo Stop Loss on Binance).
     If auto_heal=True, places an emergency Algo SL calculated via volatility/liquidation buffer.
     """
+    target_env = resolve_env(target_env)
     pos_res = send_signed_request('GET', '/fapi/v2/positionRisk', target_env=target_env)
     if not isinstance(pos_res, list):
         return {"error": f"Error querying positions: {pos_res}"}
@@ -927,7 +1220,15 @@ def audit_orphan_positions(target_env='testnet', auto_heal=False):
         "positions": positions_report
     }
 
-def close_position_market(symbol, target_env='testnet'):
+def audit_and_auto_heal_orphans(target_env=None):
+    """
+    Audits all active positions and automatically heals any orphan positions lacking Stop Loss.
+    """
+    target_env = resolve_env(target_env)
+    return audit_orphan_positions(target_env=target_env, auto_heal=True)
+
+def close_position_market(symbol, target_env=None):
+    target_env = resolve_env(target_env)
     # 1. Active position
     pos_res = send_signed_request('GET', '/fapi/v2/positionRisk', {'symbol': symbol}, target_env=target_env)
     active = [p for p in pos_res if float(p.get('positionAmt', 0)) != 0] if isinstance(pos_res, list) else []
@@ -945,8 +1246,9 @@ def close_position_market(symbol, target_env='testnet'):
     open_algos = send_signed_request('GET', '/fapi/v1/openAlgoOrders', {'symbol': symbol}, target_env=target_env)
     if isinstance(open_algos, list):
         for ao in open_algos:
-            if ao.get('algoId'):
-                send_signed_request('DELETE', '/fapi/v1/algoOrder', {'symbol': symbol, 'algoId': ao['algoId']}, target_env=target_env)
+            aid = ao.get('algoId') or ao.get('orderId')
+            if aid:
+                send_signed_request('DELETE', '/fapi/v1/algoOrder', {'symbol': symbol, 'algoId': aid}, target_env=target_env)
 
     # 4. Market close with reduceOnly
     params = {
@@ -958,3 +1260,140 @@ def close_position_market(symbol, target_env='testnet'):
     }
     res = send_signed_request('POST', '/fapi/v1/order', params, target_env=target_env)
     return {"success": True, "closed": res}
+
+def deploy_futures_trade(
+    symbol,
+    direction,
+    leverage=3,
+    margin_usdt=100.0,
+    sl_price=None,
+    tp1_price=None,
+    tp2_price=None,
+    target_env=None,
+    trigger_price=None,
+    order_type='MARKET',
+    limit_price=None,
+    bypass_delta_gate=False,
+    is_yolo=False,
+    bypass_eval_gate=False
+):
+    """
+    Deploy futures trade with risk gates, isolated margin, verified Stop Loss, and asymmetric Take Profits.
+    """
+    return execute_complete_trade(
+        symbol=symbol,
+        direction=direction,
+        leverage=leverage,
+        margin_usdt=margin_usdt,
+        sl_price=sl_price,
+        tp1_price=tp1_price,
+        tp2_price=tp2_price,
+        target_env=target_env,
+        trigger_price=trigger_price,
+        order_type=order_type,
+        limit_price=limit_price,
+        bypass_delta_gate=bypass_delta_gate,
+        is_yolo=is_yolo,
+        bypass_eval_gate=bypass_eval_gate
+    )
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Execution Engine and Risk Management Harness for Binance Futures",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument("--symbol", type=str, default=None, help="Trading pair symbol (e.g. BTCUSDT, ETHUSDT)")
+    parser.add_argument("--direction", type=str, choices=["LONG", "SHORT", "long", "short"], default=None, help="Position direction")
+    parser.add_argument("--leverage", type=int, default=3, help="Leverage multiplier (max 15x)")
+    parser.add_argument("--margin", type=float, default=100.0, help="Committed margin in USDT")
+    parser.add_argument("--trigger-price", "--trigger_price", type=float, default=None, dest="trigger_price", help="Breakout trigger price for conditional entry")
+    parser.add_argument("--sl-price", "--sl_price", type=float, default=None, dest="sl_price", help="Stop Loss price")
+    parser.add_argument("--tp1-price", "--tp1_price", type=float, default=None, dest="tp1_price", help="Take Profit 1 price (30%% position)")
+    parser.add_argument("--tp2-price", "--tp2_price", type=float, default=None, dest="tp2_price", help="Take Profit 2 price (70%% position)")
+    parser.add_argument("--order-type", "--order_type", type=str, choices=["MARKET", "LIMIT", "STOP_MARKET", "market", "limit", "stop_market"], default="MARKET", dest="order_type", help="Order type")
+    parser.add_argument("--limit-price", "--limit_price", type=float, default=None, dest="limit_price", help="Limit price when order_type=LIMIT")
+    parser.add_argument("--env", type=str, choices=["prod", "testnet"], default=None, help="Target environment ('prod' or 'testnet')")
+    parser.add_argument("--bypass-eval-gate", "--bypass_eval_gate", action="store_true", dest="bypass_eval_gate", help="Bypass clean-room evaluation gate (Testnet only)")
+    parser.add_argument("--bypass-delta-gate", "--bypass_delta_gate", action="store_true", dest="bypass_delta_gate", help="Bypass delta-neutral gate (Testnet only)")
+    parser.add_argument("--is-yolo", "--is_yolo", action="store_true", dest="is_yolo", help="Mark trade as YOLO moonshot (authorizes leverage > 5x)")
+    parser.add_argument("--close-position", "--close_position", action="store_true", dest="close_position", help="Close open position at market with reduceOnly")
+    parser.add_argument("--audit-orphans", "--audit_orphans", action="store_true", dest="audit_orphans", help="Audit all open positions for missing Stop Loss")
+    parser.add_argument("--auto-heal", "--auto_heal", action="store_true", dest="auto_heal", help="Audit and automatically heal orphan positions lacking Stop Loss")
+
+    args = parser.parse_args()
+
+    target_env = resolve_env(args.env)
+
+    # 1. Close Position
+    if args.close_position:
+        if not args.symbol:
+            print(json.dumps({"success": False, "error": "--symbol is required for --close-position"}, indent=2))
+            sys.exit(1)
+            return
+        res = close_position_market(args.symbol.upper(), target_env=target_env)
+        print(json.dumps(res, indent=2))
+        sys.exit(0 if res.get("success") else 1)
+        return
+
+    # 2. Auto-Heal Orphans
+    if args.auto_heal:
+        res = audit_and_auto_heal_orphans(target_env=target_env)
+        print(json.dumps(res, indent=2))
+        if "error" in res or (res.get("orphans_count", 0) > 0 and not res.get("all_protected", False)):
+            sys.exit(1)
+        else:
+            sys.exit(0)
+        return
+
+    # 3. Audit Orphans
+    if args.audit_orphans:
+        res = audit_orphan_positions(target_env=target_env, auto_heal=False)
+        print(json.dumps(res, indent=2))
+        if "error" in res:
+            sys.exit(1)
+        else:
+            sys.exit(0)
+        return
+
+    # 4. Standard Trade Deployment
+    if not args.symbol:
+        print(json.dumps({"success": False, "error": "--symbol is required for trade deployment"}, indent=2))
+        sys.exit(1)
+        return
+
+    if not args.direction:
+        print(json.dumps({"success": False, "error": "--direction (LONG or SHORT) is required for trade deployment"}, indent=2))
+        sys.exit(1)
+        return
+
+    direction = args.direction.upper()
+    symbol = args.symbol.upper()
+    order_type = args.order_type.upper()
+
+    res = execute_complete_trade(
+        symbol=symbol,
+        direction=direction,
+        leverage=args.leverage,
+        margin_usdt=args.margin,
+        sl_price=args.sl_price,
+        tp1_price=args.tp1_price,
+        tp2_price=args.tp2_price,
+        target_env=target_env,
+        trigger_price=args.trigger_price,
+        order_type=order_type,
+        limit_price=args.limit_price,
+        bypass_delta_gate=args.bypass_delta_gate,
+        is_yolo=args.is_yolo,
+        bypass_eval_gate=args.bypass_eval_gate
+    )
+
+    print(json.dumps(res, indent=2))
+    if res.get("success"):
+        sys.exit(0)
+    else:
+        sys.exit(1)
+    return
+
+if __name__ == '__main__':
+    main()
