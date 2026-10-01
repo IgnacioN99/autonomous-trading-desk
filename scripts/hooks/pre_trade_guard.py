@@ -32,6 +32,7 @@ import sys
 import json
 import time
 import re
+import shlex
 from typing import Dict, Any, Tuple, Optional
 
 # Ensure scripts directory is on sys.path for utils
@@ -385,14 +386,45 @@ def main() -> int:
         is_leverage_command = False
 
         if tool_name == "run_command":
-            subcmds = re.split(r'(&&|;|\|\||\|)', command_line)
-            for subcmd in subcmds:
-                subcmd_clean = subcmd.strip()
-                if not subcmd_clean or subcmd_clean in ["&&", ";", "||", "|"]:
+            # Quote-aware command splitting for compound shell commands (&&, ||, ;, |)
+            try:
+                lexer = shlex.shlex(command_line, posix=True)
+                lexer.whitespace_split = True
+                lexer.commenters = ""
+                tokens = list(lexer)
+            except Exception:
+                tokens = command_line.split()
+
+            subcmd_tokens_list = []
+            curr_tokens = []
+            for t in tokens:
+                if t in ["&&", "||", ";", "|"]:
+                    if curr_tokens:
+                        subcmd_tokens_list.append(curr_tokens)
+                        curr_tokens = []
+                else:
+                    curr_tokens.append(t)
+            if curr_tokens:
+                subcmd_tokens_list.append(curr_tokens)
+
+            for cmd_tokens in subcmd_tokens_list:
+                if not cmd_tokens:
                     continue
-                if any(subcmd_clean.startswith(p) for p in ["git ", "gh ", "grep ", "cat ", "ls ", "find ", "diff ", "python3 -m py_compile ", "python3 -m unittest", "pytest", "cp ", "rm ", "mkdir ", "chmod "]):
+                cmd_prog = os.path.basename(cmd_tokens[0]).lower()
+                # Skip non-trading commands and inspection tools
+                if cmd_prog in ["git", "gh", "grep", "cat", "ls", "find", "diff", "pytest", "cp", "rm", "mkdir", "chmod", "echo", "curl"]:
                     continue
-                if any(script in subcmd_clean for script in ["execute_futures_trade.py", "deploy_fresh_basket.py", "deploy_"]):
+                full_subcmd_str = " ".join(cmd_tokens)
+                if any(script in full_subcmd_str for script in [
+                    "execute_futures_trade.py",
+                    "deploy_fresh_basket.py",
+                    "deploy_clarity_batch.py",
+                    "deploy_fomc_batch.py",
+                    "deploy_afternoon_batch.py",
+                    "deploy_morning_20usd_batch.py",
+                    "deploy_overnight_batch.py",
+                    "deploy_post_fomc_batch.py"
+                ]):
                     is_trading_command = True
                     break
 
