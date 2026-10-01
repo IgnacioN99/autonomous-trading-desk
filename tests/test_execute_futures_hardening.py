@@ -113,7 +113,8 @@ class TestLeverageCeilingGates(unittest.TestCase):
         self.assertIn("exceeds standard limit", reason)
 
     @patch("quant_risk_engine.get_account_equity", return_value=10000.0)
-    def test_yolo_leverage_up_to_15x_allowed(self, mock_eq):
+    @patch("user_profile.load_user_profile", return_value={"yolo_slot_enabled": True, "leverage_standard": 3, "max_open_positions": 5})
+    def test_yolo_leverage_up_to_15x_allowed(self, mock_prof, mock_eq):
         ok, reason = eft.check_mechanical_gates(
             direction="LONG",
             cur_price=100.0,

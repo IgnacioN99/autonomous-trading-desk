@@ -674,18 +674,18 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
     if total_active_positions >= max_open_positions:
         return False, f"MECHANICAL HARD GATE REJECTION: Max open positions limit ({max_open_positions}) reached."
 
-    # --- GATE 0B: YOLO Slot Enabled Gate ---
-    if is_yolo:
-        if not prof.get("yolo_slot_enabled", False):
-            return False, "MECHANICAL HARD GATE REJECTION: YOLO moonshot slot is disabled in user profile."
-
-    # --- GATE 0C: Leverage Ceiling Gate (Finding 8 & Profile-Driven Standard Leverage) ---
-    # Absolute ceiling: 15x under any circumstances
+    # --- GATE 0B: Leverage Ceiling Gate (Absolute Ceiling) ---
+    # Absolute ceiling: 15x under any circumstances across all strategies
     if leverage > 15:
         return False, f"MECHANICAL HARD GATE REJECTION: Leverage {leverage}x exceeds absolute desk ceiling of 15x."
 
     if leverage < 1:
         return False, f"MECHANICAL HARD GATE REJECTION: Invalid leverage {leverage}x. Must be >= 1x."
+
+    # --- GATE 0C: YOLO Slot Enabled Gate ---
+    if is_yolo:
+        if not prof.get("yolo_slot_enabled", False):
+            return False, "MECHANICAL HARD GATE REJECTION: YOLO moonshot slot is disabled in user profile."
 
     # Standard leverage limit: if not marked as YOLO, cap leverage dynamically at user profile leverage_standard
     if not is_yolo:

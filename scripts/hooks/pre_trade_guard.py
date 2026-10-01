@@ -310,11 +310,7 @@ def check_leverage_gate(symbol: str, requested_leverage: int, base_dir: str, use
     if symbol and symbol.upper() not in approved_symbols:
         return False, f"🚨 BLOCKED BY PRE-TOOL-USE HOOK (Leverage Gate): Asset '{symbol}' is not approved in evaluation dossier."
 
-    # Verify YOLO slot enabled in user profile
-    if not user_prof.get("yolo_slot_enabled", False):
-        return False, f"🚨 BLOCKED BY PRE-TOOL-USE HOOK (Leverage Gate): Requested leverage ({requested_leverage}x > {std_lev}x) requires YOLO status, but YOLO moonshot slot is disabled in user profile."
-
-    # Verify YOLO authorization
+    # Verify YOLO authorization in dossier
     is_yolo_authorized = False
     for cand in dossier_data.get("approved_candidates", []):
         if str(cand.get("symbol", "")).upper() == symbol.upper():
@@ -338,13 +334,17 @@ def check_leverage_gate(symbol: str, requested_leverage: int, base_dir: str, use
     if symbol.upper() in [s.upper() for s in dossier_data.get("yolo_approved_symbols", [])]:
         is_yolo_authorized = True
 
-    if is_yolo_authorized:
-        return True, f"YOLO moonshot leverage ({requested_leverage}x) authorized for '{symbol}' in evaluation dossier."
-    else:
+    if not is_yolo_authorized:
         return False, (
             f"🚨 BLOCKED BY PRE-TOOL-USE HOOK (Leverage Gate): "
             f"Requested leverage ({requested_leverage}x > {std_lev}x) for '{symbol}' is not authorized as a YOLO moonshot in the evaluation dossier."
         )
+
+    # Verify YOLO slot enabled in user profile
+    if not user_prof.get("yolo_slot_enabled", False):
+        return False, f"🚨 BLOCKED BY PRE-TOOL-USE HOOK (Leverage Gate): Requested leverage ({requested_leverage}x > {std_lev}x) requires YOLO status, but YOLO moonshot slot is disabled in user profile."
+
+    return True, f"YOLO moonshot leverage ({requested_leverage}x) authorized for '{symbol}' in evaluation dossier."
 
 
 def emit_decision(decision: str, reason: str = "", code: int = None) -> int:
