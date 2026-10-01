@@ -154,6 +154,54 @@ class TestExecuteFuturesMCPBridge(unittest.TestCase):
         self.assertEqual(res["orderId"], 88888)
         self.assertEqual(res["algoId"], 88888)
 
+    @patch("execute_futures_trade.get_mcp_oauth_token", return_value="fake_token_xyz")
+    @patch("urllib.request.urlopen")
+    def test_call_binance_mcp_headers_and_session_id(self, mock_urlopen, mock_token):
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps({
+            "result": {
+                "content": [{"type": "text", "text": "{\"status\": \"ok\"}"}]
+            }
+        }).encode("utf-8")
+        mock_urlopen.return_value.__enter__.return_value = mock_resp
+
+        res = eft.call_binance_mcp("test_tool", {"a": 1}, session_id="sess_12345")
+        self.assertEqual(res, {"status": "ok"})
+
+        req = mock_urlopen.call_args[0][0]
+        self.assertEqual(req.headers.get("Authorization"), "Bearer fake_token_xyz")
+        self.assertEqual(req.headers.get("Accept"), "application/json, text/event-stream")
+        self.assertEqual(req.headers.get("Mcp-session-id"), "sess_12345")
+
+    @patch("execute_futures_trade.get_mcp_oauth_token", return_value="fake_token_xyz")
+    @patch("urllib.request.urlopen")
+    def test_call_binance_mcp_jsonrpc_error(self, mock_urlopen, mock_token):
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps({
+            "error": {"code": -32600, "message": "Invalid request"}
+        }).encode("utf-8")
+        mock_urlopen.return_value.__enter__.return_value = mock_resp
+
+        res = eft.call_binance_mcp("test_tool", {})
+        self.assertTrue(res.get("isError"))
+        self.assertIn("error", res)
+
+    @patch("execute_futures_trade.get_mcp_oauth_token", return_value="fake_token_xyz")
+    @patch("urllib.request.urlopen")
+    def test_call_binance_mcp_tool_is_error(self, mock_urlopen, mock_token):
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps({
+            "result": {
+                "isError": True,
+                "content": [{"type": "text", "text": "Position not found"}]
+            }
+        }).encode("utf-8")
+        mock_urlopen.return_value.__enter__.return_value = mock_resp
+
+        res = eft.call_binance_mcp("test_tool", {})
+        self.assertTrue(res.get("isError"))
+        self.assertEqual(res.get("error"), "Position not found")
+
 
 if __name__ == "__main__":
     unittest.main()

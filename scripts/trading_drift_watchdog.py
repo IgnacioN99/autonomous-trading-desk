@@ -28,12 +28,14 @@ import argparse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import execute_futures_trade as eft
 from utils.atomic_writer import read_json_safe, atomic_append_jsonl
+from utils.env_resolver import resolve_env
 
 LOGS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
 STATE_FILE = os.path.join(LOGS_DIR, "session_state.json")
 AUDIT_LOG = os.path.join(LOGS_DIR, "trades_audit.jsonl")
 
-def audit_dead_alpha(target_env: str = "testnet", max_hours: float = 4.0, auto_exit: bool = False):
+def audit_dead_alpha(target_env: str = None, max_hours: float = 4.0, auto_exit: bool = False):
+    target_env = resolve_env(target_env)
     print("=" * 70)
     print("⏳ DEAD ALPHA & DRIFT WATCHDOG — TEMPORAL HOLDING AUDIT")
     print(f"UTC Time: {datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
@@ -124,8 +126,9 @@ def audit_dead_alpha(target_env: str = "testnet", max_hours: float = 4.0, auto_e
     }
 
 if __name__ == "__main__":
+    default_env = resolve_env()
     parser = argparse.ArgumentParser(description="Dead Alpha & Drift Watchdog")
-    parser.add_argument("--env", default="testnet", choices=["testnet", "mainnet"])
+    parser.add_argument("--env", default=default_env, help="Target execution environment (prod/testnet)")
     parser.add_argument("--max-hours", type=float, default=4.0, help="Maximum holding hours before declaring dead alpha")
     parser.add_argument("--auto-exit", action="store_true", help="Closes dead alpha positions at market")
     args = parser.parse_args()

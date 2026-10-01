@@ -1,8 +1,11 @@
 # Workspace Trading Agent Rules
 
-Whenever the user asks to analyze, screen the market, evaluate, or plan a trading position, the agent MUST automatically act as the **Trade Execution & Market Radar Assistant** and follow this Standard Operating Procedure (SOP):
+Whenever the user explicitly requests crypto trading operations, Binance Futures market scans, trading opportunity evaluations, or order execution planning, the agent MUST automatically act as the **Trade Execution & Market Radar Assistant** and follow this Standard Operating Procedure (SOP). For general software engineering, bug fixing, test suite maintenance, refactoring, or non-trading administrative tasks, do NOT trigger trading workflows or execution gates.
+
+- **Explicit Safety Invariant:** If pre-trade hooks are not active in the runtime, live order execution is strictly prohibited. The desk operates fail-closed: under no circumstances may an agent bypass hooks or issue direct unverified orders.
 
 0. **Quantitative Trading Agentic Architecture (Fail-Closed Deterministic Harness):**
+   - **Runtime Safety Invariant:** If pre-trade hooks are not active in the runtime, live order execution is strictly prohibited. Orders must never be dispatched without passing pre-trade verification hooks and evaluation dossiers.
    - **Primary Operational Environment (PROD Mainnet by Default):**
      * The trading desk operates primarily in **PROD (Mainnet Real)** executing via the official Binance Agentic MCP Gateway (`agent.binance.com`) on the user's sandboxed sub-account.
      * All market scans, evaluations, diagnostics (`trading_doctor.py`), and ledger synchronizations (`sync_session_state.py`) target **PROD by default**.

@@ -25,6 +25,7 @@ import argparse
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(BASE_DIR, "scripts"))
 import execute_futures_trade as eft
+from utils.env_resolver import resolve_env, is_prod_environment
 
 NOTION_VERSION = "2022-06-28"
 
@@ -68,8 +69,9 @@ def notion_api_request(endpoint: str, method: str = "GET", data: dict = None, ap
     except Exception as e:
         return {"error": str(e), "status_code": 0}
 
-def get_binance_trade_history(target_env: str = "testnet") -> dict:
+def get_binance_trade_history(target_env: str = None) -> dict:
     """Recopila el estado final y PnL de cada símbolo tradeado en Binance."""
+    target_env = resolve_env(target_env)
     # 1. Comprobar si hay alguna posición viva en el ledger
     active_positions = eft.send_signed_request("GET", "/fapi/v2/positionRisk", target_env=target_env)
     live_map = {}
@@ -116,7 +118,8 @@ def get_binance_trade_history(target_env: str = "testnet") -> dict:
 
     return history_by_symbol, live_map
 
-def reconcile_notion(api_key: str, db_id: str, dry_run: bool = False, target_env: str = "testnet"):
+def reconcile_notion(api_key: str, db_id: str, dry_run: bool = False, target_env: str = None):
+    target_env = resolve_env(target_env)
     print("=" * 65)
     print("🔄 RECONCILIACIÓN NOTION JOURNAL vs BINANCE FUTURES LEDGER")
     print(f"Target Env: {target_env.upper()} | Notion DB: {db_id[:8]}...")
@@ -205,7 +208,7 @@ def reconcile_notion(api_key: str, db_id: str, dry_run: bool = False, target_env
                 if pnl_prop_name:
                     update_payload["properties"][pnl_prop_name] = {"number": round(pnl, 4)}
                 if "Entorno" in props_meta:
-                    env_label = "REAL" if str(target_env).lower() in ["prod", "mainnet", "production"] else "TESTNET"
+                    env_label = "REAL" if is_prod_environment(target_env) else "TESTNET"
                     update_payload["properties"]["Entorno"] = {"select": {"name": env_label}}
 
                 upd_res = notion_api_request(f"pages/{page_id}", method="PATCH", data=update_payload, api_key=api_key)
@@ -224,11 +227,12 @@ def reconcile_notion(api_key: str, db_id: str, dry_run: bool = False, target_env
     return True
 
 def main():
+    default_env = resolve_env()
     parser = argparse.ArgumentParser(description="Sync Notion Journal with Binance Ledger")
     parser.add_argument("--dry-run", action="store_true", help="Simulate reconciliation without modifying Notion")
     parser.add_argument("--api-key", type=str, help="Notion API Key (starts with secret_ or ntn_)")
     parser.add_argument("--database-id", type=str, help="Notion Database ID (32 chars UUID)")
-    parser.add_argument("--env", type=str, default="testnet", help="Binance environment (testnet/prod)")
+    parser.add_argument("--env", type=str, default=default_env, help="Binance environment (testnet/prod)")
     args = parser.parse_args()
 
     api_key = args.api_key

@@ -27,17 +27,23 @@ STATE_FILE = os.path.join(LOGS_DIR, "session_state.json")
 INSIGHTS_FILE = os.path.join(LOGS_DIR, "trade_insights.jsonl")
 BRIEF_FILE = os.path.join(LOGS_DIR, "primed_brief.json")
 
-def ensure_fresh_state(max_age_sec: int = 600) -> dict:
+def ensure_fresh_state(max_age_sec: int = 600, target_env: str = "prod") -> dict:
     """Verifies whether session_state.json is fresh; if not, syncs in ~600ms."""
     needs_sync = True
     if os.path.exists(STATE_FILE):
         age = time.time() - os.path.getmtime(STATE_FILE)
         if age < max_age_sec:
-            needs_sync = False
+            try:
+                with open(STATE_FILE, "r", encoding="utf-8") as f:
+                    curr = json.load(f)
+                    if curr.get("target_env", "").lower() == target_env.lower():
+                        needs_sync = False
+            except Exception:
+                pass
             
     if needs_sync:
         sync_script = os.path.join(BASE_DIR, "scripts", "sync_session_state.py")
-        subprocess.run([sys.executable, sync_script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run([sys.executable, sync_script, "--env", target_env], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -68,20 +74,20 @@ def load_recent_insights(limit: int = 3) -> List[dict]:
     except Exception:
         return []
 
-def get_latest_screening_payload() -> dict:
+def get_latest_screening_payload(target_env: str = "prod") -> dict:
     """Fetches the latest market screening payload or invokes screening_pipeline."""
     pipeline_script = os.path.join(BASE_DIR, "scripts", "screening_pipeline.py")
     try:
-        res = subprocess.run([sys.executable, pipeline_script, "--json"], capture_output=True, text=True, timeout=25)
+        res = subprocess.run([sys.executable, pipeline_script, "--json", "--env", target_env], capture_output=True, text=True, timeout=60)
         if res.returncode == 0 and res.stdout.strip():
             return json.loads(res.stdout.strip())
     except Exception:
         pass
     return {}
 
-def assemble_primed_brief() -> dict:
-    state = ensure_fresh_state()
-    screening = get_latest_screening_payload()
+def assemble_primed_brief(target_env: str = "prod") -> dict:
+    state = ensure_fresh_state(target_env=target_env)
+    screening = get_latest_screening_payload(target_env=target_env)
     insights = load_recent_insights(limit=3)
     
     portfolio = state.get("portfolio_exposure", {})
@@ -91,7 +97,7 @@ def assemble_primed_brief() -> dict:
     # Condensed context pack (token-budget optimized)
     brief = {
         "timestamp_utc": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
-        "target_env": state.get("target_env", "testnet").upper(),
+        "target_env": state.get("target_env", "prod").upper(),
         "ground_truth_portfolio": {
             "delta_bias": portfolio.get("delta_bias", "NEUTRAL"),
             "long_notional_usdt": portfolio.get("long_notional_usdt", 0.0),
@@ -174,7 +180,12 @@ def format_markdown_brief(brief: dict) -> str:
     return "\n".join(lines)
 
 if __name__ == "__main__":
-    brief = assemble_primed_brief()
+    env = "prod"
+    if "--env" in sys.argv:
+        idx = sys.argv.index("--env")
+        if idx + 1 < len(sys.argv):
+            env = sys.argv[idx + 1]
+    brief = assemble_primed_brief(target_env=env)
     if "--json" in sys.argv:
         print(json.dumps(brief, indent=2, ensure_ascii=False))
     else:

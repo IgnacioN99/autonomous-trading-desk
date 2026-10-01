@@ -28,8 +28,10 @@ import argparse
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import execute_futures_trade as eft
 import dynamic_exit_manager as dem
+from utils.env_resolver import resolve_env
 
-def run_night_cutoff(target_env: str = "testnet", auto_ratchet: bool = True):
+def run_night_cutoff(target_env: str = None, auto_ratchet: bool = True):
+    target_env = resolve_env(target_env)
     print("=" * 70)
     print("🌙 NIGHT CUTOFF LOOP — OVERNIGHT RISK SHIELDING PROTOCOL")
     print(f"UTC Time: {datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
@@ -121,7 +123,7 @@ def run_night_cutoff(target_env: str = "testnet", auto_ratchet: bool = True):
     # 3. Sync Final Session State
     print("\n📡 Synchronizing session state to persist Ground Truth...")
     sync_script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sync_session_state.py")
-    os.system(f"{sys.executable} {sync_script} > /dev/null 2>&1")
+    os.system(f"{sys.executable} {sync_script} --env {target_env} > /dev/null 2>&1")
     print("✅ session_state.json updated with nightly cutoff state.")
 
     print("\n" + "=" * 70)
@@ -129,8 +131,9 @@ def run_night_cutoff(target_env: str = "testnet", auto_ratchet: bool = True):
     print("=" * 70)
 
 if __name__ == "__main__":
+    default_env = resolve_env()
     parser = argparse.ArgumentParser(description="Night Cutoff Loop - Zero Overnight Risk")
-    parser.add_argument("--env", default="testnet", choices=["testnet", "mainnet"])
+    parser.add_argument("--env", default=default_env, help="Target execution environment (prod/testnet)")
     parser.add_argument("--auto-ratchet", action="store_true", default=True)
     args = parser.parse_args()
 

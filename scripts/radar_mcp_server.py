@@ -106,7 +106,10 @@ def get_crypto_newsletters(limit: int = 5, sender: str = "") -> str:
             date_hdr = fetch_newsletters.decode_mime_str(msg.get("Date", ""))
             body = fetch_newsletters.extract_body(msg)
             preview = " ".join(body.split())[:350]
-            out.append(f"• Subject: {subject}\n  From: {from_hdr} | Date: {date_hdr[:16]}\n  Summary: {preview}...\n")
+            clean_sub = fetch_newsletters.sanitize_untrusted_text(subject)
+            clean_from = fetch_newsletters.sanitize_untrusted_text(from_hdr)
+            clean_prev = fetch_newsletters.sanitize_untrusted_text(preview)
+            out.append(f"<untrusted_newsletter_data>\n• Subject: {clean_sub}\n  From: {clean_from} | Date: {date_hdr[:16]}\n  Summary: {clean_prev}...\n</untrusted_newsletter_data>\n")
 
         mail.logout()
         return "\n".join(out)
@@ -256,7 +259,7 @@ MEME CONFLUENCE (HARDENED FILTERS):
 • ⚠️ PROTECTION RULE: Do not move SL to Break-Even prematurely; only move to BE after TP1 execution (+75% ROE) to absorb microstructural noise."""
 
 @server.tool(description="Executes a complete Binance Futures position (Testnet or Prod) with isolated margin, leverage, trigger validation or conditional/limit entry, verified algo Stop Loss, and asymmetric Take Profits (30% TP1 / 70% TP2) with Reduce-Only.")
-def deploy_futures_trade(symbol: str, direction: str, leverage: int = 3, margin_usdt: float = 100.0, sl_price: float = 0.0, tp1_price: float = 0.0, tp2_price: float = 0.0, target_env: str = "testnet", trigger_price: float = 0.0, order_type: str = "MARKET", limit_price: float = 0.0) -> str:
+def deploy_futures_trade(symbol: str, direction: str, leverage: int = 3, margin_usdt: float = 100.0, sl_price: float = 0.0, tp1_price: float = 0.0, tp2_price: float = 0.0, target_env: str = "testnet", trigger_price: float = 0.0, order_type: str = "MARKET", limit_price: float = 0.0, is_yolo: bool = False) -> str:
     """
     Parameters:
     - symbol: Trading pair (e.g. 'EIGENUSDT', 'ETHUSDT').
@@ -270,21 +273,28 @@ def deploy_futures_trade(symbol: str, direction: str, leverage: int = 3, margin_
     - trigger_price: Confirmation wick break trigger level.
     - order_type: 'MARKET', 'STOP_MARKET' (conditional on trigger), or 'LIMIT'.
     - limit_price: Limit price when order_type='LIMIT'.
+    - is_yolo: True if executing a high-leverage YOLO moonshot.
     """
     try:
+        if leverage > 15:
+            return f"❌ Error executing trade: MECHANICAL HARD GATE REJECTION: Leverage {leverage}x exceeds absolute desk ceiling of 15x."
+        if not is_yolo and leverage > 5:
+            return f"❌ Error executing trade: MECHANICAL HARD GATE REJECTION: Leverage {leverage}x exceeds standard limit (5x). Mark as YOLO for leverage > 5x."
+
         importlib.reload(execute_futures_trade)
         res = execute_futures_trade.execute_complete_trade(
             symbol=symbol,
             direction=direction,
             leverage=leverage,
             margin_usdt=margin_usdt,
-            sl_price=sl_price,
-            tp1_price=tp1_price,
-            tp2_price=tp2_price,
+            sl_price=sl_price if sl_price > 0 else None,
+            tp1_price=tp1_price if tp1_price > 0 else None,
+            tp2_price=tp2_price if tp2_price > 0 else None,
             target_env=target_env,
             trigger_price=trigger_price if trigger_price > 0 else None,
             order_type=order_type,
-            limit_price=limit_price if limit_price > 0 else None
+            limit_price=limit_price if limit_price > 0 else None,
+            is_yolo=is_yolo
         )
         if not res.get("success"):
             return f"❌ Error executing trade: {res.get('error')}"
