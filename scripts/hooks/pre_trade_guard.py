@@ -283,7 +283,7 @@ def check_leverage_gate(symbol: str, requested_leverage: int, base_dir: str, use
     if user_prof is None:
         try:
             import user_profile as up
-            user_prof = up.load_user_profile()
+            user_prof = up.load_user_profile(base_dir=base_dir)
         except Exception:
             user_prof = {}
 
@@ -494,7 +494,7 @@ def main() -> int:
         # Load user profile safely
         try:
             import user_profile as up
-            user_prof = up.load_user_profile()
+            user_prof = up.load_user_profile(base_dir=base_dir)
         except Exception:
             user_prof = {}
 

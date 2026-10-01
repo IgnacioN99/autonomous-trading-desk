@@ -21,7 +21,7 @@ import sys
 import json
 import time
 import datetime
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_DIR = os.path.join(BASE_DIR, "config")
@@ -55,12 +55,14 @@ def get_yolo_margin(target_env="testnet") -> float:
         equity = 10000.0 if str(target_env).lower() == "testnet" else 100.0
     return round(max(equity * yolo_pct, 5.0), 2)
 
-def load_user_profile() -> Dict[str, Any]:
+def load_user_profile(base_dir: Optional[str] = None) -> Dict[str, Any]:
     """Loads the user profile from config/user_profile.json or defaults."""
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    if os.path.exists(PROFILE_FILE):
+    config_dir = os.path.join(base_dir, "config") if base_dir else CONFIG_DIR
+    profile_file = os.path.join(config_dir, "user_profile.json")
+    os.makedirs(config_dir, exist_ok=True)
+    if os.path.exists(profile_file):
         try:
-            with open(PROFILE_FILE, "r", encoding="utf-8") as f:
+            with open(profile_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 profile = dict(DEFAULT_PROFILE)
                 profile.update(data)
@@ -68,7 +70,7 @@ def load_user_profile() -> Dict[str, Any]:
         except Exception:
             pass
     # Fallback to example template if present
-    example_file = PROFILE_FILE + ".example"
+    example_file = profile_file + ".example"
     if os.path.exists(example_file):
         try:
             with open(example_file, "r", encoding="utf-8") as f:

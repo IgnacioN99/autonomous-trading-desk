@@ -49,6 +49,19 @@ class TestBinanceMCPGuard(unittest.TestCase):
         with open(os.path.join(self.scripts_dir, "sync_session_state.py"), "w", encoding="utf-8") as f:
             f.write("#!/usr/bin/env python3\n")
 
+        # Create mock user profile in self.mock_root for isolated test execution
+        self.config_dir = os.path.join(self.mock_root, "config")
+        os.makedirs(self.config_dir, exist_ok=True)
+        self.profile_path = os.path.join(self.config_dir, "user_profile.json")
+        with open(self.profile_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "profile_completed": True,
+                "yolo_slot_enabled": True,
+                "leverage_standard": 3,
+                "max_open_positions": 5,
+                "autonomous_execution_tier_s": True
+            }, f)
+
         self.dossier_path = os.path.join(self.eval_dir, "latest_dossier.json")
         self.state_path = os.path.join(self.logs_dir, "session_state.json")
 
