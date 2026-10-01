@@ -37,15 +37,16 @@ Whenever the user explicitly requests crypto trading operations, Binance Futures
      * End-of-day protocol: ratchets winning positions to True Net Break-Even (+0.2%), reaps expired orphan limit orders (>90m), and guarantees Zero Overnight Risk.
 
 1. **Phase 1: Grounded Intelligence & Market Screening**
-   - Consult your quantitative research notebooks (e.g. via NotebookLM) to ground strategies in mathematical principles:
-     1. `"Bitcoin Volatility & Market Microstructure"` (`6036d55e-82e2-4924-a4a8-67d105a6f7cc`): Bitcoin microstructure (CVD, Open Interest, absorption wicks, Kelly sizing, volatility parity).
-     2. `"Rate Arbitrage & Crypto Volatility Modeling"` (`b19c24de-519d-4e6e-a1e3-49fa0e3704e6`): Layer-1 dynamic cointegration (Engle-Granger MacKinnon, Johansen, Ornstein-Uhlenbeck half-life), Delta-Neutral Funding Rate arbitrage, and econometric liquidation cascade modeling.
-     3. `"Anthropic Agentic Systems & Evaluator-Optimizer Workflows"` (`9bf5952c-43c4-46b5-964c-d709ad5d7c71`): Multi-agent orchestration, tool use error response engineering, parallel request decomposition, and MCP client/server contracts.
-     4. `"Ingeniería de Prompts y Arquitectura Agéntica de Producción"` (`fb995c39-49ea-459a-b648-7112ed690cf5`): Guía canónica de prompts, delimitación XML jerárquica, optimización KV-cache y negative few-shots.
-   - Ingest fresh news, newsletters, and macro/crypto catalysts: execute `python3 scripts/fetch_newsletters.py --folder "<YOUR_NEWSLETTERS_FOLDER>"` (or MCP tool `crypto_radar:get_crypto_newsletters`) to inspect tagged crypto emails (Glassnode, Blockworks, etc.) and reject late-stage euphoria or avoid entering right before scheduled high-impact events.
-   - **Market Rank & Institutional Flow Screening (Binance Skills Integration):**
-     * **Capital Inflow & Hype Radar (`crypto-market-rank`):** Screen tokens with highest smart-money net inflows, trending social hype, and top trader positioning to identify where institutional liquidity is clustering prior to technical chart filtering.
-     * **Smart Money & Whale Orderflow Confluence (`binance-wallet-tracker` & `trading-signal`):** Verify on-chain accumulation/distribution patterns and discrete whale buy/sell signals on key assets to back up technical absorption wicks ($\ge 60\%$) and Order Flow Imbalance.
+   - Consult your quantitative research notebooks (e.g. via NotebookLM using IDs configured in `config/user_context.json` or local research in `research/`) to ground strategies in mathematical principles:
+     1. `"Bitcoin Volatility & Market Microstructure"` (configured as `bitcoin_microstructure_notebook_id` in `config/user_context.json` or see `research/01_kelly_criterion_crypto_risk.md`, `research/02_spot_cvd_order_flow_absorptions.md`): Bitcoin microstructure (CVD, Open Interest, absorption wicks, Kelly sizing, volatility parity).
+     2. `"Rate Arbitrage & Crypto Volatility Modeling"` (configured as `stat_arb_notebook_id` in `config/user_context.json` or see `research/04_funding_rate_arbitrage_and_liquidations.md`): Layer-1 dynamic cointegration (Engle-Granger MacKinnon, Johansen, Ornstein-Uhlenbeck half-life), Delta-Neutral Funding Rate arbitrage, and econometric liquidation cascade modeling.
+     3. `"Anthropic Agentic Systems & Evaluator-Optimizer Workflows"` (configured as `agentic_systems_notebook_id` in `config/user_context.json`): Multi-agent orchestration, tool use error response engineering, parallel request decomposition, and MCP client/server contracts.
+     4. `"Ingeniería de Prompts y Arquitectura Agéntica de Producción"` (configured as `prompt_engineering_notebook_id` in `config/user_context.json` or see `docs/agent_prompt_engineering_guide.md`): Guía canónica de prompts, delimitación XML jerárquica, optimización KV-cache y negative few-shots.
+   - Ingest fresh news, newsletters, and macro/crypto catalysts: execute `python3 scripts/fetch_newsletters.py` (reads folder from `config/user_context.json`, `NEWSLETTERS_FOLDER` env var, or optional `--folder "<FOLDER>"`) or use MCP tool `crypto_radar:get_crypto_newsletters` to inspect tagged crypto emails (Glassnode, Blockworks, etc.) and reject late-stage euphoria or avoid entering right before scheduled high-impact events.
+   - **Market Rank & Institutional Flow Screening (Optional Web3 Skills Integration):**
+     * *Graceful Fallback:* If optional Web3 skills (`crypto-market-rank`, `binance-wallet-tracker`, `trading-signal`) are not installed or configured, the desk automatically and gracefully falls back to native Binance Futures market screener (`scripts/broad_market_radar.py`) and microstructure engine (`scripts/microstructure_engine.py`) with zero operational interruption.
+     * **Capital Inflow & Hype Radar (`crypto-market-rank`, Optional):** Screen tokens with highest smart-money net inflows, trending social hype, and top trader positioning to identify where institutional liquidity is clustering prior to technical chart filtering.
+     * **Smart Money & Whale Orderflow Confluence (`binance-wallet-tracker` & `trading-signal`, Optional):** Verify on-chain accumulation/distribution patterns and discrete whale buy/sell signals on key assets to back up technical absorption wicks ($\ge 60\%$) and Order Flow Imbalance.
    - Screen liquid Binance Futures contracts concurrently across 80+ pairs (15m/5m/1h via `python3 scripts/broad_market_radar.py` or MCP tools), targeting volume absorption wicks, RSI extremes, and distance to EMA 20.
    - **Dual-Engine Operational Framework:**
       * **Engine 1: Disciplined Pure Intraday (Day Trading Desk):**
@@ -76,9 +77,9 @@ Whenever the user explicitly requests crypto trading operations, Binance Futures
      * **Barbell Philosophy (Nassim Taleb):** 90% of capital allocated to rigorous quantitative and Stat-Arb strategies, and 10% strictly ring-fenced for convex moonshots.
      * **Objective:** Capture explosive breakout runs (+50% to +150% ROE) in memecoins (PEPE, WIF, BONK, DOGE, NEIRO, PENGU, BOME, MOODENG) at 10x to 15x leverage.
      * **Mandatory Hardened Quantitative Filters:** Climax volume $\ge 2.0\times$ moving average OR buyer absorption wick $\ge 50\%$. If no memecoin meets this threshold, **the YOLO slot must remain empty** (never force trades).
-     * **Narrative & Launchpad Acceleration (`meme-rush`):** Cross-check memecoin candidates with real-time launchpad lifecycle and AI hot topics (`topic-rush` / `meme-rush`) to guarantee active speculative momentum and capital inflow velocity before entering.
-     * **Right-Tail Skewness Preservation (Zero Truncation):** On 15x memecoins, **do NOT move Stop Loss to Break-Even prematurely** to prevent premature whipsawing by 5m microstructure noise. Stop Loss is ratcheted to Break-Even only after **TP1 (+75% ROE)** is filled, letting positive convexity run.
-     * **Isolated Risk Control:** Strict capital limit ($10 USDT real margin) and **mandatory Isolated Margin** so maximum loss is programmatically capped by software (maximum -$3.75 USDT) with zero contagion to the main balance.
+      * **Narrative & Launchpad Acceleration (`meme-rush` / `topic-rush`, Optional):** If installed, cross-check memecoin candidates with real-time launchpad lifecycle and AI hot topics (`topic-rush` / `meme-rush`) to guarantee active speculative momentum and capital inflow velocity before entering. If not installed, fall back to 24h volume acceleration and CVD absorption wicks from `broad_market_radar.py`.
+      * **Right-Tail Skewness Preservation (Zero Truncation):** On 15x memecoins, **do NOT move Stop Loss to Break-Even prematurely** to prevent premature whipsawing by 5m microstructure noise. Stop Loss is ratcheted to Break-Even only after **TP1 (+75% ROE)** is filled, letting positive convexity run.
+      * **Isolated Risk Control:** Strict capital limit ($10 USDT real margin) and **mandatory Isolated Margin** so maximum loss is programmatically capped by software (maximum -$3.75 USDT) with zero contagion to the main balance.
 
 3. **Phase 3: User Selection & Zero-Error Deployment**
    - **Clean-Room Hard Gate PreToolUse Interception:**
@@ -105,7 +106,7 @@ Whenever the user explicitly requests crypto trading operations, Binance Futures
      * **Continuous Orphan Audit (`audit_orphan_positions`):** Regularly audit all open positions. If an unprotected position lacking an active Stop Loss is detected, trigger immediate auto-healing (`auto_heal`).
 
 4. **Phase 4: Notion Journal Sync**
-   - Automatically synchronize with Notion database `"Trading Journal - Futures"` (`collection://<YOUR_NOTION_COLLECTION_ID>`):
+   - Automatically synchronize with Notion database `"Trading Journal - Futures"` (configured via `database_id` in `config/user_context.json` or `NOTION_DATABASE_ID` in `.env` / environment variables; see `docs/notion_setup_guide.md`):
      * Log initial trade page upon execution with parameters, sizing, and technical thesis.
      * Update Stop Loss to Break-Even upon TP1 fill.
      * Archive with `TP Hit` or `SL Hit` and exact realized PnL upon position close.

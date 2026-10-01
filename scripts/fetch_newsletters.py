@@ -16,6 +16,23 @@ import argparse
 
 CONFIG_PATH = os.path.expanduser("~/.gemini/antigravity-cli/gmail_config.json")
 LOCAL_ENV_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+USER_CONTEXT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config", "user_context.json")
+
+def get_default_newsletter_folder() -> str:
+    """Resolves default newsletter folder from env or config/user_context.json."""
+    env_folder = os.environ.get("NEWSLETTERS_FOLDER")
+    if env_folder and env_folder.strip():
+        return env_folder.strip()
+    if os.path.exists(USER_CONTEXT_PATH):
+        try:
+            with open(USER_CONTEXT_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                folder = data.get("newsletters", {}).get("folder")
+                if folder and isinstance(folder, str) and folder.strip():
+                    return folder.strip()
+        except Exception:
+            pass
+    return "Newsletters/Crypto"
 
 class HTMLTextExtractor(HTMLParser):
     def __init__(self):
@@ -97,6 +114,18 @@ def load_credentials():
     # 3. Check Environment Variables
     user = os.environ.get("GMAIL_USER")
     password = os.environ.get("GMAIL_APP_PASSWORD")
+
+    # 4. Fallback: check config/user_context.json for gmail_user
+    if not user and os.path.exists(USER_CONTEXT_PATH):
+        try:
+            with open(USER_CONTEXT_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                cfg_user = data.get("newsletters", {}).get("gmail_user")
+                if cfg_user and isinstance(cfg_user, str) and cfg_user.strip():
+                    user = cfg_user.strip()
+        except Exception:
+            pass
+
     if user and password and "PEGA_AQUI" not in password:
         return user, password.replace(" ", "")
 
@@ -181,7 +210,9 @@ def list_folders(mail):
                 out.append(decoded)
     return out
 
-def fetch_emails(folder="Newsletters/Crypto", query=None, sender=None, limit=5, test_only=False, list_all_folders=False, output_format="json"):
+def fetch_emails(folder=None, query=None, sender=None, limit=5, test_only=False, list_all_folders=False, output_format="json"):
+    if not folder:
+        folder = get_default_newsletter_folder()
     user, password = load_credentials()
     if not user or not password:
         print(json.dumps({
@@ -311,7 +342,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Gmail IMAP Newsletter Reader")
     parser.add_argument("--test", action="store_true", help="Test IMAP authentication")
     parser.add_argument("--list-folders", action="store_true", help="List all mailbox labels/folders")
-    parser.add_argument("--folder", type=str, default="Newsletters/Crypto", help="Folder/label to inspect (default: Newsletters/Crypto)")
+    parser.add_argument("--folder", type=str, default=None, help="Folder/label to inspect (default: configured in config/user_context.json or Newsletters/Crypto)")
     parser.add_argument("--sender", type=str, default="", help="Filter by sender email")
     parser.add_argument("--query", type=str, default="", help="Search specific text query")
     parser.add_argument("--limit", type=int, default=5, help="Number of emails to fetch")

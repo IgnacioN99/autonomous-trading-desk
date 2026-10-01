@@ -63,7 +63,33 @@ def scan_intraday_market(interval: str = "15m", top: int = 6) -> str:
     except Exception as e:
         return f"Error executing scanner: {str(e)}"
 
-@server.tool(description="Queries latest crypto newsletters from Gmail inbox (label 'Newsletters/Crypto') to detect macro catalysts and market sentiment.")
+def get_newsletter_folder() -> str:
+    """
+    Resolves the newsletter folder/label to inspect in Gmail.
+    Precedence:
+    1. NEWSLETTERS_FOLDER environment variable
+    2. config/user_context.json ('newsletters.folder')
+    3. Safe default: 'Newsletters/Crypto'
+    """
+    env_folder = os.environ.get("NEWSLETTERS_FOLDER")
+    if env_folder and env_folder.strip():
+        return env_folder.strip()
+
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    user_context_path = os.path.join(base_dir, "config", "user_context.json")
+    if os.path.exists(user_context_path):
+        try:
+            with open(user_context_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                folder = data.get("newsletters", {}).get("folder")
+                if folder and isinstance(folder, str) and folder.strip():
+                    return folder.strip()
+        except Exception:
+            pass
+
+    return "Newsletters/Crypto"
+
+@server.tool(description="Queries latest crypto newsletters from Gmail inbox (configured in config/user_context.json or NEWSLETTERS_FOLDER, default 'Newsletters/Crypto') to detect macro catalysts and market sentiment.")
 def get_crypto_newsletters(limit: int = 5, sender: str = "") -> str:
     """
     Parameters:
@@ -78,23 +104,27 @@ def get_crypto_newsletters(limit: int = 5, sender: str = "") -> str:
         import imaplib, email
         from email.header import decode_header
 
+        folder = get_newsletter_folder()
+        folder_quoted = f'"{folder}"' if not (folder.startswith('"') and folder.endswith('"')) else folder
+
         mail = imaplib.IMAP4_SSL("imap.gmail.com", 993)
         mail.login(user, password)
-        status, count = mail.select('"Newsletters/Crypto"', readonly=True)
+        status, count = mail.select(folder_quoted, readonly=True)
         if status != "OK":
             mail.select("INBOX", readonly=True)
+            folder = "INBOX"
 
         search_cmd = f'FROM "{sender}"' if sender else "ALL"
         status, messages = mail.search(None, search_cmd)
         if status != "OK" or not messages[0]:
             mail.logout()
-            return "No emails found in Newsletters/Crypto."
+            return f"No emails found in {folder}."
 
         msg_ids = messages[0].split()
         selected_ids = msg_ids[-limit:]
         selected_ids.reverse()
 
-        out = [f"📬 Latest {len(selected_ids)} Newsletters in 'Newsletters/Crypto':\n"]
+        out = [f"📬 Latest {len(selected_ids)} Newsletters in '{folder}':\n"]
         for mid in selected_ids:
             res, data = mail.fetch(mid, "(RFC822)")
             if res != "OK":
@@ -259,7 +289,7 @@ MEME CONFLUENCE (HARDENED FILTERS):
 • ⚠️ PROTECTION RULE: Do not move SL to Break-Even prematurely; only move to BE after TP1 execution (+75% ROE) to absorb microstructural noise."""
 
 @server.tool(description="Executes a complete Binance Futures position (Testnet or Prod) with isolated margin, leverage, trigger validation or conditional/limit entry, verified algo Stop Loss, and asymmetric Take Profits (30% TP1 / 70% TP2) with Reduce-Only.")
-def deploy_futures_trade(symbol: str, direction: str, leverage: int = 3, margin_usdt: float = 100.0, sl_price: float = 0.0, tp1_price: float = 0.0, tp2_price: float = 0.0, target_env: str = "testnet", trigger_price: float = 0.0, order_type: str = "MARKET", limit_price: float = 0.0, is_yolo: bool = False) -> str:
+def deploy_futures_trade(symbol: str, direction: str, leverage: int = 3, margin_usdt: float = 100.0, sl_price: float = 0.0, tp1_price: float = 0.0, tp2_price: float = 0.0, target_env: str = "testnet", trigger_price: float = 0.0, order_type: str = "MARKET", limit_price: float = 0.0, is_yolo: bool = False, confirmed: bool = False) -> str:
     """
     Parameters:
     - symbol: Trading pair (e.g. 'EIGENUSDT', 'ETHUSDT').
@@ -274,12 +304,30 @@ def deploy_futures_trade(symbol: str, direction: str, leverage: int = 3, margin_
     - order_type: 'MARKET', 'STOP_MARKET' (conditional on trigger), or 'LIMIT'.
     - limit_price: Limit price when order_type='LIMIT'.
     - is_yolo: True if executing a high-leverage YOLO moonshot.
+    - confirmed: True if human confirmation has been explicitly provided for PROD.
     """
     try:
+        import user_profile as up
+        prof = up.load_user_profile()
+        std_cap = int(prof.get("leverage_standard", 3))
+
         if leverage > 15:
             return f"❌ Error executing trade: MECHANICAL HARD GATE REJECTION: Leverage {leverage}x exceeds absolute desk ceiling of 15x."
-        if not is_yolo and leverage > 5:
-            return f"❌ Error executing trade: MECHANICAL HARD GATE REJECTION: Leverage {leverage}x exceeds standard limit (5x). Mark as YOLO for leverage > 5x."
+        if not is_yolo and leverage > std_cap:
+            return f"❌ Error executing trade: MECHANICAL HARD GATE REJECTION: Leverage {leverage}x exceeds standard limit ({std_cap}x). Mark as YOLO for leverage > {std_cap}x."
+
+        max_margin_ratio = float(prof.get("max_margin_ratio", 0.30))
+        try:
+            import quant_risk_engine as qre
+            account_equity = qre.get_account_equity(target_env)
+        except Exception:
+            account_equity = 10000.0 if str(target_env).lower() == "testnet" else 100.0
+
+        if margin_usdt is None or margin_usdt == 100.0:
+            if is_yolo:
+                margin_usdt = up.get_yolo_margin(target_env)
+            else:
+                margin_usdt = round(min(100.0, max(5.0, account_equity * max_margin_ratio * 0.5)), 2)
 
         importlib.reload(execute_futures_trade)
         res = execute_futures_trade.execute_complete_trade(
@@ -294,7 +342,8 @@ def deploy_futures_trade(symbol: str, direction: str, leverage: int = 3, margin_
             trigger_price=trigger_price if trigger_price > 0 else None,
             order_type=order_type,
             limit_price=limit_price if limit_price > 0 else None,
-            is_yolo=is_yolo
+            is_yolo=is_yolo,
+            confirmed=confirmed
         )
         if not res.get("success"):
             return f"❌ Error executing trade: {res.get('error')}"

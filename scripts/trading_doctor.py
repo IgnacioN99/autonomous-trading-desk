@@ -124,21 +124,54 @@ def run_doctor(target_env: str = None, auto_heal: bool = False) -> int:
         critical_failures.append(f"Failed to fetch balance: {str(e)}")
         print(f"❌ [BALANCE] Authentication or connection error: {e}")
 
-    # 3b. User Profile Calibration Check
+    # 3b. User Profile Calibration Check (FAIL CLOSED)
     try:
         import user_profile as up
         profile = up.load_user_profile()
         risk_pct = profile.get("risk_pct_equity", 0.005) * 100
         is_completed = profile.get("profile_completed", False)
-        if is_completed:
+        if not is_completed:
+            critical_failures.append("User profile has not completed onboarding. Run 'python3 scripts/user_profile.py --setup' before trading.")
+            print("🚨 [USER PROFILE] User profile has not completed onboarding. Run 'python3 scripts/user_profile.py --setup' before trading.")
+        else:
             ok_items.append(f"User Profile calibrated (Risk: {risk_pct:.2f}% equity, Mode: {profile.get('operating_mode')})")
             print(f"✅ [USER PROFILE] Calibrated: {risk_pct:.2f}% risk per trade ({profile.get('operating_mode')})")
-        else:
-            warnings.append(f"User Profile onboarding pending (running on {risk_pct:.2f}% defaults)")
-            print(f"ℹ️  [USER PROFILE] Default profile active ({risk_pct:.2f}% equity). Run 'python3 scripts/user_profile.py --setup' to calibrate.")
     except Exception as e:
-        warnings.append(f"User profile error: {e}")
-        print(f"⚠️  [USER PROFILE] Could not load profile: {e}")
+        critical_failures.append(f"User profile error: {e}")
+        print(f"🚨 [USER PROFILE] Could not load profile: {e}")
+
+    # 3c. PreToolUse Safety Hook Activation Check (FAIL CLOSED)
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    agents_hooks = os.path.join(base_dir, ".agents", "hooks.json")
+    claude_settings = os.path.join(base_dir, ".claude", "settings.json")
+    hooks_configured = False
+
+    if os.path.exists(agents_hooks):
+        try:
+            with open(agents_hooks, "r", encoding="utf-8") as f:
+                hdata = json.load(f)
+                content_str = json.dumps(hdata)
+                if "pre_trade_guard.py" in content_str and "PreToolUse" in content_str:
+                    hooks_configured = True
+        except Exception:
+            pass
+
+    if not hooks_configured and os.path.exists(claude_settings):
+        try:
+            with open(claude_settings, "r", encoding="utf-8") as f:
+                sdata = json.load(f)
+                content_str = json.dumps(sdata)
+                if "pre_trade_guard.py" in content_str and "PreToolUse" in content_str:
+                    hooks_configured = True
+        except Exception:
+            pass
+
+    if hooks_configured:
+        ok_items.append("PreToolUse safety guard active (.agents/hooks.json or .claude/settings.json)")
+        print("✅ [SAFETY HOOKS] PreToolUse execution guard active and configured.")
+    else:
+        critical_failures.append("PreToolUse hook missing or unconfigured in .agents/hooks.json or .claude/settings.json. Live order execution is strictly prohibited.")
+        print("🚨 [SAFETY HOOKS] PreToolUse hook missing or unconfigured in .agents/hooks.json or .claude/settings.json. Live order execution is strictly prohibited.")
 
     # 4. Forensic Orphan Position Audit (FAIL CLOSED)
     try:

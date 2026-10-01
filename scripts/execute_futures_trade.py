@@ -649,32 +649,52 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
     if bypass_all_gates:
         return True, None
 
-    # --- GATE 0: Leverage Ceiling Gate (Finding 8) ---
-    # Absolute ceiling: 15x under any circumstances
+    try:
+        import user_profile as up
+        prof = up.load_user_profile()
+    except Exception:
+        prof = {}
+
+    # --- GATE 0A: Max Open Positions Gate ---
+    max_open_positions = int(prof.get("max_open_positions", 3))
+    log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'logs')
+    state_file = os.path.join(log_dir, 'session_state.json')
+    total_active_positions = 0
+    if os.path.exists(state_file):
+        try:
+            with open(state_file, 'r', encoding='utf-8') as f:
+                state_data_pos = json.load(f)
+                total_active_positions = state_data_pos.get('portfolio_exposure', {}).get('total_active_positions')
+                if total_active_positions is None:
+                    total_active_positions = len(state_data_pos.get('active_positions', []))
+                total_active_positions = int(total_active_positions)
+        except Exception:
+            total_active_positions = 0
+
+    if total_active_positions >= max_open_positions:
+        return False, f"MECHANICAL HARD GATE REJECTION: Max open positions limit ({max_open_positions}) reached."
+
+    # --- GATE 0B: Leverage Ceiling Gate (Absolute Ceiling) ---
+    # Absolute ceiling: 15x under any circumstances across all strategies
     if leverage > 15:
         return False, f"MECHANICAL HARD GATE REJECTION: Leverage {leverage}x exceeds absolute desk ceiling of 15x."
 
     if leverage < 1:
         return False, f"MECHANICAL HARD GATE REJECTION: Invalid leverage {leverage}x. Must be >= 1x."
 
-    # Standard leverage limit: if not marked as YOLO, cap leverage at max 5x (or user profile leverage_standard, default 3x)
-    if not is_yolo:
-        std_cap = 5
-        try:
-            import user_profile as up
-            prof = up.load_user_profile()
-            prof_std = int(prof.get("leverage_standard", 3))
-            std_cap = max(5, prof_std)
-        except Exception:
-            std_cap = 5
+    # --- GATE 0C: YOLO Slot Enabled Gate ---
+    if is_yolo:
+        if not prof.get("yolo_slot_enabled", False):
+            return False, "MECHANICAL HARD GATE REJECTION: YOLO moonshot slot is disabled in user profile."
 
+    # Standard leverage limit: if not marked as YOLO, cap leverage dynamically at user profile leverage_standard
+    if not is_yolo:
+        std_cap = int(prof.get("leverage_standard", 3))
         if leverage > std_cap:
             return False, f"MECHANICAL HARD GATE REJECTION: Leverage {leverage}x exceeds standard limit ({std_cap}x). Set --is-yolo for leverage > {std_cap}x."
 
     # --- GATE 1: Delta-Neutral Gate (Finding 6: Fail-Closed & Staleness Check) ---
     if not bypass_delta_gate and not is_testnet:
-        log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'logs')
-        state_file = os.path.join(log_dir, 'session_state.json')
         if not os.path.exists(state_file):
             return False, "MECHANICAL HARD GATE REJECTION: FAIL-CLOSED — session_state.json does not exist. Cannot verify portfolio delta in PROD. Order blocked."
         try:
@@ -722,9 +742,7 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
 
     # Load risk percentage from user profile (default 0.005 = 0.5%)
     try:
-        import user_profile as up
-        user_prof = up.load_user_profile()
-        raw_risk = float(user_prof.get("risk_pct_equity", 0.005))
+        raw_risk = float(prof.get("risk_pct_equity", 0.005))
     except Exception:
         raw_risk = 0.005
 
@@ -762,7 +780,8 @@ def execute_complete_trade(
     limit_price=None,
     bypass_delta_gate=False,
     is_yolo=False,
-    bypass_eval_gate=False
+    bypass_eval_gate=False,
+    confirmed=False
 ):
     target_env = resolve_env(target_env)
     is_prod = str(target_env).lower() != 'testnet'
@@ -785,9 +804,22 @@ def execute_complete_trade(
 
     try:
         import user_profile as up
-        max_margin_ratio = up.load_user_profile().get("max_margin_ratio", 0.30)
+        prof = up.load_user_profile()
+        max_margin_ratio = float(prof.get("max_margin_ratio", 0.30))
     except Exception:
+        prof = {}
         max_margin_ratio = 0.30
+
+    # Dynamic margin scaling: if margin_usdt is None or default 100.0, scale dynamically
+    if margin_usdt is None or margin_usdt == 100.0:
+        if is_yolo:
+            try:
+                import user_profile as up
+                margin_usdt = up.get_yolo_margin(target_env)
+            except Exception:
+                margin_usdt = 10.0
+        else:
+            margin_usdt = round(min(100.0, max(5.0, account_equity * max_margin_ratio * 0.5)), 2)
 
     max_prod_margin = account_equity * max_margin_ratio
     if is_prod and margin_usdt > max_prod_margin:
@@ -1275,7 +1307,8 @@ def deploy_futures_trade(
     limit_price=None,
     bypass_delta_gate=False,
     is_yolo=False,
-    bypass_eval_gate=False
+    bypass_eval_gate=False,
+    confirmed=False
 ):
     """
     Deploy futures trade with risk gates, isolated margin, verified Stop Loss, and asymmetric Take Profits.
@@ -1294,7 +1327,8 @@ def deploy_futures_trade(
         limit_price=limit_price,
         bypass_delta_gate=bypass_delta_gate,
         is_yolo=is_yolo,
-        bypass_eval_gate=bypass_eval_gate
+        bypass_eval_gate=bypass_eval_gate,
+        confirmed=confirmed
     )
 
 def main():
@@ -1317,6 +1351,7 @@ def main():
     parser.add_argument("--bypass-eval-gate", "--bypass_eval_gate", action="store_true", dest="bypass_eval_gate", help="Bypass clean-room evaluation gate (Testnet only)")
     parser.add_argument("--bypass-delta-gate", "--bypass_delta_gate", action="store_true", dest="bypass_delta_gate", help="Bypass delta-neutral gate (Testnet only)")
     parser.add_argument("--is-yolo", "--is_yolo", action="store_true", dest="is_yolo", help="Mark trade as YOLO moonshot (authorizes leverage > 5x)")
+    parser.add_argument("--confirmed", "--user-confirmed", action="store_true", dest="confirmed", help="Explicit human confirmation for live order in PROD")
     parser.add_argument("--close-position", "--close_position", action="store_true", dest="close_position", help="Close open position at market with reduceOnly")
     parser.add_argument("--audit-orphans", "--audit_orphans", action="store_true", dest="audit_orphans", help="Audit all open positions for missing Stop Loss")
     parser.add_argument("--auto-heal", "--auto_heal", action="store_true", dest="auto_heal", help="Audit and automatically heal orphan positions lacking Stop Loss")
@@ -1371,22 +1406,26 @@ def main():
     symbol = args.symbol.upper()
     order_type = args.order_type.upper()
 
-    res = execute_complete_trade(
-        symbol=symbol,
-        direction=direction,
-        leverage=args.leverage,
-        margin_usdt=args.margin,
-        sl_price=args.sl_price,
-        tp1_price=args.tp1_price,
-        tp2_price=args.tp2_price,
-        target_env=target_env,
-        trigger_price=args.trigger_price,
-        order_type=order_type,
-        limit_price=args.limit_price,
-        bypass_delta_gate=args.bypass_delta_gate,
-        is_yolo=args.is_yolo,
-        bypass_eval_gate=args.bypass_eval_gate
-    )
+    trade_kwargs = {
+        "symbol": symbol,
+        "direction": direction,
+        "leverage": args.leverage,
+        "margin_usdt": args.margin,
+        "sl_price": args.sl_price,
+        "tp1_price": args.tp1_price,
+        "tp2_price": args.tp2_price,
+        "target_env": target_env,
+        "trigger_price": args.trigger_price,
+        "order_type": order_type,
+        "limit_price": args.limit_price,
+        "bypass_delta_gate": args.bypass_delta_gate,
+        "is_yolo": args.is_yolo,
+        "bypass_eval_gate": args.bypass_eval_gate,
+    }
+    if getattr(args, "confirmed", False):
+        trade_kwargs["confirmed"] = True
+
+    res = execute_complete_trade(**trade_kwargs)
 
     print(json.dumps(res, indent=2))
     if res.get("success"):

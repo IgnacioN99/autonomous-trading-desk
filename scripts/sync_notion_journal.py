@@ -46,6 +46,16 @@ def load_env_credentials():
                         api_key = v
                     elif k == "NOTION_DATABASE_ID" and not db_id:
                         db_id = v
+    if not db_id:
+        user_context_path = os.path.join(BASE_DIR, "config", "user_context.json")
+        if os.path.exists(user_context_path):
+            try:
+                with open(user_context_path, "r", encoding="utf-8") as f:
+                    u_ctx = json.load(f)
+                    notion_cfg = u_ctx.get("notion", {})
+                    db_id = notion_cfg.get("database_id") or notion_cfg.get("collection_id")
+            except Exception:
+                pass
     return api_key, db_id
 
 def notion_api_request(endpoint: str, method: str = "GET", data: dict = None, api_key: str = None):
