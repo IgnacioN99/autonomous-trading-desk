@@ -35,9 +35,16 @@
           {
             "type": "command",
             "command": "python3 ../scripts/hooks/post_pr_review_hook.py",
-            "timeout": 60
+            "timeout": 10
           }
         ]
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python3 ../scripts/hooks/pr_review_stop_hook.py",
+        "timeout": 10
       }
     ]
   }

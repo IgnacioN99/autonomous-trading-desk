@@ -440,8 +440,8 @@ def print_shadow_dashboard():
     
     fer_color = "🟢" if m["filter_efficacy_ratio_pct"] >= 70 else ("🟡" if m["filter_efficacy_ratio_pct"] >= 50 else "🔴")
     print(f"  • Filter Efficacy Ratio:  {fer_color} {m['filter_efficacy_ratio_pct']}% (Target: > 70%)")
-    print(f"  • Capital Saved (SL Evitado): +${m['capital_saved_usdt']} USDT")
-    print(f"  • Missed Alpha (TP Perdido):  -${m['missed_alpha_usdt']} USDT")
+    print(f"  • Capital Saved (SL Avoided): +${m['capital_saved_usdt']} USDT")
+    print(f"  • Missed Alpha (TP Missed):   -${m['missed_alpha_usdt']} USDT")
     net_str = f"+${m['net_filter_edge_usdt']}" if m['net_filter_edge_usdt'] >= 0 else f"-${abs(m['net_filter_edge_usdt'])}"
     print(f"  • Net Filter Advantage:   {net_str} USDT")
     print("-" * 80)

@@ -187,7 +187,7 @@ Ready for algorithmic execution.
 ### Step 5: Antigravity (agy) Harness Setup
 1. Open a POSIX shell (Linux, macOS or WSL) and `cd <repo>`; launch agy from the repository root.
 2. `.agents/hooks.json` runs `scripts/hooks/pre_trade_guard.py` (PreToolUse) and `scripts/hooks/post_trade_sync.py` (PostToolUse) with paths relative to `.agents/`. Do not commit absolute paths or machine-specific interpreters.
-3. agy discovers the evaluator at `.agents/agents/isolated_market_evaluator/agent.md`; no `define_subagent` step is needed.
+3. agy discovers the evaluator at `.agents/agents/isolated_market_evaluator/agent.md` and the PR reviewers at `.agents/agents/*_reviewer/agent.md`; no `define_subagent` step is needed.
 4. Verify the guard is live: `python3 scripts/trading_doctor.py` must report the pre-trade guard OK (`logs/hook_heartbeat.json` refreshed this session). Without it, live orders are prohibited.
 
 ### Step 6: (Optional) Notion & Research Setup
@@ -238,6 +238,21 @@ If subagents, hooks, or loops encounter unexpected failures, unhandled exception
 ./scripts/report_issue.sh --sync
 ```
 
+### 5. PR Review with Native Subagents
+Pull Requests are audited inside the same agy session by four isolated, read-only reviewer subagents (`.agents/agents/<domain>_reviewer/agent.md`: `trading_risk`, `binance_microstructure`, `agentic_harness`, `prompt_engineering`). Each starts with a clean context, can only `view_file` / `grep_search` / `list_dir` (`commandExecutionPolicy: "off"`) and returns one `### Verdict: <reviewer>` section with `send_message`.
+
+* **Manual:** type `/pr-review` (optionally with the PR number). The [`pr-review` skill](.agents/skills/pr-review/SKILL.md) asks before posting the comment.
+* **Automatic:** after a successful `gh pr create` or feature-branch push, the `pr-review-trigger` PostToolUse hook marks a review as pending (`logs/pr_review_state.json`) and the Stop hook (`scripts/hooks/pr_review_stop_hook.py`) keeps the session going with an instruction to run the skill, which then posts without asking. It stops prompting once the comment is posted, the agent closes it (`python3 scripts/ci/pr_review_state.py done --reason no_pr|declined`), or after 3 attempts.
+
+Flow (all helpers are deterministic):
+1. `python3 scripts/ci/triage_pr.py origin/main --context-dir logs/pr_review` maps changed files to the required reviewers (fail-closed: core or unclassified files trigger all four) and writes the diff, per-file patches and `index.md`.
+2. One `invoke_subagent` call launches every required reviewer in parallel.
+3. `python3 scripts/ci/assemble_review.py --pr <n> --from-subagent <reviewer>=<conversationId> ...` copies each verdict verbatim from the subagent transcript into `logs/pr_review/report.md` and computes the consolidated verdict.
+4. `python3 scripts/ci/verify_review.py logs/pr_manifest.json logs/pr_review/report.md` (exit 0 approved, 1 changes required, 2 missing reviewers to re-invoke).
+5. `gh pr comment <n> --body-file logs/pr_review/report.md`.
+
+Headless fallback without an interactive agy session (e.g. CI with `GEMINI_API_KEY`): `python3 scripts/ci/run_pr_audit.py origin/main logs/pr_review/report.md` builds one prompt from the same agent definitions.
+
 ---
 
 ## 📂 Repository Structure
@@ -246,12 +261,15 @@ If subagents, hooks, or loops encounter unexpected failures, unhandled exception
 autonomous-trading-desk/
 ├── .agents/
 │   ├── agents/
-│   │   └── isolated_market_evaluator/
-│   │       └── agent.md               # Clean-room evaluator subagent (XML prompt, negative few-shots)
-│   ├── hooks.json                     # Antigravity PreToolUse/PostToolUse hooks (paths relative to .agents/)
+│   │   ├── isolated_market_evaluator/
+│   │   │   └── agent.md               # Clean-room evaluator subagent (XML prompt, negative few-shots)
+│   │   └── <domain>_reviewer/
+│   │       └── agent.md               # Read-only PR reviewer subagents (4 domains)
+│   ├── hooks.json                     # Antigravity PreToolUse/PostToolUse/Stop hooks (paths relative to .agents/)
 │   ├── rules/
 │   │   └── trading.md                 # Always-on safety invariants
 │   └── skills/
+│       ├── pr-review/                 # /pr-review: multi-agent PR review orchestration
 │       └── trade-execution-planner/   # Core execution & market radar skill
 ├── .claude/
 │   └── settings.json                  # Claude Code PreToolUse/PostToolUse safety hooks
@@ -273,9 +291,17 @@ autonomous-trading-desk/
 ├── scripts/
 │   ├── adapters/
 │   │   └── exchange_adapter.py        # Exchange seam abstraction
+│   ├── ci/
+│   │   ├── triage_pr.py               # Deterministic PR triage & reviewer context
+│   │   ├── assemble_review.py         # Builds the review report from reviewer transcripts
+│   │   ├── verify_review.py           # Mechanical review completeness gate
+│   │   ├── pr_review_state.py         # Pending auto-review marker
+│   │   └── run_pr_audit.py            # Headless PR review fallback (agy -p / Gemini API)
 │   ├── hooks/
 │   │   ├── pre_trade_guard.py         # Mechanical hard gate hook (<15ms, fail-closed)
-│   │   └── post_trade_sync.py         # Auto ground-truth sync on fills
+│   │   ├── post_trade_sync.py         # Auto ground-truth sync on fills
+│   │   ├── post_pr_review_hook.py     # Arms the PR review after gh pr create / push
+│   │   └── pr_review_stop_hook.py     # Stop hook: runs /pr-review in the same session
 │   ├── loops/
 │   │   └── night_cutoff_loop.py       # Zero overnight risk manager & order reaper
 │   ├── utils/

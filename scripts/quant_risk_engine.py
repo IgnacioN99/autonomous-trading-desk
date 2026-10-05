@@ -63,7 +63,7 @@ def get_account_equity(target_env="testnet") -> float:
     except Exception as e:
         print(f"Warning: Failed to fetch balance from REST API: {e}", file=sys.stderr)
 
-    raise RuntimeError(f"FAIL-CLOSED: Imposible sincronizar equity contable para el entorno '{target_env_clean}'.")
+    raise RuntimeError(f"FAIL-CLOSED: Unable to sync account equity for environment '{target_env_clean}'.")
 
 def calculate_dynamic_equity_sizing(
     symbol, entry_price, sl_price, risk_pct_equity=None, leverage=3, target_env="testnet", max_margin_ratio=0.30

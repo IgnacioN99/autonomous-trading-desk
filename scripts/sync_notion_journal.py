@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-sync_notion_journal.py - Sincronizador de Notion Trading Journal con el Ledger de Binance.
+sync_notion_journal.py - Syncs the Notion Trading Journal with the Binance ledger.
 
-Audita las posiciones abiertas en la base de datos de Notion ("Trading Journal - Futures")
-y las reconcilia contra la realidad contable de Binance (fapi/v1/userTrades y positionRisk).
+Audits open positions in the Notion database ("Trading Journal - Futures") and
+reconciles them against Binance's accounting ground truth (fapi/v1/userTrades and positionRisk).
 
-Si una posición figura como "Open" o "Active" en Notion pero está cerrada en Binance,
-actualiza la fila a "TP Hit" o "SL Hit", registrando el precio de salida, el PnL neto
-realizado y la fecha de cierre.
+If a position is marked "Open" or "Active" in Notion but is closed on Binance, the row
+is updated to "TP Hit" or "SL Hit", recording the exit price, net realized PnL and
+close date.
 
-Uso:
+Usage:
   python3 scripts/sync_notion_journal.py [--dry-run] [--api-key <KEY>] [--database-id <ID>]
 """
 
@@ -80,9 +80,9 @@ def notion_api_request(endpoint: str, method: str = "GET", data: dict = None, ap
         return {"error": str(e), "status_code": 0}
 
 def get_binance_trade_history(target_env: str = None) -> dict:
-    """Recopila el estado final y PnL de cada símbolo tradeado en Binance."""
+    """Collects the final state and PnL of every symbol traded on Binance."""
     target_env = resolve_env(target_env)
-    # 1. Comprobar si hay alguna posición viva en el ledger
+    # 1. Check for any live position on the ledger
     active_positions = eft.send_signed_request("GET", "/fapi/v2/positionRisk", target_env=target_env)
     live_map = {}
     if isinstance(active_positions, list):
@@ -96,7 +96,7 @@ def get_binance_trade_history(target_env: str = None) -> dict:
                     "unrealized_pnl": float(p.get("unRealizedProfit", 0))
                 }
 
-    # 2. Obtener historial reciente de trades
+    # 2. Fetch recent trade history
     trades = eft.send_signed_request("GET", "/fapi/v1/userTrades", {"limit": 100}, target_env=target_env)
     history_by_symbol = {}
     if isinstance(trades, list):
@@ -131,26 +131,28 @@ def get_binance_trade_history(target_env: str = None) -> dict:
 def reconcile_notion(api_key: str, db_id: str, dry_run: bool = False, target_env: str = None):
     target_env = resolve_env(target_env)
     print("=" * 65)
-    print("🔄 RECONCILIACIÓN NOTION JOURNAL vs BINANCE FUTURES LEDGER")
+    print("🔄 NOTION JOURNAL vs BINANCE FUTURES LEDGER RECONCILIATION")
     print(f"Target Env: {target_env.upper()} | Notion DB: {db_id[:8]}...")
     print("=" * 65)
 
     if not api_key or not db_id:
-        print("❌ Error: NOTION_API_KEY o NOTION_DATABASE_ID no configurados.")
+        print("❌ Error: NOTION_API_KEY or NOTION_DATABASE_ID not configured.")
         return False
 
-    # 1. Obtener Ground Truth de Binance
+    # 1. Fetch Binance ground truth
     binance_history, live_map = get_binance_trade_history(target_env)
-    print(f"• Binance Ledger: {len(live_map)} posiciones activas | {len(binance_history)} símbolos con historial.")
+    print(f"• Binance Ledger: {len(live_map)} active positions | {len(binance_history)} symbols with history.")
 
-    # 2. Consultar la base de datos de Notion
+    # 2. Query the Notion database metadata
     db_meta = notion_api_request(f"databases/{db_id}", method="GET", api_key=api_key)
     if "error" in db_meta:
-        print(f"❌ Error al consultar metadata de la base de datos: {db_meta.get('error')}")
+        print(f"❌ Error querying database metadata: {db_meta.get('error')}")
         return False
 
     props_meta = db_meta.get("properties", {})
     status_prop_name = None
+    # "estado" / "ganancia" / "abierta" / "activa" are Spanish aliases kept so existing
+    # Spanish-named Notion columns and status options keep matching.
     for name, p in props_meta.items():
         if p.get("type") in ["status", "select"] and any(w in name.lower() for w in ["status", "estado"]):
             status_prop_name = name
@@ -162,19 +164,19 @@ def reconcile_notion(api_key: str, db_id: str, dry_run: bool = False, target_env
             pnl_prop_name = name
             break
 
-    print(f"• Propiedades detectadas en Notion: Status='{status_prop_name}', PnL='{pnl_prop_name}'")
+    print(f"• Notion properties detected: Status='{status_prop_name}', PnL='{pnl_prop_name}'")
 
-    # 3. Consultar páginas de la base de datos
+    # 3. Query database pages
     query_res = notion_api_request(f"databases/{db_id}/query", method="POST", data={"page_size": 100}, api_key=api_key)
     pages = query_res.get("results", [])
-    print(f"• Filas encontradas en Notion: {len(pages)}")
+    print(f"• Rows found in Notion: {len(pages)}")
 
     updated_count = 0
     for page in pages:
         props = page.get("properties", {})
         page_id = page.get("id")
 
-        # Extraer símbolo
+        # Extract symbol
         symbol = None
         for k, v in props.items():
             if v.get("type") == "title" and v.get("title"):
@@ -187,7 +189,7 @@ def reconcile_notion(api_key: str, db_id: str, dry_run: bool = False, target_env
         if not symbol:
             continue
 
-        # Extraer estado actual
+        # Extract current status
         current_status = ""
         if status_prop_name and status_prop_name in props:
             p_val = props[status_prop_name]
@@ -198,17 +200,17 @@ def reconcile_notion(api_key: str, db_id: str, dry_run: bool = False, target_env
 
         is_considered_open = current_status.lower() in ["open", "abierta", "active", "activa", "pending", "in progress"]
         
-        # Verificar contra Binance
+        # Check against Binance
         binance_data = binance_history.get(symbol)
         is_live_on_binance = live_map.get(symbol, {}).get("is_open", False)
 
         if is_considered_open and not is_live_on_binance:
-            # En Notion está abierta pero en Binance está 100% CERRADA
+            # Open in Notion but 100% CLOSED on Binance
             pnl = binance_data["total_realized_pnl"] if binance_data else 0.0
             new_status = "TP Hit" if pnl > 0 else ("SL Hit" if pnl < 0 else "Closed")
 
-            print(f"⚠️ DISCREPANCIA DETECTADA en {symbol}:")
-            print(f"   Notion dice: '{current_status}' | Binance Ledger: CERRADA (PnL: {pnl:+.4f} USDT)")
+            print(f"⚠️ DISCREPANCY DETECTED on {symbol}:")
+            print(f"   Notion says: '{current_status}' | Binance Ledger: CLOSED (PnL: {pnl:+.4f} USDT)")
 
             if not dry_run:
                 update_payload = {"properties": {}}
@@ -217,22 +219,23 @@ def reconcile_notion(api_key: str, db_id: str, dry_run: bool = False, target_env
                     update_payload["properties"][status_prop_name] = {p_type: {"name": new_status}}
                 if pnl_prop_name:
                     update_payload["properties"][pnl_prop_name] = {"number": round(pnl, 4)}
+                # "Entorno" (environment) is the existing Notion column name; keep it.
+                env_label = "REAL" if is_prod_environment(target_env) else "TESTNET"
                 if "Entorno" in props_meta:
-                    env_label = "REAL" if is_prod_environment(target_env) else "TESTNET"
                     update_payload["properties"]["Entorno"] = {"select": {"name": env_label}}
 
                 upd_res = notion_api_request(f"pages/{page_id}", method="PATCH", data=update_payload, api_key=api_key)
                 if "error" not in upd_res:
-                    print(f"   ✅ Actualizado en Notion -> Estado: '{new_status}', PnL: {pnl:+.4f} USDT, Entorno: '{env_label}'")
+                    print(f"   ✅ Updated in Notion -> Status: '{new_status}', PnL: {pnl:+.4f} USDT, Entorno: '{env_label}'")
                     updated_count += 1
                 else:
-                    print(f"   ❌ Fallo al actualizar página {page_id}: {upd_res.get('error')}")
+                    print(f"   ❌ Failed to update page {page_id}: {upd_res.get('error')}")
             else:
-                print(f"   [DRY-RUN] Se actualizaría a: '{new_status}', PnL: {pnl:+.4f} USDT")
+                print(f"   [DRY-RUN] Would update to: '{new_status}', PnL: {pnl:+.4f} USDT")
                 updated_count += 1
 
     print("=" * 65)
-    print(f"🎯 RECONCILIACIÓN COMPLETADA: {updated_count} posiciones reconciliadas.")
+    print(f"🎯 RECONCILIATION COMPLETE: {updated_count} positions reconciled.")
     print("=" * 65)
     return True
 

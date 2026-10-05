@@ -144,17 +144,17 @@ def interactive_terminal_onboarding():
     print("=" * 65)
     print("👋 TRADING SYSTEM ONBOARDING & RISK PROFILER")
     print("=" * 65)
-    print("Antes de operar, calibremos tus parámetros de riesgo y estilo:\n")
+    print("Before trading, let's calibrate your risk and style parameters:\n")
 
     current = load_user_profile()
 
-    # 1. Riesgo por Trade
-    print("1. ¿Qué porcentaje de tu capital deseas arriesgar por trade en Stop Loss?")
-    print("   [1] 0.5% (Recomendado - Conservador / Estándar Prop Firm)")
-    print("   [2] 1.0% (Equilibrado / Crecimiento Moderado)")
-    print("   [3] 2.0% (Dinámico / Alto Crecimiento)")
-    print(f"   (Actual: {current.get('risk_pct_equity', 0.005)*100:.1f}%)")
-    choice = input("Selecciona [1/2/3] o escribe un porcentaje (ej. 0.5): ").strip()
+    # 1. Risk per Trade
+    print("1. What percentage of your capital do you want to risk per trade at Stop Loss?")
+    print("   [1] 0.5% (Recommended - Conservative / Prop Firm Standard)")
+    print("   [2] 1.0% (Balanced / Moderate Growth)")
+    print("   [3] 2.0% (Dynamic / High Growth)")
+    print(f"   (Current: {current.get('risk_pct_equity', 0.005)*100:.1f}%)")
+    choice = input("Select [1/2/3] or type a percentage (e.g. 0.5): ").strip()
     risk_map = {"1": 0.005, "2": 0.01, "3": 0.02}
     if choice in risk_map:
         current["risk_pct_equity"] = risk_map[choice]
@@ -165,12 +165,12 @@ def interactive_terminal_onboarding():
         except Exception:
             current["risk_pct_equity"] = 0.005
 
-    # 2. Gestión Nocturna
-    print("\n2. ¿Cómo prefieres gestionar las posiciones abiertas durante la noche (22:00 UTC)?")
-    print("   [1] Cero Riesgo Nocturno (ZERO_OVERNIGHT_RISK - Ratchetear a Break-Even obligatorio o cerrar)")
-    print("   [2] Cerrar Todo al Mercado (CLOSE_ALL_AT_MARKET - Liquidar 100% de posiciones a las 22:00 UTC)")
-    print("   [3] Swing Estructural (SWING_STRUCTURAL_STOP - Permitir posiciones con Stop Loss estructural)")
-    c2 = input("Selecciona [1/2/3]: ").strip()
+    # 2. Overnight Handling
+    print("\n2. How do you want to handle open positions overnight (22:00 UTC)?")
+    print("   [1] Zero Overnight Risk (ZERO_OVERNIGHT_RISK - Mandatory ratchet to Break-Even or close)")
+    print("   [2] Close All at Market (CLOSE_ALL_AT_MARKET - Close 100% of positions at 22:00 UTC)")
+    print("   [3] Structural Swing (SWING_STRUCTURAL_STOP - Allow positions with a structural Stop Loss)")
+    c2 = input("Select [1/2/3]: ").strip()
     if c2 == "2":
         current["overnight_mode"] = "CLOSE_ALL_AT_MARKET"
     elif c2 == "3":
@@ -178,20 +178,20 @@ def interactive_terminal_onboarding():
     else:
         current["overnight_mode"] = "ZERO_OVERNIGHT_RISK"
 
-    # 3. Slot YOLO Memecoins
-    print("\n3. ¿Deseas activar el slot Barbell YOLO (10x-15x en memecoins con clímax, máx $10 margin)?")
-    print("   [1] No (Solo operaciones cuantitativas estándar Tier S)")
-    print("   [2] Sí (Habilitar slot asimétrico acotado)")
-    c3 = input("Selecciona [1/2]: ").strip()
+    # 3. YOLO Memecoin Slot
+    print("\n3. Do you want to enable the Barbell YOLO slot (10x-15x on memecoins with climax volume, max $10 margin)?")
+    print("   [1] No (Standard Tier S quantitative trades only)")
+    print("   [2] Yes (Enable the capped asymmetric slot)")
+    c3 = input("Select [1/2]: ").strip()
     current["yolo_slot_enabled"] = (c3 == "2")
 
-    # 4. Apalancamiento Estándar
-    print("\n4. ¿Qué apalancamiento deseas utilizar para operaciones estándar?")
-    print("   [1] 2x (Conservador / Swing: buffer ~45% a liquidación, menor ruido intradía)")
-    print("   [2] 3x (Recomendado / Intradía óptimo: equilibrio entre margen y riesgo, buffer ~30%)")
-    print("   [3] 5x (Agresivo / Intradía activo: menor margen requerido, mayor sensibilidad a mechas)")
-    print(f"   (Actual: {current.get('leverage_standard', 3)}x)")
-    c4 = input("Selecciona [1/2/3]: ").strip()
+    # 4. Standard Leverage
+    print("\n4. Which leverage do you want to use for standard trades?")
+    print("   [1] 2x (Conservative / Swing: ~45% buffer to liquidation, less intraday noise)")
+    print("   [2] 3x (Recommended / Optimal intraday: balance between margin and risk, ~30% buffer)")
+    print("   [3] 5x (Aggressive / Active intraday: less margin required, more sensitive to wicks)")
+    print(f"   (Current: {current.get('leverage_standard', 3)}x)")
+    c4 = input("Select [1/2/3]: ").strip()
     lev_map = {"1": 2, "2": 3, "3": 5}
     if c4 in lev_map:
         current["leverage_standard"] = lev_map[c4]
@@ -203,21 +203,21 @@ def interactive_terminal_onboarding():
         except Exception:
             pass
 
-    # 5. Ejecución Autónoma Tier S
-    print("\n5. ¿Deseas activar la ejecución autónoma inmediata para oportunidades Tier S?")
-    print("   [1] No (Recomendado / Seguro: Requiere confirmación humana en chat antes de desplegar)")
-    print("   [2] Sí (Fast-Track: Ejecución y blindaje autónomo inmediato en setups Tier S aprobados)")
-    c5 = input("Selecciona [1/2]: ").strip()
+    # 5. Tier S Autonomous Execution
+    print("\n5. Do you want to enable immediate autonomous execution for Tier S opportunities?")
+    print("   [1] No (Recommended / Safe: Requires human confirmation in chat before deploying)")
+    print("   [2] Yes (Fast-Track: Immediate autonomous execution and protection of approved Tier S setups)")
+    c5 = input("Select [1/2]: ").strip()
     current["autonomous_execution_tier_s"] = (c5 == "2")
 
     save_user_profile(current)
     print("\n" + "=" * 65)
-    print(f"✅ PERFIL GUARDADO EXITOSAMENTE en config/user_profile.json")
-    print(f"• Riesgo por trade: {current['risk_pct_equity']*100:.2f}% de tu balance total")
-    print(f"• Modo nocturno: {current['overnight_mode']}")
-    print(f"• Slot YOLO: {'ACTIVADO' if current['yolo_slot_enabled'] else 'DESACTIVADO'}")
-    print(f"• Apalancamiento estándar: {current['leverage_standard']}x")
-    print(f"• Ejecución autónoma Tier S: {'ACTIVADA (Fast-Track)' if current.get('autonomous_execution_tier_s') else 'DESACTIVADA (Requiere confirmación humana)'}")
+    print(f"✅ PROFILE SAVED SUCCESSFULLY to config/user_profile.json")
+    print(f"• Risk per trade: {current['risk_pct_equity']*100:.2f}% of your total balance")
+    print(f"• Overnight mode: {current['overnight_mode']}")
+    print(f"• YOLO slot: {'ENABLED' if current['yolo_slot_enabled'] else 'DISABLED'}")
+    print(f"• Standard leverage: {current['leverage_standard']}x")
+    print(f"• Tier S autonomous execution: {'ENABLED (Fast-Track)' if current.get('autonomous_execution_tier_s') else 'DISABLED (Requires human confirmation)'}")
     print("=" * 65)
 
 if __name__ == "__main__":

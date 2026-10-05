@@ -26,15 +26,18 @@ Create an inline or full-page database named **`Trading Journal - Futures`** wit
 | **TP2** | `number` | Currency / 4-6 decimal places | Optional | Structural take-profit target (+4.0R). |
 | **Leverage** | `number` | Integer (e.g. `3`, `5`, `15`) | Optional | Effective leverage applied. |
 | **Realized PnL**| `number` | Currency (USDT), colored by value | **Required** | Populated automatically by `sync_notion_journal.py` from actual Binance trade fills. |
-| **Entorno** | `select` | `REAL`, `TESTNET` | Optional | Operating environment identifier (`REAL` = Mainnet, `TESTNET` = Sandbox). |
+| **Entorno** | `select` | `REAL`, `TESTNET` | Optional | Operating environment (Spanish for "Environment"; keep this exact column name). `REAL` = Mainnet, `TESTNET` = Sandbox. |
 | **Date** | `date` | Timestamp (UTC) | Optional | Entry execution timestamp. |
 | **Notes** | `rich_text` | Text | Optional | Technical thesis, catalyst, or evaluation dossier summary. |
 
 > [!TIP]
 > `scripts/sync_notion_journal.py` uses flexible property resolution:
-> - **Status property:** Matches any column named `Status` or `Estado` of type `select` or `status`.
-> - **PnL property:** Matches any column named `Realized PnL`, `PnL`, `Profit`, or `Ganancia` of type `number`.
-> - **Environment property:** Updates `Entorno` with `REAL` or `TESTNET` if present.
+> - **Status property:** Matches any column whose name contains `Status` or `Estado` (Spanish for "status") of type `select` or `status`.
+> - **PnL property:** Matches any column whose name contains `PnL`, `Profit`, or `Ganancia` (Spanish for "profit") of type `number` (e.g. `Realized PnL`).
+> - **Open status values:** `Open`, `Active`, `Pending`, `In Progress` and the Spanish aliases `Abierta` / `Activa` (case-insensitive).
+> - **Environment property:** Updates `Entorno` (Spanish for "Environment") with `REAL` or `TESTNET` if present.
+>
+> The Spanish names above are matched literally by the script so existing Spanish-named databases keep working; do not rename them in the script.
 
 ---
 
@@ -145,14 +148,14 @@ python3 scripts/sync_notion_journal.py
 Expected output:
 ```text
 =================================================================
-🔄 RECONCILIACIÓN NOTION JOURNAL vs BINANCE FUTURES LEDGER
+🔄 NOTION JOURNAL vs BINANCE FUTURES LEDGER RECONCILIATION
 Target Env: TESTNET | Notion DB: a8b9c1d2...
 =================================================================
-• Binance Ledger: 0 posiciones activas | 4 símbolos con historial.
-• Propiedades detectadas en Notion: Status='Status', PnL='Realized PnL'
-• Filas encontradas en Notion: 4
+• Binance Ledger: 0 active positions | 4 symbols with history.
+• Notion properties detected: Status='Status', PnL='Realized PnL'
+• Rows found in Notion: 4
 =================================================================
-🎯 RECONCILIACIÓN COMPLETADA: 0 posiciones reconciliadas.
+🎯 RECONCILIATION COMPLETE: 0 positions reconciled.
 =================================================================
 ```
 
@@ -170,4 +173,4 @@ Target Env: TESTNET | Notion DB: a8b9c1d2...
    - Transitions `Status` to **`SL HIT`** if realized PnL < 0.
    - Transitions `Status` to **`CLOSED`** if realized PnL == 0.
    - Updates `Realized PnL` with the exact numerical dollar amount.
-   - Stamps `Entorno` with `REAL` or `TESTNET`.
+   - Stamps `Entorno` (environment) with `REAL` or `TESTNET`.

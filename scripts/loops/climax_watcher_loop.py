@@ -169,19 +169,19 @@ def run_watcher(interval_seconds: int = 180, once: bool = False, auto_deploy: bo
     while True:
         iteration += 1
         now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        print(f"\n[{now_str}] (Scan #{iteration}) Escaneando mercado de futuros...")
+        print(f"\n[{now_str}] (Scan #{iteration}) Scanning futures market...")
         
         try:
             candidates, payload, portfolio_delta = scan_for_climax_setups(target_env=target_env)
             
             if not candidates:
-                print(f"   ⏳ Sin clímax institucional compatible (Delta: {portfolio_delta}). Esperando próxima vela...")
+                print(f"   ⏳ No compatible institutional climax (Delta: {portfolio_delta}). Waiting for next candle...")
             else:
-                print(f"   🚨 ¡CLÍMAX INSTITUCIONAL DETECTADO! {len(candidates)} candidato(s) calificado(s):")
+                print(f"   🚨 INSTITUTIONAL CLIMAX DETECTED! {len(candidates)} qualified candidate(s):")
                 approved_dicts = []
                 for c in candidates:
                     wick = c.upper_wick_pct if c.direction == "SHORT" else c.lower_wick_pct
-                    print(f"   🔥 {c.symbol} ({c.direction}) | Vol: {c.vol_ratio:.1f}x | Mecha: {wick:.1f}% | Entrada: {c.current_price} | SL: {c.sl_price:.4f} | Margen: ${c.required_margin:.1f} USDT")
+                    print(f"   🔥 {c.symbol} ({c.direction}) | Vol: {c.vol_ratio:.1f}x | Wick: {wick:.1f}% | Entry: {c.current_price} | SL: {c.sl_price:.4f} | Margin: ${c.required_margin:.1f} USDT")
                     approved_dicts.append({
                         "symbol": c.symbol,
                         "direction": c.direction,
@@ -209,14 +209,14 @@ def run_watcher(interval_seconds: int = 180, once: bool = False, auto_deploy: bo
 
                 if auto_deploy:
                     top_c = candidates[0]
-                    print(f"\n⚡ Auto-desplegando orden para {top_c.symbol} ({top_c.direction})...")
+                    print(f"\n⚡ Auto-deploying order for {top_c.symbol} ({top_c.direction})...")
                     auto_deploy_candidate(top_c, leverage, target_env)
 
                 # Exit code 10 signals Antigravity / external orchestrator that an actionable event occurred
                 sys.exit(10)
                 
         except Exception as e:
-            print(f"   ⚠️ Error en ciclo de escaneo: {e}", file=sys.stderr)
+            print(f"   ⚠️ Scan cycle error: {e}", file=sys.stderr)
             
         if once:
             break
