@@ -22,8 +22,8 @@ Whenever the user explicitly requests crypto trading operations, Binance Futures
    - **Layer 2: Hard Code Gates (Mechanical Software Gates in `scripts/execute_futures_trade.py`):**
      * *Deterministic Execution Interception:* Risk control is never delegated to natural language LLM instructions; it is programmatically enforced at runtime. The execution engine physically intercepts every order:
        1. **Delta-Neutral Gate:** If the portfolio marks `LONG_HEAVY`, physically rejects any `LONG` order (`hard_gate_rejection: True`). If it marks `SHORT_HEAVY`, rejects any `SHORT`.
-       2. **Monetary Risk Gate:** Blocks any order whose maximum loss exceeds the profile's `risk_pct_equity` × equity + buffer (default 0.5%, adjustable up to 2.0% in the user profile).
-       3. **Financial Friction Gate:** Blocks orders where distance to TP1 is under 0.35% (ensuring taker fees do not eat the edge).
+       2. **Monetary Risk Gate:** Blocks any order whose loss at SL from the effective entry (limit/trigger price if conditional) exceeds profile `risk_pct_equity` × equity + buffer (default 0.5%, max 2.0%).
+       3. **Financial Friction Gate:** Blocks orders whose TP1 is under 0.35% from the effective entry (taker fees would eat the edge).
        4. **Leverage Gate:** Standard orders use the profile's `leverage_standard`, YOLO orders `leverage_yolo`; absolute desk ceiling = profile `leverage_ceiling` (default 15x).
      * *Environment Operational Rule (PROD vs TESTNET Sandbox):* In **PROD (Mainnet Real)**, mechanical hard gates are 100% strict and inviolable (Fail-closed, zero exceptions). In **TESTNET**, explicit bypass or gate relaxation is permitted (Delta-Neutral, risk caps, friction) to allow testing, stress tests, concurrent runs, and new hypotheses freely without friction.
    - **Layer 3: Deterministic Context Packing (`scripts/prime_evaluator_brief.py`):**
