@@ -29,6 +29,23 @@ except ImportError:
         def resolve_env(env=None):
             return str(env).lower() if env else os.environ.get('BINANCE_API_ENV', 'testnet').lower()
 
+try:
+    from utils.env_resolver import find_workspace_root
+except ImportError:
+    def find_workspace_root():
+        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Single dossier gate shared with the PreToolUse hook (scripts/utils/dossier_provenance.py).
+# If it cannot be imported, new positions fail closed in PROD (see enforce_evaluation_dossier).
+try:
+    from utils.dossier_provenance import validate_dossier_for_trade
+except Exception:  # pragma: no cover - exercised only on broken installs
+    validate_dossier_for_trade = None
+
+# Liquidation gate parameters
+DEFAULT_MAINT_MARGIN_RATIO = 0.01      # Conservative fallback when /fapi/v1/leverageBracket is unavailable
+LIQUIDATION_SAFETY_FRACTION = 0.80     # SL distance must be <= 80% of the entry->liquidation distance
+
 def load_env(target_env=None):
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     config = {}
@@ -319,19 +336,51 @@ def send_mcp_gateway_request(method, endpoint, params=None):
             'symbol': params['symbol'],
             'side': params['side'],
             'type': order_type,
-            'stopPrice': trig_p,
-            'closePosition': close_pos
+            'algoType': 'CONDITIONAL',
+            'triggerPrice': str(trig_p),
         }
-        if close_pos != 'true':
-            if 'quantity' in params:
-                mcp_args['quantity'] = float(params['quantity'])
-            if 'reduceOnly' in params and str(params['reduceOnly']).lower() == 'true':
+        if 'workingType' in params:
+            mcp_args['workingType'] = params['workingType']
+        # MCP Gateway requires 'quantity' even with closePosition=true.
+        # Always include quantity: from params, or look up from exchange.
+        qty = params.get('quantity')
+        if not qty and close_pos == 'true':
+            try:
+                pos_data = call_binance_mcp('futures_usds.positionInformationV2')
+                if isinstance(pos_data, list):
+                    for p in pos_data:
+                        if p.get('symbol') == params['symbol']:
+                            pos_amt = abs(float(p.get('positionAmt', 0)))
+                            if pos_amt > 0:
+                                qty = pos_amt
+                                break
+            except Exception:
+                pass
+        if qty:
+            mcp_args['quantity'] = str(qty)
+        if close_pos == 'true':
+            if qty:
+                # closePosition cannot be combined with quantity: a quantity-based protective stop MUST be
+                # reduce-only, otherwise it could open a reverse position once the original one is gone.
                 mcp_args['reduceOnly'] = 'true'
+            else:
+                mcp_args['closePosition'] = 'true'
+        elif 'reduceOnly' in params and str(params['reduceOnly']).lower() == 'true':
+            mcp_args['reduceOnly'] = 'true'
 
-        res = call_binance_mcp('futures_usds.newOrder', mcp_args)
-        if isinstance(res, dict) and 'orderId' in res:
+        # Use hidden tool futures_usds.newAlgoOrder via tool_execute
+        res = call_binance_mcp('tool_execute', {
+            'toolName': 'futures_usds.newAlgoOrder',
+            'arguments': mcp_args
+        })
+        if isinstance(res, dict) and 'orderId' in res and 'algoId' not in res:
             res['algoId'] = res['orderId']
         return res
+
+    # 12. Notional & leverage brackets (read-only; used by the liquidation gate).
+    # Any error here makes the caller fall back to the conservative DEFAULT_MAINT_MARGIN_RATIO.
+    if endpoint == '/fapi/v1/leverageBracket' and method.upper() == 'GET':
+        return call_binance_mcp('futures_usds.notionalAndLeverageBrackets', {'symbol': params['symbol']} if params.get('symbol') else {})
 
     # Public fallbacks: time, ticker, exchangeInfo
     public_url = f"https://fapi.binance.com{endpoint}"
@@ -352,8 +401,10 @@ def get_client_config(target_env=None):
     if norm_env == 'prod':
         auth_mode = str(cfg.get('BINANCE_AUTH_MODE', '')).strip().lower()
         mcp_token = get_mcp_oauth_token(cfg)
-        # If explicitly MCP mode OR OAuth token is present, use MCP Agentic Gateway
-        if auth_mode == 'mcp' or (mcp_token and not cfg.get('BINANCE_PROD_API_KEY')):
+        # Explicit MCP mode uses the Agentic Gateway; explicit KEYS mode always uses HMAC keys.
+        # Without an explicit mode, fall back to MCP only when an OAuth token exists and no keys are configured.
+        has_keys = bool(cfg.get('BINANCE_PROD_API_KEY') or cfg.get('BINANCE_API_KEY'))
+        if auth_mode == 'mcp' or (auth_mode != 'keys' and mcp_token and not has_keys):
             return "MCP_OAUTH_ACTIVE", mcp_token or "mcp_token", "https://fapi.binance.com"
 
         api_key = cfg.get('BINANCE_PROD_API_KEY') or cfg.get('BINANCE_API_KEY', '')
@@ -467,14 +518,80 @@ def round_price(val, step, prec):
     rounded = (d_val / d_step).quantize(Decimal('1'), rounding=ROUND_DOWN) * d_step
     return float(f"{rounded:.{prec}f}")
 
+def margin_type_isolated_confirmed(margin_res):
+    """
+    Interprets the response of POST /fapi/v1/marginType (ISOLATED), via HMAC REST or the MCP gateway.
+    Returns (ok, reason). Only an explicit success or Binance -4046 ("No need to change margin type",
+    i.e. already ISOLATED) is accepted; anything else (errors, -4047/-4048 open orders/positions,
+    network failures, empty/unknown payloads) fails closed.
+    """
+    text = str(margin_res)
+    lowered = text.lower()
+    if '-4046' in text or 'no need to change margin type' in lowered:
+        return True, "Margin type already ISOLATED (-4046)."
+    if isinstance(margin_res, dict):
+        code = margin_res.get('code')
+        try:
+            code_int = int(code) if code is not None else None
+        except (TypeError, ValueError):
+            code_int = None
+        if margin_res.get('isError') or 'error' in margin_res or (code_int is not None and code_int < 0):
+            err = margin_res.get('error') or margin_res.get('msg') or margin_res.get('message') or text
+            return False, f"Failed to set ISOLATED margin ({err})."
+        if code_int == 200 or str(margin_res.get('msg', '')).lower() == 'success':
+            return True, "Margin type set to ISOLATED."
+        if margin_res:
+            return True, "Margin type set to ISOLATED."
+        return False, "Empty response when setting ISOLATED margin."
+    if isinstance(margin_res, str) and 'success' in lowered and 'error' not in lowered:
+        return True, "Margin type set to ISOLATED."
+    return False, f"Unexpected response when setting ISOLATED margin ({text})."
+
+
 def setup_margin_and_leverage(symbol, leverage, target_env=None):
+    """
+    1. Forces ISOLATED margin (fail-closed: on any failure other than -4046 the leverage is not touched
+       and (None, margin_res, None) is returned so the caller aborts the trade).
+    2. Sets leverage; on the generic sub-account cap (-4421) auto-clamps to 5x.
+    Returns (lev_res, margin_res, confirmed_leverage).
+    """
     target_env = resolve_env(target_env)
-    lev_res = send_signed_request('POST', '/fapi/v1/leverage', {'symbol': symbol, 'leverage': leverage}, target_env=target_env)
+    # 1. Set Margin Type to ISOLATED (Binance returns error -4046 if already isolated, which is normal)
     margin_res = send_signed_request('POST', '/fapi/v1/marginType', {'symbol': symbol, 'marginType': 'ISOLATED'}, target_env=target_env)
-    return lev_res, margin_res
+    margin_ok, _ = margin_type_isolated_confirmed(margin_res)
+    if not margin_ok:
+        return None, margin_res, None
+
+    # 2. Set Leverage
+    lev_res = send_signed_request('POST', '/fapi/v1/leverage', {'symbol': symbol, 'leverage': leverage}, target_env=target_env)
+
+    confirmed_leverage = leverage
+    err_str = str(lev_res)
+    # Subaccount leverage cap (-4421): Binance restricts subaccounts to 5x max leverage
+    if isinstance(lev_res, dict) and (lev_res.get('isError') or 'error' in lev_res or lev_res.get('code') in [-4421, -32603]):
+        if '-4421' in err_str or 'Subaccounts are restricted from using leverage greater than 5x' in err_str:
+            if leverage > 5:
+                print(f"⚠️ Subaccount leverage ceiling detected (-4421). Clamping leverage from {leverage}x to 5x max for {symbol}.", file=sys.stderr)
+                lev_res = send_signed_request('POST', '/fapi/v1/leverage', {'symbol': symbol, 'leverage': 5}, target_env=target_env)
+                confirmed_leverage = 5
+
+    if isinstance(lev_res, dict) and 'leverage' in lev_res:
+        try:
+            confirmed_leverage = int(lev_res['leverage'])
+        except Exception:
+            pass
+
+    return lev_res, margin_res, confirmed_leverage
+
 
 def place_algo_stop_loss(symbol, exit_side, sl_price, target_env=None):
     target_env = resolve_env(target_env)
+    try:
+        filters = get_symbol_filters(symbol, target_env=target_env)
+        if filters and 'tickSize' in filters and 'precision_price' in filters:
+            sl_price = round_price(sl_price, filters['tickSize'], filters['precision_price'])
+    except Exception:
+        pass
     params = {
         'algoType': 'CONDITIONAL',
         'symbol': symbol,
@@ -631,7 +748,120 @@ def emergency_abort_market_close(symbol, exit_side, total_qty, target_env=None):
         "retries": attempt + 1
     }
 
-def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty, leverage, bypass_delta_gate=False, target_env=None, bypass_all_gates=False, is_yolo=False):
+def get_maint_margin_bracket(symbol, notional, target_env=None):
+    """
+    Read-only lookup of the maintenance margin ratio (and maintenance amount 'cum') that applies to
+    `notional` for `symbol` via GET /fapi/v1/leverageBracket.
+    Returns (maint_margin_ratio, maint_amount, source). Falls back to DEFAULT_MAINT_MARGIN_RATIO on any failure.
+    """
+    try:
+        res = send_signed_request('GET', '/fapi/v1/leverageBracket', {'symbol': symbol}, target_env=target_env)
+    except Exception:
+        res = None
+    entries = res if isinstance(res, list) else ([res] if isinstance(res, dict) else [])
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get('brackets'), list):
+            continue
+        if entry.get('symbol') and str(entry.get('symbol')).upper() != str(symbol).upper():
+            continue
+        brackets = []
+        for b in entry['brackets']:
+            try:
+                brackets.append((float(b.get('notionalFloor', 0)), float(b.get('notionalCap', 0)),
+                                 float(b['maintMarginRatio']), float(b.get('cum', 0) or 0)))
+            except (KeyError, TypeError, ValueError, AttributeError):
+                continue
+        if not brackets:
+            continue
+        brackets.sort()
+        chosen = brackets[-1]
+        for floor, cap, mmr, cum in brackets:
+            if floor <= notional < cap:
+                chosen = (floor, cap, mmr, cum)
+                break
+        mmr, cum = chosen[2], chosen[3]
+        if 0 < mmr < 1:
+            return mmr, max(cum, 0.0), 'leverageBracket'
+    return DEFAULT_MAINT_MARGIN_RATIO, 0.0, 'fallback'
+
+
+def estimate_isolated_liquidation_price(direction, entry_price, leverage, maint_margin_ratio=DEFAULT_MAINT_MARGIN_RATIO, maint_amount=0.0, qty=None):
+    """
+    Binance USD-M isolated liquidation price for a single one-way position:
+        LP = (WB + cum - side*Q*EP) / (Q*MMR - side*Q),  WB = Q*EP/L (isolated margin), side = +1 LONG / -1 SHORT
+    Per unit of quantity (cum only applies when qty is known):
+        LONG : LP = EP*(1 - 1/L) / (1 - MMR)   (minus cum/Q/(1-MMR))
+        SHORT: LP = EP*(1 + 1/L) / (1 + MMR)   (plus  cum/Q/(1+MMR))
+    """
+    entry_price = float(entry_price)
+    leverage = float(leverage)
+    mmr = float(maint_margin_ratio)
+    if entry_price <= 0 or leverage < 1 or not (0 <= mmr < 1):
+        raise ValueError(f"Invalid liquidation inputs (entry={entry_price}, leverage={leverage}, mmr={mmr}).")
+    side = 1.0 if str(direction).upper() == 'LONG' else -1.0
+    cum_per_unit = (float(maint_amount) / float(qty)) if (qty and float(qty) > 0 and maint_amount) else 0.0
+    liq = (entry_price / leverage + cum_per_unit - side * entry_price) / (mmr - side)
+    return max(liq, 0.0)
+
+
+def check_liquidation_gate(direction, entry_price, sl_price, leverage, maint_margin_ratio=None, maint_amount=0.0, qty=None, mmr_source=None, safety_fraction=LIQUIDATION_SAFETY_FRACTION):
+    """
+    Hard gate: the Stop Loss must sit strictly between entry and the estimated isolated liquidation price,
+    and its distance from entry must be <= safety_fraction (80%) of the entry->liquidation distance.
+    Returns (ok, message_or_None, details).
+    """
+    is_long = str(direction).upper() == 'LONG'
+    if maint_margin_ratio is None:
+        maint_margin_ratio, mmr_source = DEFAULT_MAINT_MARGIN_RATIO, 'fallback'
+    mmr_source = mmr_source or 'provided'
+    try:
+        entry = float(entry_price)
+        sl = float(sl_price)
+        liq = estimate_isolated_liquidation_price(direction, entry, leverage, maint_margin_ratio, maint_amount, qty)
+    except (TypeError, ValueError) as e:
+        return False, f"MECHANICAL HARD GATE REJECTION (Liquidation Gate): FAIL-CLOSED — cannot estimate liquidation price ({e}).", {}
+
+    liq_dist = (entry - liq) if is_long else (liq - entry)
+    sl_dist = (entry - sl) if is_long else (sl - entry)
+    max_sl_dist = safety_fraction * liq_dist
+    sl_limit = entry - max_sl_dist if is_long else entry + max_sl_dist
+    details = {
+        'direction': 'LONG' if is_long else 'SHORT',
+        'entry_price': entry,
+        'sl_price': sl,
+        'leverage': leverage,
+        'maint_margin_ratio': maint_margin_ratio,
+        'maint_margin_source': mmr_source,
+        'liquidation_price': liq,
+        'liq_distance_pct': (liq_dist / entry * 100.0) if entry else 0.0,
+        'sl_distance_pct': (sl_dist / entry * 100.0) if entry else 0.0,
+        'max_sl_distance_pct': (max_sl_dist / entry * 100.0) if entry else 0.0,
+        'sl_limit_price': sl_limit,
+    }
+    summary = (
+        f"{details['direction']} {leverage}x entry {entry:.6g} -> est. isolated liquidation {liq:.6g} "
+        f"({details['liq_distance_pct']:.2f}% away, MMR {maint_margin_ratio*100:.2f}% [{mmr_source}])"
+    )
+    if sl_dist <= 0:
+        return False, (
+            f"MECHANICAL HARD GATE REJECTION (Liquidation Gate): Stop Loss {sl:.6g} is on the wrong side of entry "
+            f"for a {details['direction']} ({summary}). The SL must sit strictly between entry and liquidation."
+        ), details
+    if sl_dist > max_sl_dist:
+        bound = ">=" if is_long else "<="
+        beyond = (sl <= liq) if is_long else (sl >= liq)
+        where = "at/beyond the liquidation price" if beyond else f"inside the last {100 - safety_fraction*100:.0f}% buffer before liquidation"
+        return False, (
+            f"MECHANICAL HARD GATE REJECTION (Liquidation Gate): {summary}. Stop Loss {sl:.6g} is "
+            f"{details['sl_distance_pct']:.2f}% from entry, {where}; it must be <= {safety_fraction*100:.0f}% of the "
+            f"entry->liquidation distance ({details['max_sl_distance_pct']:.2f}%, i.e. SL {bound} {sl_limit:.6g}). "
+            f"Lower the leverage or tighten the stop."
+        ), details
+    return True, None, details
+
+
+def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty, leverage, bypass_delta_gate=False, target_env=None, bypass_all_gates=False, is_yolo=False,
+                           maint_margin_ratio=None, maint_amount=0.0, mmr_source=None, liq_entry_price=None):
     """
     Mechanical Software Gates (Deterministic Precondition Validation).
     Verifies mathematical invariants and physically prevents execution if risk rules are violated.
@@ -651,6 +881,9 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
 
     try:
         import user_profile as up
+    except Exception as e:
+        return False, f"MECHANICAL HARD GATE REJECTION: FAIL-CLOSED — user_profile module unavailable ({e}); cannot resolve the desk leverage ceiling."
+    try:
         prof = up.load_user_profile()
     except Exception:
         prof = {}
@@ -675,9 +908,10 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
         return False, f"MECHANICAL HARD GATE REJECTION: Max open positions limit ({max_open_positions}) reached."
 
     # --- GATE 0B: Leverage Ceiling Gate (Absolute Ceiling) ---
-    # Absolute ceiling: 15x under any circumstances across all strategies
-    if leverage > 15:
-        return False, f"MECHANICAL HARD GATE REJECTION: Leverage {leverage}x exceeds absolute desk ceiling of 15x."
+    # Single source of truth: user_profile.get_leverage_ceiling() (profile `leverage_ceiling`, default 15x)
+    leverage_ceiling = up.get_leverage_ceiling(prof)
+    if leverage > leverage_ceiling:
+        return False, f"MECHANICAL HARD GATE REJECTION: Leverage {leverage}x exceeds absolute desk ceiling of {leverage_ceiling}x."
 
     if leverage < 1:
         return False, f"MECHANICAL HARD GATE REJECTION: Invalid leverage {leverage}x. Must be >= 1x."
@@ -686,6 +920,27 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
     if is_yolo:
         if not prof.get("yolo_slot_enabled", False):
             return False, "MECHANICAL HARD GATE REJECTION: YOLO moonshot slot is disabled in user profile."
+        try:
+            yolo_cap = int(prof.get("leverage_yolo", leverage_ceiling))
+        except (TypeError, ValueError):
+            yolo_cap = leverage_ceiling
+        yolo_cap = min(max(yolo_cap, 1), leverage_ceiling)
+        if leverage > yolo_cap:
+            return False, f"MECHANICAL HARD GATE REJECTION: Leverage {leverage}x exceeds the YOLO leverage limit ({yolo_cap}x, profile leverage_yolo)."
+
+    # --- GATE 0D: Liquidation Gate (computed with the leverage that will actually apply) ---
+    liq_ok, liq_err, _ = check_liquidation_gate(
+        direction,
+        liq_entry_price if liq_entry_price else cur_price,
+        sl_price,
+        leverage,
+        maint_margin_ratio=maint_margin_ratio,
+        maint_amount=maint_amount,
+        qty=total_qty,
+        mmr_source=mmr_source,
+    )
+    if not liq_ok:
+        return False, liq_err
 
     # Standard leverage limit: if not marked as YOLO, cap leverage dynamically at user profile leverage_standard
     if not is_yolo:
@@ -752,6 +1007,10 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
     # Dynamic risk ceiling = account_equity * (risk_pct_equity / 100) * 1.25 buffer
     if is_testnet:
         max_allowed_loss = max(account_equity * risk_fraction * 1.25, 50.0)
+    elif is_yolo:
+        # Barbell YOLO Moonshot: strict software loss cap (35% of margin, min $3.75 USDT)
+        margin_est = (cur_price * total_qty / max(leverage, 1))
+        max_allowed_loss = max(3.75, margin_est * 0.35)
     else:
         max_allowed_loss = account_equity * risk_fraction * 1.25
 
@@ -765,6 +1024,56 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
             return False, f"MECHANICAL HARD GATE REJECTION: Distance to TP1 ({profit_pct_tp1*100:.2f}%) below 0.35% friction floor. Taker commissions erode statistical edge."
 
     return True, None
+
+def enforce_evaluation_dossier(symbol, direction, target_env=None, bypass_eval_gate=False, confirmed=False, base_dir=None):
+    """
+    Clean-room evaluation gate for NEW positions (never used by close/breakeven/trailing/audit/heal/cancel paths).
+    Delegates to utils.dossier_provenance.validate_dossier_for_trade (same gate as the PreToolUse hook).
+    - PROD: fail closed. --bypass-eval-gate is refused. If the evaluator flagged the candidate as requiring
+      user confirmation, `confirmed=True` is required.
+    - TESTNET: same validation (provenance/direction only when present); explicit bypass_eval_gate is allowed.
+    Returns (ok, reason, candidate).
+    """
+    try:
+        env = resolve_env(target_env)
+    except Exception as e:
+        return False, f"MECHANICAL HARD GATE REJECTION (Evaluation Gate): FAIL-CLOSED — environment resolution failed ({e}).", None
+    is_prod = env == 'prod'
+    label = env.upper()
+
+    if bypass_eval_gate:
+        if is_prod:
+            return False, (
+                "MECHANICAL HARD GATE REJECTION (Evaluation Gate): --bypass-eval-gate is refused in PROD. "
+                "Orders require an APPROVED dossier from 'isolated_market_evaluator' recorded with "
+                "`record_evaluation.py --from-subagent <conversationId>`."
+            ), None
+        return True, "Evaluation gate explicitly bypassed (TESTNET only).", None
+
+    if validate_dossier_for_trade is None:
+        return False, "MECHANICAL HARD GATE REJECTION (Evaluation Gate): FAIL-CLOSED — dossier validator (utils/dossier_provenance.py) unavailable.", None
+
+    try:
+        ok, reason, cand = validate_dossier_for_trade(
+            symbol, direction, env, base_dir=base_dir or find_workspace_root()
+        )
+    except Exception as e:
+        return False, f"MECHANICAL HARD GATE REJECTION (Evaluation Gate, {label}): FAIL-CLOSED — dossier validation error ({e}).", None
+
+    if not ok:
+        hint = "" if is_prod else " (TESTNET: pass --bypass-eval-gate to skip explicitly)"
+        return False, f"MECHANICAL HARD GATE REJECTION (Evaluation Gate, {label}): {reason}{hint}", None
+
+    if is_prod and isinstance(cand, dict):
+        needs_confirmation = cand.get('requires_user_confirmation')
+        if (needs_confirmation is True or str(needs_confirmation).lower() == 'true') and not confirmed:
+            return False, (
+                f"MECHANICAL HARD GATE REJECTION (Evaluation Gate, {label}): the evaluator approved {str(symbol).upper()} "
+                "pending explicit user confirmation. Re-run with confirmed=True / --confirmed after the user confirms."
+            ), cand
+
+    return True, reason, cand
+
 
 def execute_complete_trade(
     symbol,
@@ -784,6 +1093,8 @@ def execute_complete_trade(
     confirmed=False
 ):
     target_env = resolve_env(target_env)
+    is_yolo = (is_yolo is True) or (str(is_yolo).lower() in ['true', '1', 'yes'])
+    confirmed = (confirmed is True) or (str(confirmed).lower() in ['true', '1', 'yes'])
     is_prod = str(target_env).lower() != 'testnet'
     if is_prod:
         cfg = load_env(target_env=target_env)
@@ -793,6 +1104,15 @@ def execute_complete_trade(
                 "hard_gate_rejection": True,
                 "error": "FAIL-CLOSED: Environment is PROD but LIVE_TRADING_ARMED is not 'true'. Live trading execution is disarmed."
             }
+
+    # 0. Clean-room evaluation dossier gate (before ANY write: margin type, leverage or orders)
+    bypass_eval_gate = (bypass_eval_gate is True) or (str(bypass_eval_gate).lower() in ['true', '1', 'yes'])
+    eval_ok, eval_reason, _eval_cand = enforce_evaluation_dossier(
+        symbol, direction, target_env=target_env, bypass_eval_gate=bypass_eval_gate, confirmed=confirmed
+    )
+    if not eval_ok:
+        return {"success": False, "hard_gate_rejection": True, "evaluation_gate_rejection": True, "error": eval_reason}
+
     try:
         import quant_risk_engine as qre
         account_equity = qre.get_account_equity(target_env)
@@ -848,8 +1168,34 @@ def execute_complete_trade(
     if tp2_price is None or float(tp2_price) <= 0:
         tp2_price = cur_price * (1.0 + 0.06) if is_long else cur_price * (1.0 - 0.06)
 
-    # 2. Calculate exact token quantity
-    notional_target = margin_usdt * leverage
+    # 2. Configure Isolated margin and leverage first (Fail-Closed & Auto-Clamp for Subaccounts)
+    setup_res = setup_margin_and_leverage(symbol, leverage, target_env=target_env)
+    confirmed_leverage = leverage
+    if isinstance(setup_res, tuple):
+        if len(setup_res) >= 3:
+            lev_res, margin_res, confirmed_leverage = setup_res[:3]
+        elif len(setup_res) == 2:
+            lev_res, margin_res = setup_res
+            if isinstance(lev_res, dict) and 'leverage' in lev_res:
+                try:
+                    confirmed_leverage = int(lev_res['leverage'])
+                except Exception:
+                    pass
+        # Fail-closed check: ISOLATED margin must be confirmed (only -4046 "no need to change" is tolerated)
+        margin_ok, margin_reason = margin_type_isolated_confirmed(margin_res)
+        if not margin_ok:
+            return {"success": False, "error": f"{margin_reason} Execution aborted (fail-closed): isolated margin is mandatory."}
+        # Fail-closed check: if setting leverage failed completely on Binance
+        if lev_res is None:
+            return {"success": False, "error": "Leverage was not configured on Binance. Execution aborted (fail-closed)."}
+        if isinstance(lev_res, dict) and (lev_res.get('isError') or ('code' in lev_res and lev_res.get('code') < 0)):
+            err_msg = lev_res.get('error') or lev_res.get('message') or str(lev_res)
+            return {"success": False, "error": f"Failed to configure leverage on Binance ({err_msg}). Execution aborted (fail-closed)."}
+
+    effective_leverage = int(confirmed_leverage) if confirmed_leverage else leverage
+
+    # 3. Calculate exact token quantity using verified effective leverage
+    notional_target = margin_usdt * effective_leverage
     raw_qty = notional_target / cur_price
     total_qty = round_step(raw_qty, filters['stepSize'], filters['precision_qty'])
     min_notional = filters.get('minNotional', 5.0)
@@ -860,16 +1206,21 @@ def execute_complete_trade(
     if total_qty < filters['minQty']:
         return {"success": False, "error": f"Quantity {total_qty} lower than minimum allowed {filters['minQty']}"}
 
-    # 3. MECHANICAL HARD GATES VERIFICATION
+    # 4. MECHANICAL HARD GATES VERIFICATION (incl. liquidation gate with the confirmed effective leverage)
+    liq_entry_price = cur_price
+    if str(order_type).upper() == 'LIMIT' and limit_price:
+        liq_entry_price = float(limit_price)
+    elif str(order_type).upper() == 'STOP_MARKET' and trigger_price:
+        liq_entry_price = float(trigger_price)
+    mmr, maint_amount, mmr_source = get_maint_margin_bracket(symbol, total_qty * liq_entry_price, target_env=target_env)
     gate_ok, gate_err = check_mechanical_gates(
-        direction, cur_price, sl_price, tp1_price, total_qty, leverage,
-        bypass_delta_gate=bypass_delta_gate, target_env=target_env, is_yolo=is_yolo
+        direction, cur_price, sl_price, tp1_price, total_qty, effective_leverage,
+        bypass_delta_gate=bypass_delta_gate, target_env=target_env, is_yolo=is_yolo,
+        maint_margin_ratio=mmr, maint_amount=maint_amount, mmr_source=mmr_source,
+        liq_entry_price=liq_entry_price
     )
     if not gate_ok:
         return {"success": False, "hard_gate_rejection": True, "error": gate_err}
-
-    # 4. Configure Isolated margin and leverage
-    setup_margin_and_leverage(symbol, leverage, target_env=target_env)
 
     # 5. Split TPs asymmetrically (30% TP1 / 70% TP2) to preserve positive right-tail skewness
     # and prevent premature profit truncation.
@@ -1000,28 +1351,32 @@ def execute_complete_trade(
             }
 
         # 10. Execute TP1 (LIMIT, 30% position, Reduce-Only)
-        tp1_params = {
-            'symbol': symbol,
-            'side': exit_side,
-            'type': 'LIMIT',
-            'price': tp1_p,
-            'quantity': tp1_qty,
-            'timeInForce': 'GTC',
-            'reduceOnly': 'true'
-        }
-        tp1_order = send_signed_request('POST', '/fapi/v1/order', tp1_params, target_env=target_env)
+        tp1_order = None
+        if tp1_qty > 0:
+            tp1_params = {
+                'symbol': symbol,
+                'side': exit_side,
+                'type': 'LIMIT',
+                'price': tp1_p,
+                'quantity': tp1_qty,
+                'timeInForce': 'GTC',
+                'reduceOnly': 'true'
+            }
+            tp1_order = send_signed_request('POST', '/fapi/v1/order', tp1_params, target_env=target_env)
 
         # 11. Execute TP2 (LIMIT, 70% position remaining, Reduce-Only)
-        tp2_params = {
-            'symbol': symbol,
-            'side': exit_side,
-            'type': 'LIMIT',
-            'price': tp2_p,
-            'quantity': tp2_qty,
-            'timeInForce': 'GTC',
-            'reduceOnly': 'true'
-        }
-        tp2_order = send_signed_request('POST', '/fapi/v1/order', tp2_params, target_env=target_env)
+        tp2_order = None
+        if tp2_qty > 0:
+            tp2_params = {
+                'symbol': symbol,
+                'side': exit_side,
+                'type': 'LIMIT',
+                'price': tp2_p,
+                'quantity': tp2_qty,
+                'timeInForce': 'GTC',
+                'reduceOnly': 'true'
+            }
+            tp2_order = send_signed_request('POST', '/fapi/v1/order', tp2_params, target_env=target_env)
 
         # Log to local audit ledger with canonical provenance and atomic writing
         log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'logs')
@@ -1032,7 +1387,7 @@ def execute_complete_trade(
             'timestamp': int(time.time()),
             'symbol': symbol,
             'direction': str(direction).upper(),
-            'leverage': leverage,
+            'leverage': effective_leverage,
             'entry_price': actual_entry_price,
             'total_qty': total_qty,
             'sl_price': sl_p,
@@ -1065,7 +1420,7 @@ def execute_complete_trade(
             "success": True,
             "symbol": symbol,
             "direction": str(direction).upper(),
-            "leverage": leverage,
+            "leverage": effective_leverage,
             "entry_price": actual_entry_price,
             "total_qty": total_qty,
             "entry_order_id": entry_order.get('orderId'),
@@ -1078,7 +1433,7 @@ def execute_complete_trade(
             "tp2_qty": tp2_qty,
             "tp2_order_id": tp2_order.get('orderId') if isinstance(tp2_order, dict) else None,
             "notional": total_qty * actual_entry_price,
-            "real_margin": (total_qty * actual_entry_price) / leverage
+            "real_margin": (total_qty * actual_entry_price) / effective_leverage
         }
     except Exception as exc:
         abort_exit = emergency_abort_market_close(symbol, exit_side, total_qty, target_env=target_env)
@@ -1339,7 +1694,7 @@ def main():
     )
     parser.add_argument("--symbol", type=str, default=None, help="Trading pair symbol (e.g. BTCUSDT, ETHUSDT)")
     parser.add_argument("--direction", type=str, choices=["LONG", "SHORT", "long", "short"], default=None, help="Position direction")
-    parser.add_argument("--leverage", type=int, default=3, help="Leverage multiplier (max 15x)")
+    parser.add_argument("--leverage", type=int, default=3, help="Leverage multiplier (max: profile leverage_ceiling, default 15x)")
     parser.add_argument("--margin", type=float, default=100.0, help="Committed margin in USDT")
     parser.add_argument("--trigger-price", "--trigger_price", type=float, default=None, dest="trigger_price", help="Breakout trigger price for conditional entry")
     parser.add_argument("--sl-price", "--sl_price", type=float, default=None, dest="sl_price", help="Stop Loss price")
@@ -1348,7 +1703,7 @@ def main():
     parser.add_argument("--order-type", "--order_type", type=str, choices=["MARKET", "LIMIT", "STOP_MARKET", "market", "limit", "stop_market"], default="MARKET", dest="order_type", help="Order type")
     parser.add_argument("--limit-price", "--limit_price", type=float, default=None, dest="limit_price", help="Limit price when order_type=LIMIT")
     parser.add_argument("--env", type=str, choices=["prod", "testnet"], default=None, help="Target environment ('prod' or 'testnet')")
-    parser.add_argument("--bypass-eval-gate", "--bypass_eval_gate", action="store_true", dest="bypass_eval_gate", help="Bypass clean-room evaluation gate (Testnet only)")
+    parser.add_argument("--bypass-eval-gate", "--bypass_eval_gate", action="store_true", dest="bypass_eval_gate", help="Bypass clean-room evaluation gate (TESTNET only; refused in PROD)")
     parser.add_argument("--bypass-delta-gate", "--bypass_delta_gate", action="store_true", dest="bypass_delta_gate", help="Bypass delta-neutral gate (Testnet only)")
     parser.add_argument("--is-yolo", "--is_yolo", action="store_true", dest="is_yolo", help="Mark trade as YOLO moonshot (authorizes leverage > 5x)")
     parser.add_argument("--confirmed", "--user-confirmed", action="store_true", dest="confirmed", help="Explicit human confirmation for live order in PROD")

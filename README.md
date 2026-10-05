@@ -16,7 +16,7 @@ Autonomous Trading Desk (ATD) bridges the gap between frontier Artificial Intell
 
 ATD is built to operate across modern agentic runtimes without lock-in:
 
-1. **Antigravity IDE / CLI Native:** Full harness integration with deterministic lifecycle hooks configured via [`.agents/hooks.json`](.agents/hooks.json). PreToolUse security gates intercept tool calls in `<15ms`.
+1. **Antigravity IDE / CLI Native (agy):** Full harness integration with deterministic lifecycle hooks configured via [`.agents/hooks.json`](.agents/hooks.json) (paths relative to `.agents/`, the hooks' working directory), the always-on rule [`.agents/rules/trading.md`](.agents/rules/trading.md) and the clean-room evaluator subagent [`.agents/agents/isolated_market_evaluator/agent.md`](.agents/agents/isolated_market_evaluator/agent.md). Launch agy from the repository root in a POSIX shell (Linux, macOS or WSL); native Windows agy runs hooks through `cmd /c` and is not supported. PreToolUse security gates intercept tool calls in `<15ms`.
 2. **Claude Code:** Full harness parity via [`.claude/settings.json`](.claude/settings.json), enforcing PreToolUse choke-point validation and PostToolUse ground-truth ledger synchronization on all bash and tool operations.
 3. **Standalone CLI / Automated Scripts:** Every core engine (`scripts/trading_doctor.py`, `scripts/sync_session_state.py`, `scripts/execute_futures_trade.py`, `scripts/broad_market_radar.py`) runs deterministically from standard bash shells with identical fail-closed software gates.
 
@@ -43,11 +43,11 @@ graph TD
     end
 
     subgraph L4 ["Layer 4: Clean-Room Isolated Evaluator"]
-        EVAL["isolated_market_evaluator (Ephemeral Subagent)<br/>• Canonical XML Hierarchy<br/>• Negative Few-Shots (Anti-Hyper-Triggering)<br/>• &lt;thinking&gt; 4-Step Precondition Checklist<br/>• Typed &lt;dossier_json&gt; Contract"]
+        EVAL["isolated_market_evaluator (agy subagent, invoke_subagent)<br/>• Dossier recorded from its transcript (sha256 provenance)<br/>• Canonical XML Hierarchy<br/>• Negative Few-Shots (Anti-Hyper-Triggering)<br/>• &lt;thinking&gt; 4-Step Precondition Checklist<br/>• Typed &lt;dossier_json&gt; Contract"]
     end
 
     subgraph L5 ["Layer 5: Fail-Closed Atomic Execution"]
-        EXEC["scripts/execute_futures_trade.py<br/>• Isolated Margin 3x (15x YOLO)<br/>• Dynamic Equity Volatility Parity Sizing<br/>• Atomic Stop Loss Verification (3 Retries)<br/>• Immediate Auto-Destruct if unhedged"]
+        EXEC["scripts/execute_futures_trade.py<br/>• Isolated Margin, profile leverage (ceiling 15x)<br/>• Dynamic Equity Volatility Parity Sizing<br/>• Atomic Stop Loss Verification (3 Retries)<br/>• Immediate Auto-Destruct if unhedged"]
     end
 
     subgraph L6 ["Layer 6: Committed Memory"]
@@ -68,11 +68,11 @@ graph TD
 ### 1. Deterministic Mechanical Hard Gates (PreToolUse Interception)
 Natural language instructions are not a reliable safety barrier in live financial trading. ATD rejects the antipattern of relying on the LLM's stochastic memory to enforce risk boundaries. Instead, runtime **PreToolUse hooks physically intercept every order execution attempt at the OS level**:
 - **Single Choke Point Enforcement:** Direct calls to exchange order tools are mechanically blocked. All orders must pass through `scripts/execute_futures_trade.py` or the approved MCP wrapper (`crypto_radar:deploy_futures_trade`).
-- **Mandatory Clean-Room Evaluation:** Orders require a valid, non-expired (<20m) signed evaluation dossier in `logs/evaluations/latest_dossier.json` approving the symbol.
+- **Mandatory Clean-Room Evaluation:** Orders require a non-expired (<20m) dossier in `logs/evaluations/latest_dossier.json`, recorded from the evaluator subagent transcript with `record_evaluation.py --from-subagent` and re-verified (sha256 provenance), approving the symbol and direction. Hand-written dossiers are rejected in PROD.
 - **Delta-Neutral Gate:** If the portfolio marks `LONG_HEAVY`, attempts to execute a `LONG` order are rejected with `hard_gate_rejection: True` before any network packet reaches the exchange API. If `SHORT_HEAVY`, additional `SHORT` orders are blocked.
 - **Dynamic Equity Risk Gate:** Maximum monetary loss is capped to the user's calibrated equity risk profile (default 0.5% of Account Equity + 1.25x buffer, e.g. ~$50 on $10k, $5 on $1k, $0.50 on $100), dynamically verified against live balance.
 - **Financial Friction Floor:** Orders where distance to TP1 is less than 0.35% are physically blocked, ensuring taker fees and bid-ask spread never consume the statistical edge.
-- **Leverage Ceiling Gate:** Absolute desk ceiling of 15x; standard positions are restricted to 3x-5x unless explicitly flagged as YOLO moonshots.
+- **Leverage Ceiling Gate:** Absolute desk ceiling of 15x; standard positions use the profile's `leverage_standard`, YOLO moonshots `leverage_yolo` (Binance agentic sub-accounts are capped at 5x and the executor clamps automatically).
 
 ### 2. Clean-Room Context Isolation
 Long conversational histories accumulate token baggage, emotional bias from past streaks, and prompt drift. ATD packs real-time exchange data into an ultra-dense brief (< 1,800 tokens) and spawns an ephemeral clean-room evaluator (`isolated_market_evaluator`) with:
@@ -101,7 +101,7 @@ ATD operates a complementary dual-engine framework:
 │ • Structural Trailing Stop 15m   │ • Hurwicz-Corrected Half-Life       │
 │ • True Net Break-Even (+0.2%)    │   (3h <= H <= 72h)                  │
 │ • Taleb Barbell YOLO Moonshot    │ • Dynamic Beta Hedging (Δ ≈ 0)      │
-│   (Isolated 15x, isolated cap,   │ • Cash & Carry Funding Harvest      │
+│   (Isolated, profile leverage,   │ • Cash & Carry Funding Harvest      │
 │    Zero premature truncation)    │   (Hurdle Rate >= 25% APR)          │
 │ • Session Cutoff / Zero Night    │ • Multi-day horizon with neutral    │
 │   unhedged exposure              │   directional risk                  │
@@ -116,8 +116,8 @@ Follow these steps to deploy a safe, clone-ready environment. **TESTNET (Sandbox
 
 ### Step 1: Clone & Install Dependencies
 ```bash
-git clone https://github.com/IgnacioN99/autonomous-trading-desk.git
-cd autonomous-trading-desk
+git clone <repo-url> <repo>
+cd <repo>
 
 python3 -m venv venv
 source venv/bin/activate
@@ -143,14 +143,20 @@ BINANCE_SECRET_KEY=your_testnet_secret_key_here
 BINANCE_FUTURES_BASE_URL=https://testnet.binancefuture.com
 ```
 
+For PROD, start from `config/environments/prod.env.example` and choose an authentication mode with `BINANCE_AUTH_MODE`:
+- `MCP`: Binance Agentic MCP Gateway on an isolated agentic sub-account (no API keys). Binance caps sub-accounts at 5x leverage (error `-4421`); the executor clamps leverage automatically.
+- `KEYS`: standard HMAC API keys. Use a futures-only key with withdrawals disabled and IP restriction.
+
 ### Step 3: Interactive Onboarding & Risk Calibration
 Run the interactive profiler to configure your risk profile (`config/user_profile.json`):
 ```bash
 python3 scripts/user_profile.py --setup
 ```
 This configures:
-- Risk percentage per trade (default 0.5% equity on Stop Loss, e.g. ~$50 on $10k equity, $5 on $1k equity, $0.50 on $100 equity).
-- Maximum margin ratio ceiling (30% per trade).
+- Risk percentage per trade (`risk_pct_equity`, default 0.5% of equity on Stop Loss).
+- Maximum margin ratio ceiling (`max_margin_ratio`, default 30% per trade).
+- Leverage (`leverage_standard`, `leverage_yolo`; desk ceiling 15x) and optional `yolo_margin_fixed`.
+- Autonomous Tier S execution (`autonomous_execution_tier_s`, off by default).
 - Maximum concurrent open positions (default: 3).
 - Overnight handling mode (`ZERO_OVERNIGHT_RISK`).
 - Taleb Barbell YOLO moonshot preference.
@@ -178,7 +184,13 @@ Ready for algorithmic execution.
 =================================================================
 ```
 
-### Step 5: (Optional) Notion & Research Setup
+### Step 5: Antigravity (agy) Harness Setup
+1. Open a POSIX shell (Linux, macOS or WSL) and `cd <repo>`; launch agy from the repository root.
+2. `.agents/hooks.json` runs `scripts/hooks/pre_trade_guard.py` (PreToolUse) and `scripts/hooks/post_trade_sync.py` (PostToolUse) with paths relative to `.agents/`. Do not commit absolute paths or machine-specific interpreters.
+3. agy discovers the evaluator at `.agents/agents/isolated_market_evaluator/agent.md` and the PR reviewers at `.agents/agents/*_reviewer/agent.md`; no `define_subagent` step is needed.
+4. Verify the guard is live: `python3 scripts/trading_doctor.py` must report the pre-trade guard OK (`logs/hook_heartbeat.json` refreshed this session). Without it, live orders are prohibited.
+
+### Step 6: (Optional) Notion & Research Setup
 To enable automated journaling and research newsletter ingestion:
 1. Copy the user context template:
    ```bash
@@ -201,10 +213,23 @@ python3 scripts/sync_session_state.py
 Run concurrent radar across 80+ contracts with Order Flow, CVD, and Taker volume analysis:
 ```bash
 python3 scripts/broad_market_radar.py
-python3 scripts/prime_evaluator_brief.py --json
+python3 scripts/prime_evaluator_brief.py --json   # writes logs/primed_brief.json (add --out <path> for a copy)
 ```
 
-### 3. Automated GitHub Issue Reporting & Observability
+### 3. Clean-Room Evaluation & Dossier Recording (Layer 4)
+Every new trade goes through the evaluator subagent; the dossier is never written by hand:
+1. `python3 scripts/prime_evaluator_brief.py`
+2. In agy, `invoke_subagent` with `TypeName: "isolated_market_evaluator"`; wait for its Master Dossier message (it ends in one `<dossier_json>` block with `status` APPROVED / REJECTED / NEUTRAL).
+3. Record it from the subagent transcript:
+   ```bash
+   python3 scripts/record_evaluation.py --from-subagent <conversationId>
+   ```
+   The recorder prints approved symbols, directions, `requires_user_confirmation` flags and the validity window (20 min from evaluation). Tier A/A+ candidates require explicit user confirmation.
+4. Execute through `crypto_radar:deploy_futures_trade` or `python3 scripts/execute_futures_trade.py` only.
+
+In TESTNET, the legacy manual recorder (`--env testnet --symbols ... --directions ...`) remains available for experiments; it is refused in PROD.
+
+### 4. Automated GitHub Issue Reporting & Observability
 If subagents, hooks, or loops encounter unexpected failures, unhandled exceptions, or infrastructure drift, the system directly invokes the native bash reporter (`report_issue.sh`):
 ```bash
 ./scripts/report_issue.sh --title "Endpoint timeout in ticker stream" --error "ReadTimeout at /fapi/v1/ticker/24hr" --severity "HIGH" --category "infra"
@@ -213,6 +238,21 @@ If subagents, hooks, or loops encounter unexpected failures, unhandled exception
 ./scripts/report_issue.sh --sync
 ```
 
+### 5. PR Review with Native Subagents
+Pull Requests are audited inside the same agy session by four isolated, read-only reviewer subagents (`.agents/agents/<domain>_reviewer/agent.md`: `trading_risk`, `binance_microstructure`, `agentic_harness`, `prompt_engineering`). Each starts with a clean context, can only `view_file` / `grep_search` / `list_dir` (`commandExecutionPolicy: "off"`) and returns one `### Verdict: <reviewer>` section with `send_message`.
+
+* **Manual:** type `/pr-review` (optionally with the PR number). The [`pr-review` skill](.agents/skills/pr-review/SKILL.md) asks before posting the comment.
+* **Automatic:** after a successful `gh pr create` or feature-branch push, the `pr-review-trigger` PostToolUse hook marks a review as pending (`logs/pr_review_state.json`) and the Stop hook (`scripts/hooks/pr_review_stop_hook.py`) keeps the session going with an instruction to run the skill, which then posts without asking. It stops prompting once the comment is posted, the agent closes it (`python3 scripts/ci/pr_review_state.py done --reason no_pr|declined`), or after 3 attempts.
+
+Flow (all helpers are deterministic):
+1. `python3 scripts/ci/triage_pr.py origin/main --context-dir logs/pr_review` maps changed files to the required reviewers (fail-closed: core or unclassified files trigger all four) and writes the diff, per-file patches and `index.md`.
+2. One `invoke_subagent` call launches every required reviewer in parallel.
+3. `python3 scripts/ci/assemble_review.py --pr <n> --from-subagent <reviewer>=<conversationId> ...` copies each verdict verbatim from the subagent transcript into `logs/pr_review/report.md` and computes the consolidated verdict.
+4. `python3 scripts/ci/verify_review.py logs/pr_manifest.json logs/pr_review/report.md` (exit 0 approved, 1 changes required, 2 missing reviewers to re-invoke).
+5. `gh pr comment <n> --body-file logs/pr_review/report.md`.
+
+Headless fallback without an interactive agy session (e.g. CI with `GEMINI_API_KEY`): `python3 scripts/ci/run_pr_audit.py origin/main logs/pr_review/report.md` builds one prompt from the same agent definitions.
+
 ---
 
 ## 📂 Repository Structure
@@ -220,8 +260,16 @@ If subagents, hooks, or loops encounter unexpected failures, unhandled exception
 ```
 autonomous-trading-desk/
 ├── .agents/
-│   ├── hooks.json                     # Antigravity PreToolUse/PostToolUse hook configuration
+│   ├── agents/
+│   │   ├── isolated_market_evaluator/
+│   │   │   └── agent.md               # Clean-room evaluator subagent (XML prompt, negative few-shots)
+│   │   └── <domain>_reviewer/
+│   │       └── agent.md               # Read-only PR reviewer subagents (4 domains)
+│   ├── hooks.json                     # Antigravity PreToolUse/PostToolUse/Stop hooks (paths relative to .agents/)
+│   ├── rules/
+│   │   └── trading.md                 # Always-on safety invariants
 │   └── skills/
+│       ├── pr-review/                 # /pr-review: multi-agent PR review orchestration
 │       └── trade-execution-planner/   # Core execution & market radar skill
 ├── .claude/
 │   └── settings.json                  # Claude Code PreToolUse/PostToolUse safety hooks
@@ -235,9 +283,6 @@ autonomous-trading-desk/
 ├── docs/
 │   ├── agent_prompt_engineering_guide.md # Definitive agent prompt manual
 │   └── notion_setup_guide.md          # Step-by-step Notion Trading Journal integration guide
-├── prompts/
-│   └── subagents/
-│       └── isolated_market_evaluator.md # Clean-room XML prompt with Negative Few-Shots
 ├── research/
 │   ├── 01_kelly_criterion_crypto_risk.md
 │   ├── 02_spot_cvd_order_flow_absorptions.md
@@ -246,13 +291,22 @@ autonomous-trading-desk/
 ├── scripts/
 │   ├── adapters/
 │   │   └── exchange_adapter.py        # Exchange seam abstraction
+│   ├── ci/
+│   │   ├── triage_pr.py               # Deterministic PR triage & reviewer context
+│   │   ├── assemble_review.py         # Builds the review report from reviewer transcripts
+│   │   ├── verify_review.py           # Mechanical review completeness gate
+│   │   ├── pr_review_state.py         # Pending auto-review marker
+│   │   └── run_pr_audit.py            # Headless PR review fallback (agy -p / Gemini API)
 │   ├── hooks/
 │   │   ├── pre_trade_guard.py         # Mechanical hard gate hook (<15ms, fail-closed)
-│   │   └── post_trade_sync.py         # Auto ground-truth sync on fills
+│   │   ├── post_trade_sync.py         # Auto ground-truth sync on fills
+│   │   ├── post_pr_review_hook.py     # Arms the PR review after gh pr create / push
+│   │   └── pr_review_stop_hook.py     # Stop hook: runs /pr-review in the same session
 │   ├── loops/
 │   │   └── night_cutoff_loop.py       # Zero overnight risk manager & order reaper
 │   ├── utils/
 │   │   ├── atomic_writer.py           # POSIX atomic ledger persistence
+│   │   ├── dossier_provenance.py      # Dossier extraction & provenance verification
 │   │   └── env_resolver.py            # Centralized environment resolver & security enforcer
 │   ├── broad_market_radar.py          # Concurrent 80+ pair screener (15m/5m/1h)
 │   ├── dynamic_exit_manager.py        # Chandelier ATR structural trailing stop
@@ -264,7 +318,7 @@ autonomous-trading-desk/
 │   ├── prime_evaluator_brief.py       # Context packing engine (<1,800 tokens)
 │   ├── quant_risk_engine.py           # MacKinnon 2010 cointegration & dynamic equity sizing
 │   ├── radar_mcp_server.py            # Official MCP server for trading radar
-│   ├── record_evaluation.py           # Atomic dossier registration & token gate
+│   ├── record_evaluation.py           # Records the evaluator dossier (--from-subagent)
 │   ├── remember_trade_lesson.py       # Append-only immutable memory
 │   ├── report_agent_issue.py          # Python issue reporter module
 │   ├── report_issue.sh                # Native bash issue reporter tool
@@ -294,7 +348,7 @@ autonomous-trading-desk/
 ## 🛡️ Security & Fail-Closed Guarantee
 
 1. **Zero Credential Commits:** Strictly enforced via exhaustive `.gitignore`.
-2. **Atomic Dossier Verification:** The execution hook requires a fresh (<20 min) signed dossier in `logs/evaluations/latest_dossier.json` before allowing order dispatch.
+2. **Atomic Dossier Verification:** The execution hook requires a fresh (<20 min) dossier in `logs/evaluations/latest_dossier.json` whose provenance (sha256 of the `<dossier_json>` block in the evaluator subagent transcript) is re-verified before allowing order dispatch.
 3. **Environment Separation:**
    * **PROD:** All gates (Delta-Neutral, Dynamic Equity Risk, Transaction Fee Floor, Leverage Limit) are 100% rigid and inviolable. Zero exceptions.
    * **TESTNET:** Gates can be bypassed via explicit command flags (`--bypass-delta-gate`, `--bypass-eval-gate`) for stress testing and exploratory development.

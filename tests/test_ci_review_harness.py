@@ -1,15 +1,60 @@
 """
 tests/test_ci_review_harness.py
-Unit tests for the Deterministic PR Triage and Review Verification Gate.
+Unit tests for the PR review harness: deterministic triage, reviewer subagent definitions,
+the /pr-review skill, the review assembler, the verification gate and the agy review hooks.
 Supports standard library unittest (zero extra dependencies) and pytest.
 """
 
+import io
+import os
 import json
-import unittest
+import shutil
 import tempfile
+import unittest
+import subprocess
+import sys
+from contextlib import redirect_stderr
 from pathlib import Path
-from scripts.ci.triage_pr import triage
-from scripts.ci.verify_review import verify_review
+from unittest import mock
+
+from scripts.ci.triage_pr import triage, REVIEWERS, split_diff_by_file, write_review_context, assign_reviewer_files
+from scripts.ci.verify_review import verify_review, check_review, reviewer_status, EXIT_INCOMPLETE, EXIT_CHANGES_REQUIRED
+from scripts.ci import pr_review_state as state_mod
+from scripts.ci import assemble_review
+from scripts.ci.run_pr_audit import strip_frontmatter, build_orchestrator_prompt
+from scripts.hooks import post_pr_review_hook as post_hook
+from scripts.hooks import pr_review_stop_hook as stop_hook
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+ALL_REVIEWERS = {"agentic_harness", "binance_microstructure", "prompt_engineering", "trading_risk"}
+READ_ONLY_TOOLS = {"view_file", "grep_search", "list_dir", "find_by_name", "send_message"}
+
+
+def parse_frontmatter(text: str) -> dict:
+    """Minimal YAML frontmatter parser for the subset used by agy agent definitions
+    (scalars, folded '>-' blocks and '- item' lists)."""
+    lines = text.splitlines()
+    assert lines[0].strip() == "---", "frontmatter must start with ---"
+    end = lines.index("---", 1)
+    data, key = {}, None
+    for line in lines[1:end]:
+        if not line.strip():
+            continue
+        if line.startswith((" ", "\t")) and key is not None:
+            stripped = line.strip()
+            if stripped.startswith("- "):
+                data[key] = (data[key] if isinstance(data[key], list) else []) + [stripped[2:].strip()]
+            else:
+                data[key] = (data[key] + " " if isinstance(data[key], str) and data[key] else "") + stripped
+            continue
+        key, _, value = line.partition(":")
+        key, value = key.strip(), value.strip()
+        data[key] = "" if value in (">-", ">", "|") else value.strip('"')
+        if value == "true":
+            data[key] = True
+        elif value == "false":
+            data[key] = False
+    return data
 
 
 class TestCIReviewHarness(unittest.TestCase):
@@ -34,21 +79,62 @@ class TestCIReviewHarness(unittest.TestCase):
         manifest = triage(files)
         self.assertTrue(manifest["fail_closed_triggered"])
         self.assertEqual(len(manifest["required_reviewers"]), 4)
-        self.assertEqual(
-            set(manifest["required_reviewers"]),
-            {
-                "agentic_harness",
-                "binance_microstructure",
-                "prompt_engineering",
-                "trading_risk",
-            },
-        )
+        self.assertEqual(set(manifest["required_reviewers"]), ALL_REVIEWERS)
 
     def test_triage_fail_closed_on_unclassified_file(self):
         files = ["scripts/unclassified_experimental_tool.py"]
         manifest = triage(files)
         self.assertTrue(manifest["fail_closed_triggered"])
         self.assertEqual(len(manifest["required_reviewers"]), 4)
+
+    def test_triage_maps_reviewers_to_subagent_names(self):
+        manifest = triage(["AGENTS.md"])
+        for rev in ALL_REVIEWERS:
+            details = manifest["reviewer_details"][rev]
+            self.assertEqual(details["agent"], f"{rev}_reviewer")
+            self.assertEqual(details["doc"], f".agents/agents/{rev}_reviewer/agent.md")
+            self.assertTrue((REPO_ROOT / details["doc"]).is_file(), details["doc"])
+
+    def test_triage_reviewer_file_assignment_is_fail_closed(self):
+        files = ["scripts/execute_futures_trade.py", "docs/notion_setup_guide.md", "tests/test_new.py"]
+        manifest = triage(files)
+        assigned = manifest["reviewer_files"]
+        # Unclassified file goes to every reviewer; domain files only to their owners
+        for rev in ALL_REVIEWERS:
+            self.assertIn("tests/test_new.py", assigned[rev])
+        self.assertIn("scripts/execute_futures_trade.py", assigned["trading_risk"])
+        self.assertNotIn("scripts/execute_futures_trade.py", assigned["prompt_engineering"])
+        self.assertIn("docs/notion_setup_guide.md", assigned["prompt_engineering"])
+        # Omnibus files go to everyone
+        self.assertEqual(assign_reviewer_files(["AGENTS.md"], ["trading_risk"]), {"trading_risk": ["AGENTS.md"]})
+
+    def test_review_context_split_and_index(self):
+        diff = (
+            "diff --git a/scripts/execute_futures_trade.py b/scripts/execute_futures_trade.py\n"
+            "--- a/scripts/execute_futures_trade.py\n+++ b/scripts/execute_futures_trade.py\n@@ -1 +1 @@\n-a\n+b\n"
+            "diff --git a/docs/x guide.md b/docs/x guide.md\n--- a/docs/x guide.md\n+++ b/docs/x guide.md\n@@ -1 +1 @@\n-c\n+d\n"
+        )
+        parts = split_diff_by_file(diff)
+        self.assertEqual([p for p, _ in parts], ["scripts/execute_futures_trade.py", "docs/x guide.md"])
+        manifest = triage(["scripts/execute_futures_trade.py", "docs/x guide.md"])
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = os.path.join(tmp, "pr_review")
+            patches = write_review_context(manifest, diff, ctx)
+            self.assertEqual(len(patches), 2)
+            index = Path(ctx, "index.md").read_text(encoding="utf-8")
+            self.assertIn("## Assigned to `trading_risk` (trading_risk_reviewer)", index)
+            self.assertTrue(Path(ctx, "diff.patch").is_file())
+            for name in os.listdir(os.path.join(ctx, "files")):
+                self.assertTrue(name.endswith(".patch"))
+                self.assertNotIn(" ", name)
+            # Re-running recreates the directory (report.md allowed), but never wipes foreign files
+            Path(ctx, "report.md").write_text("x", encoding="utf-8")
+            write_review_context(manifest, diff, ctx)
+            self.assertFalse(Path(ctx, "report.md").exists())
+            Path(ctx, "user_notes.txt").write_text("keep", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                write_review_context(manifest, diff, ctx)
+            self.assertTrue(Path(ctx, "user_notes.txt").exists())
 
     def test_verify_review_success(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -61,13 +147,16 @@ class TestCIReviewHarness(unittest.TestCase):
 
             report = """
 # PR Audit Report
-### Veredicto: trading_risk
-- **Estado:** [APROBADO]
-- **Resumen:** All risk limits and R:R ratios respected.
+### Verdict: trading_risk
+- **Status:** [APPROVED]
+- **Summary:** All risk limits and R:R ratios respected.
 
-### Veredicto: binance_microstructure
-- **Estado:** [APROBADO]
-- **Resumen:** Precision stepSize and reduceOnly confirmed.
+### Verdict: binance_microstructure
+- **Status:** [APPROVED]
+- **Summary:** Precision stepSize and reduceOnly confirmed.
+
+### Final Consolidated Verdict
+- **Overall Status:** [APPROVED FOR MERGE]
 """
             report_file = tmp_path / "report.md"
             report_file.write_text(report, encoding="utf-8")
@@ -87,8 +176,8 @@ class TestCIReviewHarness(unittest.TestCase):
 
             # Report only contains trading_risk, missing prompt_engineering
             report = """
-### Veredicto: trading_risk
-- **Estado:** [APROBADO]
+### Verdict: trading_risk
+- **Status:** [APPROVED]
 """
             report_file = tmp_path / "report.md"
             report_file.write_text(report, encoding="utf-8")
@@ -97,6 +186,9 @@ class TestCIReviewHarness(unittest.TestCase):
             self.assertFalse(success)
             self.assertIn("FATAL OMISSION DETECTED", msg)
             self.assertIn("prompt_engineering", msg)
+            code, _, result = check_review(str(manifest_file), str(report_file))
+            self.assertEqual(code, EXIT_INCOMPLETE)
+            self.assertEqual(result["missing_ids"], ["prompt_engineering"])
 
     def test_verify_review_changes_requested(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -108,9 +200,9 @@ class TestCIReviewHarness(unittest.TestCase):
             manifest_file.write_text(json.dumps(manifest), encoding="utf-8")
 
             report = """
-### Veredicto: trading_risk
-- **Estado:** [CAMBIOS REQUERIDOS]
-- **Resumen:** Stop Loss is too wide and violates $1.50 cap.
+### Verdict: trading_risk
+- **Status:** [CHANGES REQUIRED]
+- **Summary:** Stop Loss is too wide and violates the profile risk cap.
 """
             report_file = tmp_path / "report.md"
             report_file.write_text(report, encoding="utf-8")
@@ -118,19 +210,284 @@ class TestCIReviewHarness(unittest.TestCase):
             success, msg = verify_review(str(manifest_file), str(report_file))
             self.assertFalse(success)
             self.assertIn("CHANGES REQUESTED", msg)
+            self.assertEqual(check_review(str(manifest_file), str(report_file))[0], EXIT_CHANGES_REQUIRED)
+
+    def test_verify_review_status_parsing_edge_cases(self):
+        # Unfilled template is inconclusive
+        self.assertIsNone(reviewer_status("### Verdict: trading_risk\n- **Status:** [APPROVED] | [CHANGES REQUIRED]\n",
+                                          "trading_risk"))
+        # The consolidated section must not leak into the last reviewer's section
+        report = ("### Verdict: trading_risk\n- **Status:** [APPROVED]\n\n"
+                  "### Final Consolidated Verdict\n- **Overall Status:** [CHANGES REQUIRED] elsewhere\n")
+        self.assertEqual(reviewer_status(report, "trading_risk"), "APPROVED")
+        # A reviewer id must not match a longer id
+        self.assertEqual(reviewer_status("### Verdict: trading_risk_extra\n- **Status:** [APPROVED]\n",
+                                         "trading_risk"), "")
+        # Table fallback
+        self.assertEqual(reviewer_status("| `agentic_harness` | CHANGES REQUIRED |", "agentic_harness"),
+                         "CHANGES REQUIRED")
+
+
+class TestReviewerSubagents(unittest.TestCase):
+
+    def test_reviewer_agent_frontmatter_is_valid_and_read_only(self):
+        self.assertFalse((REPO_ROOT / ".agents" / "reviewers").exists(), "legacy rubric folder must be gone")
+        for rev, conf in REVIEWERS.items():
+            path = REPO_ROOT / conf["doc"]
+            text = path.read_text(encoding="utf-8")
+            fm = parse_frontmatter(text)
+            self.assertEqual(fm["name"], conf["agent"], path)
+            self.assertEqual(path.parent.name, conf["agent"])
+            self.assertTrue(fm.get("description"), path)
+            self.assertIn(conf["agent"], fm["description"])
+            self.assertIsInstance(fm["tools"], list)
+            self.assertTrue(set(fm["tools"]) <= READ_ONLY_TOOLS, f"{path}: {fm['tools']}")
+            self.assertIn("send_message", fm["tools"])
+            self.assertNotIn("run_command", fm["tools"])
+            self.assertEqual(fm["commandExecutionPolicy"], "off")
+            self.assertIs(fm["mainAgent"], False)
+            self.assertIs(fm["subagent"], True)
+            self.assertEqual(fm["model"], "inherit")
+            # The output contract must match what verify_review.py parses
+            body = strip_frontmatter(text)
+            self.assertFalse(body.startswith("---"))
+            self.assertIn(f"### Verdict: {rev}", body)
+            self.assertIn("[APPROVED]", body)
+            self.assertIn("[CHANGES REQUIRED]", body)
+            self.assertIn("<output_contract>", body)
+
+    def test_pr_review_skill_references_every_reviewer(self):
+        path = REPO_ROOT / ".agents" / "skills" / "pr-review" / "SKILL.md"
+        text = path.read_text(encoding="utf-8")
+        fm = parse_frontmatter(text)
+        self.assertEqual(fm["name"], "pr-review")
+        self.assertTrue(fm["description"])
+        for rev, conf in REVIEWERS.items():
+            self.assertIn(f"`{rev}`", text)
+            self.assertIn(f"`{conf['agent']}`", text)
+        for needle in ("invoke_subagent", "scripts/ci/triage_pr.py", "scripts/ci/assemble_review.py",
+                       "scripts/ci/verify_review.py", "gh pr comment", "logs/pr_review/report.md",
+                       "pr_review_state.py"):
+            self.assertIn(needle, text)
+        # Skill must be committed (not swallowed by the .agents/skills/* ignore rule)
+        res = subprocess.run(["git", "check-ignore", "-q", str(path.relative_to(REPO_ROOT).as_posix())],
+                             cwd=REPO_ROOT, capture_output=True)
+        self.assertNotEqual(res.returncode, 0, "SKILL.md is gitignored")
+
+    def test_headless_fallback_prompt_uses_agent_bodies(self):
+        manifest = triage(["AGENTS.md"])
+        prompt = build_orchestrator_prompt(manifest, "diff --git a/x b/x\n")
+        self.assertNotIn("mainAgent: false", prompt)  # frontmatter stripped
+        self.assertNotIn("audit compliance with AGENTS.md within this domain", prompt)  # no placeholder rubric
+        for rev in ALL_REVIEWERS:
+            self.assertIn(f"### Verdict: {rev}", prompt)
+        self.assertIn("### Final Consolidated Verdict", prompt)
+
+
+class TestReviewAssembler(unittest.TestCase):
+
+    def _write_transcript(self, brain: Path, conv_id: str, message: str) -> None:
+        logs = brain / conv_id / ".system_generated" / "logs"
+        logs.mkdir(parents=True)
+        steps = [
+            {"source": "SYSTEM", "type": "USER_INPUT", "content": "sender=aaaaaaaa-0000-0000-0000-000000000000"},
+            {"source": "MODEL", "type": "PLANNER_RESPONSE", "content": "",
+             "tool_calls": [{"name": "send_message", "args": {"Message": json.dumps(message)}}]},
+        ]
+        (logs / "transcript.jsonl").write_text("\n".join(json.dumps(s) for s in steps) + "\n", encoding="utf-8")
+
+    def test_assemble_from_subagent_transcripts(self):
+        manifest = {"required_reviewers": ["agentic_harness", "trading_risk"], "changed_files": ["a.py"],
+                    "base_ref": "origin/main", "head_sha": "abc", "fail_closed_triggered": True}
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = Path(tmp) / "brain"
+            self._write_transcript(brain, "11111111-aaaa-bbbb-cccc-000000000001",
+                                   "### Verdict: agentic_harness\n- **Status:** [APPROVED]\n- **Findings:** ok")
+            self._write_transcript(brain, "11111111-aaaa-bbbb-cccc-000000000002",
+                                   "### Verdict: trading_risk\n- **Status:** [CHANGES REQUIRED]\n- 🔴 x.py:1")
+            with mock.patch.dict(os.environ, {"AGY_BRAIN_DIRS": str(brain)}):
+                sections, provenance, errors = assemble_review.collect_sections(
+                    manifest["required_reviewers"],
+                    {"agentic_harness": "11111111-aaaa-bbbb-cccc-000000000001",
+                     # wrong mapping: this transcript holds the agentic_harness verdict, not trading_risk
+                     "trading_risk": "11111111-aaaa-bbbb-cccc-000000000001"},
+                    {},
+                )
+                self.assertIn("agentic_harness", sections)
+                self.assertNotIn("trading_risk", sections)
+                self.assertTrue(errors)
+
+                sections, provenance, errors = assemble_review.collect_sections(
+                    manifest["required_reviewers"],
+                    {"agentic_harness": "11111111-aaaa-bbbb-cccc-000000000001",
+                     "trading_risk": "11111111-aaaa-bbbb-cccc-000000000002"},
+                    {},
+                )
+            self.assertEqual(errors, [])
+            report, result = assemble_review.build_report(manifest, sections, provenance, pr="13")
+            self.assertIn(assemble_review.OVERALL_BLOCKED, report)
+            self.assertIn("- **PR:** #13", report)
+            self.assertEqual(result["rejected"], ["trading_risk"])
+
+            manifest_file = Path(tmp) / "manifest.json"
+            manifest_file.write_text(json.dumps(manifest), encoding="utf-8")
+            report_file = Path(tmp) / "report.md"
+            report_file.write_text(report, encoding="utf-8")
+            code, _, gate = check_review(str(manifest_file), str(report_file))
+            self.assertEqual(code, EXIT_CHANGES_REQUIRED)
+            self.assertEqual(gate["approved"], ["agentic_harness"])
+
+    def test_assemble_marks_missing_reviewers_incomplete(self):
+        manifest = {"required_reviewers": ["prompt_engineering"], "changed_files": ["docs/a.md"]}
+        report, result = assemble_review.build_report(manifest, {}, {}, pr="")
+        self.assertIn(assemble_review.OVERALL_INCOMPLETE, report)
+        self.assertEqual(result["missing_ids"], ["prompt_engineering"])
+
+
+class TestPRReviewHooks(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.state_file = os.path.join(self.tmp, "logs", "pr_review_state.json")
+        self.env = mock.patch.dict(os.environ, {state_mod.STATE_ENV: self.state_file})
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _post(self, command: str, conv: str = "conv-parent", error: str = "") -> str:
+        payload = {"toolCall": {"name": "run_command", "args": {"CommandLine": command}}, "conversationId": conv}
+        if error:
+            payload["error"] = error
+        with redirect_stderr(io.StringIO()):
+            return post_hook.handle_post_tool_use(payload)
+
+    def _stop(self, conv: str = "conv-parent", **extra) -> dict:
+        payload = dict({"conversationId": conv, "executionNum": 1, "terminationReason": "model_stop",
+                        "fullyIdle": True}, **extra)
+        with redirect_stderr(io.StringIO()):
+            return stop_hook.decide(payload)
 
     def test_hook_is_pr_creation_or_push(self):
-        from scripts.hooks.post_pr_review_hook import is_pr_creation_or_push
+        is_pr_creation_or_push = post_hook.is_pr_creation_or_push
         # True cases
         self.assertTrue(is_pr_creation_or_push("gh pr create --title 'feat'"))
         self.assertTrue(is_pr_creation_or_push("git push -u origin feat/multi-agent-pr-review"))
         self.assertTrue(is_pr_creation_or_push("git push origin fix/some-bug"))
-        
+
         # False cases
         self.assertFalse(is_pr_creation_or_push("git push origin main"))
         self.assertFalse(is_pr_creation_or_push("git status"))
         self.assertFalse(is_pr_creation_or_push("python3 scripts/ci/run_pr_audit.py"))
+        self.assertFalse(is_pr_creation_or_push("python3 scripts/ci/pr_review_state.py done --reason no_pr"))
         self.assertFalse(is_pr_creation_or_push(""))
+
+    def test_review_post_detection(self):
+        self.assertTrue(post_hook.is_review_post("gh pr comment 13 --body-file logs/pr_review/report.md"))
+        self.assertTrue(post_hook.is_review_post("gh pr comment 13 --body-file=./logs/pr_review/report.md"))
+        self.assertFalse(post_hook.is_review_post("gh pr comment 13 --body 'lgtm'"))
+        self.assertFalse(post_hook.is_review_post("cat logs/pr_review/report.md"))
+
+    def test_no_pending_review_never_blocks_stop(self):
+        self.assertEqual(self._stop(), {"decision": "stop"})
+        self.assertEqual(self._post("git status"), "ignored")
+        self.assertEqual(self._stop(), {"decision": "stop"})
+
+    def test_failed_pr_creation_does_not_arm_review(self):
+        self.assertEqual(self._post("gh pr create --fill", error="exit status 1"), "ignored")
+        self.assertEqual(state_mod.load_state(), {})
+
+    def test_pending_review_continues_until_cap(self):
+        self.assertEqual(self._post("gh pr create --fill"), "pending")
+        state = state_mod.load_state()
+        self.assertEqual(state["status"], "pending")
+        self.assertEqual(state["conversation_id"], "conv-parent")
+
+        for attempt in range(1, state_mod.MAX_STOP_ATTEMPTS + 1):
+            out = self._stop()
+            self.assertEqual(out["decision"], "continue")
+            self.assertIn("/pr-review", out["reason"])
+            self.assertIn(f"{attempt}/{state_mod.MAX_STOP_ATTEMPTS}", out["reason"])
+        # Cap reached: stop allowed and marker abandoned (never loops forever)
+        self.assertEqual(self._stop(), {"decision": "stop"})
+        self.assertEqual(state_mod.load_state()["status"], "abandoned")
+        self.assertEqual(self._stop(), {"decision": "stop"})
+
+    def test_stop_allowed_for_other_conversations_errors_and_busy_sessions(self):
+        self._post("git push -u origin feat/x")
+        self.assertEqual(self._stop(conv="reviewer-subagent"), {"decision": "stop"})
+        self.assertEqual(self._stop(terminationReason="error", error="boom"), {"decision": "stop"})
+        self.assertEqual(self._stop(fullyIdle=False), {"decision": "stop"})
+        self.assertEqual(state_mod.load_state()["stop_attempts"], 0)
+
+    def test_in_progress_review_waits_for_reviewers(self):
+        self._post("gh pr create --fill")
+        self.assertIsNotNone(state_mod.mark_started())
+        self.assertEqual(self._stop(), {"decision": "stop"})
+        # A stale in-progress review is re-prompted
+        state = state_mod.load_state()
+        state["started_ts"] -= state_mod.IN_PROGRESS_GRACE_S + 1
+        state_mod.save_state(state)
+        self.assertEqual(self._stop()["decision"], "continue")
+
+    def test_review_posted_clears_marker(self):
+        self._post("gh pr create --fill")
+        self.assertEqual(self._post("gh pr comment 13 --body-file logs/pr_review/report.md", error="exit status 1"),
+                         "ignored")
+        self.assertEqual(state_mod.load_state()["status"], "pending")
+        self.assertEqual(self._post("gh pr comment 13 --body-file logs/pr_review/report.md"), "done")
+        self.assertEqual(state_mod.load_state()["status"], "done")
+        self.assertEqual(self._stop(), {"decision": "stop"})
+        events = Path(state_mod.events_path()).read_text(encoding="utf-8").splitlines()
+        self.assertEqual([json.loads(e)["event"] for e in events], ["review_pending", "review_posted"])
+
+    def test_manual_done_and_start_without_marker(self):
+        self.assertIsNone(state_mod.mark_started())
+        self.assertIsNone(state_mod.mark_done("declined"))
+        self._post("gh pr create --fill")
+        self.assertEqual(state_mod.mark_done("no_pr")["done_reason"], "no_pr")
+        self.assertEqual(self._stop(), {"decision": "stop"})
+
+    def _run_hook_agy_style(self, script: str, payload) -> subprocess.CompletedProcess:
+        """Runs a hook the way agy does: cwd = .agents/, `sh -c` command from hooks.json, JSON on stdin."""
+        hooks = json.loads((REPO_ROOT / ".agents" / "hooks.json").read_text(encoding="utf-8"))
+        commands = [h["command"] for group in hooks["pr-review-trigger"].get("PostToolUse", [])
+                    for h in group["hooks"]] + [h["command"] for h in hooks["pr-review-trigger"].get("Stop", [])]
+        command = next(c for c in commands if script in c)
+        command = command.replace("python3", sys.executable, 1)
+        stdin = payload if isinstance(payload, str) else json.dumps(payload)
+        return subprocess.run(["sh", "-c", command], cwd=REPO_ROOT / ".agents", input=stdin,
+                              capture_output=True, text=True, timeout=20, env=dict(os.environ))
+
+    @unittest.skipUnless(shutil.which("sh"), "POSIX sh required")
+    def test_hooks_json_wiring_agy_style(self):
+        hooks = json.loads((REPO_ROOT / ".agents" / "hooks.json").read_text(encoding="utf-8"))
+        trigger = hooks["pr-review-trigger"]
+        self.assertTrue(trigger["enabled"])
+        self.assertEqual(trigger["PostToolUse"][0]["matcher"], "run_command")
+        stop_cmds = [h["command"] for h in trigger["Stop"]]
+        self.assertEqual(stop_cmds, ["python3 ../scripts/hooks/pr_review_stop_hook.py"])
+        self.assertNotIn("run_pr_audit", json.dumps(hooks))
+        for cmd in stop_cmds + [h["command"] for h in trigger["PostToolUse"][0]["hooks"]]:
+            self.assertTrue(cmd.startswith("python3 ../scripts/hooks/"), cmd)
+
+        for raw in ("", "not json", "[]"):
+            res = self._run_hook_agy_style("pr_review_stop_hook", raw)
+            self.assertEqual(res.returncode, 0)
+            self.assertEqual(json.loads(res.stdout), {"decision": "stop"})
+            res = self._run_hook_agy_style("post_pr_review_hook", raw)
+            self.assertEqual(res.returncode, 0)
+            self.assertEqual(json.loads(res.stdout), {})
+
+        res = self._run_hook_agy_style("post_pr_review_hook", {
+            "toolCall": {"name": "run_command", "args": {"CommandLine": "gh pr create --fill"}},
+            "conversationId": "conv-parent", "stepIdx": 4})
+        self.assertEqual((res.returncode, json.loads(res.stdout)), (0, {}))
+        res = self._run_hook_agy_style("pr_review_stop_hook", {
+            "conversationId": "conv-parent", "executionNum": 1, "terminationReason": "model_stop", "fullyIdle": True})
+        self.assertEqual(res.returncode, 0)
+        self.assertEqual(json.loads(res.stdout)["decision"], "continue")
 
 
 if __name__ == "__main__":

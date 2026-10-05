@@ -453,7 +453,7 @@ class TestPreTradeGuardHardening(unittest.TestCase):
         res = self._run_guard_payload(payload)
         self.assertEqual(res.get("decision"), "deny")
         self.assertEqual(res.get("code"), 2)
-        self.assertIn("session_state.json no existe", res.get("reason", ""))
+        self.assertIn("session_state.json does not exist", res.get("reason", ""))
 
     def test_invalid_session_state_flagged_denied(self):
         """session_state.json with is_valid=False blocks execution fail-closed."""
@@ -473,7 +473,7 @@ class TestPreTradeGuardHardening(unittest.TestCase):
         res = self._run_guard_payload(payload)
         self.assertEqual(res.get("decision"), "deny")
         self.assertEqual(res.get("code"), 2)
-        self.assertIn("marcado como INVÁLIDO", res.get("reason", ""))
+        self.assertIn("flagged INVALID", res.get("reason", ""))
 
     def test_stale_session_state_denied(self):
         """session_state.json older than 300 seconds (e.g. 350s) blocks execution."""
@@ -494,7 +494,7 @@ class TestPreTradeGuardHardening(unittest.TestCase):
         res = self._run_guard_payload(payload)
         self.assertEqual(res.get("decision"), "deny")
         self.assertEqual(res.get("code"), 2)
-        self.assertIn("OBSOLETO", res.get("reason", ""))
+        self.assertIn("STALE", res.get("reason", ""))
 
     def test_fresh_session_state_passes(self):
         """Fresh session_state.json (e.g. 30s old) passes staleness check."""

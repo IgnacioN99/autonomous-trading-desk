@@ -34,16 +34,23 @@ Generate a clear, ranked table with 5 to 6 setups ordered by confluence and prob
   * Pullback to Support / S-R Retest (order limit on confirmed support)
   * Breakout & Retest (volume breakout above 4h resistance)
 - **Levels:** Entry, Stop Loss, TP1 (30% size at +1.8R to lock fees / free-trade), TP2 (70% size at +4.0R structural target)
-- **Sizing & Returns:** Standard dynamic equity sizing (default $100 USDT margin, 0.5% dynamic equity risk, 3x leverage) / YOLO moonshot slot ($10 USDT margin, 15x leverage), R:R ≥ 3:1.
+- **Sizing & Returns:** All values come from `config/user_profile.json` (via `scripts/user_profile.py`): risk per trade = `risk_pct_equity` × equity, standard leverage = `leverage_standard`, YOLO slot (only if `yolo_slot_enabled`) = `yolo_margin_fixed` / `yolo_equity_pct` margin at `leverage_yolo` (desk ceiling `leverage_ceiling`, default 15x). R:R ≥ 3:1. Never quote fixed dollar amounts.
 
-## Phase 3: User Selection & Zero-Error Deployment
-1. The user selects which setup(s) to trade from the TOP ranking (or Tier S setups trigger autonomous fast-track execution).
-2. Provide the field-by-field checklist for Binance Futures:
+## Phase 3: Clean-Room Evaluation & Zero-Error Deployment
+Follow these steps in order. Skipping one is a hard failure: the PreToolUse hook and the executor reject orders without a verified dossier.
+
+1. **Prime the brief:** `python3 scripts/prime_evaluator_brief.py` (add `--env testnet` only when the user asked for TESTNET). It writes `logs/primed_brief.json` (with `generated_at_ts` and the profile's `risk_profile`).
+2. **Invoke the evaluator:** call `invoke_subagent` with `TypeName: "isolated_market_evaluator"` (defined in `.agents/agents/isolated_market_evaluator/agent.md`). In `Prompt`, ask it to evaluate `logs/primed_brief.json` for the target environment; do not paraphrase the numbers yourself. Never use `define_subagent` to recreate it.
+3. **Wait for its message** containing the Master Dossier and its `<dossier_json>` block. Keep the subagent `conversationId` returned by `invoke_subagent`.
+4. **Record the verdict:** `python3 scripts/record_evaluation.py --from-subagent <conversationId>`. It extracts the block from the subagent transcript, stamps provenance (sha256) and writes `logs/evaluations/latest_dossier.json` (valid 20 min from when the evaluator emitted it). If it exits non-zero (expired, env mismatch, no block), re-run steps 1-4. **Never write or edit the dossier by hand** and never use `--symbols` / `--json-file` in PROD (refused).
+5. **Confirmation policy:** candidates with `requires_user_confirmation: true` (Tier A+ / Tier A) need the user's explicit "yes" in chat before execution. Tier S candidates with `requires_user_confirmation: false` may be fast-tracked only if the profile enables `autonomous_execution_tier_s`.
+6. **Execute only through the gated engine:** `crypto_radar:deploy_futures_trade` (MCP) or `python3 scripts/execute_futures_trade.py`, with the symbol and direction exactly as approved. Never call Binance order tools directly.
+7. Field-by-field checklist the engine enforces:
    - Margin: Mandatory Isolated
-   - Leverage: 3x for standard / 15x for YOLO
-   - Size: $100 USDT margin (standard) / $10 USDT margin (YOLO)
+   - Leverage: profile `leverage_standard` (standard) / `leverage_yolo` (YOLO), ceiling `leverage_ceiling` (default 15x); MCP sub-accounts are clamped to 5x by Binance (-4421)
+   - Size: risk-based from `risk_pct_equity`, margin capped at `max_margin_ratio` of equity
    - Currency unit: USDT vs Token check
-   - Order 1: Entry + SL (Algo Order with `closePosition: true`)
+   - Order 1: Entry + SL (Algo Order with `closePosition: true`), SL verified on the ledger or the position is closed `reduceOnly`
    - Order 2: TP1 (30% size at +1.8R) Limit with `Reduce-Only: Checked`
    - Order 3: TP2 (70% size at +4.0R) Limit with `Reduce-Only: Checked`
 

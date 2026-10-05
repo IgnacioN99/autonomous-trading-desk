@@ -132,7 +132,8 @@ class TestRequirementsDependencies(unittest.TestCase):
         with open(req_path, "r", encoding="utf-8") as f:
             content = f.read()
 
-        self.assertIn("mcp>=1.0.0", content)
+        # radar_mcp_server.py imports mcp.server.mcpserver (2.x SDK only)
+        self.assertIn("mcp>=2.0,<3", content)
         self.assertIn("pytest>=7.0.0", content)
 
 

@@ -178,23 +178,35 @@ def calculate_position_sizing(entry_price: float, stop_loss_price: float, margin
 • Estimated Liquidation Price: {liq_price:.4f} (Stop Loss at {stop_loss_price:.4f} protects capital well in advance)
 """
 
-@server.tool(description="Screens memecoins and hyper-volatile assets (PEPE, WIF, BONK, DOGE, NEIRO, PENGU, BOME, MOODENG) to find high-conviction YOLO Moonshot opportunities with isolated risk ($10 USDT, 10x-15x).")
-def scan_yolo_moonshot(leverage: int = 15, margin_usdt: float = 10.0) -> str:
+@server.tool(description="Screens memecoins and hyper-volatile assets (PEPE, WIF, BONK, DOGE, NEIRO, PENGU, BOME, MOODENG) to find high-conviction YOLO Moonshot opportunities with isolated risk (bounded margin, leverage from the user profile's leverage_yolo).")
+def scan_yolo_moonshot(leverage: int = 0, margin_usdt: float = 10.0) -> str:
     """
     Parameters:
-    - leverage: Aggressive leverage (10x to 15x). Default: 15x.
+    - leverage: Aggressive leverage. 0 (default) uses the profile's leverage_yolo, capped at the desk leverage ceiling.
+      Sub-accounts limited to 5x are auto-clamped by the execution engine (-4421).
     - margin_usdt: Bounded micro-capital to risk (default: dynamically calculated from user profile, e.g. 0.5% equity).
     """
     try:
-        from user_profile import get_yolo_margin
+        import user_profile as up
+        prof = up.load_user_profile()
+        ceiling = up.get_leverage_ceiling(prof)
+        if not leverage or leverage <= 0:
+            leverage = int(prof.get("leverage_yolo", ceiling))
+        leverage = max(1, min(int(leverage), ceiling))
         if margin_usdt == 10.0:
-            margin_usdt = get_yolo_margin(target_env="testnet")
+            margin_usdt = up.get_yolo_margin(target_env="testnet")
     except Exception:
-        pass
+        leverage = leverage if leverage and leverage > 0 else 1
 
     memes = [
         "1000PEPEUSDT", "DOGEUSDT", "WIFUSDT", "1000BONKUSDT", "1000SHIBUSDT",
-        "FLOKIUSDT", "POPCATUSDT", "NEIROUSDT", "PENGUUSDT", "BOMEUSDT", "MOODENGUSDT"
+        "FLOKIUSDT", "POPCATUSDT", "NEIROUSDT", "PENGUUSDT", "BOMEUSDT", "MOODENGUSDT",
+        "1000000BOBUSDT", "1000000MOGUSDT", "1000CATUSDT", "1000CHEEMSUSDT", "1000FLOKIUSDT",
+        "1000LUNCUSDT", "1000RATSUSDT", "1000SATSUSDT", "1000XECUSDT", "1MBABYDOGEUSDT",
+        "ACTUSDT", "BRETTUSDT", "CATIUSDT", "CATUSDT", "CHILLGUYUSDT", "FARTCOINUSDT",
+        "GOATUSDT", "GRIFFAINUSDT", "MELANIAUSDT", "MEMEUSDT", "MEWUSDT", "PNUTUSDT",
+        "PUMPUSDT", "SPXUSDT", "SWARMSUSDT", "TOSHIUSDT", "TRUMPUSDT", "TURBOUSDT",
+        "VIRTUALUSDT"
     ]
     best = None
 
@@ -294,7 +306,7 @@ def deploy_futures_trade(symbol: str, direction: str, leverage: int = 3, margin_
     Parameters:
     - symbol: Trading pair (e.g. 'EIGENUSDT', 'ETHUSDT').
     - direction: 'LONG' or 'SHORT'.
-    - leverage: Leverage multiplier (e.g. 3 for standard, 10-15 for YOLO).
+    - leverage: Leverage multiplier (e.g. 3 for standard, profile leverage_yolo for YOLO; max: profile leverage_ceiling).
     - margin_usdt: Committed margin (default: 100.0 USDT).
     - sl_price: Technical Stop Loss price level.
     - tp1_price: Take Profit 1 price level (30% of position, fees locked, move to free-trade).
@@ -307,12 +319,15 @@ def deploy_futures_trade(symbol: str, direction: str, leverage: int = 3, margin_
     - confirmed: True if human confirmation has been explicitly provided for PROD.
     """
     try:
+        is_yolo = (is_yolo is True) or (str(is_yolo).lower() in ['true', '1', 'yes'])
+        confirmed = (confirmed is True) or (str(confirmed).lower() in ['true', '1', 'yes'])
         import user_profile as up
         prof = up.load_user_profile()
         std_cap = int(prof.get("leverage_standard", 3))
+        leverage_ceiling = up.get_leverage_ceiling(prof)
 
-        if leverage > 15:
-            return f"❌ Error executing trade: MECHANICAL HARD GATE REJECTION: Leverage {leverage}x exceeds absolute desk ceiling of 15x."
+        if leverage > leverage_ceiling:
+            return f"❌ Error executing trade: MECHANICAL HARD GATE REJECTION: Leverage {leverage}x exceeds absolute desk ceiling of {leverage_ceiling}x."
         if not is_yolo and leverage > std_cap:
             return f"❌ Error executing trade: MECHANICAL HARD GATE REJECTION: Leverage {leverage}x exceeds standard limit ({std_cap}x). Mark as YOLO for leverage > {std_cap}x."
 
@@ -343,6 +358,8 @@ def deploy_futures_trade(symbol: str, direction: str, leverage: int = 3, margin_
             order_type=order_type,
             limit_price=limit_price if limit_price > 0 else None,
             is_yolo=is_yolo,
+            # No bypass is exposed through MCP: the executor always enforces the clean-room dossier gate.
+            bypass_eval_gate=False,
             confirmed=confirmed
         )
         if not res.get("success"):

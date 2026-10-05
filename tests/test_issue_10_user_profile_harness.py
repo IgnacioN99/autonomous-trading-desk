@@ -275,7 +275,8 @@ class TestMechanicalGatesProfileEnforcement(unittest.TestCase):
                 direction="LONG",
                 leverage=3,
                 margin_usdt=100.0,
-                target_env="testnet"
+                target_env="testnet",
+                bypass_eval_gate=True  # TESTNET-only explicit bypass: this test targets margin scaling
             )
             self.assertTrue(res.get("success"), f"Expected success but got: {res.get('error')}")
             # Real margin should be scaled to $15.00
@@ -294,23 +295,34 @@ class TestPreTradeGuardProfileEnforcement(unittest.TestCase):
 
         self.dossier_path = os.path.join(self.eval_dir, "latest_dossier.json")
         self.state_path = os.path.join(self.logs_dir, "session_state.json")
+        # PROD dossiers must carry evaluator-subagent provenance: simulate the agy brain dir
+        self.brain_dir = os.path.join(self.mock_root, "brain")
+        self._brain_env = patch.dict(os.environ, {"AGY_BRAIN_DIRS": self.brain_dir})
+        self._brain_env.start()
 
     def tearDown(self):
+        self._brain_env.stop()
         self.test_dir.cleanup()
 
     def _write_dossier(self, approved_candidates):
-        now_ts = int(time.time())
-        approved_symbols = [c["symbol"] for c in approved_candidates if isinstance(c, dict) and "symbol" in c]
-        dossier = {
-            "timestamp_ts": now_ts,
-            "valid_until_ts": now_ts + 1200,
-            "evaluator_agent": "isolated_market_evaluator",
-            "status": "APPROVED",
-            "approved_symbols": approved_symbols,
-            "approved_candidates": approved_candidates
-        }
+        """Writes a dossier exactly as `record_evaluation.py --from-subagent` would (schema v2 + provenance)."""
+        import datetime
+        from utils import dossier_provenance as dp
+        candidates = [dict(c, direction=c.get("direction", "LONG")) for c in approved_candidates]
+        conv_id = "abcdef12-3456-7890-abcd-ef1234567890"
+        tdir = os.path.join(self.brain_dir, conv_id, ".system_generated", "logs")
+        os.makedirs(tdir, exist_ok=True)
+        block = json.dumps({"status": "APPROVED", "approved_candidates": candidates, "summary": "test"})
+        created = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        tpath = os.path.join(tdir, "transcript.jsonl")
+        with open(tpath, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"step_index": 0, "source": "SYSTEM", "type": "USER_INPUT",
+                                "content": "sender=11111111-2222-3333-4444-555555555555"}) + "\n")
+            f.write(json.dumps({"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": created,
+                                "content": f"<dossier_json>{block}</dossier_json>"}) + "\n")
+        record = dp.build_record_from_extraction(dp.extract_dossier_from_transcript(tpath))
         with open(self.dossier_path, "w", encoding="utf-8") as f:
-            json.dump(dossier, f)
+            json.dump(record, f)
 
     def _write_session_state(self, total_active=0):
         state = {
@@ -356,7 +368,7 @@ class TestPreTradeGuardProfileEnforcement(unittest.TestCase):
                 "toolCall": {
                     "name": "run_command",
                     "args": {
-                        "CommandLine": "python3 scripts/execute_futures_trade.py --symbol BTCUSDT --dir LONG --env prod"
+                        "CommandLine": "python3 scripts/execute_futures_trade.py --symbol BTCUSDT --direction LONG --env prod"
                     }
                 }
             })
@@ -369,7 +381,7 @@ class TestPreTradeGuardProfileEnforcement(unittest.TestCase):
                 "toolCall": {
                     "name": "run_command",
                     "args": {
-                        "CommandLine": "python3 scripts/execute_futures_trade.py --symbol BTCUSDT --dir LONG --env prod --confirmed"
+                        "CommandLine": "python3 scripts/execute_futures_trade.py --symbol BTCUSDT --direction LONG --env prod --confirmed"
                     }
                 }
             })
@@ -393,7 +405,7 @@ class TestPreTradeGuardProfileEnforcement(unittest.TestCase):
                 "toolCall": {
                     "name": "run_command",
                     "args": {
-                        "CommandLine": "python3 scripts/execute_futures_trade.py --symbol BTCUSDT --dir LONG --env prod"
+                        "CommandLine": "python3 scripts/execute_futures_trade.py --symbol BTCUSDT --direction LONG --env prod"
                     }
                 }
             })
@@ -531,8 +543,8 @@ class TestTradingDoctorBlockingSensor(unittest.TestCase):
             {"asset": "USDT", "balance": "1000.0", "availableBalance": "1000.0"}
         ] if endpoint == "/fapi/v2/balance" else []
 
-        # Profile is NOT completed
-        with patch("user_profile.load_user_profile", return_value={"profile_completed": False}):
+        # Profile is NOT completed (hook self-test stubbed: this test isolates the profile check)
+        with patch("user_profile.load_user_profile", return_value={"profile_completed": False}),              patch("trading_doctor.check_pretool_hook", return_value={"ok": True, "critical": [], "warnings": [], "info": []}):
             exit_code = trading_doctor.run_doctor(target_env="testnet")
             self.assertEqual(exit_code, 1, "Doctor must return 1 (Fail-Closed) when profile onboarding is not completed.")
 

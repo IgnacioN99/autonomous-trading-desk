@@ -26,6 +26,7 @@ logs/*.json
 logs/*.jsonl
 logs/*.md
 logs/evaluations/*
+logs/pr_review/
 !logs/.gitkeep
 !logs/evaluations/.gitkeep
 
@@ -42,6 +43,8 @@ skills-lock.json
 .agents/skills/*
 !.agents/skills/trade-execution-planner/
 !.agents/skills/trade-execution-planner/**
+!.agents/skills/pr-review/
+!.agents/skills/pr-review/**
 
 # =================================================================
 # ONE-OFF DEPLOYMENT BATCHES & LOCAL OPERATIONAL SESSIONS
@@ -95,3 +98,6 @@ venv.bak/
 .DS_Store
 Thumbs.db
 .playwright-mcp/
+
+# Claude Code per-machine settings
+.claude/settings.local.json

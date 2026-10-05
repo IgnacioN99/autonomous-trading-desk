@@ -1,14 +1,15 @@
 {
   "mcpServers": {
     "notion": {
-      "serverUrl": "https://mcp.notion.com/mcp",
+      "type": "http",
       "url": "https://mcp.notion.com/mcp"
     },
     "binance": {
-      "serverUrl": "https://agent.binance.com/mcp/agentic",
+      "type": "http",
       "url": "https://agent.binance.com/mcp/agentic"
     },
     "crypto_radar": {
+      "type": "stdio",
       "command": "python3",
       "args": [
         "scripts/radar_mcp_server.py"

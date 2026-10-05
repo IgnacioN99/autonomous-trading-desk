@@ -173,7 +173,7 @@ def enrich_and_size_candidate(c: dict, target_env: Optional[str] = None) -> Opti
         # Calculate dynamic equity sizing (default 0.5% equity risk per trade, or user profile)
         sizing = qre.calculate_dynamic_equity_sizing(sym, entry, sl, risk_pct_equity=None, leverage=lev, target_env=target_env)
         if not sizing or "error" in sizing or sizing.get("step_qty", 0.0) <= 0.0:
-            logger.warning(f"Sizing inválido o no cuantizable para {sym}: {sizing.get('error') if sizing else 'Empty sizing'}")
+            logger.warning(f"Invalid or non-quantizable sizing for {sym}: {sizing.get('error') if sizing else 'Empty sizing'}")
             return None
 
         req_margin = sizing["required_margin"]

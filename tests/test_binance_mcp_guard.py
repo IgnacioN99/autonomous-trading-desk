@@ -557,7 +557,7 @@ class TestBinanceMCPGuard(unittest.TestCase):
         }
         res = self._run_guard(payload)
         self.assertEqual(res.get("decision"), "deny")
-        self.assertIn("No fue posible extraer determinísticamente el símbolo objetivo", res.get("reason", ""))
+        self.assertIn("Unable to determine the order symbol deterministically", res.get("reason", ""))
 
     def test_algoorder_not_unconditional_risk_reducing(self):
         """Verifies tool calls with 'algoorder' in name require explicit reduceOnly or closePosition flag."""

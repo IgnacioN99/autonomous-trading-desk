@@ -2,24 +2,24 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "run_command|call_mcp_tool|Bash",
+        "matcher": "Bash|mcp__.*|Write|Edit|MultiEdit",
         "hooks": [
           {
             "type": "command",
-            "command": "python3 scripts/hooks/pre_trade_guard.py",
-            "timeout": 5
+            "command": "python3 \"$CLAUDE_PROJECT_DIR\"/scripts/hooks/pre_trade_guard.py",
+            "timeout": 10
           }
         ]
       }
     ],
     "PostToolUse": [
       {
-        "matcher": "run_command|call_mcp_tool|Bash",
+        "matcher": "Bash|mcp__.*",
         "hooks": [
           {
             "type": "command",
-            "command": "python3 scripts/hooks/post_trade_sync.py",
-            "timeout": 12
+            "command": "python3 \"$CLAUDE_PROJECT_DIR\"/scripts/hooks/post_trade_sync.py",
+            "timeout": 30
           }
         ]
       }

@@ -299,7 +299,8 @@ class TestAutoDestructAndFailSafe(unittest.TestCase):
             sl_price=98.0,
             tp1_price=103.0,
             tp2_price=106.0,
-            target_env="testnet"
+            target_env="testnet",
+            bypass_eval_gate=True  # TESTNET-only explicit bypass: this test targets the SL fail-safe
         )
 
         self.assertFalse(res["success"])
@@ -341,7 +342,8 @@ class TestRestingLimitOrders(unittest.TestCase):
             tp2_price=110.0,
             target_env="testnet",
             order_type="LIMIT",
-            limit_price=98.0
+            limit_price=98.0,
+            bypass_eval_gate=True  # TESTNET-only explicit bypass: this test targets resting LIMIT handling
         )
 
         self.assertTrue(res["success"])
@@ -349,8 +351,10 @@ class TestRestingLimitOrders(unittest.TestCase):
         self.assertEqual(res["orderId"], 70001)
         self.assertEqual(res["status"], "NEW")
         self.assertIn("deferred until fill", res["message"])
-        # Only 2 requests: ticker and entry order. No premature TP orders dispatched!
-        self.assertEqual(mock_send.call_count, 2)
+        # Exactly one order dispatched (the LIMIT entry). No premature reduce-only TP orders!
+        posted = [c for c in mock_send.call_args_list if c.args[0] == 'POST' and c.args[1] == '/fapi/v1/order']
+        self.assertEqual(len(posted), 1)
+        self.assertNotIn('reduceOnly', posted[0].args[2])
 
 
 class TestCLIEntryPoint(unittest.TestCase):
@@ -434,6 +438,49 @@ class TestCLIEntryPoint(unittest.TestCase):
             eft.main()
             mock_exit.assert_called_once_with(1)
 
+    @patch("execute_futures_trade.send_signed_request")
+    def test_setup_margin_and_leverage_clamps_subaccount_to_5x(self, mock_send):
+        def fake_send(method, endpoint, params=None, target_env=None):
+            if endpoint == '/fapi/v1/marginType':
+                return {'code': 200, 'msg': 'success'}
+            if endpoint == '/fapi/v1/leverage':
+                if params.get('leverage') == 15:
+                    return {'code': -4421, 'msg': 'Subaccounts are restricted from using leverage greater than 5x.'}
+                if params.get('leverage') == 5:
+                    return {'symbol': 'GRASSUSDT', 'leverage': 5}
+            return {}
+        mock_send.side_effect = fake_send
+
+        lev_res, margin_res, confirmed_lev = eft.setup_margin_and_leverage("GRASSUSDT", 15, target_env="testnet")
+        self.assertEqual(confirmed_lev, 5)
+        self.assertEqual(lev_res.get('leverage'), 5)
+
+    @patch("quant_risk_engine.get_account_equity", return_value=10000.0)
+    @patch("execute_futures_trade.setup_margin_and_leverage")
+    @patch("execute_futures_trade.get_symbol_filters")
+    @patch("execute_futures_trade.send_signed_request")
+    def test_execute_complete_trade_fails_closed_when_leverage_fails(
+        self, mock_send, mock_filters, mock_setup, mock_equity
+    ):
+        mock_filters.return_value = {
+            "stepSize": 0.001, "minQty": 0.001, "tickSize": 0.1,
+            "precision_qty": 3, "precision_price": 1, "minNotional": 5.0
+        }
+        mock_send.return_value = {'price': '100.0'}
+        mock_setup.return_value = ({'code': -4028, 'isError': True, 'error': 'Leverage exceeds account limit'}, {'code': 200, 'msg': 'success'}, 3)
+
+        res = eft.execute_complete_trade(
+            symbol="BTCUSDT",
+            direction="LONG",
+            leverage=10,
+            margin_usdt=10.0,
+            target_env="testnet",
+            bypass_eval_gate=True
+        )
+        self.assertFalse(res["success"])
+        self.assertIn("Failed to configure leverage", res["error"])
+
 
 if __name__ == "__main__":
     unittest.main()
+

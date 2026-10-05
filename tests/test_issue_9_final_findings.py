@@ -121,9 +121,11 @@ class TestIssue9FinalFindings(unittest.TestCase):
         with open(skill_path, "r", encoding="utf-8") as f:
             content = f.read()
 
-        # Check aligned parameters
-        self.assertIn("100 USDT", content)
-        self.assertIn("10 USDT", content)
+        # Sizing is profile-driven (generic clone): no hard-coded dollar margins, values come from user_profile
+        self.assertIn("risk_pct_equity", content)
+        self.assertIn("leverage_standard", content)
+        self.assertIn("leverage_yolo", content)
+        self.assertNotIn("100 USDT", content)
         self.assertIn("30%", content)
         self.assertIn("70%", content)
         self.assertIn("+1.8R", content)
@@ -139,7 +141,8 @@ class TestIssue9FinalFindings(unittest.TestCase):
     # Finding 15 & 16: Configuration Harmonization & Runtime Portability
     # =========================================================================
     def test_finding_15_mcp_configs_harmonized(self):
-        """Validates .mcp.json and .agents/mcp_config.json have identical content."""
+        """Claude Code (.mcp.json) and Antigravity (.agents/mcp_config.json) expose the same servers:
+        same names, same remote endpoints (each in its client's schema) and the same generic stdio script."""
         root_mcp = os.path.join(BASE_DIR, ".mcp.json")
         agents_mcp = os.path.join(BASE_DIR, ".agents", "mcp_config.json")
 
@@ -147,15 +150,37 @@ class TestIssue9FinalFindings(unittest.TestCase):
         self.assertTrue(os.path.exists(agents_mcp))
 
         with open(root_mcp, "r", encoding="utf-8") as f1, open(agents_mcp, "r", encoding="utf-8") as f2:
-            d1 = json.load(f1)
-            d2 = json.load(f2)
+            claude = json.load(f1)["mcpServers"]
+            agy = json.load(f2)["mcpServers"]
 
-        self.assertEqual(d1, d2)
-        # Ensure serverUrl and url exist for binance and notion
-        self.assertIn("serverUrl", d1["mcpServers"]["binance"])
-        self.assertIn("url", d1["mcpServers"]["binance"])
-        self.assertIn("serverUrl", d1["mcpServers"]["notion"])
-        self.assertIn("url", d1["mcpServers"]["notion"])
+        self.assertEqual(set(claude), set(agy))
+        for name in ("binance", "notion", "crypto_radar"):
+            self.assertIn(name, claude)
+
+        for name, spec in agy.items():
+            if "command" in spec:
+                # stdio: same interpreter and script, workspace-relative and machine-independent
+                self.assertEqual(spec["command"], claude[name]["command"])
+                self.assertEqual(spec.get("args"), claude[name].get("args"))
+                self.assertEqual(spec["command"], "python3")
+                for arg in spec.get("args", []):
+                    self.assertFalse(os.path.isabs(arg), f"{name}: absolute path in args ({arg})")
+            else:
+                # remote: agy uses serverUrl only; Claude Code uses {"type": "http", "url": ...}
+                self.assertIn("serverUrl", spec)
+                self.assertNotIn("url", spec)
+                self.assertEqual(claude[name].get("type"), "http")
+                self.assertEqual(claude[name].get("url"), spec["serverUrl"])
+
+        radar_args = agy["crypto_radar"]["args"]
+        self.assertEqual(radar_args, ["scripts/radar_mcp_server.py"])
+        self.assertTrue(os.path.exists(os.path.join(BASE_DIR, *radar_args[0].split("/"))))
+
+        for path in (root_mcp, agents_mcp):
+            with open(path, "r", encoding="utf-8") as f:
+                raw = f.read()
+            for needle in ("/mnt/", "/home/", "/Users/", "C:\\", "C:/", "/usr/bin/python3"):
+                self.assertNotIn(needle, raw, f"{os.path.basename(path)} contains machine-specific path '{needle}'")
 
     def test_finding_16_claude_settings_hooks(self):
         """Validates .claude/settings.json exists and defines pre_trade_guard hook."""
