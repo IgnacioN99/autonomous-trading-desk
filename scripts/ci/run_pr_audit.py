@@ -22,6 +22,9 @@ import urllib.request
 import subprocess
 from pathlib import Path
 
+# Linux caps a single argv string at 128 KiB (MAX_ARG_STRLEN); stay well below it
+INLINE_PROMPT_MAX_BYTES = 100_000
+
 
 def invoke_auditor(prompt: str) -> str:
     """Invokes the auditor agent via agy CLI (local) or direct Gemini API (cloud CI)."""
@@ -29,7 +32,17 @@ def invoke_auditor(prompt: str) -> str:
     model = os.getenv("AGY_REVIEW_MODEL", "gemini-3.8-flash-medium")
     agy_path = shutil.which("agy") or os.path.expanduser("~/.local/bin/agy")
     if os.path.isfile(agy_path):
-        agy_cmd = [agy_path, "-p", prompt, "--dangerously-skip-permissions", "--model", model]
+        agy_prompt = prompt
+        if len(prompt.encode("utf-8")) > INLINE_PROMPT_MAX_BYTES:
+            # Large diffs exceed the OS per-argument limit (E2BIG); hand the prompt over as a file instead
+            prompt_path = Path("logs") / "pr_audit_prompt.md"
+            prompt_path.parent.mkdir(parents=True, exist_ok=True)
+            prompt_path.write_text(prompt, encoding="utf-8")
+            agy_prompt = (
+                f"Read the file {prompt_path.resolve()} completely with view_file (all of it, in chunks if needed) "
+                "and carry out the audit it describes. Reply ONLY with the report required by its <output_contract>."
+            )
+        agy_cmd = [agy_path, "-p", agy_prompt, "--dangerously-skip-permissions", "--model", model]
         # Set effort parameter appropriately
         if "medium" in model:
             agy_cmd += ["--effort", "medium"]
