@@ -135,7 +135,18 @@ class TestExecuteFuturesMCPBridge(unittest.TestCase):
 
     @patch("execute_futures_trade.call_binance_mcp")
     def test_send_mcp_gateway_request_algo_stop_loss(self, mock_mcp):
-        mock_mcp.return_value = {"orderId": 88888, "status": "NEW"}
+        """closePosition SL via the gateway: quantity looked up from the live position, sent through
+        tool_execute -> futures_usds.newAlgoOrder as a CONDITIONAL reduce-only stop."""
+        def fake_mcp(tool_name, args=None, session_id=None):
+            if tool_name == "futures_usds.positionInformationV2":
+                return [
+                    {"symbol": "ETHUSDT", "positionAmt": "3.0"},
+                    {"symbol": "BTCUSDT", "positionAmt": "0.5"},
+                ]
+            if tool_name == "tool_execute":
+                return {"orderId": 88888, "status": "NEW"}
+            return {"error": f"unexpected tool {tool_name}", "isError": True}
+        mock_mcp.side_effect = fake_mcp
         algo_params = {
             "symbol": "BTCUSDT",
             "side": "SELL",
@@ -144,15 +155,37 @@ class TestExecuteFuturesMCPBridge(unittest.TestCase):
             "closePosition": "true"
         }
         res = eft.send_mcp_gateway_request("POST", "/fapi/v1/algoOrder", params=algo_params)
-        mock_mcp.assert_called_once_with("futures_usds.newOrder", {
-            "symbol": "BTCUSDT",
-            "side": "SELL",
-            "type": "STOP_MARKET",
-            "stopPrice": 81500.0,
-            "closePosition": "true"
+        mock_mcp.assert_any_call("futures_usds.positionInformationV2")
+        mock_mcp.assert_called_with("tool_execute", {
+            "toolName": "futures_usds.newAlgoOrder",
+            "arguments": {
+                "symbol": "BTCUSDT",
+                "side": "SELL",
+                "type": "STOP_MARKET",
+                "algoType": "CONDITIONAL",
+                "triggerPrice": "81500.0",
+                "quantity": "0.5",
+                "reduceOnly": "true"
+            }
         })
         self.assertEqual(res["orderId"], 88888)
         self.assertEqual(res["algoId"], 88888)
+
+    @patch("execute_futures_trade.call_binance_mcp")
+    def test_send_mcp_gateway_request_algo_stop_loss_without_position_uses_close_position(self, mock_mcp):
+        def fake_mcp(tool_name, args=None, session_id=None):
+            if tool_name == "futures_usds.positionInformationV2":
+                return []
+            return {"algoId": 77777}
+        mock_mcp.side_effect = fake_mcp
+        res = eft.send_mcp_gateway_request("POST", "/fapi/v1/algoOrder", params={
+            "symbol": "BTCUSDT", "side": "BUY", "type": "STOP_MARKET", "triggerPrice": 90000.0, "closePosition": "true"
+        })
+        sent = mock_mcp.call_args[0][1]["arguments"]
+        self.assertEqual(sent.get("closePosition"), "true")
+        self.assertNotIn("quantity", sent)
+        self.assertNotIn("reduceOnly", sent)
+        self.assertEqual(res["algoId"], 77777)
 
     @patch("execute_futures_trade.get_mcp_oauth_token", return_value="fake_token_xyz")
     @patch("urllib.request.urlopen")

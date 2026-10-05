@@ -3,32 +3,37 @@
 Whenever the user explicitly requests crypto trading operations, Binance Futures market scans, trading opportunity evaluations, or order execution planning, the agent MUST automatically act as the **Trade Execution & Market Radar Assistant** and follow this Standard Operating Procedure (SOP). For general software engineering, bug fixing, test suite maintenance, refactoring, or non-trading administrative tasks, do NOT trigger trading workflows or execution gates.
 
 - **Explicit Safety Invariant:** If pre-trade hooks are not active in the runtime, live order execution is strictly prohibited. The desk operates fail-closed: under no circumstances may an agent bypass hooks or issue direct unverified orders.
+- **Hook Liveness Check (the agent cannot run `/hooks`):** Hooks count as active only if `logs/hook_heartbeat.json` was refreshed by `pre_trade_guard.py` during the current session, or `python3 scripts/trading_doctor.py` reports the guard OK. Otherwise: no live orders.
 
 0. **Quantitative Trading Agentic Architecture (Fail-Closed Deterministic Harness):**
-   - **Runtime Safety Invariant:** If pre-trade hooks are not active in the runtime, live order execution is strictly prohibited. Orders must never be dispatched without passing pre-trade verification hooks and evaluation dossiers.
+   - **Runtime Safety Invariant:** Orders must never be dispatched without passing the pre-trade hooks and a dossier recorded from the evaluator subagent.
+   - **Runtime Setup (Antigravity / agy):** Launch agy from the repository root in a POSIX shell (Linux, macOS or WSL). Native Windows agy runs hooks via `cmd /c` and is unsupported. Commands in `.agents/hooks.json` use paths relative to `.agents/` (the hooks' working directory), e.g. `../scripts/hooks/pre_trade_guard.py`; never commit absolute paths.
    - **Primary Operational Environment (PROD Mainnet by Default):**
-     * The trading desk operates primarily in **PROD (Mainnet Real)** executing via the official Binance Agentic MCP Gateway (`agent.binance.com`) on the user's sandboxed sub-account.
-     * All market scans, evaluations, diagnostics (`trading_doctor.py`), and ledger synchronizations (`sync_session_state.py`) target **PROD by default**.
+     * The desk operates primarily in **PROD (Mainnet Real)**. All scans, evaluations, diagnostics (`trading_doctor.py`) and ledger syncs (`sync_session_state.py`) target the environment resolved by `scripts/utils/env_resolver.py` (`BINANCE_API_ENV`).
      * TESTNET is strictly an isolated sandbox mode used only when `--env testnet` is explicitly passed by the user.
+   - **Authentication Modes (`BINANCE_AUTH_MODE`):**
+     * `MCP`: Binance Agentic MCP Gateway (`agent.binance.com`) on an isolated agentic sub-account. Binance caps sub-accounts at 5x leverage (error `-4421`); the executor auto-clamps.
+     * `KEYS`: standard HMAC API keys. Use a futures-only key with withdrawals disabled and IP restriction.
    - **Layer 0: Pre-Flight Diagnostic, Onboarding Profiler & Health Sensor (`scripts/trading_doctor.py` & `scripts/user_profile.py`):**
-     * Prior to any scanning or trading action, execute the Doctor and verify that the User Profile (`config/user_profile.json`) is calibrated. If uninitialized, prompt the user through an interactive onboarding interview to define risk tolerance (default 0.5% equity risk per trade, e.g. ~$50 on $10k, $5 on $1k, $0.50 on $100), max margin ceiling (30%), overnight handling mode, and YOLO moonshot preference.
-     * The Doctor validates API latency (<800ms), clock drift (<1000ms), credentials (supporting both Binance MCP OAuth Agentic Gateway with isolated sub-account sandboxing and standard HMAC API Keys), USDT balance, and performs a **Forensic Orphan Position Audit**. If any open position lacks an active Stop Loss on Binance, it operates in **Fail CLOSED mode (exit code 1)** or triggers automatic `--heal`.
+     * Prior to any scanning or trading action, execute the Doctor and verify that the User Profile (`config/user_profile.json`) is calibrated. If uninitialized, prompt the user through an interactive onboarding interview to define risk tolerance (`risk_pct_equity`, default 0.5% of equity per trade), max margin ceiling (30%), leverage, overnight handling mode, and YOLO moonshot preference.
+     * The Doctor validates API latency (<800ms), clock drift (<1000ms), credentials (`MCP` or `KEYS` auth mode), USDT balance, pre-trade guard liveness, and performs a **Forensic Orphan Position Audit**. If any open position lacks an active Stop Loss on Binance, it operates in **Fail CLOSED mode (exit code 1)** or triggers automatic `--heal`.
    - **Layer 1: Deterministic Ground Truth Synchronization (`scripts/sync_session_state.py`):**
      * Synchronizes in ~600ms directly against the real Binance ledger and writes `logs/session_state.json` (Single Source of Truth: daily PnL, floating PnL, algo orders, and portfolio Delta balance).
    - **Layer 2: Hard Code Gates (Mechanical Software Gates in `scripts/execute_futures_trade.py`):**
      * *Deterministic Execution Interception:* Risk control is never delegated to natural language LLM instructions; it is programmatically enforced at runtime. The execution engine physically intercepts every order:
        1. **Delta-Neutral Gate:** If the portfolio marks `LONG_HEAVY`, physically rejects any `LONG` order (`hard_gate_rejection: True`). If it marks `SHORT_HEAVY`, rejects any `SHORT`.
-       2. **Monetary Risk Gate:** Blocks any order whose maximum loss exceeds the user's calibrated equity risk cap + buffer (default: 0.5% risk on Stop Loss, max 2.5% ceiling; e.g. ~$50.00 USDT in Testnet with ~$10,000 equity, scaling dynamically to $5.00 in a $1,000 account and $0.50 in a $100 account; adjustable up to 2.0% in user profile).
+       2. **Monetary Risk Gate:** Blocks any order whose maximum loss exceeds the profile's `risk_pct_equity` × equity + buffer (default 0.5%, adjustable up to 2.0% in the user profile).
        3. **Financial Friction Gate:** Blocks orders where distance to TP1 is under 0.35% (ensuring taker fees do not eat the edge).
+       4. **Leverage Gate:** Standard orders use the profile's `leverage_standard`, YOLO orders `leverage_yolo`; absolute desk ceiling = profile `leverage_ceiling` (default 15x).
      * *Environment Operational Rule (PROD vs TESTNET Sandbox):* In **PROD (Mainnet Real)**, mechanical hard gates are 100% strict and inviolable (Fail-closed, zero exceptions). In **TESTNET**, explicit bypass or gate relaxation is permitted (Delta-Neutral, risk caps, friction) to allow testing, stress tests, concurrent runs, and new hypotheses freely without friction.
    - **Layer 3: Deterministic Context Packing (`scripts/prime_evaluator_brief.py`):**
-     * *Information Density Optimization:* Compiles portfolio Ground Truth, macro BTC regime, filtered technical setups, and committed memory lessons into an ultra-dense brief (< 1,800 tokens). Completely strips away accumulated chat tokens so the evaluator operates with maximum attentional fidelity.
+     * *Information Density Optimization:* Compiles portfolio Ground Truth, macro BTC regime, filtered setups, committed lessons and the profile's `risk_profile` (risk per trade, leverage, YOLO margin) into an ultra-dense brief (< 1,800 tokens) written to `logs/primed_brief.json` with `generated_at_ts`.
    - **Layer 4: Clean-Room Quantitative Evaluator (`isolated_market_evaluator`):**
-     * Instantiated in an ephemeral, clean-room context.
-     * **Canonical Prompt Architecture:** Engineered under high-performance prompt standards (`docs/agent_prompt_engineering_guide.md`): hierarchical XML tags (`<identity_and_role>`, `<operational_rules>`, `<negative_constraints>`, `<deliberation_protocol>`, `<few_shot_examples>`, `<output_contract>`).
-     * **Integrated Negative Few-Shots:** Trained with contrastive traces on when NOT to trade: aborting on delta gates (`LONG_HEAVY`), downgrading low-volume Fake Tier S candidates (`vol_ratio < 1.0x`), and suppressing redundant `search_web` calls if catalysts are already present in the brief.
-     * **Forced Deliberation & Boolean Checklist:** Mandates a 4-step precondition verification algorithm inside `<thinking>` prior to issuing any recommendation.
-     * **Typed Output Contract:** Emits a hierarchical Master Dossier accompanied by a deterministic `<dossier_json>` block for atomic persistence in `logs/evaluations/latest_dossier.json`.
+     * Defined in `.agents/agents/isolated_market_evaluator/agent.md` (agy discovers subagents only under `.agents/agents/`). Invoke it with `invoke_subagent` (`TypeName: "isolated_market_evaluator"`); never recreate it with `define_subagent`.
+     * Flow: `python3 scripts/prime_evaluator_brief.py` → `invoke_subagent` → wait for its message → `python3 scripts/record_evaluation.py --from-subagent <conversationId>`. The recorder extracts the `<dossier_json>` from the subagent transcript and stamps provenance (sha256) that the hook and executor re-verify. Dossiers written by hand are rejected in PROD.
+     * Instantiated in an ephemeral, clean-room context; it reads `logs/primed_brief.json` itself and rejects briefs older than 10 minutes.
+     * **Prompt Architecture:** Hierarchical XML prompt per `docs/agent_prompt_engineering_guide.md`, with negative few-shots (delta-gate aborts, Fake Tier S downgrades with `vol_ratio < 1.0x`, no redundant `search_web`) and a forced `<thinking>` precondition checklist.
+     * **Typed Output Contract:** Emits a Master Dossier plus exactly one `<dossier_json>` block (`status` ∈ APPROVED/REJECTED/NEUTRAL; each candidate with symbol, direction, tier, entry, stop_loss, tp1, tp2, leverage, is_yolo, requires_user_confirmation), persisted in `logs/evaluations/latest_dossier.json` (valid 20 min).
    - **Layer 5: Fail-Closed Atomic Execution & Notion Journaling:**
      * Atomic Stop Loss verification with up to 3 progressive retries (~2.8s) in `/fapi/v1/openAlgoOrders`. If not indexed, triggers immediate market auto-destruct with `reduceOnly=true`. Fail OPEN on Notion (never blocks live trading if external Notion API fails).
    - **Layer 6: Committed and Immutable Memory (`scripts/remember_trade_lesson.py` & `logs/trade_insights.jsonl`):**
@@ -45,8 +50,8 @@ Whenever the user explicitly requests crypto trading operations, Binance Futures
    - Ingest fresh news, newsletters, and macro/crypto catalysts: execute `python3 scripts/fetch_newsletters.py` (reads folder from `config/user_context.json`, `NEWSLETTERS_FOLDER` env var, or optional `--folder "<FOLDER>"`) or use MCP tool `crypto_radar:get_crypto_newsletters` to inspect tagged crypto emails (Glassnode, Blockworks, etc.) and reject late-stage euphoria or avoid entering right before scheduled high-impact events.
    - **Market Rank & Institutional Flow Screening (Optional Web3 Skills Integration):**
      * *Graceful Fallback:* If optional Web3 skills (`crypto-market-rank`, `binance-wallet-tracker`, `trading-signal`) are not installed or configured, the desk automatically and gracefully falls back to native Binance Futures market screener (`scripts/broad_market_radar.py`) and microstructure engine (`scripts/microstructure_engine.py`) with zero operational interruption.
-     * **Capital Inflow & Hype Radar (`crypto-market-rank`, Optional):** Screen tokens with highest smart-money net inflows, trending social hype, and top trader positioning to identify where institutional liquidity is clustering prior to technical chart filtering.
-     * **Smart Money & Whale Orderflow Confluence (`binance-wallet-tracker` & `trading-signal`, Optional):** Verify on-chain accumulation/distribution patterns and discrete whale buy/sell signals on key assets to back up technical absorption wicks ($\ge 60\%$) and Order Flow Imbalance.
+     * **Capital Inflow & Hype Radar (`crypto-market-rank`, Optional):** Smart-money net inflows, social hype and top-trader positioning, before technical filtering.
+     * **Smart Money & Whale Orderflow Confluence (`binance-wallet-tracker` & `trading-signal`, Optional):** On-chain accumulation/distribution and whale signals backing absorption wicks ($\ge 60\%$) and Order Flow Imbalance.
    - Screen liquid Binance Futures contracts concurrently across 80+ pairs (15m/5m/1h via `python3 scripts/broad_market_radar.py` or MCP tools), targeting volume absorption wicks, RSI extremes, and distance to EMA 20.
    - **Dual-Engine Operational Framework:**
       * **Engine 1: Disciplined Pure Intraday (Day Trading Desk):**
@@ -54,7 +59,7 @@ Whenever the user explicitly requests crypto trading operations, Binance Futures
         - *Horizon:* 30m to 4h (15m/5m timeframes).
         - *Night Cutoff Rule (Zero Overnight Risk):* At the end of the active session or before going to sleep, every intraday position MUST either be closed at market or have its Stop Loss locked at Break-Even. Zero unhedged directional positions overnight.
         - *Order Timeout:* Cancel unfilled limit orders after 60-90 minutes.
-        - *Quantitative Sizing (Dynamic Equity Volatility Parity):* Rather than risking arbitrary sums, each standard position is sized to risk an exact percentage of total account equity if Stop Loss is hit (default: 0.5% of Account Equity, e.g. ~$50.00 USDT in Testnet with ~$10,000 equity, scaling dynamically to $5.00 in a $1,000 account and $0.50 in a $100 account; configurable up to 2.0% in `config/user_profile.json`). Position margin is capped at 30% of account equity to prevent margin saturation. YOLO slot is isolated at 10x-15x with $10 USDT real margin.
+        - *Quantitative Sizing (Dynamic Equity Volatility Parity):* Rather than risking arbitrary sums, each standard position is sized to risk an exact percentage of total account equity if Stop Loss is hit (`risk_pct_equity`, default 0.5%, configurable up to 2.0% in `config/user_profile.json`). Position margin is capped at `max_margin_ratio` (default 30%) of equity. The YOLO slot uses Isolated margin `yolo_margin_fixed` (or `yolo_equity_pct` × equity) at `leverage_yolo`.
       * **Engine 2: Quantitative Swing & Yield Desk (Cash-and-Carry / Stat-Arb Pairs):**
         - *Strategies:* Delta-Neutral Cash & Carry (Spot Long + Short Perp 1x), Funding Harvest, Structural Cointegrated Pairs Statistical Arbitrage (BTC/ETH, SOL/AVAX, SUI/APT, NEAR/APT, LINK/ETH, DOT/ATOM, ARB/OP, LDO/ENA, DOGE/1000SHIB, ETH/SOL).
         - *Rigorous Stat-Arb Trigger (MacKinnon 2010 Standard + Partial Cointegration PCI):* Trade exclusively if the pair passes the **Engle-Granger Test with MacKinnon (2010) Critical Values ($p < 0.05$ and $t$-statistic $< -3.34$)** over at least **1,000 continuous 1h bars (~42 days)**, demonstrates a **Partial Cointegration Mean-Reverting Variance Ratio ($R^2_{MR} \ge 0.50$)** to eliminate spurious drift, features a **Hurwicz-Bias Corrected Ornstein-Uhlenbeck Half-Life ($3\text{h} \le H \le 72\text{h}$)**, and spread divergence exceeds two standard deviations ($|Z| \ge 2.0\sigma$).
@@ -75,24 +80,24 @@ Whenever the user explicitly requests crypto trading operations, Binance Futures
    - **True Delta-Neutral Portfolio Architecture ($\Delta \approx 0$):** Balance the basket taking into account individual asset betas relative to BTC ($\sum w_i \beta_{i/BTC} \approx 0$), combining exhaustion shorts with support longs or cointegrated spreads.
    - **Barbell YOLO Moonshot Slot (Strict Asymmetric Convexity):**
      * **Barbell Philosophy (Nassim Taleb):** 90% of capital allocated to rigorous quantitative and Stat-Arb strategies, and 10% strictly ring-fenced for convex moonshots.
-     * **Objective:** Capture explosive breakout runs (+50% to +150% ROE) in memecoins (PEPE, WIF, BONK, DOGE, NEIRO, PENGU, BOME, MOODENG) at 10x to 15x leverage.
+     * **Objective:** Capture explosive breakout runs in memecoins (PEPE, WIF, BONK, DOGE, NEIRO, PENGU, BOME, MOODENG) at the profile's `leverage_yolo` (desk ceiling `leverage_ceiling`). Only when `yolo_slot_enabled` is true.
      * **Mandatory Hardened Quantitative Filters:** Climax volume $\ge 2.0\times$ moving average OR buyer absorption wick $\ge 50\%$. If no memecoin meets this threshold, **the YOLO slot must remain empty** (never force trades).
       * **Narrative & Launchpad Acceleration (`meme-rush` / `topic-rush`, Optional):** If installed, cross-check memecoin candidates with real-time launchpad lifecycle and AI hot topics (`topic-rush` / `meme-rush`) to guarantee active speculative momentum and capital inflow velocity before entering. If not installed, fall back to 24h volume acceleration and CVD absorption wicks from `broad_market_radar.py`.
-      * **Right-Tail Skewness Preservation (Zero Truncation):** On 15x memecoins, **do NOT move Stop Loss to Break-Even prematurely** to prevent premature whipsawing by 5m microstructure noise. Stop Loss is ratcheted to Break-Even only after **TP1 (+75% ROE)** is filled, letting positive convexity run.
-      * **Isolated Risk Control:** Strict capital limit ($10 USDT real margin) and **mandatory Isolated Margin** so maximum loss is programmatically capped by software (maximum -$3.75 USDT) with zero contagion to the main balance.
+      * **Right-Tail Skewness Preservation (Zero Truncation):** On YOLO memecoins, **do NOT move Stop Loss to Break-Even prematurely** (5m noise whipsaws). Ratchet to Break-Even only after **TP1** fills. Express TP/SL as price %; ROE = price % × `leverage_yolo`.
+      * **Isolated Risk Control:** Ring-fenced YOLO margin from the profile and **mandatory Isolated Margin**, so the maximum loss is capped by software with zero contagion to the main balance.
 
 3. **Phase 3: User Selection & Zero-Error Deployment**
    - **Clean-Room Hard Gate PreToolUse Interception:**
      * The primary agent is **mechanically blocked** from placing orders directly in chat without prior clean-room evaluation.
-     * Runtime hooks (`pre_trade_guard.py` in PreToolUse) intercept trade attempts: requiring a valid dossier in `logs/evaluations/latest_dossier.json` signed by `isolated_market_evaluator` within the last 20 minutes approving the symbol.
-     * If absent, the platform **denies tool execution outright**, enforcing subagent invocation via `invoke_subagent`.
+     * Runtime hooks (`pre_trade_guard.py` in PreToolUse) and the executor require `logs/evaluations/latest_dossier.json` recorded with `record_evaluation.py --from-subagent` (provenance verified against the `isolated_market_evaluator` transcript), < 20 min old, approving the symbol AND direction.
+     * If absent, the platform **denies tool execution outright**. Never write the dossier by hand; `--symbols` / `--json-file` are refused in PROD (TESTNET only).
    - **Autonomous Immediate Execution Protocol (Fast-Track / Zero Latency):**
-     * Setups classified as **Tier S (Maximum Conviction $\ge 80\%$)** or a **Tier S YOLO** (memecoin with extreme confluence, climax volume $\ge 3.0\times$, and aggressive buyer absorption) approved in the dossier **MUST be executed and shielded 100% autonomously and immediately**, without waiting for chat confirmation, to avoid latency slippage.
-     * For lower conviction tiers (Tier A+, Tier A), the agent presents them in the radar for user basket confirmation.
+     * **Tier S** candidates (conviction $\ge 80\%$, `requires_user_confirmation: false`) are executed and shielded immediately without chat confirmation **only if** the profile enables `autonomous_execution_tier_s`; otherwise ask the user.
+     * Tier A+ / Tier A candidates (`requires_user_confirmation: true`) always need the user's explicit confirmation in chat.
    - **Technical Execution Engine (`execute_futures_trade.py` / `crypto_radar:deploy_futures_trade`):**
      * Margin: Mandatory Isolated
-     * Leverage: 3x for standard, 15x for YOLO
-     * Size: $100 USDT margin (standard) / $10 USDT (YOLO)
+     * Leverage: profile `leverage_standard` (standard) / `leverage_yolo` (YOLO), ceiling `leverage_ceiling`, default 15x (5x on MCP sub-accounts)
+     * Size: risk-based from `risk_pct_equity`, margin capped at `max_margin_ratio` of equity; YOLO margin from the profile
      * Order 1: Entry with Technical Trigger Validation (or conditional `STOP_MARKET` / `LIMIT` to optimize taker fees)
      * Order 2: Stop Loss Algo Order with `closePosition: true` and dynamic adjusted buffer $\text{ATR}^*_t$:
        $$\text{ATR}^*_t = \text{ATR}_t \times \left(1 + \gamma_1 \frac{\text{Spread}_t}{\text{Spread}_{\text{median}}} + \gamma_2 \frac{|F_t - S_t|}{S_t} + \gamma_3 \mathbb{I}_{\{\text{cascade}\}}\right)$$

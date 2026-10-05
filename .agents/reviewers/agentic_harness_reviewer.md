@@ -21,7 +21,7 @@ Debes auditar rigurosamente los siguientes principios de arquitectura agéntica:
    - Prohibido que un agente confíe en su memoria de conversación o en variables locales no sincronizadas para saber si está expuesto en el mercado.
 
 4. **Context Packing & Clean-Room Evaluator:**
-   - Los subagentes evaluadores (`isolated_market_evaluator`) deben ejecutarse en un contexto efímero y limpio, recibiendo un brief ultra-denso generado determinísticamente (<1,800 tokens via `scripts/prime_evaluator_brief.py`).
+   - Los subagentes evaluadores (`isolated_market_evaluator`, definido en `.agents/agents/isolated_market_evaluator/agent.md` e invocado con `invoke_subagent`; su veredicto se registra con `scripts/record_evaluation.py --from-subagent <conversationId>`) deben ejecutarse en un contexto efímero y limpio, recibiendo un brief ultra-denso generado determinísticamente (<1,800 tokens via `scripts/prime_evaluator_brief.py`).
    - Esto evita la degradación de atención y la "ceguera por contexto largo" acumulado en chats prolongados.
 
 5. **Observabilidad, Auto-Healing y Auto-Destruct:**

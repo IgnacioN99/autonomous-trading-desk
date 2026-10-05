@@ -14,6 +14,9 @@ Default Parameters:
 - overnight_mode: "ZERO_OVERNIGHT_RISK" (Ratchet to BE or close at 22:00 UTC)
 - yolo_slot_enabled: False
 - leverage_standard: 3
+- leverage_yolo: 15 (Barbell YOLO slot; sub-accounts are auto-clamped to 5x by the executor on -4421)
+- leverage_ceiling: 15 (absolute desk ceiling enforced by the execution engine and the radar MCP server;
+  raise it here, never above MAX_LEVERAGE_CEILING)
 """
 
 import os
@@ -27,6 +30,12 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_DIR = os.path.join(BASE_DIR, "config")
 PROFILE_FILE = os.path.join(CONFIG_DIR, "user_profile.json")
 
+# Single source of truth for the absolute desk leverage ceiling.
+# execute_futures_trade.py (hard gate) and radar_mcp_server.py (pre-check) both read it through
+# get_leverage_ceiling(); users may raise it per profile via `leverage_ceiling` up to MAX_LEVERAGE_CEILING.
+DEFAULT_LEVERAGE_CEILING = 15
+MAX_LEVERAGE_CEILING = 125
+
 DEFAULT_PROFILE = {
     "profile_completed": False,
     "risk_pct_equity": 0.005,           # 0.5% default risk per trade (e.g. $50 on $10k, $5 on $1k)
@@ -39,21 +48,27 @@ DEFAULT_PROFILE = {
     "overnight_mode": "ZERO_OVERNIGHT_RISK", # ZERO_OVERNIGHT_RISK | CLOSE_ALL_AT_MARKET | SWING_STRUCTURAL_STOP
     "leverage_standard": 3,
     "leverage_yolo": 15,
+    "leverage_ceiling": DEFAULT_LEVERAGE_CEILING,
     "experience_level": "INTERMEDIATE",# BEGINNER | INTERMEDIATE | ADVANCED_QUANT
     "created_at_utc": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
     "updated_at_utc": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
 }
 
 def get_yolo_margin(target_env="testnet") -> float:
-    """Calculates YOLO margin based on yolo_equity_pct (default 0.5% of total equity)."""
+    """Calculates YOLO margin based on yolo_margin_fixed or yolo_equity_pct (default $10 - $15 USDT)."""
     prof = load_user_profile()
-    yolo_pct = float(prof.get("yolo_equity_pct", 0.005))
+    if "yolo_margin_fixed" in prof and prof["yolo_margin_fixed"] is not None:
+        try:
+            return round(float(prof["yolo_margin_fixed"]), 2)
+        except Exception:
+            pass
+    yolo_pct = float(prof.get("yolo_equity_pct", 0.12))
     try:
         from quant_risk_engine import get_account_equity
         equity = get_account_equity(target_env=target_env)
     except Exception:
         equity = 10000.0 if str(target_env).lower() == "testnet" else 100.0
-    return round(max(equity * yolo_pct, 5.0), 2)
+    return round(min(max(equity * yolo_pct, 10.0), 15.0), 2)
 
 def load_user_profile(base_dir: Optional[str] = None) -> Dict[str, Any]:
     """Loads the user profile from config/user_profile.json or defaults."""
@@ -98,6 +113,26 @@ def save_user_profile(profile_data: Dict[str, Any]) -> bool:
     except Exception as e:
         print(f"Error saving profile: {e}", file=sys.stderr)
         return False
+
+def get_leverage_ceiling(profile: Optional[Dict[str, Any]] = None) -> int:
+    """Absolute desk leverage ceiling: profile `leverage_ceiling` (default 15), clamped to [1, MAX_LEVERAGE_CEILING].
+    Invalid values fall back to DEFAULT_LEVERAGE_CEILING."""
+    if profile is None:
+        profile = load_user_profile()
+    raw = (profile or {}).get("leverage_ceiling", DEFAULT_LEVERAGE_CEILING)
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_LEVERAGE_CEILING
+    if value < 1:
+        return DEFAULT_LEVERAGE_CEILING
+    return min(value, MAX_LEVERAGE_CEILING)
+
+def validate_leverage_setting(name: str, value: int, ceiling: int) -> Optional[str]:
+    """Returns an error message if `value` is not a valid leverage for `name` (1..ceiling), else None."""
+    if not isinstance(value, int) or value < 1 or value > ceiling:
+        return f"{name} must be an integer between 1 and the desk leverage ceiling ({ceiling}x); got {value}."
+    return None
 
 def get_risk_pct_equity() -> float:
     """Returns the user's configured risk per trade as a fraction (default 0.005 = 0.5%)."""
@@ -163,7 +198,7 @@ def interactive_terminal_onboarding():
     else:
         try:
             val = int(c4.replace("x", ""))
-            if 1 <= val <= 20:
+            if validate_leverage_setting("leverage_standard", val, get_leverage_ceiling(current)) is None:
                 current["leverage_standard"] = val
         except Exception:
             pass
@@ -194,11 +229,45 @@ if __name__ == "__main__":
     parser.add_argument("--set-overnight-mode", choices=["ZERO_OVERNIGHT_RISK", "CLOSE_ALL_AT_MARKET", "SWING_STRUCTURAL_STOP"], help="Set overnight mode")
     parser.add_argument("--set-max-positions", type=int, help="Set max open positions limit")
     parser.add_argument("--set-yolo", choices=["true", "false", "True", "False"], help="Enable/disable YOLO moonshot slot")
-    parser.add_argument("--set-leverage-standard", type=int, help="Set standard leverage limit")
+    parser.add_argument("--set-leverage-standard", type=int, help="Set standard leverage limit (1..leverage ceiling)")
+    parser.add_argument("--set-leverage-yolo", type=int, help="Set YOLO moonshot leverage (1..leverage ceiling)")
+    parser.add_argument("--set-leverage-ceiling", type=int,
+                        help=f"Set absolute desk leverage ceiling (1..{MAX_LEVERAGE_CEILING}, default {DEFAULT_LEVERAGE_CEILING})")
     parser.add_argument("--show", action="store_true", help="Show current profile")
     args = parser.parse_args()
 
     updates = {}
+    if not args.setup:
+        current_prof = load_user_profile()
+        ceiling = get_leverage_ceiling(current_prof)
+        errors = []
+        if args.set_leverage_ceiling is not None:
+            if not 1 <= args.set_leverage_ceiling <= MAX_LEVERAGE_CEILING:
+                errors.append(f"leverage_ceiling must be between 1 and {MAX_LEVERAGE_CEILING}; got {args.set_leverage_ceiling}.")
+            else:
+                ceiling = args.set_leverage_ceiling
+                updates["leverage_ceiling"] = ceiling
+        for name, value in (("leverage_standard", args.set_leverage_standard), ("leverage_yolo", args.set_leverage_yolo)):
+            if value is None:
+                continue
+            err = validate_leverage_setting(name, value, ceiling)
+            if err:
+                errors.append(err)
+            else:
+                updates[name] = value
+        if errors:
+            for err in errors:
+                print(f"❌ {err}", file=sys.stderr)
+            sys.exit(2)
+        if "leverage_ceiling" in updates:
+            for name in ("leverage_standard", "leverage_yolo"):
+                existing = updates.get(name, current_prof.get(name))
+                try:
+                    if int(existing) > ceiling:
+                        print(f"⚠️ {name}={existing}x exceeds the new ceiling ({ceiling}x); the execution engine will reject it until lowered.", file=sys.stderr)
+                except (TypeError, ValueError):
+                    pass
+
     if args.setup:
         interactive_terminal_onboarding()
     else:
@@ -213,8 +282,6 @@ if __name__ == "__main__":
             updates["max_open_positions"] = int(args.set_max_positions)
         if args.set_yolo is not None:
             updates["yolo_slot_enabled"] = args.set_yolo.lower() == "true"
-        if args.set_leverage_standard is not None:
-            updates["leverage_standard"] = int(args.set_leverage_standard)
 
         if updates:
             save_user_profile(updates)

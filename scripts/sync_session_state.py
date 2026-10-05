@@ -29,9 +29,10 @@ def get_start_of_day_utc() -> int:
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     return int(start.timestamp() * 1000)
 
-def load_audit_metadata() -> Dict[str, dict]:
-    """Loads latest metadata from trades_audit.jsonl keyed by symbol."""
+def load_audit_metadata(target_env: str = None) -> Dict[str, dict]:
+    """Loads latest metadata from trades_audit.jsonl keyed by symbol, strictly filtered by target_env."""
     meta = {}
+    norm_env = str(target_env).lower() if target_env else None
     if os.path.exists(AUDIT_LOG):
         try:
             with open(AUDIT_LOG, "r", encoding="utf-8") as f:
@@ -40,6 +41,9 @@ def load_audit_metadata() -> Dict[str, dict]:
                     if line:
                         try:
                             record = json.loads(line)
+                            rec_env = str(record.get("target_env", "")).lower()
+                            if norm_env and rec_env and rec_env != norm_env:
+                                continue
                             sym = record.get("symbol")
                             if sym:
                                 meta[sym] = record
@@ -58,7 +62,7 @@ def sync_session_state(target_env: str = None) -> dict:
         cfg = eft.load_env()
         target_env = (os.environ.get("BINANCE_API_ENV") or cfg.get("BINANCE_API_ENV", "prod")).lower()
     os.makedirs(LOGS_DIR, exist_ok=True)
-    audit_meta = load_audit_metadata()
+    audit_meta = load_audit_metadata(target_env=target_env)
     now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     now_ts = int(time.time())
 
@@ -151,8 +155,8 @@ def sync_session_state(target_env: str = None) -> dict:
                     "notional_usdt": round(notional, 2),
                     "margin_usdt": round(margin, 2),
                     "entry_order_id": meta_trade.get("entry_order_id"),
-                    "entry_time_ts": meta_trade.get("timestamp"),
-                    "entry_time_utc": datetime.datetime.fromtimestamp(meta_trade.get("timestamp", now_ts), datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC") if meta_trade.get("timestamp") else "Unknown",
+                    "entry_time_ts": meta_trade.get("timestamp") or (int(p.get("updateTime", 0)) // 1000 if p.get("updateTime") else now_ts),
+                    "entry_time_utc": datetime.datetime.fromtimestamp(meta_trade.get("timestamp") or (int(p.get("updateTime", 0)) // 1000 if p.get("updateTime") else now_ts), datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
                     "sl_price": meta_trade.get("sl_price"),
                     "sl_algo_id": meta_trade.get("sl_algo_id"),
                     "tp1_price": meta_trade.get("tp1_price"),

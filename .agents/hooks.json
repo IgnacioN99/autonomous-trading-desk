@@ -3,24 +3,24 @@
     "enabled": true,
     "PreToolUse": [
       {
-        "matcher": "run_command|call_mcp_tool",
+        "matcher": "run_command|call_mcp_tool|mcp_.*|write_to_file|replace_file_content|multi_replace_file_content",
         "hooks": [
           {
             "type": "command",
-            "command": "python3 scripts/hooks/pre_trade_guard.py",
-            "timeout": 5
+            "command": "python3 ../scripts/hooks/pre_trade_guard.py --agy",
+            "timeout": 10
           }
         ]
       }
     ],
     "PostToolUse": [
       {
-        "matcher": "run_command|call_mcp_tool",
+        "matcher": "run_command|call_mcp_tool|mcp_.*",
         "hooks": [
           {
             "type": "command",
-            "command": "python3 scripts/hooks/post_trade_sync.py",
-            "timeout": 12
+            "command": "python3 ../scripts/hooks/post_trade_sync.py",
+            "timeout": 30
           }
         ]
       }
@@ -34,7 +34,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 scripts/hooks/post_pr_review_hook.py",
+            "command": "python3 ../scripts/hooks/post_pr_review_hook.py",
             "timeout": 60
           }
         ]

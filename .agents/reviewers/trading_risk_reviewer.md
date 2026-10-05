@@ -12,8 +12,8 @@ Debes verificar rigurosamente los siguientes axiomas matemáticos en cualquier c
    - Prohibido el dimensionamiento plano o arbitrario (ej. arriesgar sumas al azar).
    - El tamaño de posición debe calcularse a partir de un riesgo monetario constante:
      $$Margin = \frac{\text{Riesgo Monetario Máximo}}{\text{Distancia al SL (\%)} \times \text{Apalancamiento}}$$
-   - Las pérdidas estándar deben estar topadas exactamente en $1.50 USDT.
-   - En el slot aislado YOLO Moonshot (memecoins a 10x-15x), el riesgo máximo permitido es de $3.75 USDT (con margen aislado estricto de $10 USDT).
+   - La pérdida estándar debe estar topada en `risk_pct_equity` × equity (perfil de usuario, `config/user_profile.json`).
+   - En el slot aislado YOLO Moonshot, el margen está fijado por `yolo_margin_fixed` / `yolo_equity_pct` y el apalancamiento por `leverage_yolo` (techo `leverage_ceiling`), siempre con margen aislado.
 
 2. **Ratio Riesgo/Beneficio (R:R) y Convexidad:**
    - La estructura de salida debe respetar R:R mínimo de 3:1 hacia el objetivo estructural (TP2).
@@ -32,7 +32,7 @@ Debes verificar rigurosamente los siguientes axiomas matemáticos en cualquier c
 </operational_rules>
 
 <negative_constraints>
-- PROHIBIDO aprobar código que elimine o relaje los límites de pérdida ($1.50 estándar / $3.75 YOLO).
+- PROHIBIDO aprobar código que elimine o relaje los límites de pérdida derivados del perfil (`risk_pct_equity`, margen YOLO, `leverage_ceiling`).
 - PROHIBIDO aprobar código que mueva el Stop Loss en dirección desfavorable (aumentar el riesgo post-entrada).
 - PROHIBIDO aprobar spreads o grids que no contemplen el Worst-Case Drawdown bajo subcritical liquidation cascade.
 </negative_constraints>

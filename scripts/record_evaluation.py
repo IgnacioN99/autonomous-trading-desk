@@ -1,77 +1,80 @@
 #!/usr/bin/env python3
 """
-record_evaluation.py - Atomic Registration of Subagent Evaluation Dossier.
-Atomic persistence of pre-execution evaluation authorization tokens.
+record_evaluation.py - Atomic registration of the evaluator subagent dossier.
 
-Saves the verdict emitted by the 'isolated_market_evaluator' subagent into logs/evaluations/latest_dossier.json.
-This file serves as a mechanical authorization token that the pre_trade_guard.py hook
-requires prior to permitting any order execution on Binance.
+Persists the verdict emitted by the 'isolated_market_evaluator' subagent into
+logs/evaluations/latest_dossier.json. That file is the authorization token required by
+the pre_trade_guard.py hook and execute_futures_trade.py before any order is dispatched.
 
-Usage:
-  python3 scripts/record_evaluation.py --symbols TIAUSDT,SAGAUSDT --directions LONG,SHORT --evaluator isolated_market_evaluator --summary "Delta-neutral basket approved"
-  python3 scripts/record_evaluation.py --json-file path/to/dossier.json
+Canonical flow (PROD and TESTNET):
+  1. python3 scripts/prime_evaluator_brief.py
+  2. invoke_subagent(TypeName="isolated_market_evaluator")  -> returns its conversationId
+  3. python3 scripts/record_evaluation.py --from-subagent <conversationId>
+
+--from-subagent reads the <dossier_json> block the subagent itself emitted in its Antigravity
+transcript and stores a provenance stamp (transcript path, step index, sha256) that every
+consumer re-verifies. Dossiers typed by hand are NOT accepted in PROD.
+
+Legacy manual paths (TESTNET only, stored as schema_version 1 / source "manual_testnet"):
+  python3 scripts/record_evaluation.py --env testnet --symbols TIAUSDT,SAGAUSDT --directions LONG,SHORT
+  python3 scripts/record_evaluation.py --env testnet --json-file path/to/dossier.json
+  echo '<dossier_json>{...}</dossier_json>' | python3 scripts/record_evaluation.py --env testnet
 """
 
-import os
-import sys
-import json
-import time
-import datetime
 import argparse
+import datetime
+import json
+import os
+import re
+import sys
+import time
+from typing import Optional
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from utils.atomic_writer import atomic_write_json, atomic_append_jsonl
+SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, SCRIPTS_DIR)
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EVAL_DIR = os.path.join(BASE_DIR, "logs", "evaluations")
-DOSSIER_FILE = os.path.join(EVAL_DIR, "latest_dossier.json")
-EVAL_HISTORY_FILE = os.path.join(EVAL_DIR, "evaluations_history.jsonl")
+from utils.atomic_writer import atomic_write_json, atomic_append_jsonl  # noqa: E402
+from utils import dossier_provenance as dp  # noqa: E402
 
-TTL_SECONDS = 1200 # 20 minutes maximum validity window before expiration
+# Workspace root resolved relative to this script (scripts/ -> repo root). Tests may patch BASE_DIR.
+BASE_DIR = os.path.dirname(SCRIPTS_DIR)
 
-def record_evaluation_dossier(
-    approved_candidates: list,
-    evaluator_agent: str = "isolated_market_evaluator",
-    conversation_id: str = None,
-    summary: str = "",
-    status: str = "APPROVED",
-    raw_payload: dict = None
-) -> dict:
-    os.makedirs(EVAL_DIR, exist_ok=True)
-    now_ts = int(time.time())
-    now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+TTL_SECONDS = dp.TTL_SECONDS  # 20 minutes, counted from the moment the evaluator emitted the dossier
+LEGACY_SCHEMA_VERSION = 1
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_REFUSED = 2
 
-    dossier = {
-        "timestamp_utc": now_utc,
-        "timestamp_ts": now_ts,
-        "valid_until_ts": now_ts + TTL_SECONDS,
-        "evaluator_agent": evaluator_agent,
-        "conversation_id": conversation_id or os.environ.get("CONVERSATION_ID", "clean_room_context"),
-        "status": status.upper(),
-        "approved_symbols": [c.get("symbol", "").upper() for c in approved_candidates if isinstance(c, dict)],
-        "approved_candidates": approved_candidates,
-        "summary": summary.strip(),
-        "raw_payload": raw_payload or {}
-    }
 
-    # Atomic write to latest_dossier.json
-    atomic_write_json(DOSSIER_FILE, dossier)
+class RecordRefused(Exception):
+    """Raised when policy forbids recording the dossier (exit code 2)."""
 
-    # Append-only persistent audit history
-    history_record = {
-        "timestamp_utc": now_utc,
-        "evaluator_agent": evaluator_agent,
-        "status": status.upper(),
-        "approved_symbols": dossier["approved_symbols"],
-        "summary": summary.strip()
-    }
-    atomic_append_jsonl(EVAL_HISTORY_FILE, history_record)
 
-    print(f"✅ EVALUATION DOSSIER RECORDED: {len(dossier['approved_symbols'])} asset(s) approved.")
-    print(f"   Symbols: {', '.join(dossier['approved_symbols'])} | Valid until: {datetime.datetime.fromtimestamp(dossier['valid_until_ts'], datetime.timezone.utc).strftime('%H:%M:%S UTC')}")
-    print(f"   Location: {DOSSIER_FILE}")
+def _paths(base_dir: Optional[str] = None):
+    base = base_dir or BASE_DIR
+    eval_dir = os.path.join(base, "logs", "evaluations")
+    return base, os.path.join(eval_dir, "latest_dossier.json"), os.path.join(eval_dir, "evaluations_history.jsonl")
 
-    # Auto-register unapproved/disqualified candidates into shadow tracking
+
+def _resolve_env(explicit_env: Optional[str] = None, base_dir: Optional[str] = None) -> str:
+    from utils.env_resolver import resolve_env
+    return resolve_env(explicit_env, base_dir=base_dir or BASE_DIR)
+
+
+def _fmt_utc(ts: int, fmt: str = "%Y-%m-%d %H:%M:%S UTC") -> str:
+    return datetime.datetime.fromtimestamp(int(ts), datetime.timezone.utc).strftime(fmt)
+
+
+def _rel(path: str, base: str) -> str:
+    try:
+        return os.path.relpath(path, base)
+    except ValueError:
+        return path
+
+
+def _register_shadow() -> None:
+    """Enrolls unapproved/disqualified candidates into counterfactual shadow tracking (best effort)."""
     try:
         import shadow_tracker
         shadow_count = shadow_tracker.register_from_evaluation()
@@ -80,65 +83,260 @@ def record_evaluation_dossier(
     except Exception:
         pass
 
-    return dossier
 
-def main():
-    parser = argparse.ArgumentParser(description="Subagent Evaluation Dossier Recorder")
-    parser.add_argument("--symbols", type=str, help="Comma-separated list of approved symbols (e.g. TIAUSDT,SAGAUSDT)")
-    parser.add_argument("--directions", type=str, help="Corresponding directions (e.g. LONG,SHORT)")
-    parser.add_argument("--evaluator", type=str, default="isolated_market_evaluator", help="Evaluator subagent name")
-    parser.add_argument("--summary", type=str, default="Quantitative evaluation approved", help="Summary or thesis")
-    parser.add_argument("--status", type=str, default="APPROVED", choices=["APPROVED", "REJECTED", "NEUTRAL"], help="Verdict")
-    parser.add_argument("--json-file", type=str, help="Load complete dossier from a JSON file")
-    args = parser.parse_args()
+def _persist(record: dict, base_dir: Optional[str] = None, shadow: bool = True) -> str:
+    base, dossier_file, history_file = _paths(base_dir)
+    atomic_write_json(dossier_file, record)
+    prov = record.get("provenance") or {}
+    atomic_append_jsonl(history_file, {
+        "timestamp_utc": record.get("timestamp_utc"),
+        "recorded_at_utc": _fmt_utc(record.get("recorded_at_ts") or time.time()),
+        "target_env": record.get("target_env"),
+        "schema_version": record.get("schema_version"),
+        "evaluator_agent": record.get("evaluator_agent"),
+        "conversation_id": record.get("conversation_id"),
+        "status": record.get("status"),
+        "approved_symbols": record.get("approved_symbols", []),
+        "provenance_source": prov.get("source"),
+        "sha256": prov.get("sha256"),
+        "summary": record.get("summary", ""),
+    })
+    if shadow:
+        _register_shadow()
+    return dossier_file
 
-    if args.json_file and os.path.exists(args.json_file):
-        with open(args.json_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        candidates = data.get("approved_candidates", [])
-        if not candidates and "top_candidates" in data:
-            candidates = data["top_candidates"]
-        record_evaluation_dossier(
-            approved_candidates=candidates,
-            evaluator_agent=data.get("evaluator_agent", args.evaluator),
-            summary=data.get("summary", args.summary),
-            status=data.get("status", args.status),
-            raw_payload=data
-        )
-    elif args.symbols:
-        syms = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
-        dirs = [d.strip().upper() for d in (args.directions or "").split(",") if d.strip()]
-        candidates = []
-        for i, sym in enumerate(syms):
-            direction = dirs[i] if i < len(dirs) else "LONG"
-            candidates.append({"symbol": sym, "direction": direction})
-        record_evaluation_dossier(
-            approved_candidates=candidates,
-            evaluator_agent=args.evaluator,
-            summary=args.summary,
-            status=args.status
-        )
+
+def _print_summary(record: dict, dossier_file: str, base: str, now_ts: int) -> None:
+    status = record.get("status")
+    cands = record.get("approved_candidates") or []
+    valid_until = int(record.get("valid_until_ts") or 0)
+    remaining = max(0, valid_until - now_ts)
+    print(f"✅ EVALUATION DOSSIER RECORDED | env: {str(record.get('target_env', '')).upper()} | status: {status}")
+    print(f"   Evaluator: {record.get('evaluator_agent')} | conversation: {record.get('conversation_id')}")
+    print(f"   Evaluated at: {record.get('timestamp_utc')} | Valid until: {_fmt_utc(valid_until, '%H:%M:%S UTC')} "
+          f"({remaining // 60}m {remaining % 60:02d}s left)")
+    if status == "APPROVED" and cands:
+        print(f"   Approved ({len(cands)}):")
+        for c in cands:
+            direction = c.get("direction") or "UNKNOWN DIRECTION (will be rejected in PROD)"
+            confirm = c.get("requires_user_confirmation")
+            if confirm is None:
+                flag = "requires_user_confirmation not set -> ask the user before executing"
+            elif confirm:
+                flag = "REQUIRES USER CONFIRMATION in chat before executing"
+            else:
+                flag = "fast-track (no confirmation required)"
+            extras = []
+            for key in ("tier", "leverage", "entry", "stop_loss", "tp1", "tp2"):
+                if c.get(key) is not None:
+                    extras.append(f"{key}={c.get(key)}")
+            if c.get("is_yolo"):
+                extras.append("YOLO")
+            print(f"     - {c['symbol']} {direction} | {flag}" + (f" | {' '.join(extras)}" if extras else ""))
     else:
-        # If no arguments provided, try reading JSON from stdin
-        if not sys.stdin.isatty():
-            try:
-                import re
-                raw_input = sys.stdin.read()
-                match = re.search(r"<dossier_json>([\s\S]*?)</dossier_json>", raw_input)
-                json_str = match.group(1).strip() if match else raw_input.strip()
-                data = json.loads(json_str)
-                candidates = data.get("approved_candidates", data.get("top_candidates", []))
-                record_evaluation_dossier(
-                    approved_candidates=candidates,
-                    evaluator_agent=data.get("evaluator_agent", args.evaluator),
-                    summary=data.get("summary", args.summary),
-                    status=data.get("status", args.status),
-                    raw_payload=data
-                )
-                return
-            except Exception as e:
-                print(f"Error parsing JSON from stdin: {e}", file=sys.stderr)
-        parser.print_help()
+        print("   No trade authorized by this dossier.")
+    if record.get("summary"):
+        print(f"   Summary: {record['summary']}")
+    prov = record.get("provenance") or {}
+    if prov.get("source") == "agy_subagent_transcript":
+        print(f"   Provenance: subagent transcript step {prov.get('step_index')} sha256 {str(prov.get('sha256'))[:16]}…")
+    else:
+        print(f"   Provenance: {prov.get('source', 'none')} (schema v{record.get('schema_version')}, not accepted in PROD)")
+    print(f"   Location: {_rel(dossier_file, base)}")
+
+
+def record_from_subagent(
+    conversation_id: str,
+    target_env: Optional[str] = None,
+    base_dir: Optional[str] = None,
+    now_ts: Optional[int] = None,
+    shadow: bool = True,
+    verbose: bool = True,
+) -> dict:
+    """Extracts the dossier emitted by the evaluator subagent from its transcript and records it.
+    Raises dp.ProvenanceError (extraction failed) or RecordRefused (policy)."""
+    base = base_dir or BASE_DIR
+    env = _resolve_env(target_env, base)
+    now_ts = int(now_ts if now_ts is not None else time.time())
+
+    transcript = dp.find_subagent_transcript(conversation_id)
+    extracted = dp.extract_dossier_from_transcript(transcript)
+    record = dp.build_record_from_extraction(extracted, recorded_at_ts=now_ts)
+
+    parent_id = extracted.get("parent_conversation_id")
+    if not parent_id or parent_id == extracted.get("conversation_id"):
+        raise RecordRefused(
+            "The transcript is not a subagent conversation (no parent sender found). Pass the conversationId "
+            "returned by invoke_subagent for 'isolated_market_evaluator', not the main agent's own conversation."
+        )
+
+    evaluated_at = int(record.get("timestamp_ts") or 0)
+    if evaluated_at <= 0:
+        raise RecordRefused("Could not determine when the evaluator emitted the dossier (missing transcript timestamp).")
+    if evaluated_at > now_ts + dp.CLOCK_DRIFT_TOLERANCE_S:
+        raise RecordRefused(f"Dossier timestamp {evaluated_at} is in the future (now {now_ts}). Check the system clock.")
+    if now_ts > evaluated_at + TTL_SECONDS:
+        age_min = (now_ts - evaluated_at) / 60.0
+        raise RecordRefused(
+            f"Dossier is already expired: emitted at {_fmt_utc(evaluated_at)} ({age_min:.1f} min ago, "
+            f"TTL {TTL_SECONDS // 60} min). Re-run prime_evaluator_brief.py and the evaluator subagent."
+        )
+
+    dossier_env = str((extracted.get("dossier") or {}).get("target_env") or "").strip().lower()
+    if dossier_env:
+        try:
+            dossier_env = _resolve_env(dossier_env, base)
+        except ValueError:
+            raise RecordRefused(f"Dossier target_env '{dossier_env}' is not a valid environment.")
+        if dossier_env != env:
+            raise RecordRefused(
+                f"Dossier was evaluated for {dossier_env.upper()} but this recording targets {env.upper()}. "
+                "Re-run the brief and evaluator for the correct environment (or pass --env)."
+            )
+
+    record["target_env"] = env
+    dossier_file = _persist(record, base, shadow=shadow)
+    if verbose:
+        _print_summary(record, dossier_file, base, now_ts)
+    return record
+
+
+def record_evaluation_dossier(
+    approved_candidates: list,
+    evaluator_agent: str = "isolated_market_evaluator",
+    conversation_id: str = None,
+    summary: str = "",
+    status: str = "APPROVED",
+    raw_payload: dict = None,
+    target_env: Optional[str] = None,
+    base_dir: Optional[str] = None,
+    shadow: bool = True,
+) -> dict:
+    """Legacy manual recording (TESTNET only). Refused in PROD with RecordRefused: PROD dossiers
+    must come from the evaluator subagent transcript (--from-subagent)."""
+    base = base_dir or BASE_DIR
+    env = _resolve_env(target_env, base)
+    if env == "prod":
+        raise RecordRefused(
+            "Manual dossiers are not accepted in PROD. Invoke the 'isolated_market_evaluator' subagent and run "
+            "`python3 scripts/record_evaluation.py --from-subagent <conversationId>`."
+        )
+
+    now_ts = int(time.time())
+    status_norm, pending = dp.normalize_status(status)
+    candidates = dp.normalize_candidates({"approved_candidates": approved_candidates or []}, pending)
+    if status_norm != "APPROVED":
+        candidates = []
+    record = {
+        "schema_version": LEGACY_SCHEMA_VERSION,
+        "timestamp_utc": _fmt_utc(now_ts),
+        "timestamp_ts": now_ts,
+        "valid_until_ts": now_ts + TTL_SECONDS,
+        "recorded_at_ts": now_ts,
+        "target_env": env,
+        "evaluator_agent": evaluator_agent,
+        "conversation_id": conversation_id or os.environ.get("CONVERSATION_ID", "manual_testnet"),
+        "status": status_norm,
+        "approved_symbols": [c["symbol"] for c in candidates],
+        "approved_candidates": candidates,
+        "summary": str(summary or "").strip(),
+        "provenance": {"source": "manual_testnet"},
+        "raw_payload": raw_payload or {},
+    }
+    dossier_file = _persist(record, base, shadow=shadow)
+    _print_summary(record, dossier_file, base, now_ts)
+    return record
+
+
+def _legacy_from_payload(data: dict, args, env: str) -> dict:
+    candidates = data.get("approved_candidates") or data.get("top_candidates") or []
+    return record_evaluation_dossier(
+        approved_candidates=candidates,
+        evaluator_agent=data.get("evaluator_agent", args.evaluator),
+        summary=data.get("summary", args.summary),
+        status=data.get("status", args.status),
+        raw_payload=data,
+        target_env=env,
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Evaluator subagent dossier recorder")
+    parser.add_argument("--from-subagent", metavar="CONVERSATION_ID",
+                        help="Record the <dossier_json> emitted by the evaluator subagent (full conversationId or unique prefix)")
+    parser.add_argument("--env", default=None, help="Target environment (prod|testnet). Defaults to the project resolver.")
+    # Legacy manual paths (TESTNET only)
+    parser.add_argument("--symbols", type=str, help="[TESTNET only] Comma-separated approved symbols")
+    parser.add_argument("--directions", type=str, help="[TESTNET only] Directions matching --symbols (LONG,SHORT)")
+    parser.add_argument("--evaluator", type=str, default=dp.EVALUATOR_NAME, help="[TESTNET only] Evaluator name")
+    parser.add_argument("--summary", type=str, default="Manual TESTNET evaluation", help="[TESTNET only] Summary")
+    parser.add_argument("--status", type=str, default="APPROVED", choices=list(dp.VALID_STATUSES), help="[TESTNET only] Verdict")
+    parser.add_argument("--json-file", type=str, help="[TESTNET only] Load a dossier from a JSON file")
+    return parser
+
+
+def main(argv: Optional[list] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        env = _resolve_env(args.env)
+    except ValueError as e:
+        print(f"❌ {e}", file=sys.stderr)
+        return EXIT_REFUSED
+
+    try:
+        if args.from_subagent:
+            record_from_subagent(args.from_subagent, target_env=env)
+            return EXIT_OK
+
+        stdin_piped = not args.symbols and not args.json_file and not sys.stdin.isatty()
+        if not (args.symbols or args.json_file or stdin_piped):
+            parser.print_help()
+            return EXIT_ERROR
+
+        if env == "prod":
+            raise RecordRefused(
+                "Manual dossier recording (--symbols / --json-file / stdin) is disabled in PROD. "
+                "Invoke the 'isolated_market_evaluator' subagent via invoke_subagent and record its verdict with "
+                "`python3 scripts/record_evaluation.py --from-subagent <conversationId>`."
+            )
+
+        if args.json_file:
+            if not os.path.exists(args.json_file):
+                print(f"❌ JSON file not found: {args.json_file}", file=sys.stderr)
+                return EXIT_ERROR
+            with open(args.json_file, "r", encoding="utf-8") as f:
+                _legacy_from_payload(json.load(f), args, env)
+        elif args.symbols:
+            syms = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+            dirs = [d.strip().upper() for d in (args.directions or "").split(",") if d.strip()]
+            candidates = [{"symbol": sym, "direction": dirs[i] if i < len(dirs) else "LONG"} for i, sym in enumerate(syms)]
+            record_evaluation_dossier(
+                approved_candidates=candidates,
+                evaluator_agent=args.evaluator,
+                summary=args.summary,
+                status=args.status,
+                target_env=env,
+            )
+        else:
+            raw_input = sys.stdin.read()
+            match = re.search(r"<dossier_json>([\s\S]*?)</dossier_json>", raw_input)
+            data = json.loads(match.group(1).strip() if match else raw_input.strip())
+            if not isinstance(data, dict):
+                raise ValueError("stdin dossier is not a JSON object")
+            _legacy_from_payload(data, args, env)
+        return EXIT_OK
+    except RecordRefused as e:
+        print(f"⛔ REFUSED: {e}", file=sys.stderr)
+        return EXIT_REFUSED
+    except dp.ProvenanceError as e:
+        print(f"❌ PROVENANCE ERROR: {e}", file=sys.stderr)
+        return EXIT_ERROR
+    except (ValueError, json.JSONDecodeError) as e:
+        print(f"❌ Invalid dossier input: {e}", file=sys.stderr)
+        return EXIT_ERROR
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

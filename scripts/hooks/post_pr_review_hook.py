@@ -83,9 +83,14 @@ def main():
             return
 
         payload = json.loads(raw_input)
-        tool_call = payload.get("toolCall", {})
-        args = tool_call.get("args", {})
+        tool_call = payload.get("toolCall") if isinstance(payload.get("toolCall"), dict) else {}
+        args = tool_call.get("args") if isinstance(tool_call.get("args"), dict) else {}
         command_line = args.get("CommandLine", "")
+        if not command_line and isinstance(payload.get("tool_input"), dict):
+            # Claude Code PostToolUse payload (Bash tool)
+            command_line = payload["tool_input"].get("command", "")
+        if not isinstance(command_line, str):
+            command_line = ""
 
         if is_pr_creation_or_push(command_line):
             root = find_workspace_root()
@@ -106,8 +111,8 @@ def main():
 
             if os.path.exists(audit_script):
                 sys.stderr.write(
-                    f"\n🚀 [POST-TOOL HOOK] Detección de creación/push de PR en rama '{branch}'.\n"
-                    f"   Lanzando agente orquestador de auditoría...\n"
+                    f"\n🚀 [POST-TOOL HOOK] PR creation/push detected on branch '{branch}'.\n"
+                    f"   Launching the audit orchestrator agent...\n"
                 )
 
                 # Launch PR audit in background to ensure hook responds in < 15ms
@@ -120,8 +125,8 @@ def main():
                 )
 
                 sys.stderr.write(
-                    f"✅ [POST-TOOL HOOK] Auditoría multi-agente despachada en background.\n"
-                    f"   El informe se guardará en: {report_out}\n"
+                    f"✅ [POST-TOOL HOOK] Multi-agent audit dispatched in the background.\n"
+                    f"   The report will be saved to: {report_out}\n"
                 )
                 log_event["status"] = "dispatched_async"
 

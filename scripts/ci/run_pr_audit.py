@@ -166,7 +166,7 @@ def build_orchestrator_prompt(manifest: dict, diff: str) -> str:
         "<negative_constraints>",
         f"TIENES ESTRICTAMENTE PROHIBIDO omitir cualquiera de los siguientes revisores requeridos: {required_reviewers}.",
         "Prohibido emitir un veredicto genérico sin evaluar los criterios específicos de cada rúbrica.",
-        "Prohibido aprobar código que viole los hard gates de AGENTS.md ($1.50 estándar / $3.75 YOLO, SL atómico, minNotional, friction gate).",
+        "Prohibido aprobar código que viole los hard gates de AGENTS.md (riesgo por `risk_pct_equity` del perfil, techo `leverage_ceiling`, SL atómico, gate de liquidación, minNotional, friction gate).",
         "</negative_constraints>",
         "",
         "<code_diff_to_audit>",

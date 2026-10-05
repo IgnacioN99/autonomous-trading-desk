@@ -64,7 +64,7 @@ REVIEWERS = {
             r"^docs/.*",
             r"^scripts/.*evaluator.*\.py$",
             r"^scripts/prime_evaluator_brief\.py$",
-            r"^prompts/.*",
+            r"^\.agents/agents/.*",
         ],
     },
 }
