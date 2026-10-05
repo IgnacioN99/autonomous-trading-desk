@@ -43,7 +43,7 @@ graph TD
     end
 
     subgraph L4 ["Layer 4: Clean-Room Isolated Evaluator"]
-        EVAL["isolated_market_evaluator (agy subagent, invoke_subagent)<br/>• Dossier recorded from its transcript (sha256 provenance)<br/>• Canonical XML Hierarchy<br/>• Negative Few-Shots (Anti-Hyper-Triggering)<br/>• &lt;thinking&gt; 4-Step Precondition Checklist<br/>• Typed &lt;dossier_json&gt; Contract"]
+        EVAL["isolated_market_evaluator (agy subagent, invoke_subagent)<br/>• Dossier recorded from its transcript (sha256 provenance)<br/>• Canonical XML Hierarchy<br/>• Negative Few-Shots (Anti-Hyper-Triggering)<br/>• Visible Precondition Checklist section (PASS/FAIL gates)<br/>• Typed &lt;dossier_json&gt; Contract"]
     end
 
     subgraph L5 ["Layer 5: Fail-Closed Atomic Execution"]
@@ -78,7 +78,7 @@ Natural language instructions are not a reliable safety barrier in live financia
 Long conversational histories accumulate token baggage, emotional bias from past streaks, and prompt drift. ATD packs real-time exchange data into an ultra-dense brief (< 1,800 tokens) and spawns an ephemeral clean-room evaluator (`isolated_market_evaluator`) with:
 * **Canonical XML Hierarchy:** `<identity_and_role>`, `<operational_rules>`, `<negative_constraints>`, `<deliberation_protocol>`, `<few_shot_examples>`, `<output_contract>`.
 * **Negative Few-Shots:** Explicit exemplars training the agent when **NOT** to act (e.g. aborting Longs on Delta gates, rejecting low-volume "Fake Tier S" setups, suppressing redundant search calls).
-* **Forced Deliberation Checklist:** A mandatory 4-step boolean verification protocol inside `<thinking>` before emitting recommendations.
+* **Forced Deliberation Checklist:** A mandatory, visible `## Precondition Checklist` (delta gate, brief freshness, institutional volume, friction, macro and catalyst checks, each with the brief value and a PASS/FAIL result) published before the Master Dossier. No XML scratch tags: Claude rejects them.
 
 ### 3. Fail-Closed Atomic Execution
 Placing an entry order without an active Stop Loss is unacceptable. ATD queries Binance algo orders (`/fapi/v1/openAlgoOrders`) with up to 3 progressive retries (~2.8s) to absorb Mainnet indexing latency. If the Stop Loss fails to index, **the bot immediately triggers auto-destruct and closes the position at market (`reduceOnly=true`)**, guaranteeing zero unhedged exposure.
@@ -402,7 +402,7 @@ autonomous-trading-desk/
 ## 📖 In-Depth Documentation
 
 * **[Operating SOP (AGENTS.md)](AGENTS.md):** The operational handbook defining execution phases, sizing mathematics, and night cutoff protocols.
-* **[Agent Prompt Engineering Guide](docs/agent_prompt_engineering_guide.md):** 60 KB comprehensive guide covering XML tag scoping, BPE attention routing, negative few-shots, KV cache optimization (>90% hit rate), and deliberation scratchpads.
+* **[Agent Prompt Engineering Guide](docs/agent_prompt_engineering_guide.md):** 60 KB comprehensive guide covering XML tag scoping, BPE attention routing, negative few-shots, KV cache optimization (>90% hit rate), and a visible, plain-markdown precondition checklist for deliberation (no tagged scratch output).
 * **[Notion Setup Guide](docs/notion_setup_guide.md):** Complete guide to configuring the Notion Trading Journal database schema and automated reconciliation.
 * **[Research Notebooks](research/):** Deep-dive mathematical foundations on the Kelly Criterion, CVD order flow absorptions, ATR stop hunt neutralization, and funding arbitrage.
 
