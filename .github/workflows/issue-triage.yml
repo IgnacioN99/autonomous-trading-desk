@@ -1,0 +1,46 @@
+name: Issue Triage (severity + priority labels)
+
+on:
+  issues:
+    # `labeled` clears needs-triage once a maintainer adds severity/priority. Label edits made with
+    # GITHUB_TOKEN do not trigger workflows, so this job cannot loop on its own changes.
+    types: [opened, reopened, edited, labeled, unlabeled]
+
+permissions:
+  issues: write
+
+concurrency:
+  group: issue-triage-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  require-severity-priority:
+    name: Flag issues missing severity or priority
+    runs-on: ubuntu-latest
+    steps:
+      - name: Add or clear needs-triage
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.issue.number }}
+        run: |
+          labels="$(gh issue view "$NUMBER" --repo "$REPO" --json labels --jq '.labels[].name')"
+          has_severity=false
+          has_priority=false
+          has_triage=false
+          while IFS= read -r label; do
+            case "$label" in
+              severity:*) has_severity=true ;;
+              priority:*) has_priority=true ;;
+              needs-triage) has_triage=true ;;
+            esac
+          done <<< "$labels"
+          if [ "$has_severity" != true ] || [ "$has_priority" != true ]; then
+            gh label create needs-triage --repo "$REPO" --color e4e669 \
+              --description "Missing severity or priority label" --force
+            gh issue edit "$NUMBER" --repo "$REPO" --add-label needs-triage
+            echo "Issue #$NUMBER is missing a severity:* or priority:* label -> needs-triage"
+          elif [ "$has_triage" = true ]; then
+            gh issue edit "$NUMBER" --repo "$REPO" --remove-label needs-triage
+            echo "Issue #$NUMBER has severity and priority labels -> needs-triage removed"
+          fi
