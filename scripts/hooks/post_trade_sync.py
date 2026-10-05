@@ -9,8 +9,8 @@ Ground Truth (session_state.json) remains permanently fresh.
 If an opening order was placed, it immediately runs an orphan audit with auto-heal.
 
 Recognized tool calls (Antigravity and Claude Code payloads):
-  * run_command / Bash executing the sanctioned trading scripts (inspection commands such as grep/cat
-    that merely mention them are ignored):
+  * run_command / Bash / PowerShell executing the sanctioned trading scripts (inspection commands such as
+    grep/cat/Get-Content that merely mention them are ignored):
       - scripts/execute_futures_trade.py: trade openings, --close-position, --move-breakeven,
         --audit-orphans, --auto-heal, --protect-pending (read-only --positions and --help are ignored);
       - scripts/loops/position_guardian_loop.py (except --dry-run), night_cutoff_loop.py,
@@ -59,6 +59,16 @@ INSPECTION_PROGRAMS = {
     "git", "gh", "grep", "rg", "cat", "ls", "find", "diff", "echo", "printf", "head", "tail", "less", "wc",
     "stat", "file", "jq", "sort", "uniq", "awk", "sed", "cp", "mv", "rm", "mkdir", "chmod", "pytest",
 }
+# PowerShell cmdlets that merely mention the scripts (Claude Code PowerShell tool)
+PS_INSPECTION_PROGRAMS = {
+    "get-content", "gc", "type", "select-string", "sls", "get-childitem", "gci", "dir", "get-item", "gi",
+    "test-path", "get-filehash", "write-output", "write-host", "copy-item", "move-item", "remove-item",
+}
+# Same mapping as pre_trade_guard.PS_UNICODE_TRANSLATION (fallback normaliser)
+PS_UNICODE_TRANSLATION = str.maketrans({
+    "‘": "'", "’": "'", "‚": "'", "‛": "'", "“": '"', "”": '"', "„": '"',
+    "–": "-", "—": "-", "―": "-",
+})
 
 try:
     import pre_trade_guard as _guard
@@ -110,17 +120,31 @@ def is_opening_mcp_order(mcp_args: dict) -> bool:
     return True
 
 
+def _fallback_powershell_text(command: str) -> str:
+    """PowerShell text for classify_command when pre_trade_guard cannot be imported, with the same escape rules as
+    its scanner: Unicode quotes/dashes -> ASCII, backtick + newline -> space, escaped quotes dropped, `x -> x,
+    backslashes -> '/'."""
+    command = command.translate(PS_UNICODE_TRANSLATION)
+    command = re.sub(r"`(\r?\n|.)", lambda m: " " if m.group(1) in ("\n", "\r\n") else
+                     ("" if m.group(1) in ("'", '"') else m.group(1)), command, flags=re.DOTALL)
+    return command.replace("\\", "/")
+
+
 def _normalize(payload: dict) -> dict:
-    """Returns {kind, command, server, tool, args} for agy or Claude Code payloads."""
+    """Returns {kind, command, shell, server, tool, args} for agy or Claude Code payloads (PowerShell commands are
+    normalised: backtick escapes stripped, backslashes -> /)."""
     if _guard is not None:
         try:
             call = _guard.normalize_tool_call(payload)
-            return {"kind": call["kind"], "command": call["command"], "server": call["server"],
-                    "tool": call["mcp_tool"], "args": call["mcp_args"] or {}}
+            command = call["command"]
+            if call.get("shell") == "powershell":
+                command = _guard.normalize_powershell_command(command)  # scripts\x.py -> scripts/x.py
+            return {"kind": call["kind"], "command": command, "shell": call.get("shell", "bash"),
+                    "server": call["server"], "tool": call["mcp_tool"], "args": call["mcp_args"] or {}}
         except Exception:
             pass
 
-    out = {"kind": "other", "command": "", "server": "", "tool": "", "args": {}}
+    out = {"kind": "other", "command": "", "shell": "bash", "server": "", "tool": "", "args": {}}
     tool_call = payload.get("toolCall") if isinstance(payload.get("toolCall"), dict) else None
     if tool_call is not None:
         name = tool_call.get("name", "")
@@ -139,8 +163,11 @@ def _normalize(payload: dict) -> dict:
 
     name = payload.get("tool_name", "")
     tool_input = payload.get("tool_input", {}) if isinstance(payload.get("tool_input"), dict) else {}
-    if name == "Bash":
-        out.update(kind="run_command", command=str(tool_input.get("command", "")))
+    if name in ("Bash", "PowerShell"):
+        command = str(tool_input.get("command", ""))
+        if name == "PowerShell":
+            command = _fallback_powershell_text(command)
+        out.update(kind="run_command", command=command, shell="powershell" if name == "PowerShell" else "bash")
     elif isinstance(name, str) and name.startswith("mcp__"):
         parts = name.split("__")
         out.update(kind="mcp", server=parts[1] if len(parts) > 1 else "",
@@ -197,12 +224,13 @@ def _program(tokens) -> str:
     return ""
 
 
-def classify_command(command_line: str):
+def classify_command(command_line: str, shell: str = "bash"):
     """Returns (order_placed, is_opening) for a shell command, evaluated per sub-command."""
     order_placed = False
     is_opening = False
+    inspection = INSPECTION_PROGRAMS | (PS_INSPECTION_PROGRAMS if shell == "powershell" else set())
     for tokens in _split_subcommands(command_line or ""):
-        if not tokens or _program(tokens) in INSPECTION_PROGRAMS:
+        if not tokens or _program(tokens) in inspection:
             continue
         text = " ".join(tokens)
         flags = {t.split("=", 1)[0].lower() for t in tokens if t.startswith("-")}
@@ -248,7 +276,7 @@ def handle_post_trade_sync(payload: dict) -> dict:
             order_placed, is_opening = classify_binance_call(tool, mcp_args)
 
     elif call["kind"] == "run_command":
-        order_placed, is_opening = classify_command(command_line)
+        order_placed, is_opening = classify_command(command_line, call.get("shell", "bash"))
 
     result = {
         "order_placed": order_placed,

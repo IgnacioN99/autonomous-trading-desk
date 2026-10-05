@@ -74,12 +74,30 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    symlinks/hard links (ln, mklink) aliasing logs/, git clean -x/-X and git stash --all.
    Reads by allowlisted programs keep the normal permission policy (ask). Not covered: variable indirection,
    xargs, archives, bare globs without a logs/ component (cd logs && rm *.json), cp -r src/. . / rsync src/ .
-   into the repo root, rsync --files-from, powershell -EncodedCommand, and a missing pending_entries.json still
-   reads as empty in the executor (tracked as a follow-up).
-9. PASS-THROUGH:
+   into the repo root, rsync --files-from, powershell -EncodedCommand inside a Bash command (the PowerShell tool
+   denies it, see 9), and a missing pending_entries.json still reads as empty in the executor (tracked as a
+   follow-up).
+9. CLAUDE CODE POWERSHELL TOOL (Windows) AND NOTEBOOKEDIT:
+   NotebookEdit is a file tool (notebook_path). PowerShell commands are scanned for analysis only (Unicode quotes
+   and dashes mapped to ASCII; quote-aware: '...' literal, backtick escapes in "..." and bare text; comments
+   dropped; backslashes -> '/'); unbalanced quotes / brackets / block comments are denied. Each body of {...},
+   $(...) (also inside "..."), @(...) and (...) is judged recursively as its own command (depth limit), the
+   statement itself with the bodies replaced by a placeholder, and the whole text once more for denials; the most
+   restrictive result wins and a command with bodies is never auto-allowed. Statements are judged exactly like Bash
+   (trading primitives, deploy batches, raw Binance HTTP, evaluation trail, harness, ground truth; read-only cmdlets
+   such as Get-Content / Select-String may name ground-truth files; wsl.exe [options] -- <cmd> is judged as the
+   Linux command). A backstop then denies a command naming a ground-truth file (literally, through a
+   logs/ glob or an 8.3 short name), the evaluation trail or the logs/ directory unless every statement starts with
+   a read-only / navigation cmdlet and nothing in it can write or run code (write cmdlets and aliases anywhere,
+   redirection other than to $null, .NET static / method calls, ${provider:path} variables, iex / Invoke-Command /
+   Start-Process / ForEach-Object, call operator, dot-sourcing, %); a glob that can expand to logs/ (*, log*)
+   counts only next to such a construct. Encoded payloads (powershell/pwsh -EncodedCommand / -enc / -ec / -e,
+   FromBase64String executed), Invoke-RestMethod / Invoke-WebRequest writes to Binance and unparseable commands
+   (unbalanced quotes) are always denied. Not covered: names assembled at runtime (string concatenation, variables).
+10. PASS-THROUGH:
    Tool calls unrelated to trading return "ask" so the runtime's normal permission policy applies.
    "allow" is reserved for calls that passed every trading gate or are purely risk-reducing.
-10. HEARTBEAT:
+11. HEARTBEAT:
    Every invocation refreshes logs/hook_heartbeat.json (best effort, never alters the decision).
 
 Target latency: < 15ms (plus dossier provenance re-verification on trade openings).
@@ -150,6 +168,8 @@ EVALUATOR_HINT = (
 AGY_MCP_CALL_TOOLS = {"call_mcp_tool", "mcp_tool"}
 FILE_WRITE_TOOLS = {"write_to_file", "replace_file_content", "multi_replace_file_content"}
 CLAUDE_FILE_WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
+# Claude Code shell tools -> shell dialect (PowerShell: Claude Code on Windows)
+CLAUDE_SHELL_TOOLS = {"Bash": "bash", "PowerShell": "powershell"}
 # Retired servers stay listed so eager names (mcp_crypto_radar_<tool>) still split correctly.
 KNOWN_MCP_SERVERS = ("crypto_radar", "binance")
 
@@ -435,9 +455,93 @@ HARNESS_FILES = {
 }
 HARNESS_DIRS = ("scripts/hooks/", ".agents/agents/", ".claude/agents/")
 BRAIN_PATH_RE = re.compile(r"(?:^|/)\.gemini/[^/]+/brain(?:/|$)", re.IGNORECASE)
+# File-tool target inside a logs/evaluations/ directory (relative, POSIX, WSL or Windows absolute)
+EVALUATION_TRAIL_TARGET_RE = re.compile(r"(?:^|/)logs/evaluations(?:/|$)", re.IGNORECASE)
 # Claude Code subagent transcripts: <projects>/<slug>/<sessionId>/subagents/agent-<id>.jsonl (+ .meta.json)
 CLAUDE_SUBAGENT_PATH_RE = re.compile(r"(?:^|/)subagents/agent-a[0-9a-f]+\.(?:jsonl|meta\.json)$|"
                                      r"(?:^|/)\.claude/projects/[^/]+/[^/]+/subagents(?:/|$)", re.IGNORECASE)
+
+# -----------------------------------------------------------------------------
+# PowerShell tool (Claude Code on Windows). Commands are normalised for analysis only (backtick escapes stripped,
+# backslashes -> '/') and judged like Bash, plus a backstop for commands naming a protected target.
+# -----------------------------------------------------------------------------
+# PowerShell accepts typographic quotes and dashes as quotes / parameter dashes
+PS_UNICODE_TRANSLATION = str.maketrans({
+    "‘": "'", "’": "'", "‚": "'", "‛": "'", "“": '"', "”": '"', "„": '"',
+    "–": "-", "—": "-", "―": "-",
+})
+# Nested bodies ({...}, $(...), @(...), (...)) are judged on their own; the statement keeps this neutral word
+PS_NESTED_PLACEHOLDER = "__ps_nested__"
+PS_OPENERS = {"(": ")", "{": "}"}
+PS_SCAN_DEPTH_LIMIT = 32
+# '#' / '<#' start a comment only at the start of a token
+PS_TOKEN_BOUNDARY = " \t\r\n;|&(){}"
+PS_DECISION_RANK = {"allow": 0, "ask": 1, "force_ask": 2, "deny": 3}
+# Expressions (not commands) at the start of a statement: $var, $_.Length, $env:X, .is_valid
+PS_EXPRESSION_LEAD_RE = re.compile(r"^(?:\$[A-Za-z_?][\w:?]*|\.[A-Za-z_]\w*)(?:\.[A-Za-z_]\w*)*$")
+PS_ASSIGNMENT_OPERATORS = ("??=", "+=", "-=", "*=", "/=", "%=", "=")
+# wsl.exe [options] [--|-e] <linux command>: the command is judged with the Bash ground-truth logic
+WSL_VALUE_OPTIONS = {"-d", "--distribution", "-u", "--user", "--cd", "--shell-type"}
+WSL_COMMAND_OPTIONS = {"--", "-e", "--exec"}
+# Read-only cmdlets / aliases allowed to name protected files (also added to the ground-truth read programs)
+PS_READ_CMDLETS = frozenset({
+    "get-content", "gc", "cat", "type", "select-string", "sls", "test-path", "get-item", "gi", "get-childitem",
+    "gci", "ls", "dir", "get-filehash", "measure-object", "measure", "convertfrom-json", "convertto-json",
+    "select-object", "select", "where-object", "where", "?", "sort-object", "sort", "format-table", "ft",
+    "format-list", "fl", "out-string", "write-output", "echo", "write-host", "get-date", "join-path", "split-path",
+    "resolve-path", "set-location", "sl", "cd", "push-location", "pushd", "pop-location", "popd", "get-location",
+    "gl", "pwd", "if", "elseif", "else",
+})
+_PS_WORD_START, _PS_WORD_END = r"(?<![\w.$-])", r"(?![\w-])"
+# Write / destructive cmdlets and aliases, anywhere in the command (script blocks and pipelines included)
+PS_WRITE_CMDLET_RE = re.compile(
+    _PS_WORD_START + r"(?:set-content|sc|add-content|ac|out-file|clear-content|clc|new-item|ni|md|mkdir|"
+    r"copy-item|cp|cpi|copy|move-item|mv|mi|move|rename-item|ren|rni|remove-item|rm|ri|del|erase|rd|rmdir|"
+    r"tee-object|tee|set-item|si|set-itemproperty|sp|clear-item|cli|clear-itemproperty|clp|new-itemproperty|"
+    r"remove-itemproperty|rp|copy-itemproperty|cpp|move-itemproperty|mp|rename-itemproperty|rnp|set-acl|"
+    r"export-\w+|epcsv|invoke-webrequest|iwr|invoke-restmethod|irm|start-bitstransfer|expand-archive|"
+    r"compress-archive)" + _PS_WORD_END,
+    re.IGNORECASE,
+)
+# Cmdlets that run arbitrary code or programs
+PS_EXEC_CMDLET_RE = re.compile(
+    _PS_WORD_START + r"(?:invoke-expression|iex|invoke-command|icm|start-process|saps|start|start-job|sajb|"
+    r"invoke-item|ii|foreach-object|foreach)" + _PS_WORD_END,
+    re.IGNORECASE,
+)
+PS_DOTNET_STATIC_RE = re.compile(r"\[[^\]\n]+\]\s*::")
+PS_METHOD_CALL_RE = re.compile(r"\.\s*[A-Za-z_]\w*\s*\(")
+# Provider variables write files: ${C:\repo\logs\x.json} = '...'
+PS_PROVIDER_VARIABLE_RE = re.compile(r"\$\{[^}]*[:/]")
+# Call operator / dot-sourcing / % (ForEach-Object) at the start of a statement (& $cmd, . ./x.ps1, | % Delete)
+PS_CALL_OPERATOR_RE = re.compile(r"(?:^|[;|{(\n]|&&|\|\|)\s*(?:&(?![&>])|\.(?=\s)|%(?=\s|\{|$))")
+# NTFS 8.3 short name inside logs/ (logs\SESSIO~1.JSO is an alias of a protected file)
+PS_SHORT_NAME_RE = re.compile(r"(?:^|/)logs/[^/]*~\d", re.IGNORECASE)
+PS_NAMED_VALUE_RE = re.compile(r"^-[A-Za-z][\w-]*:")
+# Unauditable payloads: powershell/pwsh -EncodedCommand (-e, -ec, -en..., -ea) or FromBase64String executed
+PS_ENCODED_COMMAND_RE = re.compile(
+    _PS_WORD_START + r"(?:powershell|pwsh)(?:\.exe)?" + _PS_WORD_END
+    + r"[^\n;|]*?(?<=[\s'\",])(?:--?|/)(?:e|ec|ea|en[a-z]*)(?=[\s'\",:]|$)",
+    re.IGNORECASE,
+)
+# Raw HTTP writes through the PowerShell web cmdlets (Invoke-RestMethod -Method Post ... fapi.binance.com)
+PS_HTTP_CMDLET_RE = re.compile(
+    _PS_WORD_START + r"(?:invoke-restmethod|irm|invoke-webrequest|iwr)" + _PS_WORD_END, re.IGNORECASE
+)
+PS_HTTP_WRITE_RE = re.compile(r"-method[:\s]+['\"]?(?:post|put|delete|patch)\b|-body\b|-infile\b", re.IGNORECASE)
+PS_FROM_BASE64_RE = re.compile(r"frombase64string", re.IGNORECASE)
+# PowerShell inline code (the equivalent of `| bash` / `bash -c`): iex / Invoke-Expression anywhere, a pipe into
+# powershell / pwsh, [scriptblock]::Create
+PS_INLINE_CODE_RE = re.compile(
+    _PS_WORD_START + r"(?:iex|invoke-expression)" + _PS_WORD_END
+    + r"|\|\s*(?:\S*/)?(?:powershell|pwsh)(?:\.exe)?(?![\w-])|scriptblock\]\s*::\s*create",
+    re.IGNORECASE,
+)
+PS_BASE64_RUNNER_RE = re.compile(
+    _PS_WORD_START + r"(?:iex|invoke-expression|invoke-command|icm|powershell|pwsh)" + _PS_WORD_END
+    + r"|&|scriptblock\]\s*::\s*create|invokescript|newscriptblock|\.invoke\s*\(",
+    re.IGNORECASE,
+)
 
 
 # =============================================================================
@@ -512,11 +616,12 @@ def _split_eager_mcp_name(name: str, args: dict) -> Tuple[str, str]:
 def normalize_tool_call(payload: dict) -> Dict[str, Any]:
     """
     Maps agy and Claude Code payloads onto a common structure:
-    {kind: run_command|mcp|file_write|other, tool, command, cwd, server, mcp_tool, mcp_args, raw_args,
+    {kind: run_command|mcp|file_write|other, tool, command, cwd, shell, server, mcp_tool, mcp_args, raw_args,
      target_file, content}
+    shell is "powershell" for the Claude Code PowerShell tool (command = raw PowerShell text), otherwise "bash".
     """
     call: Dict[str, Any] = {
-        "kind": "other", "tool": "", "command": "", "cwd": "", "server": "", "mcp_tool": "",
+        "kind": "other", "tool": "", "command": "", "cwd": "", "shell": "bash", "server": "", "mcp_tool": "",
         "mcp_args": {}, "raw_args": {}, "target_file": "", "content": "",
     }
 
@@ -567,8 +672,9 @@ def normalize_tool_call(payload: dict) -> Dict[str, Any]:
         tool_input = {}
     call["tool"] = name
     call["raw_args"] = tool_input
-    if name == "Bash":
+    if isinstance(name, str) and name in CLAUDE_SHELL_TOOLS:
         call["kind"] = "run_command"
+        call["shell"] = CLAUDE_SHELL_TOOLS[name]
         call["command"] = _decode_str(tool_input.get("command"))
         call["cwd"] = _decode_str(payload.get("cwd"))
     elif isinstance(name, str) and name.startswith("mcp__"):
@@ -1265,13 +1371,15 @@ def _find_ground_truth(args: List[str], cwd: str = "", base_dir: str = "", depth
     return hits
 
 
-def _ground_truth_read_only(prog: str, args: List[str], assigned: bool = False) -> bool:
+def _ground_truth_read_only(prog: str, args: List[str], assigned: bool = False,
+                            read_programs: frozenset = frozenset(GROUND_TRUTH_READ_PROGRAMS)) -> bool:
     """True when a sub-command that names a protected file can only read it (read-only allowlist). Options that make
     an allowlisted program write a file or run a command (git --output / -O / -c, rg --pre, less -o) and leading
-    VAR= assignments (LESSOPEN, GIT_EXTERNAL_DIFF, NODE_OPTIONS...) void the exemption."""
+    VAR= assignments (LESSOPEN, GIT_EXTERNAL_DIFF, NODE_OPTIONS...) void the exemption. PowerShell commands pass
+    read_programs extended with PS_READ_CMDLETS (Get-Content, Select-String...)."""
     if assigned:
         return False
-    if prog in GROUND_TRUTH_READ_PROGRAMS:
+    if prog in read_programs:
         if prog == "jq":
             return not any(a == "-i" or a.startswith("--in-place") for a in args)
         if prog == "rg":
@@ -1478,8 +1586,11 @@ def _nested_commands(prog: str, args: List[str]) -> List[str]:
     return []
 
 
-def _ground_truth_writes(tokens: List[str], text: str, cwd: str = "", base_dir: str = "", depth: int = 0) -> List[str]:
-    """Protected ground-truth files a single shell sub-command can create, modify, move, delete or alias."""
+def _ground_truth_writes(tokens: List[str], text: str, cwd: str = "", base_dir: str = "", depth: int = 0,
+                         shell: str = "bash") -> List[str]:
+    """Protected ground-truth files a single shell sub-command can create, modify, move, delete or alias.
+    shell="powershell" (this sub-command only; nested shells and find -exec are Bash): PS_READ_CMDLETS also read,
+    and `wsl.exe [options] [--] <linux command>` is judged as that Linux command."""
     if depth > NESTED_DEPTH_LIMIT:
         return list(GROUND_TRUTH_FILES)  # pathological nesting: fail closed
     hits: List[str] = []
@@ -1488,11 +1599,18 @@ def _ground_truth_writes(tokens: List[str], text: str, cwd: str = "", base_dir: 
     idx = _program_index(tokens)
     prog = re.sub(r"\.exe$", "", _program(tokens))
     args = _plain_args(tokens[idx + 1:] if idx < len(tokens) else [])
+    if shell == "powershell" and prog == "wsl":
+        linux = _wsl_command(args)
+        if linux is not None:
+            if linux:
+                hits += _ground_truth_writes(linux, " ".join(linux), cwd, base_dir, depth + 1)
+            return [p for p in GROUND_TRUTH_FILES if p in set(hits)]
+    read_programs = GROUND_TRUTH_READ_PROGRAMS | (PS_READ_CMDLETS if shell == "powershell" else set())
     assigned = any(ASSIGNMENT_RE.match(t) for t in tokens[:idx])
     mentioned = _ground_truth_named(text)
     for a in tokens:
         mentioned += _glob_ground_truth(_word_value(a))
-    if mentioned and not _ground_truth_read_only(prog, args, assigned):
+    if mentioned and not _ground_truth_read_only(prog, args, assigned, frozenset(read_programs)):
         hits += mentioned
     # Nested shells (bash -c 'rm -rf logs', eval, cmd //c rd /s /q logs): the inner command line is judged too
     for nested in _nested_commands(prog, args):
@@ -1666,9 +1784,313 @@ def _unsanctioned_trading_script(tokens: List[str], cwd: str, base_dir: str) -> 
     return None
 
 
-def analyze_run_command(command_line: str, cwd: str, base_dir: str) -> Dict[str, Any]:
+# -----------------------------------------------------------------------------
+# PowerShell tool (Claude Code on Windows)
+# -----------------------------------------------------------------------------
+def _ps_scan(text: str, i: int, closer: Optional[str], depth: int) -> Tuple[str, str, List[str], int]:
+    """Quote-, escape- and comment-aware pass over PowerShell text from index i up to `closer` (or the end).
+    Returns (outer, full, bodies, end): outer has every nested body replaced by PS_NESTED_PLACEHOLDER, full has them
+    inlined as ' ( body ) ' (closing / reopening the string for "...$(...)..."), bodies are the raw texts of the
+    direct {...}, $(...), @(...), @{...} and (...) bodies, end is the index after `closer`.
+    '...' and @'...'@ are literal ('' is a quote); in "...", @"..."@ and bare text a backtick escapes the next
+    character (backtick + newline = continuation) and only $( opens a body inside strings. Comments outside strings
+    (# at a token start to the end of the line, <# ... #>) are dropped. Quote characters inside strings are dropped
+    so the POSIX tokenizer sees balanced quoting. Raises ValueError on unbalanced quotes, brackets or block comments."""
+    if depth > PS_SCAN_DEPTH_LIMIT:
+        raise ValueError("brackets nested too deeply")
+    outer: List[str] = []
+    full: List[str] = []
+    bodies: List[str] = []
+    n = len(text)
+    mode = ""  # "" bare text, "'" / '"' strings, "@'" / '@"' here-strings
+
+    def emit(s: str) -> None:
+        outer.append(s)
+        full.append(s)
+
+    def nested(start: int, close: str, in_string: bool) -> int:
+        _outer, inner_full, _bodies, end = _ps_scan(text, start, close, depth + 1)
+        bodies.append(text[start:end - 1])
+        outer.append(PS_NESTED_PLACEHOLDER)
+        full.append(('" ( ' + inner_full + ' ) "') if in_string else (" ( " + inner_full + " ) "))
+        return end
+
+    while i < n:
+        c = text[i]
+        nxt = text[i + 1] if i + 1 < n else ""
+        if mode in ("'", "@'"):
+            if mode == "'" and c == "'":
+                if nxt == "'":
+                    i += 2  # '' is a literal quote
+                    continue
+                emit("'")
+                mode = ""
+            elif mode == "@'" and c == "\n" and text.startswith("'@", i + 1):
+                emit("\n'")
+                mode = ""
+                i += 2
+            elif c != "'":
+                emit(c)
+            i += 1
+            continue
+        if c == "`":
+            if text.startswith("\r\n", i + 1):
+                emit(" ")
+                i += 3
+                continue
+            emit(" " if nxt == "\n" else ("" if nxt in ("'", '"') else nxt))
+            i += 2
+            continue
+        if mode in ('"', '@"'):
+            if mode == '"' and c == '"':
+                if nxt == '"':
+                    i += 2  # "" is a literal quote
+                    continue
+                emit('"')
+                mode = ""
+            elif mode == '@"' and c == "\n" and text.startswith('"@', i + 1):
+                emit('\n"')
+                mode = ""
+                i += 2
+            elif c == "$" and nxt == "(":
+                i = nested(i + 2, ")", True)
+                continue
+            elif c != '"':
+                emit(c)
+            i += 1
+            continue
+        boundary = i == 0 or text[i - 1] in PS_TOKEN_BOUNDARY
+        if c == "@" and nxt in ("'", '"') and re.match(r"[ \t]*\r?\n", text[i + 2:]):
+            emit(nxt)
+            mode = "@" + nxt
+            i = text.index("\n", i + 2) + 1
+        elif c in ("'", '"'):
+            emit(c)
+            mode = c
+            i += 1
+        elif c == "#" and boundary:
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+        elif c == "<" and nxt == "#" and boundary:
+            j = text.find("#>", i + 2)
+            if j < 0:
+                raise ValueError("unterminated <# block comment")
+            emit(" ")
+            i = j + 2
+        elif c == "$" and nxt == "{":
+            j = text.find("}", i + 2)
+            if j < 0:
+                raise ValueError("unterminated ${...} variable")
+            emit(text[i:j + 1])
+            i = j + 1
+        elif c in "$@" and nxt == "(":
+            i = nested(i + 2, ")", False)
+        elif c == "@" and nxt == "{":
+            i = nested(i + 2, "}", False)
+        elif c in PS_OPENERS:
+            i = nested(i + 1, PS_OPENERS[c], False)
+        elif c in ")}":
+            if c != closer:
+                raise ValueError(f"unbalanced '{c}'")
+            return "".join(outer), "".join(full), bodies, i + 1
+        else:
+            emit(c)
+            i += 1
+    if mode:
+        raise ValueError("unterminated string")
+    if closer:
+        raise ValueError(f"missing '{closer}'")
+    return "".join(outer), "".join(full), bodies, i
+
+
+def scan_powershell(command_line: str) -> Tuple[str, str, List[str]]:
+    """(outer, full, bodies) of a PowerShell command prepared for the shell analysis (never executed): Unicode
+    quotes and dashes mapped to ASCII, CRLF and lone CR turned into LF (PowerShell line ends), _ps_scan applied and
+    backslashes turned into '/' (PowerShell does not escape with backslash, so C:\\repo\\logs must not lose its
+    separators in the POSIX tokenizer). Raises ValueError."""
+    # PowerShell ends lines (comments, statements) at a lone \r too
+    text = (command_line or "").translate(PS_UNICODE_TRANSLATION).replace("\r\n", "\n").replace("\r", "\n")
+    outer, full, bodies, _ = _ps_scan(text, 0, None, 0)
+    return outer.replace("\\", "/"), full.replace("\\", "/"), bodies
+
+
+def normalize_powershell_command(command_line: str) -> str:
+    """Whole PowerShell command (nested bodies inlined) as analysed text; raises ValueError (see scan_powershell)."""
+    return scan_powershell(command_line)[1]
+
+
+def _powershell_tokens(command_line: str) -> List[str]:
+    """Quote-aware tokens of a normalised PowerShell command. Unlike _tokenize there is no fallback: unbalanced
+    quotes raise, so the PowerShell path fails closed."""
+    lexer = shlex.shlex(command_line, posix=True, punctuation_chars=SHELL_PUNCTUATION)
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    return [part for tok in lexer for part in _split_operators(tok)]
+
+
+def powershell_payload_denial(command_line: str) -> Optional[str]:
+    """Denial for PowerShell payloads judged on the whole command (any target): unauditable encoded payloads
+    (powershell/pwsh -EncodedCommand / -enc / -ec / -e, FromBase64String next to iex / Invoke-Expression /
+    Invoke-Command / & / powershell) and raw HTTP writes to Binance through Invoke-RestMethod / Invoke-WebRequest."""
+    if PS_ENCODED_COMMAND_RE.search(command_line) or (
+            PS_FROM_BASE64_RE.search(command_line) and PS_BASE64_RUNNER_RE.search(command_line)):
+        return (
+            "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Obfuscated Execution): PowerShell encoded payloads (powershell/pwsh "
+            "-EncodedCommand, FromBase64String run through iex / & / powershell) cannot be audited and are forbidden. "
+            "Run the plain command instead."
+        )
+    if PS_HTTP_CMDLET_RE.search(command_line) and BINANCE_HOST_RE.search(command_line) and \
+            PS_HTTP_WRITE_RE.search(command_line):
+        return (
+            "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Choke Point Enforcement): Raw HTTP write requests to Binance "
+            f"(fapi / MCP gateway) are strictly forbidden. Route orders through {CHOKE_POINT}."
+        )
+    return None
+
+
+def _powershell_words(tokens: List[str]) -> List[str]:
+    """Path-like values of PowerShell tokens: the token, option values (-Path:logs, --x=y) and array items (a,logs)."""
+    words: List[str] = []
+    for i, tok in enumerate(tokens):
+        if tok in SHELL_SEPARATORS or _is_redirect(tok):
+            continue
+        if tok == "*" and i + 1 < len(tokens) and _is_redirect(tokens[i + 1]):
+            continue  # *> redirects every stream, it is not a glob
+        for value in {tok, _word_value(tok), PS_NAMED_VALUE_RE.sub("", tok)}:
+            words.extend(w for w in value.split(",") if w)
+    return words
+
+
+def _powershell_redirects(tokens: List[str]) -> bool:
+    """True when the command redirects a stream anywhere but $null (>, >>, 2>, *>, n>&m)."""
+    return any(_is_redirect(tok) and (tokens[i + 1] if i + 1 < len(tokens) else "").lower() != "$null"
+               for i, tok in enumerate(tokens))
+
+
+def _powershell_write_construct(command_line: str, tokens: List[str]) -> Optional[str]:
+    """First construct that can write a file or run code (write/exec cmdlets anywhere, .NET static or method calls,
+    provider variables, call operator / dot-sourcing, redirection); None when the command can only read."""
+    for label, rx in (("write cmdlet", PS_WRITE_CMDLET_RE), ("code-running cmdlet", PS_EXEC_CMDLET_RE),
+                      (".NET static call", PS_DOTNET_STATIC_RE), ("method call", PS_METHOD_CALL_RE),
+                      ("provider variable", PS_PROVIDER_VARIABLE_RE),
+                      ("call operator / dot-sourcing", PS_CALL_OPERATOR_RE)):
+        m = rx.search(command_line)
+        if m:
+            return f"{label} '{m.group(0).strip()}'"
+    return "output redirection" if _powershell_redirects(tokens) else None
+
+
+def _wsl_invocation(args: List[str]) -> Optional[Tuple[List[str], bool]]:
+    """(Linux command, through the default shell) run by `wsl.exe [-d X] [-u X] [--cd X] [--|-e] cmd...` ([] when
+    none). Without -e/--exec wsl joins the arguments and its default shell parses them again. None for any other
+    wsl option (--import, --mount, --export...), which is judged like an unknown program."""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in WSL_COMMAND_OPTIONS:
+            return args[i + 1:], a == "--"
+        if a in WSL_VALUE_OPTIONS:
+            i += 2
+        elif a.startswith("-"):
+            return None
+        else:
+            return args[i:], True
+    return [], True
+
+
+def _wsl_command(args: List[str]) -> Optional[List[str]]:
+    """Linux command tokens of a wsl.exe invocation (see _wsl_invocation)."""
+    invocation = _wsl_invocation(args)
+    return invocation[0] if invocation is not None else None
+
+
+def _powershell_wsl_shell_commands(command_line: str) -> List[str]:
+    """Command lines that wsl.exe hands to the Linux default shell (no -e/--exec): the arguments joined with spaces,
+    re-parsed by that shell (wsl -- cat x '>logs/session_state.json' redirects)."""
+    lines: List[str] = []
+    segments: List[List[str]] = [[]]
+    for tok in _powershell_tokens(command_line):
+        if tok in SHELL_SEPARATORS:
+            segments.append([])
+        else:
+            segments[-1].append(tok)
+    for seg in segments:
+        if seg and re.sub(r"\.exe$", "", os.path.basename(seg[0]).lower()) == "wsl":
+            invocation = _wsl_invocation(_plain_args(seg[1:]))
+            if invocation is not None and invocation[1] and invocation[0]:
+                lines.append(" ".join(invocation[0]))
+    return lines
+
+
+def _powershell_unlisted_command(tokens: List[str]) -> Optional[str]:
+    """Leading command of the first statement / pipeline segment outside PS_READ_CMDLETS. Expressions are not
+    commands ($_.Length -gt 0, `(Get-Content x | ConvertFrom-Json).is_valid`), assignments are judged by their
+    value ($x = robocopy ...), and wsl.exe <linux command> is left to the Bash ground-truth analysis."""
+    segments: List[List[str]] = [[]]
+    for tok in tokens:
+        if tok in SHELL_SEPARATORS:
+            segments.append([])
+        else:
+            segments[-1].append(tok)
+    for seg in segments:
+        while len(seg) > 1 and PS_EXPRESSION_LEAD_RE.match(seg[0]) and seg[1].startswith(PS_ASSIGNMENT_OPERATORS):
+            op = next(o for o in PS_ASSIGNMENT_OPERATORS if seg[1].startswith(o))
+            seg = ([seg[1][len(op):]] if seg[1][len(op):] else []) + seg[2:]
+        if not seg or seg[0].lower() in PS_READ_CMDLETS or PS_EXPRESSION_LEAD_RE.match(seg[0]):
+            continue
+        if re.sub(r"\.exe$", "", os.path.basename(seg[0]).lower()) == "wsl" and _wsl_command(seg[1:]) is not None:
+            continue
+        return seg[0]
+    return None
+
+
+def powershell_backstop(command_line: str, cwd: str, base_dir: str) -> Tuple[Optional[str], Optional[str]]:
+    """(deny reason, force_ask reason) for a normalised PowerShell command, applied on top of analyze_run_command.
+    A command naming a ground-truth file (also through a logs/ glob or an 8.3 short name), the evaluation trail or
+    the logs/ directory literally is denied unless every statement starts with a read-only or navigation cmdlet
+    (PS_READ_CMDLETS) and nothing in it can write or run code; a glob that can expand to logs/ (*, log*) is denied
+    next to a write construct; harness paths next to a write construct require confirmation.
+    Raises on unbalanced quotes (the caller denies)."""
+    tokens = _powershell_tokens(command_line)
+    words = _powershell_words(tokens)
+    ground_truth = _ground_truth_named(command_line)
+    for w in words:
+        ground_truth += _glob_ground_truth(w)
+    trail = bool(EVALUATION_TRAIL_CMD_RE.search(command_line) or TRANSCRIPT_ROOT_OVERRIDE_RE.search(command_line))
+    if any(PS_SHORT_NAME_RE.search(_shell_path(w)) for w in words):
+        ground_truth += list(GROUND_TRUTH_FILES)
+    # A literal logs/ word is judged like a protected file; a glob that can expand to logs/ (*, log*) only next to a
+    # write construct (git add * stays usable)
+    logs_words = [w for w in words if _is_logs_dir(w, cwd, base_dir)]
+    logs_dir = bool(logs_words)
+    logs_literal = any(not SHELL_GLOB_RE.search(w) for w in logs_words)
+    harness = bool(HARNESS_PATH_CMD_RE.search(command_line))
+    if not (ground_truth or trail or logs_dir or harness):
+        return None, None
+    construct = _powershell_write_construct(command_line, tokens)
+    unlisted = None if construct else _powershell_unlisted_command(tokens)
+    how = construct or (f"command '{unlisted}' outside the read-only cmdlets" if unlisted else None)
+    suffix = (f" PowerShell {how} next to a protected path: only read-only cmdlets (Get-Content, Select-String, "
+              "Test-Path, Get-ChildItem...) may name it.")
+    if trail and how:
+        return ("🚨 BLOCKED BY PRE-TOOL-USE HOOK (Evaluation Trail Protection): Commands must not write "
+                "logs/evaluations/, latest_dossier.json, Antigravity brain transcripts or Claude Code subagent "
+                "transcripts." + suffix + " " + EVALUATOR_HINT), None
+    if ground_truth and how:
+        return ground_truth_denial(ground_truth) + suffix, None
+    if (logs_literal and how) or (logs_dir and construct):
+        return ground_truth_denial(list(GROUND_TRUTH_FILES)).rstrip(".") + " (they live in logs/)." + suffix, None
+    if harness and construct:
+        return None, ("PowerShell command modifies trading harness files (hooks, dossier provenance, profile). "
+                      "Explicit confirmation required.")
+    return None, None
+
+
+def analyze_run_command(command_line: str, cwd: str, base_dir: str, shell: str = "bash") -> Dict[str, Any]:
     """
-    Classifies a shell command. Returns
+    Classifies a shell command (shell="powershell": a command already normalised by
+    normalize_powershell_command, whose read-only cmdlets may name ground-truth files). Returns
     {deny: reason|None, force_ask: reason|None, trading: [subcommand text], risk_reducing: bool,
      neutral_only: bool, record_eval: {...}|None}
     """
@@ -1679,7 +2101,7 @@ def analyze_run_command(command_line: str, cwd: str, base_dir: str) -> Dict[str,
     if not command_line.strip():
         return result
 
-    inline = _is_inline_code(command_line)
+    inline = _is_inline_code(command_line) or (shell == "powershell" and bool(PS_INLINE_CODE_RE.search(command_line)))
     subcommands = split_subcommands(command_line)
 
     # 1. Evaluation trail is immutable for the agent (record_evaluation.py --from-subagent writes it itself)
@@ -1736,7 +2158,7 @@ def analyze_run_command(command_line: str, cwd: str, base_dir: str) -> Dict[str,
 
     # 4b. Ground-truth state (GROUND_TRUTH_FILES) may only be written by its sanctioned desk script
     for tokens in _ground_truth_subcommands(command_line):
-        protected = _ground_truth_writes(tokens, " ".join(tokens), cwd, base_dir)
+        protected = _ground_truth_writes(tokens, " ".join(tokens), cwd, base_dir, shell=shell)
         if protected:
             result["deny"] = ground_truth_denial(protected)
             return result
@@ -1995,8 +2417,10 @@ def evaluate_file_write(target: str, content: str, base_dir: str) -> Tuple[str, 
         return "force_ask", "File write without a resolvable target path."
     abs_norm, rel = _normalize_target(target, base_dir)
     rel_l = rel.lower()
-    if (rel_l == "logs/evaluations" or rel_l.startswith("logs/evaluations/") or BRAIN_PATH_RE.search(abs_norm)
-            or CLAUDE_SUBAGENT_PATH_RE.search(abs_norm)):
+    # Raw target too: a Windows path (C:\repo\logs\evaluations\x) is not absolute for a hook running under WSL
+    raw = _shell_path(_strip_windows_aliases(re.sub(r"^file:/*", "/", target.strip(), flags=re.IGNORECASE)))
+    if (rel_l == "logs/evaluations" or rel_l.startswith("logs/evaluations/") or EVALUATION_TRAIL_TARGET_RE.search(raw)
+            or BRAIN_PATH_RE.search(abs_norm) or CLAUDE_SUBAGENT_PATH_RE.search(abs_norm)):
         return "deny", (
             "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Evaluation Trail Protection): Writing to logs/evaluations/, "
             "Antigravity brain transcripts or Claude Code subagent transcripts is forbidden. " + EVALUATOR_HINT
@@ -2162,6 +2586,111 @@ def evaluate_trade_opening(cmd: str, args: dict, mcp_args: dict, base_dir: str,
 # =============================================================================
 # Decision engine
 # =============================================================================
+def evaluate_shell_command(command_line: str, cwd: str, base_dir: str, conversation_id: Optional[str],
+                           shell: str = "bash") -> Tuple[str, str]:
+    """(decision, reason) for a shell command line (Bash, or PowerShell text normalised by scan_powershell)."""
+    analysis = analyze_run_command(command_line, cwd, base_dir, shell=shell)
+    if analysis["deny"]:
+        return "deny", analysis["deny"]
+
+    record_eval = analysis["record_eval"]
+    if record_eval and not record_eval["from_subagent"]:
+        try:
+            env = resolve_env(extract_env_argument(record_eval["text"]) or extract_env_argument(command_line), base_dir=base_dir)
+        except ValueError as ve:
+            return "deny", f"🚨 FAIL-CLOSED (Environment Resolution): {str(ve)}"
+        if env == "prod":
+            return "deny", (
+                "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Evaluation Trail Protection): Manual dossier recording is disabled "
+                "in PROD. " + EVALUATOR_HINT
+            )
+
+    if analysis["batch"]:
+        try:
+            env = resolve_env(extract_env_argument(command_line), base_dir=base_dir)
+        except ValueError as ve:
+            return "deny", f"🚨 FAIL-CLOSED (Environment Resolution): {str(ve)}"
+        if env == "prod" or analysis["trading"] or len(analysis["batch"]) > 1:
+            return "deny", (
+                "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Choke Point Enforcement): Batch deploy scripts and auto-deploy loops "
+                "open positions that the per-trade evaluator dossier cannot verify. Route each order through "
+                "'scripts/execute_futures_trade.py' after a clean-room evaluation."
+            )
+        analysis["trading"] = analysis["batch"]
+
+    if len(analysis["trading"]) > 1:
+        return "deny", (
+            "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Choke Point Enforcement): Only one trade opening per command is allowed "
+            "so that each order is gated individually."
+        )
+
+    if analysis["trading"]:
+        sub = analysis["trading"][0]
+        decision, reason = evaluate_trade_opening(sub, {"CommandLine": sub}, {}, base_dir, conversation_id,
+                                                  env_hint_cmd=command_line)
+        if decision == "allow" and not analysis["all_safe"]:
+            decision = "force_ask" if analysis["force_ask"] else "ask"
+            reason = reason + " Compound command contains other sub-commands; user confirmation required."
+        return decision, reason
+
+    if analysis["force_ask"]:
+        return "force_ask", analysis["force_ask"]
+    if analysis["risk_reducing"] and analysis["all_safe"]:
+        return "allow", "Risk-reducing action / exit authorized."
+    return "ask", ""
+
+
+def evaluate_powershell_command(command: str, cwd: str, base_dir: str, conversation_id: Optional[str],
+                                depth: int = 0) -> Tuple[str, str]:
+    """(decision, reason) for a Claude Code PowerShell command, fail closed:
+    1. scan_powershell (quotes, escapes, comments, nested bodies); unparseable text is denied;
+    2. the whole command (bodies inlined): payload denials (encoded payloads, raw HTTP to Binance) and the backstop;
+    3. the statement with its bodies replaced by a placeholder, judged exactly like Bash, plus the joined arguments
+       of each wsl.exe call without -e/--exec judged as a Bash command line (its default shell re-parses them);
+    4. when there are bodies: the whole command through the Bash analysis (deny only) and every body
+       ({...}, $(...), @(...), (...)) recursively, up to NESTED_DEPTH_LIMIT levels (deeper is denied).
+    Results combine most-restrictive-wins (deny > force_ask > ask > allow); a command with nested bodies is never
+    auto-allowed (risk-reducing auto-allow needs a flat command)."""
+    def fail(why: str) -> Tuple[str, str]:
+        return "deny", f"🚨 FAIL-CLOSED: PowerShell command could not be parsed for the pre-trade checks ({why})."
+
+    if depth > NESTED_DEPTH_LIMIT:
+        return fail(f"blocks nested deeper than {NESTED_DEPTH_LIMIT} levels")
+    try:
+        outer, full, bodies = scan_powershell(command)
+        payload_deny = powershell_payload_denial(full)
+        if payload_deny:
+            return "deny", payload_deny
+        ps_deny, ps_force_ask = powershell_backstop(full, cwd, base_dir)
+        wsl_lines = _powershell_wsl_shell_commands(outer)
+    except Exception as e:
+        return fail(str(e))
+    results = [evaluate_shell_command(outer, cwd, base_dir, conversation_id, shell="powershell")]
+    if results[0][0] == "deny":
+        return results[0]
+    if ps_deny:
+        return "deny", ps_deny
+    # wsl.exe without -e/--exec: the Linux default shell re-parses the joined arguments, judged as Bash
+    for line in wsl_lines:
+        results.append(evaluate_shell_command(line, cwd, base_dir, conversation_id))
+        if results[-1][0] == "deny":
+            return results[-1]
+    if ps_force_ask:
+        results.append(("force_ask", ps_force_ask))
+    if bodies:
+        whole = evaluate_shell_command(full, cwd, base_dir, conversation_id, shell="powershell")
+        if whole[0] == "deny":
+            return whole
+        for body in bodies:
+            results.append(evaluate_powershell_command(body, cwd, base_dir, conversation_id, depth + 1))
+            if results[-1][0] == "deny":
+                return results[-1]
+    decision, reason = max(results, key=lambda r: PS_DECISION_RANK.get(r[0], PS_DECISION_RANK["deny"]))
+    if bodies and decision == "allow":
+        return "ask", (reason + " The command contains nested PowerShell blocks; user confirmation required.").strip()
+    return decision, reason
+
+
 def evaluate_payload(payload: dict) -> Tuple[str, str, str]:
     """Returns (decision, reason, tool_label). decision in allow|deny|ask|force_ask."""
     call = normalize_tool_call(payload)
@@ -2219,56 +2748,11 @@ def evaluate_payload(payload: dict) -> Tuple[str, str, str]:
 
     # ---------------------------------------------------------------- shell commands
     if call["kind"] == "run_command":
-        command_line = call["command"]
-        analysis = analyze_run_command(command_line, call["cwd"], base_dir)
-        if analysis["deny"]:
-            return "deny", analysis["deny"], tool_label
-
-        record_eval = analysis["record_eval"]
-        if record_eval and not record_eval["from_subagent"]:
-            try:
-                env = resolve_env(extract_env_argument(record_eval["text"]) or extract_env_argument(command_line), base_dir=base_dir)
-            except ValueError as ve:
-                return "deny", f"🚨 FAIL-CLOSED (Environment Resolution): {str(ve)}", tool_label
-            if env == "prod":
-                return "deny", (
-                    "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Evaluation Trail Protection): Manual dossier recording is disabled "
-                    "in PROD. " + EVALUATOR_HINT
-                ), tool_label
-
-        if analysis["batch"]:
-            try:
-                env = resolve_env(extract_env_argument(command_line), base_dir=base_dir)
-            except ValueError as ve:
-                return "deny", f"🚨 FAIL-CLOSED (Environment Resolution): {str(ve)}", tool_label
-            if env == "prod" or analysis["trading"] or len(analysis["batch"]) > 1:
-                return "deny", (
-                    "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Choke Point Enforcement): Batch deploy scripts and auto-deploy loops "
-                    "open positions that the per-trade evaluator dossier cannot verify. Route each order through "
-                    "'scripts/execute_futures_trade.py' after a clean-room evaluation."
-                ), tool_label
-            analysis["trading"] = analysis["batch"]
-
-        if len(analysis["trading"]) > 1:
-            return "deny", (
-                "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Choke Point Enforcement): Only one trade opening per command is allowed "
-                "so that each order is gated individually."
-            ), tool_label
-
-        if analysis["trading"]:
-            sub = analysis["trading"][0]
-            decision, reason = evaluate_trade_opening(sub, {"CommandLine": sub}, {}, base_dir, conversation_id,
-                                                      env_hint_cmd=command_line)
-            if decision == "allow" and not analysis["all_safe"]:
-                decision = "force_ask" if analysis["force_ask"] else "ask"
-                reason = reason + " Compound command contains other sub-commands; user confirmation required."
-            return decision, reason, tool_label
-
-        if analysis["force_ask"]:
-            return "force_ask", analysis["force_ask"], tool_label
-        if analysis["risk_reducing"] and analysis["all_safe"]:
-            return "allow", "Risk-reducing action / exit authorized.", tool_label
-        return "ask", "", tool_label
+        if call["shell"] == "powershell":
+            decision, reason = evaluate_powershell_command(call["command"], call["cwd"], base_dir, conversation_id)
+        else:
+            decision, reason = evaluate_shell_command(call["command"], call["cwd"], base_dir, conversation_id)
+        return decision, reason, tool_label
 
     # ---------------------------------------------------------------- anything else
     return "ask", "", tool_label
