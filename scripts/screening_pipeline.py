@@ -12,8 +12,10 @@ import os
 import sys
 import json
 import time
-from typing import List, Literal, Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+from typing import List, Literal, Optional, Tuple
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from pydantic import BaseModel, Field
 
 # Ensure import paths
@@ -24,7 +26,25 @@ import quant_risk_engine as qre
 import funding_arbitrage as fa
 import sync_session_state as sss
 import fetch_newsletters as fn
+import broad_yolo_scanner as bys
 from utils.env_resolver import resolve_env
+
+# Barbell YOLO slot (issue #52): the memecoin scanner runs concurrently under a hard time budget so it can
+# never block or break the standard scan (prime_evaluator_brief.py gives the whole pipeline 60 s).
+YOLO_SCAN_TIMEOUT_S = 25
+YOLO_SCAN_INTERVAL = "15m"
+YOLO_SCAN_TOP = 3
+YOLO_MAX_CANDIDATES = 2  # token budget of the primed brief
+YOLO_FILTER_TEXT = f"climax volume >= {bys.MIN_VOL_RATIO}x or buyer absorption wick >= {bys.MIN_WICK_PCT:.0f}%"
+YOLO_INACTIVE_STATUS = f"INACTIVE: Preserving capital. No memecoin exceeds {YOLO_FILTER_TEXT}."
+YOLO_DISABLED_STATUS = "DISABLED: yolo_slot_enabled is false in the user profile."
+# Executor gates mirrored here (not imported) so the evaluator never sees a YOLO entry that the executor would
+# reject when entered at the trigger: friction floor (execute_futures_trade.py GATE 3, TP1 >= 0.35% from the entry)
+# and the Barbell YOLO loss cap (GATE 2, loss at SL <= 35% of the isolated margin: SL distance x leverage <= 0.35).
+YOLO_MIN_TP1_DISTANCE = 0.0035
+YOLO_MAX_LOSS_MARGIN_FRACTION = 0.35
+YOLO_SIG_DIGITS = 6  # forwarded floats are rounded to 6 significant digits (token budget)
+_last_yolo_future = None  # Future of the latest pipeline run's YOLO scan (CLI exit handling)
 
 # ==========================================
 # 1. TYPED PYDANTIC SCHEMAS (DATA CONTRACTS)
@@ -101,6 +121,31 @@ class StatArbPair(BaseModel):
     recommendation: Optional[str] = None
     is_actionable: bool
 
+class YoloCandidate(BaseModel):
+    """Compact LONG-only subset of broad_yolo_scanner.build_levels() forwarded to the evaluator."""
+    symbol: str
+    direction: Literal["LONG"]
+    score: float
+    price: float
+    trigger: float
+    sl: float
+    risk_pct: float
+    tp1: float
+    tp2: float
+    roe_tp1_pct: float
+    roe_tp2_pct: float
+    leverage: int
+    margin_usdt: float
+    max_loss_usdt: float
+    rsi: float
+    vol_ratio: float
+    lower_wick: float
+
+class YoloSlot(BaseModel):
+    status: Literal["ACTIVE", "INACTIVE", "DISABLED", "UNAVAILABLE"]
+    interval: Optional[str] = None
+    candidates: List[YoloCandidate] = Field(default_factory=list)
+
 class MarketScreeningPayload(BaseModel):
     timestamp_utc: str
     pipeline_latency_ms: int
@@ -110,6 +155,7 @@ class MarketScreeningPayload(BaseModel):
     actionable_stat_arb: List[StatArbPair]
     top_funding_arbitrage: Optional[List[dict]] = None
     yolo_slot_status: str
+    yolo_slot: Optional[YoloSlot] = None
     news_catalysts_summary: List[str]
     untrusted_external_content: bool = True
 
@@ -268,14 +314,134 @@ def fetch_news_summary() -> List[str]:
         catalysts.append("<untrusted_newsletter_data>Stable macro. No high-impact Federal Reserve or CPI events scheduled in the immediate intraday window.</untrusted_newsletter_data>")
     return catalysts[:5]
 
-def execute_screening_pipeline(top_pairs_count: int = 80, target_env: Optional[str] = None) -> MarketScreeningPayload:
+def _yolo_slot_enabled() -> bool:
+    """Profile gate: the YOLO scan only runs when the user enabled the Barbell slot."""
+    import user_profile as up
+    return bool(up.load_user_profile().get("yolo_slot_enabled", False))
+
+def _start_yolo_scan(target_env: str) -> Future:
+    """Runs broad_yolo_scanner.scan_yolo in a daemon thread. Unlike a `with ThreadPoolExecutor` block (which
+    joins its workers on exit), a hung scan cannot hold the pipeline past its budget. The scanner's own
+    non-daemon kline workers are cut off at CLI exit by `_run_cli` (hard exit while the scan is running)."""
+    fut: Future = Future()
+
+    def _run():
+        if not fut.set_running_or_notify_cancel():
+            return
+        try:
+            fut.set_result(bys.scan_yolo(target_env, interval=YOLO_SCAN_INTERVAL, top=YOLO_SCAN_TOP))
+        except BaseException as e:  # surfaced to the pipeline as UNAVAILABLE
+            fut.set_exception(e)
+
+    threading.Thread(target=_run, name="yolo-scan", daemon=True).start()
+    return fut
+
+def _yolo_unavailable(reason: str) -> Tuple[str, YoloSlot]:
+    reason = " ".join(str(reason).split())[:160]
+    return f"UNAVAILABLE: {reason}. YOLO slot kept empty.", YoloSlot(status="UNAVAILABLE", interval=YOLO_SCAN_INTERVAL)
+
+def _sig(x: float, digits: int = YOLO_SIG_DIGITS) -> float:
+    """Plain float rounded to `digits` significant digits."""
+    return float(f"{float(x):.{digits}g}")
+
+def _to_yolo_candidate(raw: dict) -> Optional[YoloCandidate]:
+    """Plain-typed LONG candidate that passes the Barbell filters and the executor's YOLO gates when entered at its
+    trigger (the entry the evaluator uses), else None. risk_pct, ROE and max loss are recomputed from the trigger
+    (the scanner computes them from the current price)."""
+    try:
+        if raw.get("direction") != "LONG":
+            return None
+        symbol, price, trigger, sl = str(raw["symbol"]), float(raw["price"]), float(raw["trigger"]), float(raw["sl"])
+        tp1, tp2 = float(raw["tp1"]), float(raw["tp2"])
+        leverage, margin = int(raw["leverage"]), float(raw["margin_usdt"])
+        score, rsi = float(raw["score"]), float(raw["rsi"])
+        vol_ratio, lower_wick = float(raw["vol_ratio"]), float(raw["lower_wick"])
+    except Exception:
+        return None
+    # Defense in depth: never forward a memecoin that fails both hardened filters (AGENTS.md Barbell rule).
+    if not (vol_ratio >= bys.MIN_VOL_RATIO or lower_wick >= bys.MIN_WICK_PCT):
+        return None
+    # LONG levels must be coherent around the current price and the trigger entry (also drops NaN levels).
+    if not (0.0 < sl < price and sl < trigger < tp1 <= tp2 and leverage >= 1 and margin > 0.0):
+        return None
+    risk_frac = (trigger - sl) / trigger
+    if (tp1 - trigger) / trigger < YOLO_MIN_TP1_DISTANCE:
+        return None
+    if risk_frac * leverage > YOLO_MAX_LOSS_MARGIN_FRACTION:
+        return None
+    return YoloCandidate(
+        symbol=symbol,
+        direction="LONG",
+        score=_sig(score),
+        price=_sig(price),
+        trigger=_sig(trigger),
+        sl=_sig(sl),
+        risk_pct=round(risk_frac * 100, 2),
+        tp1=_sig(tp1),
+        tp2=_sig(tp2),
+        roe_tp1_pct=round((tp1 - trigger) / trigger * 100 * leverage, 1),
+        roe_tp2_pct=round((tp2 - trigger) / trigger * 100 * leverage, 1),
+        leverage=leverage,
+        margin_usdt=round(margin, 2),
+        max_loss_usdt=round(margin * leverage * risk_frac, 2),
+        rsi=_sig(rsi),
+        vol_ratio=_sig(vol_ratio),
+        lower_wick=_sig(lower_wick),
+    )
+
+def build_yolo_slot(scan: dict) -> Tuple[str, YoloSlot]:
+    """Maps a broad_yolo_scanner.scan_yolo() payload to (yolo_slot_status sentence, structured YoloSlot)."""
+    interval = str(scan.get("interval") or YOLO_SCAN_INTERVAL)
+    slot_status = scan.get("slot_status")
+    if slot_status == "CANDIDATE_SLOT_DISABLED":
+        return YOLO_DISABLED_STATUS, YoloSlot(status="DISABLED", interval=interval)
+    if slot_status == "EMPTY":
+        return YOLO_INACTIVE_STATUS, YoloSlot(status="INACTIVE", interval=interval)
+    if slot_status != "CANDIDATE":
+        return _yolo_unavailable(f"unexpected scanner slot_status {slot_status!r}")
+
+    candidates: List[YoloCandidate] = []
+    for raw in scan.get("longs") or []:
+        cand = _to_yolo_candidate(raw) if isinstance(raw, dict) else None
+        if cand is not None:
+            candidates.append(cand)
+        if len(candidates) >= YOLO_MAX_CANDIDATES:
+            break
+    if not candidates:
+        return YOLO_INACTIVE_STATUS, YoloSlot(status="INACTIVE", interval=interval)
+    return (f"ACTIVE: {len(candidates)} memecoin(s) pass {YOLO_FILTER_TEXT}.",
+            YoloSlot(status="ACTIVE", interval=interval, candidates=candidates))
+
+def execute_screening_pipeline(top_pairs_count: int = 80, target_env: Optional[str] = None,
+                               include_yolo: bool = True) -> MarketScreeningPayload:
     """
     Executes the full screening pipeline concurrently in Python without any intermediary LLM.
     Returns a validated, structured MarketScreeningPayload object.
+    include_yolo=False skips the Barbell YOLO memecoin scan (for callers that only use top_candidates).
     """
+    global _last_yolo_future
+    _last_yolo_future = None
     t0 = time.time()
 
     target_env = resolve_env(target_env)
+
+    # Barbell YOLO slot: gated by the profile and started first so it overlaps the standard scan.
+    f_yolo: Optional[Future] = None
+    yolo_deadline = 0.0
+    yolo_result: Optional[Tuple[str, YoloSlot]] = None
+    if not include_yolo:
+        yolo_result = ("UNAVAILABLE: YOLO scan not requested by this caller. YOLO slot kept empty.",
+                       YoloSlot(status="UNAVAILABLE", interval=YOLO_SCAN_INTERVAL))
+    else:
+        try:
+            if _yolo_slot_enabled():
+                yolo_deadline = time.time() + YOLO_SCAN_TIMEOUT_S
+                f_yolo = _start_yolo_scan(target_env)
+                _last_yolo_future = f_yolo
+            else:
+                yolo_result = (YOLO_DISABLED_STATUS, YoloSlot(status="DISABLED", interval=YOLO_SCAN_INTERVAL))
+        except Exception as e:
+            yolo_result = _yolo_unavailable(f"user profile unavailable ({type(e).__name__})")
 
     with ThreadPoolExecutor(max_workers=5) as executor:
         f_macro = executor.submit(fetch_macro_btc)
@@ -361,8 +527,15 @@ def execute_screening_pipeline(top_pairs_count: int = 80, target_env: Optional[s
         except Exception:
             pass
 
-    # Barbell YOLO Slot Status
-    yolo_status = "INACTIVE: Preserving capital. No memecoin exceeds climax volume >= 2.0x or buyer absorption wick >= 50%."
+    # Barbell YOLO Slot Status (bounded wait; any failure or timeout leaves the slot empty)
+    if f_yolo is not None:
+        try:
+            yolo_result = build_yolo_slot(f_yolo.result(timeout=max(0.0, yolo_deadline - time.time())))
+        except FutureTimeoutError:
+            yolo_result = _yolo_unavailable(f"YOLO scan exceeded its {YOLO_SCAN_TIMEOUT_S}s budget")
+        except Exception as e:
+            yolo_result = _yolo_unavailable(f"YOLO scan failed ({type(e).__name__}: {e})")
+    yolo_status, yolo_slot = yolo_result
 
     t1 = time.time()
     latency_ms = int((t1 - t0) * 1000)
@@ -376,24 +549,39 @@ def execute_screening_pipeline(top_pairs_count: int = 80, target_env: Optional[s
         actionable_stat_arb=stat_arb_list,
         top_funding_arbitrage=raw_funding,
         yolo_slot_status=yolo_status,
+        yolo_slot=yolo_slot,
         news_catalysts_summary=news_data,
         untrusted_external_content=True
     )
 
-if __name__ == "__main__":
+def _exit_without_waiting_for_yolo(code: int) -> None:
+    """CLI only. If the YOLO scan outlived its budget, the scanner's inner ThreadPoolExecutor workers would be joined
+    at interpreter exit and keep this process alive after the payload was emitted (prime_evaluator_brief.py waits
+    for the subprocess with a 60 s timeout and would then drop the whole payload). Flush and hard-exit instead."""
+    fut = _last_yolo_future
+    if fut is None or fut.done():
+        return
+    for stream in (sys.stdout, sys.stderr, sys.__stdout__, sys.__stderr__):
+        try:
+            stream.flush()
+        except Exception:
+            pass
+    os._exit(code)
+
+def main(argv: Optional[list] = None) -> int:
     import argparse
+    import contextlib
     parser = argparse.ArgumentParser(description="Deterministic Market Intelligence Pipeline")
     parser.add_argument("--json", action="store_true", help="Print payload in strict JSON format")
     parser.add_argument("--env", default=None, help="Target execution environment (prod/testnet)")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     try:
         env = resolve_env(args.env)
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
-        sys.exit(2)
+        return 2
 
-    import contextlib
     real_stdout = sys.stdout
     try:
         # Keep stdout pure JSON with --json: library diagnostics go to stderr.
@@ -405,7 +593,7 @@ if __name__ == "__main__":
                                           "error": f"{type(e).__name__}: {e}"}, indent=2) + "\n")
         else:
             print(f"Screening pipeline failed: {type(e).__name__}: {e}", file=sys.stderr)
-        sys.exit(1)
+        return 1
 
     if args.json:
         real_stdout.write(payload.model_dump_json(indent=2) + "\n")
@@ -422,3 +610,16 @@ if __name__ == "__main__":
                 print(f"  🔥 {a.pair}: Z={a.z_score:+.2f}σ, ADF p={a.adf_pvalue:.3f}, Half-Life={a.half_life_hours:.1f}h -> {a.recommendation}")
         else:
             print("  ⚖️ No extreme cointegrated divergences (|Z| >= 2.0σ with ADF p < 0.05).")
+        print(f"• YOLO Slot: {payload.yolo_slot_status}")
+        for y in (payload.yolo_slot.candidates if payload.yolo_slot else []):
+            print(f"  🚀 {y.symbol} (LONG {y.leverage}x): Trigger {y.trigger:.6g} | SL {y.sl:.6g} (-{y.risk_pct}%) | "
+                  f"TP1 {y.tp1:.6g} / TP2 {y.tp2:.6g} | Vol {y.vol_ratio}x | Wick {y.lower_wick}% | RSI {y.rsi}")
+    return 0
+
+def _run_cli(argv: Optional[list] = None) -> None:
+    code = main(argv)
+    _exit_without_waiting_for_yolo(code)
+    sys.exit(code)
+
+if __name__ == "__main__":
+    _run_cli()

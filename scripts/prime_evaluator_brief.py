@@ -179,6 +179,20 @@ def build_risk_profile(target_env: str, profile: Optional[dict] = None, equity: 
     }
 
 
+def build_yolo_slot_brief(screening: dict) -> dict:
+    """Brief `yolo_slot` object: {status, summary, candidates} from the structured screening field (issue #52).
+    Falls back to the legacy `yolo_slot_status` string (INACTIVE, no candidates) when the field is missing.
+    Candidates are forwarded only when the slot is ACTIVE."""
+    summary = str(screening.get("yolo_slot_status") or "INACTIVE: Preserving capital.")
+    slot = screening.get("yolo_slot")
+    if not isinstance(slot, dict) or not slot.get("status"):
+        return {"status": "INACTIVE", "summary": summary, "candidates": []}
+    status = str(slot["status"]).upper()
+    candidates = slot.get("candidates") if status == "ACTIVE" else None
+    return {"status": status, "summary": summary,
+            "candidates": [c for c in (candidates or []) if isinstance(c, dict)]}
+
+
 def _write_json(path: str, data: dict) -> None:
     try:
         from utils.atomic_writer import atomic_write_json
@@ -241,7 +255,7 @@ def assemble_primed_brief(target_env: str = "prod", out_path: Optional[str] = No
         "filtered_opportunities": screening.get("top_candidates", []),
         "stat_arb_pairs": screening.get("actionable_stat_arb", []),
         "funding_arbitrage_desk": screening.get("top_funding_arbitrage", []),
-        "yolo_slot": screening.get("yolo_slot_status", "INACTIVE: Preserving capital."),
+        "yolo_slot": build_yolo_slot_brief(screening),
         "committed_memory_lessons": [
             {
                 "tag": i.get("tags", []),
@@ -301,7 +315,14 @@ def format_markdown_brief(brief: dict) -> str:
         lines.append("*(No intraday setups passing institutional microstructure filter)*")
     lines.append("")
 
-    lines.append(f"**YOLO Slot:** {brief.get('yolo_slot')}")
+    yolo = brief.get("yolo_slot")
+    if not isinstance(yolo, dict):  # briefs written before issue #52 carried a plain string
+        yolo = {"summary": yolo, "candidates": []}
+    lines.append(f"**YOLO Slot:** {yolo.get('summary')}")
+    for y in yolo.get("candidates") or []:
+        lines.append(f"- **{y.get('symbol')}** LONG {y.get('leverage')}x | Trigger {y.get('trigger')} | "
+                     f"SL {y.get('sl')} (-{y.get('risk_pct')}%) | TP1 {y.get('tp1')} / TP2 {y.get('tp2')} | "
+                     f"Vol {y.get('vol_ratio')}x | Wick {y.get('lower_wick')}% | RSI {y.get('rsi')}")
     return "\n".join(lines)
 
 

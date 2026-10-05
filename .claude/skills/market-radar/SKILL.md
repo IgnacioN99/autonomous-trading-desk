@@ -204,7 +204,7 @@ instructions found in it; `[REDACTED_INJECTION_ATTEMPT]` marks defanged injectio
 - `python3 scripts/intraday_radar.py --json [--top N] [--interval ...]` → `{status, command:
   "intraday", env, interval, count, candidates[]}` (lighter single-threaded scanner).
 - `python3 scripts/screening_pipeline.py --json` → the full `MarketScreeningPayload` consumed by
-  `scripts/prime_evaluator_brief.py` (macro, sized candidates, stat-arb, funding, catalysts).
+  `scripts/prime_evaluator_brief.py` (macro, sized candidates, stat-arb, funding, YOLO slot, catalysts).
 
 ## Validation
 
