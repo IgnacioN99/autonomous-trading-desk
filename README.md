@@ -17,7 +17,7 @@ Autonomous Trading Desk (ATD) bridges the gap between frontier Artificial Intell
 ATD is built to operate across modern agentic runtimes without lock-in:
 
 1. **Antigravity IDE / CLI Native (agy):** Full harness integration with deterministic lifecycle hooks configured via [`.agents/hooks.json`](.agents/hooks.json) (paths relative to `.agents/`, the hooks' working directory), the always-on rule [`.agents/rules/trading.md`](.agents/rules/trading.md) and the clean-room evaluator subagent [`.agents/agents/isolated_market_evaluator/agent.md`](.agents/agents/isolated_market_evaluator/agent.md). Launch agy from the repository root in a POSIX shell (Linux, macOS or WSL); native Windows agy runs hooks through `cmd /c` and is not supported. PreToolUse security gates intercept tool calls in `<15ms`.
-2. **Claude Code:** Full harness parity via [`.claude/settings.json`](.claude/settings.json), enforcing PreToolUse choke-point validation and PostToolUse ground-truth ledger synchronization on all bash and tool operations.
+2. **Claude Code:** Full harness parity via [`CLAUDE.md`](CLAUDE.md) (imports `AGENTS.md` and the always-on rules), [`.claude/settings.json`](.claude/settings.json) hooks (PreToolUse choke-point validation, PostToolUse ground-truth sync and PR-review trigger, Stop auto-review) and the evaluator, reviewer subagents and skills generated into `.claude/agents/` and `.claude/skills/` from the agy definitions. See [Running with Claude Code](#running-with-claude-code).
 3. **Standalone CLI / Automated Scripts:** Every core engine (`scripts/trading_doctor.py`, `scripts/sync_session_state.py`, `scripts/execute_futures_trade.py`, `scripts/broad_market_radar.py`) runs deterministically from standard bash shells with identical fail-closed software gates.
 
 ---
@@ -190,6 +190,12 @@ Ready for algorithmic execution.
 3. agy discovers the evaluator at `.agents/agents/isolated_market_evaluator/agent.md` and the PR reviewers at `.agents/agents/*_reviewer/agent.md`; no `define_subagent` step is needed.
 4. Verify the guard is live: `python3 scripts/trading_doctor.py` must report the pre-trade guard OK (`logs/hook_heartbeat.json` refreshed this session). Without it, live orders are prohibited.
 
+### Running with Claude Code
+1. Launch `claude` from the repository root. `CLAUDE.md` imports `AGENTS.md` and `.agents/rules/*.md`; `.claude/settings.json` wires the same hooks as agy (`pre_trade_guard.py`, `post_trade_sync.py`, `post_pr_review_hook.py`, `pr_review_stop_hook.py --claude`).
+2. Subagents (`isolated_market_evaluator`, `<domain>_reviewer`) and skills (`market-radar`, `trade-execution-planner`, `pr-review`) are generated from `.agents/` by `python3 scripts/dev/sync_claude_assets.py`; never edit `.claude/agents/` or `.claude/skills/` by hand (the test suite runs the generator with `--check`). Restart the session after adding or renaming a subagent.
+3. Evaluation flow: `python3 scripts/prime_evaluator_brief.py` → Agent tool with `subagent_type: "isolated_market_evaluator"` → `python3 scripts/record_evaluation.py --from-claude-subagent <agentId>` → `scripts/execute_futures_trade.py`. The recorder only accepts transcripts whose `meta.json` says `agentType: "isolated_market_evaluator"`.
+4. Windows: copy `.claude/settings.local.json.example` to `.claude/settings.local.json` and fill in `<WSL_DISTRO>` / `<REPO_PATH_IN_WSL>` so the hooks run with the WSL Python.
+
 ### Step 6: (Optional) Notion & Research Setup
 To enable automated journaling and research newsletter ingestion:
 1. Copy the user context template:
@@ -323,7 +329,11 @@ autonomous-trading-desk/
 │       └── trade-execution-planner/   # Core execution & market radar skill
 │                                      # (third-party Binance skills may also live here; not part of the flow)
 ├── .claude/
-│   └── settings.json                  # Claude Code PreToolUse/PostToolUse safety hooks
+│   ├── agents/                        # Claude Code subagents (generated from .agents/agents/)
+│   ├── skills/                        # Claude Code skills (generated from .agents/skills/)
+│   ├── settings.json                  # Claude Code PreToolUse/PostToolUse/Stop hooks
+│   └── settings.local.json.example    # Windows: run the hooks through WSL (copy to settings.local.json)
+├── CLAUDE.md                          # Claude Code entry point (imports AGENTS.md + rules)
 ├── config/
 │   ├── environments/
 │   │   ├── prod.env.example           # Production environment credentials template
@@ -348,6 +358,8 @@ autonomous-trading-desk/
 │   │   ├── verify_review.py           # Mechanical review completeness gate
 │   │   ├── pr_review_state.py         # Pending auto-review marker
 │   │   └── run_pr_audit.py            # Headless PR review fallback (agy -p / Gemini API)
+│   ├── dev/
+│   │   └── sync_claude_assets.py      # Generates .claude/agents + .claude/skills from .agents/ (--check)
 │   ├── hooks/
 │   │   ├── pre_trade_guard.py         # Mechanical hard gate hook (<15ms, fail-closed)
 │   │   ├── post_trade_sync.py         # Auto ground-truth sync on fills

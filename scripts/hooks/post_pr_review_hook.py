@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """
 scripts/hooks/post_pr_review_hook.py
-PostToolUse Hook (agy "pr-review-trigger"): arms the in-session multi-agent PR review.
+PostToolUse Hook (agy "pr-review-trigger" / Claude Code .claude/settings.json): arms the in-session
+multi-agent PR review.
 
-agy PostToolUse hooks cannot inject context (their output is always {}), so this hook only keeps
-the pending-review marker (scripts/ci/pr_review_state.py, logs/pr_review_state.json) up to date:
+This hook only keeps the pending-review marker (scripts/ci/pr_review_state.py,
+logs/pr_review_state.json) up to date:
   * successful `gh pr create` or `git push ... origin <feature-branch>` -> marker "pending"
     (the Stop hook pr_review_stop_hook.py then makes the agent run the /pr-review skill, which
-    launches the reviewer subagents natively with invoke_subagent in the same session);
+    launches the reviewer subagents natively in the same session: agy invoke_subagent, Claude Code
+    Agent tool);
   * successful `gh pr comment ... --body-file .../pr_review/report.md` -> marker "done".
-Failed commands (payload "error") change nothing. Events are logged to logs/pr_hook_events.jsonl.
+Failed commands change nothing. Events are logged to logs/pr_hook_events.jsonl.
 
 Contract:
-  Input (stdin): JSON with toolCall metadata (protojson camelCase); Claude Code tool_input also accepted.
-  Output (stdout): {} (mandatory empty JSON object for PostToolUse), always with exit code 0.
+  Input (stdin): agy {toolCall:{name:"run_command", args:{CommandLine}}, conversationId, error?} or
+                 Claude Code {tool_name:"Bash", tool_input:{command}, tool_response, session_id}
+                 (Claude Code only fires PostToolUse on success; failed calls go to PostToolUseFailure).
+  Output (stdout): {} (empty JSON object, valid for both runtimes), always with exit code 0.
 """
 
 import os
@@ -78,20 +82,47 @@ def _git(args: list[str]) -> str:
         return ""
 
 
+def is_claude_payload(payload: dict) -> bool:
+    return "toolCall" not in payload and ("tool_name" in payload or "hook_event_name" in payload)
+
+
 def extract_command(payload: dict) -> str:
     tool_call = payload.get("toolCall") if isinstance(payload.get("toolCall"), dict) else {}
     args = tool_call.get("args") if isinstance(tool_call.get("args"), dict) else {}
     command_line = args.get("CommandLine", "")
     if not command_line and isinstance(payload.get("tool_input"), dict):
-        # Claude Code PostToolUse payload (Bash tool)
+        # Claude Code PostToolUse payload: only the Bash tool runs shell commands
+        if payload.get("tool_name", "Bash") != "Bash":
+            return ""
         command_line = payload["tool_input"].get("command", "")
     return command_line if isinstance(command_line, str) else ""
+
+
+def conversation_of(payload: dict) -> str:
+    """agy conversationId or Claude Code session_id (the Stop hook compares against the same field)."""
+    return str(payload.get("conversationId") or payload.get("session_id") or "")
+
+
+def tool_failed(payload: dict) -> bool:
+    if payload.get("error"):
+        return True
+    if payload.get("hook_event_name") == "PostToolUseFailure":
+        return True
+    response = payload.get("tool_response")
+    if isinstance(response, dict):
+        if response.get("is_error") or response.get("interrupted"):
+            return True
+        for key in ("exit_code", "exitCode", "returncode"):
+            code = response.get(key)
+            if isinstance(code, int) and code != 0:
+                return True
+    return False
 
 
 def handle_post_tool_use(payload: dict, path: str | None = None) -> str:
     """Updates the marker for one PostToolUse payload. Returns the action taken (for tests/logs)."""
     command_line = extract_command(payload)
-    if not command_line or payload.get("error"):
+    if not command_line or tool_failed(payload):
         return "ignored"
 
     if is_review_post(command_line):
@@ -107,7 +138,7 @@ def handle_post_tool_use(payload: dict, path: str | None = None) -> str:
             trigger_command=command_line,
             branch=branch,
             head_sha=_git(["rev-parse", "HEAD"]),
-            conversation_id=str(payload.get("conversationId") or ""),
+            conversation_id=conversation_of(payload),
             path=path,
         )
         state_mod.log_event({"event": "review_pending", "trigger_command": command_line[:300],

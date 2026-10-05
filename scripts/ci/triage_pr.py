@@ -61,6 +61,8 @@ REVIEWERS = {
         "doc": ".agents/agents/agentic_harness_reviewer/agent.md",
         "patterns": [
             r"^\.agents/.*",
+            r"^\.claude/.*",
+            r"^scripts/dev/sync_claude_assets\.py$",
             r"^hooks/.*",
             r"^scripts/trading_doctor\.py$",
             r"^scripts/sync_session_state\.py$",
@@ -80,6 +82,9 @@ REVIEWERS = {
             r"^scripts/.*evaluator.*\.py$",
             r"^scripts/prime_evaluator_brief\.py$",
             r"^\.agents/agents/.*",
+            r"^\.agents/skills/.*",
+            r"^\.claude/agents/.*",
+            r"^\.claude/skills/.*",
         ],
     },
 }
@@ -87,6 +92,7 @@ REVIEWERS = {
 # Files that automatically trigger ALL reviewers (Fail-Closed Core Files)
 CORE_OMNIBUS_FILES = [
     r"^AGENTS\.md$",
+    r"^CLAUDE\.md$",
     r"^\.github/workflows/.*",
     r"^requirements\.txt$",
     r"^pyproject\.toml$",

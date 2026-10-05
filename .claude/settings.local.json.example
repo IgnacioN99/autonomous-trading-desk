@@ -6,8 +6,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_PROJECT_DIR\"/scripts/hooks/pre_trade_guard.py",
-            "timeout": 10
+            "command": "MSYS_NO_PATHCONV=1 wsl.exe -d <WSL_DISTRO> -- python3 <REPO_PATH_IN_WSL>/scripts/hooks/pre_trade_guard.py",
+            "timeout": 15
           }
         ]
       }
@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_PROJECT_DIR\"/scripts/hooks/post_trade_sync.py",
+            "command": "MSYS_NO_PATHCONV=1 wsl.exe -d <WSL_DISTRO> -- python3 <REPO_PATH_IN_WSL>/scripts/hooks/post_trade_sync.py",
             "timeout": 30
           }
         ]
@@ -28,8 +28,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_PROJECT_DIR\"/scripts/hooks/post_pr_review_hook.py",
-            "timeout": 10
+            "command": "MSYS_NO_PATHCONV=1 wsl.exe -d <WSL_DISTRO> -- python3 <REPO_PATH_IN_WSL>/scripts/hooks/post_pr_review_hook.py",
+            "timeout": 15
           }
         ]
       }
@@ -39,8 +39,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_PROJECT_DIR\"/scripts/hooks/pr_review_stop_hook.py --claude",
-            "timeout": 10
+            "command": "MSYS_NO_PATHCONV=1 wsl.exe -d <WSL_DISTRO> -- python3 <REPO_PATH_IN_WSL>/scripts/hooks/pr_review_stop_hook.py --claude",
+            "timeout": 15
           }
         ]
       }

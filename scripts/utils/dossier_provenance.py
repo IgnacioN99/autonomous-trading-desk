@@ -2,14 +2,21 @@
 """
 dossier_provenance.py - Binds evaluation dossiers to the real evaluator subagent output.
 
-The isolated_market_evaluator subagent runs as its own Antigravity conversation and writes
-its Master Dossier (ending in a <dossier_json> block) into that conversation's transcript:
-    ~/.gemini/<product>/brain/<conversationId>/.system_generated/logs/transcript.jsonl
+The isolated_market_evaluator subagent writes its Master Dossier (ending in a <dossier_json>
+block) into its own transcript. Two runtimes are supported:
 
-record_evaluation.py --from-subagent <conversationId> extracts that block and stores a
-provenance stamp (transcript path, step index, sha256 of the block). Every consumer
-(pre_trade_guard.py hook, execute_futures_trade.py) re-verifies the stamp against the
-transcript before allowing an order, so a dossier typed by the main agent is rejected.
+  * Google Antigravity (agy): the subagent is its own conversation,
+        ~/.gemini/<product>/brain/<conversationId>/.system_generated/logs/transcript.jsonl
+    record_evaluation.py --from-subagent <conversationId>
+  * Claude Code: the subagent transcript lives next to its parent session,
+        ~/.claude/projects/<project-slug>/<parentSessionId>/subagents/agent-<agentId>.jsonl
+    with agent-<agentId>.meta.json ({"agentType": "isolated_market_evaluator", ...}).
+    record_evaluation.py --from-claude-subagent <agentId>  (or --from-subagent, auto-detected)
+    The meta agentType MUST be the evaluator: a general-purpose agent cannot sign a dossier.
+
+The recorder stores a provenance stamp (source, transcript path, step, sha256 of the block).
+Every consumer (pre_trade_guard.py hook, execute_futures_trade.py) re-verifies the stamp against
+the transcript before allowing an order, so a dossier typed by the main agent is rejected.
 
 Single source of truth for dossier validation: validate_dossier_for_trade().
 """
@@ -38,6 +45,17 @@ DOSSIER_RE = re.compile(r"<dossier_json>\s*([\s\S]*?)\s*</dossier_json>")
 CONVERSATION_ID_RE = re.compile(r"^[0-9a-fA-F][0-9a-fA-F-]{7,63}$")
 SENDER_RE = re.compile(r"sender=([0-9a-fA-F-]{8,64})")
 
+# Provenance sources
+AGY_SOURCE = "agy_subagent_transcript"
+CLAUDE_SOURCE = "claude_subagent_transcript"
+SUBAGENT_SOURCES = (AGY_SOURCE, CLAUDE_SOURCE)
+
+# Claude Code subagent ids look like "a" + 16 hex chars (no dashes). agy ids are UUIDs, whose
+# first dash comes after 8 hex chars, so the two formats never collide.
+CLAUDE_AGENT_ID_RE = re.compile(r"^a[0-9a-f]{12,63}$")
+CLAUDE_TRANSCRIPT_RE = re.compile(r"^agent-(a[0-9a-f]{12,63})\.jsonl$")
+CLAUDE_PROJECTS_ENV = "CLAUDE_PROJECTS_DIRS"
+
 
 class ProvenanceError(Exception):
     pass
@@ -45,6 +63,13 @@ class ProvenanceError(Exception):
 
 def default_dossier_path(base_dir: str) -> str:
     return os.path.join(base_dir, "logs", "evaluations", "latest_dossier.json")
+
+
+def is_claude_agent_id(value: str) -> bool:
+    value = (value or "").strip()
+    if value.startswith("agent-"):
+        value = value[len("agent-"):]
+    return bool(CLAUDE_AGENT_ID_RE.match(value))
 
 
 def brain_roots() -> list:
@@ -124,13 +149,16 @@ def _model_texts(step: dict) -> list:
 
 
 def _parse_created_at(value: Any) -> int:
+    """ISO-8601 UTC timestamp ('2026-10-05T00:11:07Z' or with fractional seconds) -> epoch seconds."""
     if not value:
         return 0
-    try:
-        dt = datetime.datetime.strptime(str(value), "%Y-%m-%dT%H:%M:%SZ")
-        return int(dt.replace(tzinfo=datetime.timezone.utc).timestamp())
-    except ValueError:
-        return 0
+    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.%fZ"):
+        try:
+            dt = datetime.datetime.strptime(str(value), fmt)
+            return int(dt.replace(tzinfo=datetime.timezone.utc).timestamp())
+        except ValueError:
+            continue
+    return 0
 
 
 def _parse_block(raw: str) -> Optional[dict]:
@@ -187,6 +215,7 @@ def extract_dossier_from_transcript(path: str) -> Dict[str, Any]:
     step, raw, dossier = found
 
     return {
+        "source": AGY_SOURCE,
         "raw": raw,
         "sha256": sha256_text(raw),
         "dossier": dossier,
@@ -196,6 +225,182 @@ def extract_dossier_from_transcript(path: str) -> Dict[str, Any]:
         "parent_conversation_id": parent_id,
         "transcript_path": os.path.abspath(path),
     }
+
+
+# =============================================================================
+# Claude Code subagent transcripts
+# =============================================================================
+def _is_wsl() -> bool:
+    if os.environ.get("WSL_DISTRO_NAME"):
+        return True
+    try:
+        with open("/proc/version", "r", encoding="utf-8", errors="replace") as f:
+            return "microsoft" in f.read().lower()
+    except OSError:
+        return False
+
+
+def claude_project_roots() -> list:
+    """Directories that may contain Claude Code project folders (~/.claude/projects).
+    CLAUDE_PROJECTS_DIRS (os.pathsep-separated) overrides the defaults. Under WSL the Windows
+    profiles (/mnt/<drive>/Users/<user>/.claude/projects) are searched too, because Claude Code
+    on Windows writes its transcripts there while the hooks and scripts run inside WSL."""
+    override = os.environ.get(CLAUDE_PROJECTS_ENV)
+    if override:
+        return [p for p in override.split(os.pathsep) if p]
+    roots = []
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    if config_dir:
+        roots.append(os.path.join(os.path.expanduser(config_dir), "projects"))
+    roots.append(os.path.join(os.path.expanduser("~"), ".claude", "projects"))
+    if _is_wsl():
+        roots.extend(sorted(glob.glob("/mnt/*/Users/*/.claude/projects")))
+    out = []
+    for root in roots:
+        if root not in out:
+            out.append(root)
+    return out
+
+
+def _normalize_claude_agent_id(agent_id: str) -> str:
+    agent_id = (agent_id or "").strip()
+    if agent_id.startswith("agent-"):
+        agent_id = agent_id[len("agent-"):]
+    if not CLAUDE_AGENT_ID_RE.match(agent_id):
+        raise ProvenanceError(f"Invalid Claude Code subagent id '{agent_id}' (expected 'a' followed by hex digits).")
+    return agent_id
+
+
+def find_claude_subagent_transcript(agent_id: str) -> str:
+    """Resolves a Claude Code subagent id to <projects>/<slug>/<sessionId>/subagents/agent-<id>.jsonl."""
+    agent_id = _normalize_claude_agent_id(agent_id)
+    matches = []
+    for root in claude_project_roots():
+        pattern = os.path.join(glob.escape(root), "*", "*", "subagents", f"agent-{agent_id}.jsonl")
+        for path in glob.glob(pattern):
+            if os.path.isfile(path) and os.path.abspath(path) not in matches:
+                matches.append(os.path.abspath(path))
+    if not matches:
+        raise ProvenanceError(
+            f"No transcript found for Claude Code subagent '{agent_id}' in: {', '.join(claude_project_roots())}"
+        )
+    if len(matches) > 1:
+        raise ProvenanceError(f"Claude Code subagent id '{agent_id}' is ambiguous ({len(matches)} transcripts).")
+    return matches[0]
+
+
+def claude_meta_path(transcript_path: str) -> str:
+    base = transcript_path[:-len(".jsonl")] if transcript_path.endswith(".jsonl") else transcript_path
+    return base + ".meta.json"
+
+
+def read_claude_subagent(path: str, expected_agent_type: str) -> Tuple[dict, list]:
+    """Validates a Claude Code subagent transcript and returns (info, assistant_rows).
+
+    Checks: canonical location (.../<sessionId>/subagents/agent-<agentId>.jsonl), meta.json agentType
+    equal to expected_agent_type, and every assistant row being a sidechain row of this agent and of
+    the parent session named by the directory. info = {agent_id, agent_type, session_id, meta_path}."""
+    path = os.path.abspath(path or "")
+    m = CLAUDE_TRANSCRIPT_RE.match(os.path.basename(path))
+    subagents_dir = os.path.dirname(path)
+    if not m or os.path.basename(subagents_dir) != "subagents":
+        raise ProvenanceError(f"Not a Claude Code subagent transcript path: {path}")
+    agent_id = m.group(1)
+    session_dir_id = os.path.basename(os.path.dirname(subagents_dir))
+    if not os.path.isfile(path):
+        raise ProvenanceError(f"Subagent transcript not found: {path}")
+
+    meta_path = claude_meta_path(path)
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+    except (OSError, ValueError) as e:
+        raise ProvenanceError(f"Claude Code subagent metadata unreadable ({meta_path}): {e}")
+    agent_type = meta.get("agentType") if isinstance(meta, dict) else None
+    if agent_type != expected_agent_type:
+        raise ProvenanceError(
+            f"Claude Code subagent '{agent_id}' is of type '{agent_type}', expected '{expected_agent_type}'. "
+            f"Launch it with the Agent tool and subagent_type '{expected_agent_type}'."
+        )
+
+    rows = _read_steps(path)
+    if not rows:
+        raise ProvenanceError(f"Transcript is empty or unreadable: {path}")
+    assistant_rows = []
+    for idx, row in enumerate(rows):
+        if not isinstance(row, dict) or row.get("type") != "assistant":
+            continue
+        if row.get("isSidechain") is not True or row.get("agentId") != agent_id:
+            raise ProvenanceError(f"Transcript row {idx} does not belong to subagent '{agent_id}' ({path}).")
+        if row.get("sessionId") != session_dir_id:
+            raise ProvenanceError(f"Transcript row {idx} belongs to another parent session ({path}).")
+        assistant_rows.append((idx, row))
+    info = {"agent_id": agent_id, "agent_type": agent_type, "session_id": session_dir_id, "meta_path": meta_path}
+    return info, assistant_rows
+
+
+def claude_assistant_texts(row: dict) -> list:
+    """Text blocks the subagent model itself wrote in one assistant row (never tool results)."""
+    message = row.get("message") if isinstance(row.get("message"), dict) else {}
+    if message.get("role", "assistant") != "assistant":
+        return []
+    content = message.get("content")
+    if isinstance(content, str):
+        return [content]
+    texts = []
+    for block in content or []:
+        if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str):
+            texts.append(block["text"])
+    return texts
+
+
+def extract_dossier_from_claude_transcript(path: str, expected_agent_type: str = EVALUATOR_NAME) -> Dict[str, Any]:
+    """Returns the last <dossier_json> block the Claude Code evaluator subagent wrote, with its provenance."""
+    info, assistant_rows = read_claude_subagent(path, expected_agent_type)
+
+    found = None
+    saw_block = False
+    for idx, row in assistant_rows:
+        for text in claude_assistant_texts(row):
+            for m in DOSSIER_RE.finditer(text):
+                saw_block = True
+                raw = m.group(1).strip()
+                parsed = _parse_block(raw)
+                if parsed is not None:
+                    found = (idx, row, raw, parsed)
+                    break
+
+    if not found:
+        if saw_block:
+            raise ProvenanceError(f"<dossier_json> block emitted by the subagent is not a valid JSON object ({path}).")
+        raise ProvenanceError(f"No <dossier_json> block emitted by the subagent in {path}")
+
+    idx, row, raw, dossier = found
+    return {
+        "source": CLAUDE_SOURCE,
+        "raw": raw,
+        "sha256": sha256_text(raw),
+        "dossier": dossier,
+        "step_index": idx,
+        "step_uuid": row.get("uuid"),
+        "created_at_ts": _parse_created_at(row.get("timestamp")),
+        "conversation_id": info["agent_id"],
+        "parent_conversation_id": info["session_id"],
+        "agent_type": info["agent_type"],
+        "transcript_path": os.path.abspath(path),
+    }
+
+
+def extract_recorded_transcript(record: dict) -> Dict[str, Any]:
+    """Re-extracts the dossier from the transcript referenced by a recorded dossier's provenance."""
+    prov = record.get("provenance") if isinstance(record.get("provenance"), dict) else {}
+    source = prov.get("source")
+    path = prov.get("transcript_path")
+    if source == CLAUDE_SOURCE:
+        return extract_dossier_from_claude_transcript(path, EVALUATOR_NAME)
+    if source == AGY_SOURCE:
+        return extract_dossier_from_transcript(path)
+    raise ProvenanceError("Dossier has no subagent provenance (it was not recorded from a subagent transcript).")
 
 
 def normalize_status(status: Any) -> Tuple[str, bool]:
@@ -233,6 +438,16 @@ def build_record_from_extraction(extracted: Dict[str, Any], recorded_at_ts: Opti
     candidates = normalize_candidates(dossier, pending) if status == "APPROVED" else []
     evaluated_at = extracted.get("created_at_ts") or 0
     recorded_at = int(recorded_at_ts or time.time())
+    source = extracted.get("source") or AGY_SOURCE
+    provenance = {
+        "source": source,
+        "transcript_path": extracted["transcript_path"],
+        "step_index": extracted.get("step_index"),
+        "sha256": extracted["sha256"],
+    }
+    if source == CLAUDE_SOURCE:
+        provenance["step_uuid"] = extracted.get("step_uuid")
+        provenance["agent_type"] = extracted.get("agent_type")
     return {
         "schema_version": SCHEMA_VERSION,
         "timestamp_utc": datetime.datetime.fromtimestamp(evaluated_at, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
@@ -246,12 +461,7 @@ def build_record_from_extraction(extracted: Dict[str, Any], recorded_at_ts: Opti
         "approved_symbols": [c["symbol"] for c in candidates],
         "approved_candidates": candidates,
         "summary": str(dossier.get("summary", "")).strip(),
-        "provenance": {
-            "source": "agy_subagent_transcript",
-            "transcript_path": extracted["transcript_path"],
-            "step_index": extracted.get("step_index"),
-            "sha256": extracted["sha256"],
-        },
+        "provenance": provenance,
         "raw_payload": dossier,
     }
 
@@ -275,17 +485,25 @@ def rebuild_verified_record(record: dict) -> Tuple[bool, str, Optional[dict]]:
     evaluator actually emitted. Any hand edit to verdict fields (status, symbols, directions, timestamps)
     makes the stored record differ from the rebuilt one and fails verification."""
     prov = record.get("provenance")
-    if not isinstance(prov, dict) or prov.get("source") != "agy_subagent_transcript":
-        return False, "Dossier has no subagent provenance (it was not recorded with --from-subagent).", None
+    if not isinstance(prov, dict) or prov.get("source") not in SUBAGENT_SOURCES:
+        return False, (
+            "Dossier has no subagent provenance (it was not recorded with --from-subagent / --from-claude-subagent)."
+        ), None
+    source = prov["source"]
 
     path = prov.get("transcript_path")
     if not path or not os.path.isfile(path):
         return False, f"Subagent transcript not found: {path}", None
-    if os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(path)))) != record.get("conversation_id"):
+    if source == AGY_SOURCE:
+        transcript_conv = os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(path))))
+    else:
+        m = CLAUDE_TRANSCRIPT_RE.match(os.path.basename(path))
+        transcript_conv = m.group(1) if m else None
+    if transcript_conv != record.get("conversation_id"):
         return False, "Dossier conversation_id does not match its transcript path.", None
 
     try:
-        extracted = extract_dossier_from_transcript(path)
+        extracted = extract_recorded_transcript(record)
     except ProvenanceError as e:
         return False, str(e), None
 
@@ -293,6 +511,8 @@ def rebuild_verified_record(record: dict) -> Tuple[bool, str, Optional[dict]]:
     if not parent or parent == extracted["conversation_id"]:
         return False, "Transcript is not a subagent conversation (no parent sender).", None
     if extracted["sha256"] != prov.get("sha256") or extracted["step_index"] != prov.get("step_index"):
+        return False, "Dossier hash does not match the latest <dossier_json> emitted by the evaluator subagent.", None
+    if source == CLAUDE_SOURCE and extracted.get("step_uuid") != prov.get("step_uuid"):
         return False, "Dossier hash does not match the latest <dossier_json> emitted by the evaluator subagent.", None
 
     rebuilt = build_record_from_extraction(extracted, record.get("recorded_at_ts"))
@@ -352,7 +572,8 @@ def validate_dossier_for_trade(
         return False, (
             "No evaluation dossier at logs/evaluations/latest_dossier.json. Invoke the "
             f"'{EVALUATOR_NAME}' subagent and record its verdict with "
-            "`record_evaluation.py --from-subagent <conversationId>`."
+            "`record_evaluation.py --from-subagent <conversationId>` (agy) or "
+            "`record_evaluation.py --from-claude-subagent <agentId>` (Claude Code)."
         ), None
     try:
         record = load_dossier(dossier_path)
@@ -385,7 +606,8 @@ def validate_dossier_for_trade(
         except (TypeError, ValueError):
             schema = 1
         if schema < SCHEMA_VERSION:
-            return False, "Legacy dossier format is not accepted in PROD. Record it with --from-subagent.", None
+            return False, ("Legacy dossier format is not accepted in PROD. Record it with --from-subagent "
+                           "(agy) or --from-claude-subagent (Claude Code)."), None
         if record.get("evaluator_agent") != EVALUATOR_NAME:
             return False, f"Dossier was not signed by '{EVALUATOR_NAME}' (got '{record.get('evaluator_agent')}').", None
         ok, reason, rebuilt = rebuild_verified_record(record)
