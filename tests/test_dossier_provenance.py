@@ -448,6 +448,294 @@ class TestRecordEvaluationCli(TranscriptFixture):
         self.assertEqual(code, 2)
 
 
+# =============================================================================
+# Claude Code subagent transcripts
+# =============================================================================
+CLAUDE_SESSION = "5e55105e-0000-4000-8000-000000000001"
+CLAUDE_OTHER_SESSION = "0f0f0f0f-1111-2222-3333-444444444444"
+
+
+def iso_ms(ts: int) -> str:
+    return datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.123Z")
+
+
+class ClaudeTranscriptFixture(TranscriptFixture):
+    """Fake ~/.claude/projects tree exposed through CLAUDE_PROJECTS_DIRS."""
+
+    def setUp(self):
+        super().setUp()
+        self.projects = os.path.join(self.root, "claude_projects")
+        os.makedirs(self.projects)
+        self._claude_env = patch.dict(os.environ, {dp.CLAUDE_PROJECTS_ENV: self.projects})
+        self._claude_env.start()
+
+    def tearDown(self):
+        self._claude_env.stop()
+        super().tearDown()
+
+    def write_claude(self, agent_id: str, rows: list, agent_type: str = dp.EVALUATOR_NAME,
+                     session: str = CLAUDE_SESSION, slug: str = "-repo-trading", meta: bool = True) -> str:
+        d = os.path.join(self.projects, slug, session, "subagents")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, f"agent-{agent_id}.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            for i, row in enumerate(rows):
+                row = dict(row)
+                row.setdefault("uuid", f"uuid-{agent_id}-{i}")
+                row.setdefault("isSidechain", True)
+                row.setdefault("agentId", agent_id)
+                row.setdefault("sessionId", session)
+                f.write(json.dumps(row) + "\n")
+        if meta:
+            with open(path[:-len(".jsonl")] + ".meta.json", "w", encoding="utf-8") as f:
+                json.dump({"agentType": agent_type, "description": "Evaluate brief", "toolUseId": "toolu_x",
+                           "spawnDepth": 1}, f)
+        return path
+
+    @staticmethod
+    def user_row(ts: int, text: str) -> dict:
+        return {"type": "user", "timestamp": iso_ms(ts), "message": {"role": "user", "content": text}}
+
+    @staticmethod
+    def read_rows(ts: int) -> list:
+        """Assistant Read call + tool result holding the agent prompt with its few-shot dossiers."""
+        return [
+            {"type": "assistant", "timestamp": iso_ms(ts), "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file_path": "logs/primed_brief.json"}}]}},
+            {"type": "user", "timestamp": iso_ms(ts), "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": FEW_SHOT_PROMPT}]}},
+        ]
+
+    @staticmethod
+    def text_row(ts: int, text: str) -> dict:
+        return {"type": "assistant", "timestamp": iso_ms(ts),
+                "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}}
+
+    def standard_claude(self, agent_id: str, payload: dict, ts: int = None, **kw) -> str:
+        ts = self.now - 30 if ts is None else ts
+        rows = [self.user_row(ts - 5, "Evaluate logs/primed_brief.json for PROD.")] + self.read_rows(ts - 3) + \
+            [self.text_row(ts, dossier_text(payload))]
+        return self.write_claude(agent_id, rows, **kw)
+
+    def record_claude(self, agent_id: str, payload: dict, ts: int = None) -> dict:
+        self.standard_claude(agent_id, payload, ts)
+        with patch.object(rec, "_register_shadow"), redirect_stdout(io.StringIO()):
+            return rec.record_from_claude_subagent(agent_id, target_env="prod", base_dir=self.workspace)
+
+
+class TestClaudeTranscriptExtraction(ClaudeTranscriptFixture):
+
+    def test_id_detection(self):
+        self.assertTrue(dp.is_claude_agent_id("a09a60f5e7bdf2633"))
+        self.assertTrue(dp.is_claude_agent_id("agent-a09a60f5e7bdf2633"))
+        self.assertFalse(dp.is_claude_agent_id("aaaaaaaa-0000-0000-0000-000000000001"))
+        self.assertFalse(dp.is_claude_agent_id("aaaaaaaa"))
+        self.assertFalse(dp.is_claude_agent_id("../../etc/passwd"))
+
+    def test_valid_transcript_extracted(self):
+        agent = "a0000000000000001"
+        path = self.standard_claude(agent, APPROVED_SHORT)
+        self.assertEqual(dp.find_claude_subagent_transcript(agent), os.path.abspath(path))
+        ex = dp.extract_dossier_from_claude_transcript(path)
+        self.assertEqual(ex["source"], dp.CLAUDE_SOURCE)
+        self.assertEqual(ex["dossier"]["status"], "APPROVED")
+        self.assertEqual(ex["conversation_id"], agent)
+        self.assertEqual(ex["parent_conversation_id"], CLAUDE_SESSION)
+        self.assertEqual(ex["agent_type"], dp.EVALUATOR_NAME)
+        self.assertEqual(ex["step_index"], 3)
+        self.assertEqual(ex["step_uuid"], f"uuid-{agent}-3")
+        self.assertEqual(ex["created_at_ts"], self.now - 30)
+        self.assertEqual(ex["sha256"], dp.sha256_text(ex["raw"]))
+
+    def test_few_shots_in_tool_results_and_prompt_are_ignored(self):
+        agent = "a0000000000000002"
+        rows = [self.user_row(self.now, dossier_text(APPROVED_SHORT))] + self.read_rows(self.now) + \
+            [self.text_row(self.now, "No block.")]
+        path = self.write_claude(agent, rows)
+        with self.assertRaises(dp.ProvenanceError):
+            dp.extract_dossier_from_claude_transcript(path)
+
+    def test_last_assistant_block_wins(self):
+        agent = "a0000000000000003"
+        rejected = {"status": "REJECTED", "approved_candidates": []}
+        rows = [self.text_row(self.now - 10, dossier_text(rejected)), self.text_row(self.now, dossier_text(APPROVED_SHORT))]
+        ex = dp.extract_dossier_from_claude_transcript(self.write_claude(agent, rows))
+        self.assertEqual(ex["dossier"]["status"], "APPROVED")
+        self.assertEqual(ex["step_index"], 1)
+
+    def test_wrong_agent_type_refused(self):
+        agent = "a0000000000000004"
+        path = self.standard_claude(agent, APPROVED_SHORT, agent_type="general-purpose")
+        with self.assertRaises(dp.ProvenanceError) as cm:
+            dp.extract_dossier_from_claude_transcript(path)
+        self.assertIn("general-purpose", str(cm.exception))
+
+    def test_missing_meta_refused(self):
+        agent = "a0000000000000005"
+        path = self.standard_claude(agent, APPROVED_SHORT, meta=False)
+        with self.assertRaises(dp.ProvenanceError):
+            dp.extract_dossier_from_claude_transcript(path)
+
+    def test_rows_from_other_agent_or_session_refused(self):
+        agent = "a0000000000000006"
+        row = self.text_row(self.now, dossier_text(APPROVED_SHORT))
+        row["sessionId"] = CLAUDE_OTHER_SESSION
+        with self.assertRaises(dp.ProvenanceError):
+            dp.extract_dossier_from_claude_transcript(self.write_claude(agent, [row]))
+        agent2 = "a0000000000000007"
+        row = self.text_row(self.now, dossier_text(APPROVED_SHORT))
+        row["isSidechain"] = False
+        with self.assertRaises(dp.ProvenanceError):
+            dp.extract_dossier_from_claude_transcript(self.write_claude(agent2, [row]))
+
+    def test_non_canonical_path_refused(self):
+        path = os.path.join(self.root, "agent-a0000000000000008.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(self.text_row(self.now, dossier_text(APPROVED_SHORT))) + "\n")
+        with self.assertRaises(dp.ProvenanceError):
+            dp.extract_dossier_from_claude_transcript(path)
+
+    def test_lookup_errors(self):
+        with self.assertRaises(dp.ProvenanceError):
+            dp.find_claude_subagent_transcript("a0000000000000099")
+        with self.assertRaises(dp.ProvenanceError):
+            dp.find_claude_subagent_transcript("../etc")
+        self.standard_claude("a00000000000000aa", APPROVED_SHORT, slug="-repo-a")
+        self.standard_claude("a00000000000000aa", APPROVED_SHORT, slug="-repo-b")
+        with self.assertRaises(dp.ProvenanceError) as cm:
+            dp.find_claude_subagent_transcript("a00000000000000aa")
+        self.assertIn("ambiguous", str(cm.exception))
+
+
+class TestClaudeTradeValidation(ClaudeTranscriptFixture):
+
+    def test_valid_claude_dossier_passes(self):
+        record = self.record_claude("a1000000000000001", APPROVED_SHORT)
+        self.assertEqual(record["provenance"]["source"], dp.CLAUDE_SOURCE)
+        self.assertEqual(record["provenance"]["agent_type"], dp.EVALUATOR_NAME)
+        self.assertEqual(record["parent_conversation_id"], CLAUDE_SESSION)
+        ok, reason, cand = self.validate("FILUSDT", "SHORT")
+        self.assertTrue(ok, reason)
+        self.assertEqual(cand["direction"], "SHORT")
+
+    def test_direction_and_symbol_enforced(self):
+        self.record_claude("a1000000000000002", APPROVED_SHORT)
+        ok, reason, _ = self.validate("FILUSDT", "LONG")
+        self.assertFalse(ok)
+        self.assertIn("SHORT", reason)
+        ok, _, _ = self.validate("BTCUSDT", "SHORT")
+        self.assertFalse(ok)
+
+    def test_expired_dossier_rejected(self):
+        record = self.record_claude("a1000000000000003", APPROVED_SHORT)
+        ok, reason, _ = self.validate("FILUSDT", "SHORT", now_ts=record["timestamp_ts"] + dp.TTL_SECONDS + 1)
+        self.assertFalse(ok)
+        self.assertIn("expired", reason)
+
+    def test_tampered_transcript_rejected(self):
+        agent = "a1000000000000004"
+        self.record_claude(agent, APPROVED_SHORT)
+        tampered = json.loads(json.dumps(APPROVED_SHORT))
+        tampered["approved_candidates"][0]["stop_loss"] = 9.99
+        self.standard_claude(agent, tampered)
+        ok, reason, _ = self.validate("FILUSDT", "SHORT")
+        self.assertFalse(ok)
+        self.assertIn("hash", reason.lower())
+
+    def test_meta_changed_after_recording_rejected(self):
+        agent = "a1000000000000005"
+        path = self.standard_claude(agent, APPROVED_SHORT)
+        with patch.object(rec, "_register_shadow"), redirect_stdout(io.StringIO()):
+            rec.record_from_claude_subagent(agent, target_env="prod", base_dir=self.workspace)
+        with open(dp.claude_meta_path(path), "w", encoding="utf-8") as f:
+            json.dump({"agentType": "general-purpose"}, f)
+        ok, reason, _ = self.validate("FILUSDT", "SHORT")
+        self.assertFalse(ok)
+        self.assertIn("general-purpose", reason)
+
+    def test_edited_record_rejected(self):
+        rejected = {"status": "REJECTED", "target_env": "PROD", "approved_candidates": [], "summary": "no"}
+        self.record_claude("a1000000000000006", rejected)
+        path = dp.default_dossier_path(self.workspace)
+        record = dp.load_dossier(path)
+        record.update(status="APPROVED", approved_symbols=["BTCUSDT"],
+                      approved_candidates=[{"symbol": "BTCUSDT", "direction": "LONG"}])
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(record, f)
+        ok, _, _ = self.validate("BTCUSDT", "LONG")
+        self.assertFalse(ok)
+
+    def test_record_pointing_to_other_agent_rejected(self):
+        self.record_claude("a1000000000000007", APPROVED_SHORT)
+        path = dp.default_dossier_path(self.workspace)
+        record = dp.load_dossier(path)
+        record["conversation_id"] = "a1000000000000008"
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(record, f)
+        ok, reason, _ = self.validate("FILUSDT", "SHORT")
+        self.assertFalse(ok)
+        self.assertIn("conversation_id", reason)
+
+    def test_record_refuses_wrong_agent_type_and_expired(self):
+        self.standard_claude("a1000000000000009", APPROVED_SHORT, agent_type="general-purpose")
+        with self.assertRaises(dp.ProvenanceError):
+            rec.record_from_claude_subagent("a1000000000000009", target_env="prod", base_dir=self.workspace,
+                                            shadow=False, verbose=False)
+        self.standard_claude("a100000000000000a", APPROVED_SHORT, ts=self.now - dp.TTL_SECONDS - 60)
+        with self.assertRaises(rec.RecordRefused):
+            rec.record_from_claude_subagent("a100000000000000a", target_env="prod", base_dir=self.workspace,
+                                            shadow=False, verbose=False)
+        self.assertFalse(os.path.exists(dp.default_dossier_path(self.workspace)))
+
+
+class TestClaudeRecordEvaluationCli(ClaudeTranscriptFixture):
+
+    def run_main(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(rec, "BASE_DIR", self.workspace), patch.object(rec, "_register_shadow"), \
+                redirect_stdout(out), redirect_stderr(err):
+            code = rec.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_from_claude_subagent(self):
+        self.standard_claude("a2000000000000001", APPROVED_SHORT)
+        code, out, err = self.run_main(["--from-claude-subagent", "a2000000000000001", "--env", "prod"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("Claude Code subagent transcript", out)
+        record = dp.load_dossier(dp.default_dossier_path(self.workspace))
+        self.assertEqual(record["conversation_id"], "a2000000000000001")
+        self.assertEqual(record["provenance"]["source"], dp.CLAUDE_SOURCE)
+
+    def test_from_subagent_auto_detects_claude_id(self):
+        self.standard_claude("a2000000000000002", APPROVED_SHORT)
+        code, _, err = self.run_main(["--from-subagent", "a2000000000000002", "--env", "prod"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(dp.load_dossier(dp.default_dossier_path(self.workspace))["provenance"]["source"],
+                         dp.CLAUDE_SOURCE)
+
+    def test_wrong_agent_type_fails_closed(self):
+        self.standard_claude("a2000000000000003", APPROVED_SHORT, agent_type="general-purpose")
+        code, _, err = self.run_main(["--from-claude-subagent", "a2000000000000003", "--env", "prod"])
+        self.assertEqual(code, 1)
+        self.assertIn("PROVENANCE", err)
+        self.assertFalse(os.path.exists(dp.default_dossier_path(self.workspace)))
+
+    def test_both_flags_refused(self):
+        code, _, _ = self.run_main(["--from-claude-subagent", "a2000000000000004", "--from-subagent", "x", "--env", "prod"])
+        self.assertEqual(code, 2)
+
+
+class TestClaudeProjectRoots(unittest.TestCase):
+
+    def test_override_and_defaults(self):
+        with patch.dict(os.environ, {dp.CLAUDE_PROJECTS_ENV: os.pathsep.join(["/x", "/y"])}):
+            self.assertEqual(dp.claude_project_roots(), ["/x", "/y"])
+        env = {k: v for k, v in os.environ.items() if k not in (dp.CLAUDE_PROJECTS_ENV, "CLAUDE_CONFIG_DIR")}
+        with patch.dict(os.environ, env, clear=True):
+            roots = dp.claude_project_roots()
+        self.assertEqual(roots[0], os.path.join(os.path.expanduser("~"), ".claude", "projects"))
+
+
 class TestPrimeEvaluatorBriefRiskProfile(unittest.TestCase):
 
     def test_risk_profile_from_profile_values(self):

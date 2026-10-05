@@ -100,5 +100,18 @@ venv.bak/
 Thumbs.db
 .playwright-mcp/
 
-# Claude Code per-machine settings
+# =================================================================
+# CLAUDE CODE
+# Tracked: CLAUDE.md, .claude/settings.json, .claude/settings.local.json.example and the
+# generated .claude/agents/*.md + .claude/skills/<repo skill>/SKILL.md
+# (scripts/dev/sync_claude_assets.py). Per-machine settings and worktrees stay local.
+# =================================================================
 .claude/settings.local.json
+.claude/worktrees/
+!CLAUDE.md
+!.claude/settings.json
+!.claude/settings.local.json.example
+!.claude/agents/
+!.claude/skills/market-radar/
+!.claude/skills/trade-execution-planner/
+!.claude/skills/pr-review/

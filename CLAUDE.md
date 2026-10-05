@@ -1,0 +1,60 @@
+@AGENTS.md
+@.agents/rules/trading.md
+@.agents/rules/trading-code-freeze.md
+
+# Claude Code
+
+AGENTS.md and the always-on rules in `.agents/rules/` (imported above) are the single source of truth
+and apply to Claude Code exactly as they apply to Google Antigravity (agy). This section only maps the
+agy mechanics to Claude Code.
+
+## Where things live
+
+| What | agy (source of truth) | Claude Code |
+|---|---|---|
+| Rules | `AGENTS.md`, `.agents/rules/*.md` | this file (imports them) |
+| Subagents | `.agents/agents/<name>/agent.md` | `.claude/agents/<name>.md` (generated) |
+| Skills | `.agents/skills/{market-radar,trade-execution-planner,pr-review}/SKILL.md` | `.claude/skills/<skill>/SKILL.md` (generated) |
+| Hooks | `.agents/hooks.json` | `.claude/settings.json` (+ `.claude/settings.local.json` on Windows) |
+| MCP servers | `.agents/mcp_config.json` | `.mcp.json` |
+
+- Never edit `.claude/agents/` or `.claude/skills/` by hand: edit `.agents/*`, then run
+  `python3 scripts/dev/sync_claude_assets.py` (tests run it with `--check` and fail on stale files).
+  New or renamed subagents only appear as `subagent_type` values after restarting the Claude Code session.
+- Tool names: `invoke_subagent` = Agent tool (`subagent_type`), `send_message` = the subagent's final
+  response, `view_file` = Read, `grep_search` = Grep, `list_dir` = Glob, `search_web` = WebSearch,
+  `read_url_content` = WebFetch, `run_command` = Bash, agy `conversationId` = Claude `agentId`
+  (subagent) or `session_id` (main session).
+- Hooks (`.claude/settings.json`): PreToolUse `pre_trade_guard.py` on Bash, MCP and file writes (deny =
+  exit 2); PostToolUse `post_trade_sync.py` and `post_pr_review_hook.py`; Stop
+  `pr_review_stop_hook.py --claude`. Hooks are fail-closed exactly as in agy: if they are not active,
+  live order execution is prohibited.
+
+## Clean-room evaluation before any trade
+
+1. `python3 scripts/prime_evaluator_brief.py` (add `--env testnet` only when the user asked for TESTNET).
+2. Agent tool with `subagent_type: "isolated_market_evaluator"`, in the foreground, asking it to evaluate
+   `logs/primed_brief.json` for the target environment. Never use a general-purpose agent or evaluate yourself.
+3. Keep the `agentId` from the Agent result and run
+   `python3 scripts/record_evaluation.py --from-claude-subagent <agentId>`. The recorder reads the
+   `<dossier_json>` block from `~/.claude/projects/<slug>/<session>/subagents/agent-<agentId>.jsonl`, requires
+   `agentType: "isolated_market_evaluator"` in its `.meta.json` and stamps sha256 provenance; the hook and the
+   executor re-verify it and, in PROD, that the dossier came from this session.
+4. Execute only via `python3 scripts/execute_futures_trade.py --symbol <S> --direction <D> ...` as approved
+   (`--confirmed` only after the user's explicit "yes" for Tier A+/A). Full flow: the `trade-execution-planner` skill.
+
+## PR review
+
+`gh pr create` or a feature-branch push arms the review (PostToolUse); the Stop hook then asks you to run
+the `pr-review` skill: triage, launch every required `<id>_reviewer` with the Agent tool in ONE message,
+`python3 scripts/ci/assemble_review.py --pr <n> --from-claude-subagent <id>=<agentId> ...` (it verifies each
+transcript's agentType), `verify_review.py`, then `gh pr comment <n> --body-file logs/pr_review/report.md`.
+
+## Windows
+
+Claude Code runs hooks with Git Bash, where `python3` is usually the Microsoft Store alias and the desk's
+Python dependencies live in WSL. Copy `.claude/settings.local.json.example` to `.claude/settings.local.json`
+(gitignored), replace `<WSL_DISTRO>` and `<REPO_PATH_IN_WSL>`, and run scripts as
+`wsl.exe -d <WSL_DISTRO> -- python3 scripts/...`. Hooks from both files are merged: the `settings.json`
+copies fail as non-blocking errors and the WSL copies make the decisions. Inside WSL the transcript lookup
+also searches `/mnt/<drive>/Users/*/.claude/projects`.

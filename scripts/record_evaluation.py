@@ -8,12 +8,16 @@ the pre_trade_guard.py hook and execute_futures_trade.py before any order is dis
 
 Canonical flow (PROD and TESTNET):
   1. python3 scripts/prime_evaluator_brief.py
-  2. invoke_subagent(TypeName="isolated_market_evaluator")  -> returns its conversationId
-  3. python3 scripts/record_evaluation.py --from-subagent <conversationId>
+  2. agy:         invoke_subagent(TypeName="isolated_market_evaluator")  -> returns its conversationId
+     Claude Code: Agent tool, subagent_type "isolated_market_evaluator"   -> reports its agentId
+  3. agy:         python3 scripts/record_evaluation.py --from-subagent <conversationId>
+     Claude Code: python3 scripts/record_evaluation.py --from-claude-subagent <agentId>
+     (--from-subagent also accepts a Claude Code agentId; the id format is auto-detected)
 
---from-subagent reads the <dossier_json> block the subagent itself emitted in its Antigravity
-transcript and stores a provenance stamp (transcript path, step index, sha256) that every
-consumer re-verifies. Dossiers typed by hand are NOT accepted in PROD.
+The recorder reads the <dossier_json> block the subagent itself emitted in its transcript and
+stores a provenance stamp (source, transcript path, step, sha256) that every consumer re-verifies.
+Claude Code transcripts must carry agentType "isolated_market_evaluator" in their meta.json.
+Dossiers typed by hand are NOT accepted in PROD.
 
 Legacy manual paths (TESTNET only, stored as schema_version 1 / source "manual_testnet"):
   python3 scripts/record_evaluation.py --env testnet --symbols TIAUSDT,SAGAUSDT --directions LONG,SHORT
@@ -138,8 +142,10 @@ def _print_summary(record: dict, dossier_file: str, base: str, now_ts: int) -> N
     if record.get("summary"):
         print(f"   Summary: {record['summary']}")
     prov = record.get("provenance") or {}
-    if prov.get("source") == "agy_subagent_transcript":
-        print(f"   Provenance: subagent transcript step {prov.get('step_index')} sha256 {str(prov.get('sha256'))[:16]}…")
+    if prov.get("source") in dp.SUBAGENT_SOURCES:
+        runtime = "Claude Code" if prov.get("source") == dp.CLAUDE_SOURCE else "agy"
+        print(f"   Provenance: {runtime} subagent transcript step {prov.get('step_index')} "
+              f"sha256 {str(prov.get('sha256'))[:16]}…")
     else:
         print(f"   Provenance: {prov.get('source', 'none')} (schema v{record.get('schema_version')}, not accepted in PROD)")
     print(f"   Location: {_rel(dossier_file, base)}")
@@ -154,20 +160,49 @@ def record_from_subagent(
     verbose: bool = True,
 ) -> dict:
     """Extracts the dossier emitted by the evaluator subagent from its transcript and records it.
+    Accepts an agy conversationId or a Claude Code agentId (auto-detected).
     Raises dp.ProvenanceError (extraction failed) or RecordRefused (policy)."""
+    if dp.is_claude_agent_id(conversation_id):
+        return record_from_claude_subagent(conversation_id, target_env, base_dir, now_ts, shadow, verbose)
+    transcript = dp.find_subagent_transcript(conversation_id)
+    extracted = dp.extract_dossier_from_transcript(transcript)
+    return _record_extracted(extracted, target_env, base_dir, now_ts, shadow, verbose)
+
+
+def record_from_claude_subagent(
+    agent_id: str,
+    target_env: Optional[str] = None,
+    base_dir: Optional[str] = None,
+    now_ts: Optional[int] = None,
+    shadow: bool = True,
+    verbose: bool = True,
+) -> dict:
+    """Records the dossier emitted by a Claude Code 'isolated_market_evaluator' subagent (agentId).
+    The transcript's meta.json must report agentType 'isolated_market_evaluator'."""
+    transcript = dp.find_claude_subagent_transcript(agent_id)
+    extracted = dp.extract_dossier_from_claude_transcript(transcript, dp.EVALUATOR_NAME)
+    return _record_extracted(extracted, target_env, base_dir, now_ts, shadow, verbose)
+
+
+def _record_extracted(
+    extracted: dict,
+    target_env: Optional[str],
+    base_dir: Optional[str],
+    now_ts: Optional[int],
+    shadow: bool,
+    verbose: bool,
+) -> dict:
     base = base_dir or BASE_DIR
     env = _resolve_env(target_env, base)
     now_ts = int(now_ts if now_ts is not None else time.time())
-
-    transcript = dp.find_subagent_transcript(conversation_id)
-    extracted = dp.extract_dossier_from_transcript(transcript)
     record = dp.build_record_from_extraction(extracted, recorded_at_ts=now_ts)
 
     parent_id = extracted.get("parent_conversation_id")
     if not parent_id or parent_id == extracted.get("conversation_id"):
         raise RecordRefused(
-            "The transcript is not a subagent conversation (no parent sender found). Pass the conversationId "
-            "returned by invoke_subagent for 'isolated_market_evaluator', not the main agent's own conversation."
+            "The transcript is not a subagent conversation (no parent sender found). Pass the id of the "
+            "'isolated_market_evaluator' subagent (agy conversationId from invoke_subagent, or Claude Code "
+            "agentId from the Agent tool), not the main agent's own conversation."
         )
 
     evaluated_at = int(record.get("timestamp_ts") or 0)
@@ -219,7 +254,8 @@ def record_evaluation_dossier(
     if env == "prod":
         raise RecordRefused(
             "Manual dossiers are not accepted in PROD. Invoke the 'isolated_market_evaluator' subagent and run "
-            "`python3 scripts/record_evaluation.py --from-subagent <conversationId>`."
+            "`python3 scripts/record_evaluation.py --from-subagent <conversationId>` (agy) or "
+            "`--from-claude-subagent <agentId>` (Claude Code)."
         )
 
     now_ts = int(time.time())
@@ -263,7 +299,11 @@ def _legacy_from_payload(data: dict, args, env: str) -> dict:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluator subagent dossier recorder")
     parser.add_argument("--from-subagent", metavar="CONVERSATION_ID",
-                        help="Record the <dossier_json> emitted by the evaluator subagent (full conversationId or unique prefix)")
+                        help="Record the <dossier_json> emitted by the evaluator subagent (agy conversationId or unique "
+                             "prefix; a Claude Code agentId is auto-detected)")
+    parser.add_argument("--from-claude-subagent", metavar="AGENT_ID",
+                        help="Record the <dossier_json> emitted by the Claude Code 'isolated_market_evaluator' "
+                             "subagent (agentId reported by the Agent tool)")
     parser.add_argument("--env", default=None, help="Target environment (prod|testnet). Defaults to the project resolver.")
     # Legacy manual paths (TESTNET only)
     parser.add_argument("--symbols", type=str, help="[TESTNET only] Comma-separated approved symbols")
@@ -286,6 +326,12 @@ def main(argv: Optional[list] = None) -> int:
         return EXIT_REFUSED
 
     try:
+        if args.from_subagent and args.from_claude_subagent:
+            print("❌ Use either --from-subagent or --from-claude-subagent, not both.", file=sys.stderr)
+            return EXIT_REFUSED
+        if args.from_claude_subagent:
+            record_from_claude_subagent(args.from_claude_subagent, target_env=env)
+            return EXIT_OK
         if args.from_subagent:
             record_from_subagent(args.from_subagent, target_env=env)
             return EXIT_OK
@@ -298,8 +344,9 @@ def main(argv: Optional[list] = None) -> int:
         if env == "prod":
             raise RecordRefused(
                 "Manual dossier recording (--symbols / --json-file / stdin) is disabled in PROD. "
-                "Invoke the 'isolated_market_evaluator' subagent via invoke_subagent and record its verdict with "
-                "`python3 scripts/record_evaluation.py --from-subagent <conversationId>`."
+                "Invoke the 'isolated_market_evaluator' subagent (agy invoke_subagent / Claude Code Agent tool) and "
+                "record its verdict with `python3 scripts/record_evaluation.py --from-subagent <conversationId>` "
+                "or `--from-claude-subagent <agentId>`."
             )
 
         if args.json_file:

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
 scripts/ci/pr_review_state.py
-Pending-review marker shared by the agy PR review hooks and the /pr-review skill.
+Pending-review marker shared by the PR review hooks (agy .agents/hooks.json and Claude Code
+.claude/settings.json) and the /pr-review skill. conversation_id holds the agy conversationId or
+the Claude Code session_id of the session that created/pushed the PR.
 
 Lifecycle (logs/pr_review_state.json, gitignored):
   pending      post_pr_review_hook.py (PostToolUse) saw a successful `gh pr create` or a feature-branch push.

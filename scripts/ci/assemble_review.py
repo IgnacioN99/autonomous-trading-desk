@@ -3,15 +3,21 @@
 scripts/ci/assemble_review.py
 Deterministic assembler for the in-session multi-agent PR review (/pr-review skill).
 
-Each reviewer subagent (.agents/agents/<reviewer>_reviewer/agent.md) replies to the parent with a
-send_message holding one "### Verdict: <reviewer>" section. This script reads that section straight
-from each subagent transcript (~/.gemini/<product>/brain/<conversationId>/...), so the parent agent
-never retypes or edits a verdict, and computes the consolidated verdict mechanically.
+Each reviewer subagent (.agents/agents/<reviewer>_reviewer/agent.md, generated for Claude Code into
+.claude/agents/<reviewer>_reviewer.md) replies to the parent with one "### Verdict: <reviewer>" section.
+This script reads that section straight from each subagent transcript, so the parent agent never retypes
+or edits a verdict, and computes the consolidated verdict mechanically:
+  * agy:         ~/.gemini/<product>/brain/<conversationId>/.system_generated/logs/transcript.jsonl
+  * Claude Code: ~/.claude/projects/<slug>/<sessionId>/subagents/agent-<agentId>.jsonl, whose meta.json
+                 agentType must be "<reviewer>_reviewer" (a general-purpose agent cannot sign a verdict).
 
 Usage (repo root):
   python3 scripts/ci/assemble_review.py --pr 13 \
       --from-subagent trading_risk=<conversationId> --from-subagent agentic_harness=<conversationId> ...
-  # Runtimes without agy transcripts: --section <reviewer>=<file.md>
+  python3 scripts/ci/assemble_review.py --pr 13 \
+      --from-claude-subagent trading_risk=<agentId> --from-claude-subagent agentic_harness=<agentId> ...
+  # --from-subagent also accepts Claude Code agentIds (auto-detected).
+  # Runtimes without transcripts: --section <reviewer>=<file.md>
 
 Writes logs/pr_review/report.md (--out). Exit codes follow verify_review.py:
   0 all approved | 1 changes required | 2 incomplete (missing or inconclusive reviewers)
@@ -28,6 +34,7 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from scripts.ci import verify_review as gate  # noqa: E402
+from scripts.ci.triage_pr import REVIEWERS  # noqa: E402
 from scripts.utils import dossier_provenance as transcripts  # noqa: E402
 
 OVERALL_APPROVED = "[APPROVED FOR MERGE]"
@@ -46,6 +53,25 @@ def extract_section_from_transcript(path: str, reviewer: str) -> str | None:
     return found
 
 
+def reviewer_agent_type(reviewer: str) -> str:
+    """Subagent type that must have produced a reviewer's verdict (e.g. trading_risk -> trading_risk_reviewer)."""
+    conf = REVIEWERS.get(reviewer) or {}
+    return conf.get("agent") or f"{reviewer}_reviewer"
+
+
+def extract_section_from_claude_transcript(path: str, reviewer: str) -> str | None:
+    """Last '### Verdict: <reviewer>' section written by a Claude Code '<reviewer>_reviewer' subagent.
+    Raises ProvenanceError when the transcript does not belong to that subagent type."""
+    _, rows = transcripts.read_claude_subagent(path, reviewer_agent_type(reviewer))
+    found = None
+    for _, row in rows:
+        for text in transcripts.claude_assistant_texts(row):
+            section = gate.extract_section(text, reviewer)
+            if section:
+                found = section
+    return found
+
+
 def _pairs(values: list[str], flag: str) -> dict:
     out = {}
     for value in values or []:
@@ -56,11 +82,32 @@ def _pairs(values: list[str], flag: str) -> dict:
     return out
 
 
-def collect_sections(required: list[str], subagents: dict, section_files: dict) -> tuple[dict, dict, list]:
-    """Returns (sections, provenance, errors) for the required reviewers."""
+def collect_sections(required: list[str], subagents: dict, section_files: dict,
+                     claude_subagents: dict | None = None) -> tuple[dict, dict, list]:
+    """Returns (sections, provenance, errors) for the required reviewers.
+    subagents: reviewer -> agy conversationId (Claude Code agentIds are auto-detected);
+    claude_subagents: reviewer -> Claude Code agentId; section_files: reviewer -> Markdown file."""
     sections, provenance, errors = {}, {}, []
+    claude_subagents = dict(claude_subagents or {})
+    subagents = dict(subagents or {})
+    for rev, value in list(subagents.items()):
+        if transcripts.is_claude_agent_id(value) and rev not in claude_subagents:
+            claude_subagents[rev] = subagents.pop(rev)
     for rev in required:
-        if rev in subagents:
+        if rev in claude_subagents:
+            agent_id = claude_subagents[rev]
+            try:
+                path = transcripts.find_claude_subagent_transcript(agent_id)
+                section = extract_section_from_claude_transcript(path, rev)
+            except transcripts.ProvenanceError as e:
+                errors.append(f"{rev}: {e}")
+                continue
+            if section:
+                sections[rev] = section
+                provenance[rev] = f"claude subagent {agent_id}"
+            else:
+                errors.append(f"{rev}: no '### Verdict: {rev}' section in Claude Code subagent {agent_id} transcript")
+        elif rev in subagents:
             try:
                 path = transcripts.find_subagent_transcript(subagents[rev])
             except transcripts.ProvenanceError as e:
@@ -117,7 +164,8 @@ def build_report(manifest: dict, sections: dict, provenance: dict, pr: str = "")
         f"- **Changed Files:** {len(manifest.get('changed_files', []))} | "
         f"**Fail-Closed Triage:** {manifest.get('fail_closed_triggered', False)}",
         f"- **Required Reviewers:** {', '.join(required) or 'none'}",
-        "- **Method:** isolated agy reviewer subagents (invoke_subagent); sections copied verbatim from their transcripts.",
+        "- **Method:** isolated reviewer subagents (agy invoke_subagent / Claude Code Agent tool); "
+        "sections copied verbatim from their transcripts.",
         "",
         body if body else "_No reviewer sections were collected._",
         "",
@@ -137,6 +185,7 @@ def main() -> int:
     parser.add_argument("--out", default="logs/pr_review/report.md")
     parser.add_argument("--pr", default="", help="PR number (shown in the report).")
     parser.add_argument("--from-subagent", action="append", default=[], metavar="REVIEWER=CONVERSATION_ID")
+    parser.add_argument("--from-claude-subagent", action="append", default=[], metavar="REVIEWER=AGENT_ID")
     parser.add_argument("--section", action="append", default=[], metavar="REVIEWER=FILE")
     args = parser.parse_args()
 
@@ -144,7 +193,8 @@ def main() -> int:
         manifest = json.load(f)
     required = manifest.get("required_reviewers", [])
     sections, provenance, errors = collect_sections(
-        required, _pairs(args.from_subagent, "--from-subagent"), _pairs(args.section, "--section"))
+        required, _pairs(args.from_subagent, "--from-subagent"), _pairs(args.section, "--section"),
+        _pairs(args.from_claude_subagent, "--from-claude-subagent"))
 
     report, result = build_report(manifest, sections, provenance, args.pr)
     out = Path(args.out)

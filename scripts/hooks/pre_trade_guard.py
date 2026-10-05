@@ -34,11 +34,13 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    logs/session_state.json must exist, be valid (is_valid=True) and NOT stale (<= 300s).
 6. EVALUATION DOSSIER PROVENANCE (scripts/utils/dossier_provenance.py):
    PROD requires a schema v2 dossier whose provenance hash is re-verified against the
-   isolated_market_evaluator subagent transcript, a matching direction and (when known) a
-   parent conversation equal to the current one. TESTNET is relaxed.
+   isolated_market_evaluator subagent transcript (agy brain or Claude Code subagents/ with
+   meta agentType), a matching direction and (when known) a parent conversation equal to the
+   current one (agy conversationId / Claude Code session_id). TESTNET is relaxed.
 7. EVALUATION TRAIL PROTECTION:
-   Writes into logs/evaluations/ or Antigravity brain transcripts are denied; harness files require
-   explicit confirmation (force_ask).
+   Writes into logs/evaluations/, Antigravity brain transcripts or Claude Code subagent transcripts
+   are denied, and so are agent-set transcript-root overrides (AGY_BRAIN_DIRS / CLAUDE_PROJECTS_DIRS);
+   harness files (incl. .claude/agents/) require explicit confirmation (force_ask).
 8. PASS-THROUGH:
    Tool calls unrelated to trading return "ask" so the runtime's normal permission policy applies.
    "allow" is reserved for calls that passed every trading gate or are purely risk-reducing.
@@ -100,7 +102,9 @@ HEARTBEAT_ENV_OVERRIDE = "PRE_TRADE_GUARD_HEARTBEAT_FILE"
 CHOKE_POINT = "'scripts/execute_futures_trade.py'"
 EVALUATOR_HINT = (
     "Invoke the clean-room evaluator via invoke_subagent with TypeName 'isolated_market_evaluator', "
-    "then record its verdict with `python3 scripts/record_evaluation.py --from-subagent <conversationId>`."
+    "then record its verdict with `python3 scripts/record_evaluation.py --from-subagent <conversationId>` "
+    "(Claude Code: Agent tool with subagent_type 'isolated_market_evaluator', then "
+    "`python3 scripts/record_evaluation.py --from-claude-subagent <agentId>`)."
 )
 
 # -----------------------------------------------------------------------------
@@ -276,16 +280,22 @@ HTTP_WRITE_RE = re.compile(
 )
 HTTP_CLIENT_RE = re.compile(r"\b(?:curl|wget|http|https|xh|httpie)\b", re.IGNORECASE)
 
-# Evaluation trail (dossiers + Antigravity brain transcripts used for provenance)
+# Evaluation trail (dossiers + Antigravity brain / Claude Code subagent transcripts used for provenance)
 EVALUATION_TRAIL_CMD_RE = re.compile(
     r"latest_dos|logs[\\/]+eval|\bevaluations[\\/]|\.gemini[\\/]+[^\\/\s'\"]+[\\/]+brain\b|"
-    r"antigravity[^\\/\s'\"]*[\\/]+brain\b",
+    r"antigravity[^\\/\s'\"]*[\\/]+brain\b|\bsubagents[\\/]+agent-a[0-9a-f]|"
+    r"\.claude[\\/]+projects[\\/]+[^\\/\s'\"]+[\\/]+[^\\/\s'\"]+[\\/]+subagents\b",
     re.IGNORECASE,
+)
+# Test-only overrides of the transcript roots must never reach the recorder or the executor from the agent:
+# they would let a forged transcript outside the runtime's own directory sign a dossier.
+TRANSCRIPT_ROOT_OVERRIDE_RE = re.compile(
+    r"\b(?:AGY_BRAIN_DIRS|CLAUDE_PROJECTS_DIRS)\b(?:['\"]\]?)?\s*=|\b(?:AGY_BRAIN_DIRS|CLAUDE_PROJECTS_DIRS)['\"]\s*[,:]"
 )
 SESSION_STATE_RE = re.compile(r"session_state\.json", re.IGNORECASE)
 HARNESS_PATH_CMD_RE = re.compile(
     r"scripts[\\/]+hooks[\\/]|\.agents[\\/]+hooks\.json|dossier_provenance\.py|record_evaluation\.py|"
-    r"\.agents[\\/]+agents[\\/]|\.claude[\\/]+settings|config[\\/]+user_profile\.json",
+    r"\.agents[\\/]+agents[\\/]|\.claude[\\/]+agents[\\/]|\.claude[\\/]+settings|config[\\/]+user_profile\.json",
     re.IGNORECASE,
 )
 INLINE_WRITE_MARKERS_RE = re.compile(r"\.write\s*\(|dump\s*\(|open\s*\([^)]*['\"][wax]\+?b?['\"]|os\.(?:remove|unlink|replace|rename)|shutil\.", re.IGNORECASE)
@@ -295,8 +305,11 @@ HARNESS_FILES = {
     ".agents/hooks.json", "scripts/utils/dossier_provenance.py", "scripts/record_evaluation.py",
     ".claude/settings.json", ".claude/settings.local.json", "config/user_profile.json",
 }
-HARNESS_DIRS = ("scripts/hooks/", ".agents/agents/")
+HARNESS_DIRS = ("scripts/hooks/", ".agents/agents/", ".claude/agents/")
 BRAIN_PATH_RE = re.compile(r"(?:^|/)\.gemini/[^/]+/brain(?:/|$)", re.IGNORECASE)
+# Claude Code subagent transcripts: <projects>/<slug>/<sessionId>/subagents/agent-<id>.jsonl (+ .meta.json)
+CLAUDE_SUBAGENT_PATH_RE = re.compile(r"(?:^|/)subagents/agent-a[0-9a-f]+\.(?:jsonl|meta\.json)$|"
+                                     r"(?:^|/)\.claude/projects/[^/]+/[^/]+/subagents(?:/|$)", re.IGNORECASE)
 
 
 # =============================================================================
@@ -604,8 +617,7 @@ def check_dossier(symbol: str, direction: Optional[str], env: str, base_dir: str
     # evaluator transcript itself so a tampered approved list / parent id in the JSON file cannot widen it.
     try:
         record = dp.load_dossier(dp.default_dossier_path(base_dir))
-        transcript = (record.get("provenance") or {}).get("transcript_path")
-        rebuilt = dp.build_record_from_extraction(dp.extract_dossier_from_transcript(transcript))
+        rebuilt = dp.build_record_from_extraction(dp.extract_recorded_transcript(record))
     except Exception as e:
         return False, f"Failed to re-derive the dossier from the evaluator transcript ({e}).", None
     rebuilt_cand = dp.find_candidate(rebuilt, symbol) if rebuilt.get("status") == "APPROVED" else None
@@ -919,8 +931,15 @@ def analyze_run_command(command_line: str, cwd: str, base_dir: str) -> Dict[str,
     if EVALUATION_TRAIL_CMD_RE.search(command_line):
         result["deny"] = (
             "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Evaluation Trail Protection): Commands must not read or write "
-            "logs/evaluations/, latest_dossier.json or Antigravity brain transcripts. "
-            "Use view_file to inspect the dossier. " + EVALUATOR_HINT
+            "logs/evaluations/, latest_dossier.json, Antigravity brain transcripts or Claude Code subagent "
+            "transcripts. Use view_file (Claude Code: Read) to inspect the dossier. " + EVALUATOR_HINT
+        )
+        return result
+    if TRANSCRIPT_ROOT_OVERRIDE_RE.search(command_line):
+        result["deny"] = (
+            "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Evaluation Trail Protection): AGY_BRAIN_DIRS / CLAUDE_PROJECTS_DIRS "
+            "are test-only overrides of the subagent transcript roots and cannot be set by the agent in a "
+            "command. " + EVALUATOR_HINT
         )
         return result
 
@@ -976,7 +995,8 @@ def analyze_run_command(command_line: str, cwd: str, base_dir: str) -> Dict[str,
 
         # 7. Evaluation recorder
         if RECORD_EVALUATION_RE.search(text) and prog not in INSPECTION_PROGRAMS:
-            from_subagent = any(t == "--from-subagent" or t.startswith("--from-subagent=") for t in tokens)
+            from_subagent = any(t in ("--from-subagent", "--from-claude-subagent")
+                                or t.startswith(("--from-subagent=", "--from-claude-subagent=")) for t in tokens)
             result["record_eval"] = {"from_subagent": from_subagent, "text": text}
             result["all_safe"] = False
             continue
@@ -1142,10 +1162,11 @@ def evaluate_file_write(target: str, content: str, base_dir: str) -> Tuple[str, 
         return "force_ask", "File write without a resolvable target path."
     abs_norm, rel = _normalize_target(target, base_dir)
     rel_l = rel.lower()
-    if rel_l == "logs/evaluations" or rel_l.startswith("logs/evaluations/") or BRAIN_PATH_RE.search(abs_norm):
+    if (rel_l == "logs/evaluations" or rel_l.startswith("logs/evaluations/") or BRAIN_PATH_RE.search(abs_norm)
+            or CLAUDE_SUBAGENT_PATH_RE.search(abs_norm)):
         return "deny", (
-            "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Evaluation Trail Protection): Writing to logs/evaluations/ or to "
-            "Antigravity brain transcripts is forbidden. " + EVALUATOR_HINT
+            "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Evaluation Trail Protection): Writing to logs/evaluations/, "
+            "Antigravity brain transcripts or Claude Code subagent transcripts is forbidden. " + EVALUATOR_HINT
         )
     if rel_l == "logs/session_state.json":
         return "deny", (
@@ -1316,6 +1337,9 @@ def evaluate_payload(payload: dict) -> Tuple[str, str, str]:
     tool_label = call["tool"] or "?"
     base_dir = find_workspace_root()
     conversation_id = payload.get("conversationId") if isinstance(payload.get("conversationId"), str) else None
+    if conversation_id is None and "toolCall" not in payload and isinstance(payload.get("session_id"), str):
+        # Claude Code: the evaluator subagent transcript records the parent session as its sessionId
+        conversation_id = payload["session_id"] or None
 
     # ---------------------------------------------------------------- file writes
     if call["kind"] == "file_write":
