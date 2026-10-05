@@ -3,7 +3,7 @@
 # report_issue.sh - Native Bash GitHub Issue Reporter for Autonomous Agents
 # ==============================================================================
 # Designed to be invoked directly from the agent shell (run_command)
-# with zero Python dependencies (requires only bash and curl).
+# Transport: the authenticated GitHub CLI (gh); curl + GITHUB_TOKEN is a fallback for environments without gh.
 #
 # If Python or the virtual environment crashes, this script continues functioning
 # to report the incident directly to GitHub or safely enqueue in local backlog.
@@ -56,6 +56,24 @@ fi
 
 REPO="${GITHUB_REPO:-$(derive_repo)}"
 TOKEN="${GITHUB_TOKEN:-}"
+
+# Primary transport: the GitHub CLI with an authenticated session (gh auth login).
+# GITHUB_TOKEN + curl is only a fallback for environments without gh (e.g. CI).
+gh_ready() {
+    command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1
+}
+
+# Creates an issue from a JSON payload ({title, body, labels}) via gh; prints the issue URL.
+# Retries without labels if the repository rejects them.
+gh_create_issue() {
+    local payload="$1" url
+    url=$(printf '%s' "$payload" | gh api -X POST "repos/${REPO}/issues" --input - --jq '.html_url' 2>/dev/null) && {
+        echo "$url"; return 0; }
+    url=$(printf '%s' "$payload" | python3 -c 'import json,sys; d=json.load(sys.stdin); d.pop("labels",None); print(json.dumps(d))' 2>/dev/null \
+        | gh api -X POST "repos/${REPO}/issues" --input - --jq '.html_url' 2>/dev/null) && {
+        echo "$url"; return 0; }
+    return 1
+}
 
 # Default parameters
 TITLE=""
@@ -132,8 +150,8 @@ sync_backlog() {
         echo "❌ Error: GITHUB_REPO is not configured and cannot be derived from git remote."
         exit 1
     fi
-    if [ -z "$TOKEN" ]; then
-        echo "❌ Error: GITHUB_TOKEN is not defined in environment or .env."
+    if ! gh_ready && [ -z "$TOKEN" ]; then
+        echo "❌ Error: no authenticated GitHub CLI (run 'gh auth login') and no GITHUB_TOKEN fallback."
         exit 1
     fi
     if [ ! -f "$BACKLOG_FILE" ] || [ ! -s "$BACKLOG_FILE" ]; then
@@ -147,32 +165,44 @@ sync_backlog() {
 
     count_success=0
     count_failed=0
+    count_skipped=0
 
     while IFS= read -r line || [ -n "$line" ]; do
         [ -z "$line" ] && continue
 
-        item_title=$(echo "$line" | sed -n 's/.*"title": *\([^,]*\),.*/\1/p' | sed 's/^"//;s/"$//')
+        item_title=$(printf '%s' "$line" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("title") or "")' 2>/dev/null || true)
+        if [ -z "$item_title" ]; then
+            # Malformed entry (no title): GitHub would reject it; drop it instead of retrying forever
+            ((count_skipped++)) || true
+            continue
+        fi
 
-        http_code=$(curl -s -o /dev/null -w "%{http_code}" \
-            -X POST "https://api.github.com/repos/${REPO}/issues" \
-            -H "Authorization: Bearer ${TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            -H "User-Agent: Autonomous-Trading-Desk-Bash" \
-            -d "$line")
+        published=false
+        if gh_ready; then
+            gh_create_issue "$line" >/dev/null && published=true
+        elif [ -n "$TOKEN" ]; then
+            http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+                -X POST "https://api.github.com/repos/${REPO}/issues" \
+                -H "Authorization: Bearer ${TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "User-Agent: Autonomous-Trading-Desk-Bash" \
+                -d "$line")
+            [ "$http_code" = "201" ] && published=true
+        fi
 
-        if [ "$http_code" = "201" ]; then
+        if [ "$published" = true ]; then
             echo "   ✅ Successfully published: ${item_title}"
-            ((count_success++))
+            ((count_success++)) || true
         else
-            echo "   ❌ HTTP $http_code error publishing: ${item_title}"
+            echo "   ❌ Error publishing: ${item_title}"
             echo "$line" >> "$TEMP_BACKLOG"
-            ((count_failed++))
+            ((count_failed++)) || true
         fi
         sleep 1
     done < "$BACKLOG_FILE"
 
     mv "$TEMP_BACKLOG" "$BACKLOG_FILE"
-    echo "🏁 Backlog sync complete: $count_success published, $count_failed remaining."
+    echo "🏁 Backlog sync complete: $count_success published, $count_failed remaining, $count_skipped malformed dropped."
     exit 0
 }
 
@@ -198,9 +228,9 @@ sanitize_telemetry() {
     text=$(echo "$text" | sed -E 's/ghp_[A-Za-z0-9_]{20,}/[REDACTED_GH_TOKEN]/g')
     text=$(echo "$text" | sed -E 's/github_pat_[A-Za-z0-9_]{20,}/[REDACTED_GH_PAT]/g')
     # Redact Notion Tokens
-    text=$(echo "$text" | sed -E 's/(secret_|ntn_)[A-Za-z0-9_]{20,}/[REDACTED_NOTION_TOKEN]/g')
+    text=$(echo "$text" | sed -E 's/(secret_|ntn_)[A-Za-z0-9_]{10,}/[REDACTED_NOTION_TOKEN]/g')
     # Redact Bearer Tokens
-    text=$(echo "$text" | sed -E 's/(Bearer[[:space:]]+)[A-Za-z0-9\-._~+/]+=*/\1[REDACTED_TOKEN]/gI')
+    text=$(echo "$text" | sed -E 's|(Bearer[[:space:]]+)[A-Za-z0-9._~+/-]+=*|\1[REDACTED_TOKEN]|gI')
     # Redact API Keys / Passwords
     text=$(echo "$text" | sed -E 's/(api[_-]?key|secret[_-]?key|password|app[_-]?password)[[:space:]]*[:=][[:space:]]*["\x27]?[A-Za-z0-9/+=._-]{8,}["\x27]?/\1=[REDACTED]/gI')
     # Redact balances and dollar amounts
@@ -280,7 +310,14 @@ EOF
 # ------------------------------------------------------------------------------
 # Dispatch to GitHub API or Enqueue in Local Backlog
 # ------------------------------------------------------------------------------
-if [ -n "$TOKEN" ] && [ -n "$REPO" ]; then
+if [ -n "$REPO" ] && gh_ready; then
+    if ISSUE_URL=$(gh_create_issue "$PAYLOAD"); then
+        echo "✅ GITHUB ISSUE CREATED SUCCESSFULLY: #${ISSUE_URL##*/}"
+        echo "   URL: ${ISSUE_URL}"
+        exit 0
+    fi
+    echo "⚠️ gh failed to create the issue. Enqueueing in local backlog..."
+elif [ -n "$TOKEN" ] && [ -n "$REPO" ]; then
     HTTP_RESPONSE=$(curl -s -w "\n%{http_code}" \
         -X POST "https://api.github.com/repos/${REPO}/issues" \
         -H "Authorization: Bearer ${TOKEN}" \
@@ -303,11 +340,11 @@ if [ -n "$TOKEN" ] && [ -n "$REPO" ]; then
 elif [ -z "$REPO" ]; then
     echo "ℹ️ GITHUB_REPO not configured or detectable from git remote. Enqueueing issue in local backlog (${BACKLOG_FILE})..."
 else
-    echo "ℹ️ GITHUB_TOKEN not detected in .env. Enqueueing issue in local backlog (${BACKLOG_FILE})..."
+    echo "ℹ️ GitHub CLI not authenticated (gh auth login) and no GITHUB_TOKEN. Enqueueing issue in local backlog (${BACKLOG_FILE})..."
 fi
 
 # Fallback: persist in local backlog
 echo "$PAYLOAD" | tr '\n' ' ' >> "$BACKLOG_FILE"
 echo "" >> "$BACKLOG_FILE"
 echo "📁 Issue saved in local backlog (${BACKLOG_FILE})."
-echo "   To publish once GITHUB_TOKEN and GITHUB_REPO are configured: ./scripts/report_issue.sh --sync"
+echo "   To publish once gh is authenticated: ./scripts/report_issue.sh --sync"

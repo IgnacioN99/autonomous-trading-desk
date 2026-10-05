@@ -228,37 +228,49 @@ class TestSafeIssueReporting(unittest.TestCase):
                     self.assertNotIn("$500 USDT", entry["body"])
 
     def test_report_issue_sh_script_sanitization_and_queuing(self):
+        import shutil
         import subprocess
         script_path = os.path.join(SCRIPTS_DIR, "report_issue.sh")
         self.assertTrue(os.path.exists(script_path))
 
-        # Run bash script with sensitive tokens and balances
-        env = os.environ.copy()
-        env["GITHUB_TOKEN"] = ""
-        env["GITHUB_REPO"] = ""
-        res = subprocess.run(
-            [
-                "bash",
-                script_path,
-                "--title", "Test Anomaly ghp_abcdef1234567890abcdef",
-                "--error", "Failed with balance $9999.00 USDT and secret_token1234567890",
-                "--severity", "HIGH"
-            ],
-            capture_output=True,
-            text=True,
-            env=env
-        )
-        self.assertEqual(res.returncode, 0)
-        self.assertIn("Issue saved in local backlog", res.stdout)
+        # Isolated copy: the script resolves logs/ relative to itself, so the real backlog is never touched,
+        # and an unauthenticated stub `gh` guarantees nothing reaches GitHub.
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "scripts"))
+            shutil.copy(script_path, os.path.join(tmp, "scripts", "report_issue.sh"))
+            stub_dir = os.path.join(tmp, "bin")
+            os.makedirs(stub_dir)
+            with open(os.path.join(stub_dir, "gh"), "w", encoding="utf-8") as f:
+                f.write("#!/usr/bin/env bash\nexit 1\n")
+            os.chmod(os.path.join(stub_dir, "gh"), 0o755)
 
-        # Check backlog entry
-        backlog_file = os.path.join(BASE_DIR, "logs", "issues_backlog.jsonl")
-        self.assertTrue(os.path.exists(backlog_file))
-        with open(backlog_file, "r", encoding="utf-8") as f:
-            lines = [l for l in f if l.strip()]
-            last_line = lines[-1]
-            last_item = json.loads(last_line)
+            env = os.environ.copy()
+            env["GITHUB_TOKEN"] = ""
+            env["GITHUB_REPO"] = "owner/repo"
+            env["PATH"] = stub_dir + os.pathsep + env.get("PATH", "")
+            res = subprocess.run(
+                [
+                    "bash",
+                    os.path.join(tmp, "scripts", "report_issue.sh"),
+                    "--title", "Test Anomaly ghp_abcdef1234567890abcdef",
+                    "--error", "Failed with balance $9999.00 USDT and secret_token1234567890",
+                    "--severity", "HIGH"
+                ],
+                capture_output=True,
+                text=True,
+                env=env
+            )
+            self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+            self.assertIn("Issue saved in local backlog", res.stdout)
+
+            backlog_file = os.path.join(tmp, "logs", "issues_backlog.jsonl")
+            self.assertTrue(os.path.exists(backlog_file))
+            with open(backlog_file, "r", encoding="utf-8") as f:
+                lines = [l for l in f if l.strip()]
+            last_item = json.loads(lines[-1])
+            self.assertTrue(last_item["title"].startswith("Test Anomaly"))
             self.assertNotIn("ghp_abcdef1234567890abcdef", last_item["title"])
+            self.assertIn("Failed with balance", last_item["body"])
             self.assertNotIn("secret_token1234567890", last_item["body"])
             self.assertNotIn("$9999.00 USDT", last_item["body"])
 
