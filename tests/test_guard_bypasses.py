@@ -314,6 +314,12 @@ class TestRunCommandBypasses(GuardHarness):
         self.assertDenied(self.agy(self.cmd("cp /tmp/forged.json logs/evaluations/")))
         self.assertDenied(self.agy(self.cmd("cat ~/.gemini/antigravity/brain/x/.system_generated/logs/transcript.jsonl")))
 
+    def test_full_transcript_access_denied(self):
+        for c in ("cat ~/.gemini/antigravity/brain/x/.system_generated/logs/transcript_full.jsonl",
+                  "sed -i 's/REJECTED/APPROVED/' /home/u/.gemini/antigravity/brain/x/.system_generated/logs/transcript_full.jsonl",
+                  "cp /tmp/forged.jsonl ~/.gemini/antigravity-cli/brain/x/.system_generated/logs/transcript_full.jsonl"):
+            self.assertDenied(self.agy(self.cmd(c)), "Evaluation Trail Protection")
+
     def test_session_state_forgery_denied(self):
         c = "echo '{\"is_valid\": true, \"portfolio_exposure\": {\"delta_bias\": \"NEUTRAL\"}}' > logs/session_state.json"
         self.assertDenied(self.agy(self.cmd(c)), "Ground Truth Protection")
@@ -380,6 +386,40 @@ class TestDossierProvenance(GuardHarness):
         self.assertEqual(res.get("__exit_code__"), 0)
         self.assertEqual(set(res) - {"__exit_code__", "__stderr__"}, {"decision", "reason"})
 
+    def test_truncated_transcript_resolved_from_full_transcript_allows_deploy(self):
+        """agy truncates the send_message in transcript.jsonl; the guard re-derives it from transcript_full.jsonl."""
+        conv_dir = os.path.join(self.brain, EVALUATOR_CONV_ID, ".system_generated", "logs")
+        os.makedirs(conv_dir, exist_ok=True)
+        created = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        block = json.dumps({"status": "APPROVED", "target_env": "PROD", "summary": "test",
+                            "approved_candidates": [{"symbol": "BTCUSDT", "direction": "LONG", "tier": "Tier S",
+                                                     "leverage": 3}]})
+        message = "Master Dossier — régimen σ\n" * 30 + f"<dossier_json>\n{block}\n</dossier_json>"
+        encoded = json.dumps(message, ensure_ascii=False)
+        removed = len(encoded.encode("utf-8")) - len(encoded[:50].encode("utf-8"))
+        system = {"source": "SYSTEM", "type": "USER_INPUT", "content": f"Subagent invoked sender={PARENT_CONV_ID}",
+                  "step_index": 0}
+        short = {"source": "MODEL", "type": "PLANNER_RESPONSE", "step_index": 1, "created_at": created, "content": "",
+                 "tool_calls": [{"name": "send_message", "args": {
+                     "Message": f"{encoded[:50]}\n<truncated {removed} bytes>",
+                     "Recipient": json.dumps(PARENT_CONV_ID)}}],
+                 "truncated_fields": ["tool_calls"]}
+        full = {k: v for k, v in short.items() if k != "truncated_fields"}
+        full["tool_calls"] = [{"name": "send_message", "args": {"Message": message, "Recipient": PARENT_CONV_ID}}]
+        transcript = os.path.join(conv_dir, "transcript.jsonl")
+        for path, rows in ((transcript, (system, short)), (dp.full_transcript_path(transcript), (system, full))):
+            with open(path, "w", encoding="utf-8") as f:
+                for r in rows:
+                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        record = dp.build_record_from_extraction(dp.extract_dossier_from_transcript(transcript))
+        self.assertTrue(record["provenance"]["full_transcript_used"])
+        with open(self.dossier_path, "w", encoding="utf-8") as f:
+            json.dump(record, f)
+        res = self.deploy(conversationId=PARENT_CONV_ID)
+        self.assertEqual(res.get("decision"), "allow", res)
+        os.remove(dp.full_transcript_path(transcript))
+        self.assertDenied(self.deploy(conversationId=PARENT_CONV_ID), "transcript_full.jsonl")
+
     def test_direction_mismatch_denied(self):
         self.write_provenance_dossier(direction="LONG")
         self.assertDenied(self.deploy(direction="SHORT"), "but the order is SHORT")
@@ -404,6 +444,13 @@ class TestFileWriteProtection(GuardHarness):
         self.assertDenied(self.write("logs/../logs/evaluations/latest_dossier.json", name="replace_file_content"))
         self.assertDenied(self.write("/home/user/.gemini/antigravity/brain/abc/.system_generated/logs/transcript.jsonl",
                                      name="multi_replace_file_content"))
+
+    def test_write_to_full_transcript_denied(self):
+        target = "/home/user/.gemini/antigravity/brain/abc/.system_generated/logs/transcript_full.jsonl"
+        for name in ("write_to_file", "replace_file_content", "multi_replace_file_content"):
+            self.assertDenied(self.write(target, name=name), "Evaluation Trail Protection")
+        claude = self.run_guard({"tool_name": "Write", "tool_input": {"file_path": target, "content": "{}"}})
+        self.assertEqual(claude.get("__exit_code__"), 2)
 
     def test_harness_files_force_ask_and_others_ask(self):
         self.assertEqual(self.write("scripts/hooks/pre_trade_guard.py").get("decision"), "force_ask")
