@@ -6,6 +6,15 @@ Implements:
 2. Empirical Fractional Kelly (Derived from real ledger trade history and anchored to account capital).
 3. Rigorous Cointegrated Pairs Trading (Engle-Granger Cointegration, Augmented Dickey-Fuller (ADF),
    and Ornstein-Uhlenbeck Half-Life calculation using numpy and statsmodels).
+
+Read-only analytics: never places orders.
+
+CLI:
+    python3 scripts/quant_risk_engine.py parity --symbol X --entry E --sl S [--leverage L] [--json] [--env prod|testnet]
+    python3 scripts/quant_risk_engine.py pairs [--json] [--env prod|testnet]
+    python3 scripts/quant_risk_engine.py kelly [--json] [--env prod|testnet]
+    python3 scripts/quant_risk_engine.py            # legacy: Kelly audit + pairs scan as text
+Exit codes: 0 ok, 1 data/API error, 2 bad usage.
 """
 
 import os
@@ -13,6 +22,8 @@ import sys
 import json
 import time
 import math
+import argparse
+import contextlib
 import urllib.request
 import warnings
 warnings.filterwarnings('ignore', category=FutureWarning)
@@ -81,7 +92,7 @@ def calculate_dynamic_equity_sizing(
     if risk_pct_equity is None:
         try:
             import user_profile as up
-            risk_pct_equity = up.get_risk_pct_equity()
+            risk_pct_equity = normalize_risk_pct(up.get_risk_pct_equity())
         except Exception:
             risk_pct_equity = 0.005
 
@@ -103,7 +114,9 @@ def calculate_dynamic_equity_sizing(
 
     # Safety margin cap: maximum 30% of total equity allocated to one position
     max_margin_usdt = equity * max_margin_ratio
+    sizing["margin_capped"] = False
     if sizing.get("required_margin", 0) > max_margin_usdt:
+        sizing["margin_capped"] = True
         filters = eft.get_symbol_filters(symbol, target_env=target_env)
         sizing["required_margin"] = round(max_margin_usdt, 2)
         sizing["actual_notional"] = round(max_margin_usdt * leverage, 2)
@@ -116,6 +129,7 @@ def calculate_dynamic_equity_sizing(
 
     sizing["account_equity"] = round(equity, 2)
     sizing["risk_pct_equity"] = risk_pct_equity
+    sizing["max_margin_ratio"] = max_margin_ratio
     return sizing
 
 def calculate_volatility_parity_sizing(symbol, entry_price, sl_price, target_dollar_risk=1.50, leverage=3, target_env="testnet"):
@@ -192,6 +206,8 @@ def calculate_empirical_kelly(target_env="testnet"):
     f* = p - (q / b)
     where p = win rate, q = 1 - p, b = payoff ratio (avg_win / avg_loss).
     Requires a minimum of N >= 30 trades for basic statistical significance (MacKinnon/Kelly threshold).
+    Below that sample, or with negative expectancy, the recommendation falls back to the user profile's
+    risk_pct_equity x equity (never a fixed dollar amount).
     """
     trades = eft.send_signed_request("GET", "/fapi/v1/userTrades", {"limit": 100}, target_env=target_env)
     if not isinstance(trades, list):
@@ -200,15 +216,29 @@ def calculate_empirical_kelly(target_env="testnet"):
     pnls = [float(t["realizedPnl"]) for t in trades if float(t.get("realizedPnl", 0)) != 0]
     total_closed = len(pnls)
 
-    acc = eft.send_signed_request("GET", "/fapi/v2/account", target_env=target_env)
-    total_equity = float(acc.get("totalWalletBalance", 100.0)) if isinstance(acc, dict) else 100.0
+    try:
+        total_equity = get_account_equity(target_env=target_env)
+    except Exception as e:
+        return {"error": f"Error fetching account equity: {e}"}
+
+    try:
+        import user_profile as up
+        profile_risk_pct = normalize_risk_pct(up.get_risk_pct_equity())
+    except Exception:
+        profile_risk_pct = 0.005
+    profile_dollar_risk = round(total_equity * profile_risk_pct, 2)
 
     if total_closed < 30:
         return {
             "status": "INSUFFICIENT_DATA_CONSERVATIVE_MODE",
             "total_trades_analyzed": total_closed,
-            "message": f"Small sample size ({total_closed} trades < 30 required for statistical significance). High standard error. Applying conservative fixed Fractional Kelly: $1.50 USDT per position (bounded risk).",
-            "recommended_dollar_risk": 1.50,
+            "message": (
+                f"Small sample size ({total_closed} trades < 30 required for statistical significance). High standard error. "
+                f"Applying the profile risk per trade instead of Kelly: {profile_risk_pct * 100:.2f}% of equity "
+                f"(${profile_dollar_risk} USDT per position)."
+            ),
+            "recommended_dollar_risk": profile_dollar_risk,
+            "profile_risk_pct_equity": profile_risk_pct,
             "account_equity_usdt": round(total_equity, 2),
             "win_rate_pct": round((len([p for p in pnls if p > 0]) / total_closed * 100), 1) if total_closed > 0 else 0.0,
             "confidence": "LOW_SAMPLE_SIZE"
@@ -236,11 +266,11 @@ def calculate_empirical_kelly(target_env="testnet"):
 
     if kelly_full <= 0:
         diagnosis = "NEGATIVE_EXPECTANCY (Insufficient payoff ratio or losses exceed gains). Tighten R:R >= 2.5:1 and enforce structural stops."
-        recommended_risk_usdt = 1.50 # Minimum baseline risk
+        risk_fraction = profile_risk_pct  # Baseline: the user's calibrated risk, never more
     else:
         diagnosis = f"POSITIVE_EXPECTANCY (Full Kelly: {kelly_full*100:.1f}% | Quarter-Kelly: {kelly_quarter*100:.1f}%)"
         risk_fraction = min(0.02, max(0.005, kelly_quarter))
-        recommended_risk_usdt = max(1.50, round(total_equity * risk_fraction, 2))
+    recommended_risk_usdt = round(total_equity * risk_fraction, 2)
 
     return {
         "status": "STATISTICALLY_VALID",
@@ -256,6 +286,8 @@ def calculate_empirical_kelly(target_env="testnet"):
         "quarter_kelly_pct": round(kelly_quarter * 100, 2),
         "account_equity_usdt": round(total_equity, 2),
         "diagnosis": diagnosis,
+        "recommended_risk_fraction": round(risk_fraction, 4),
+        "profile_risk_pct_equity": profile_risk_pct,
         "recommended_dollar_risk": round(recommended_risk_usdt, 2)
     }
 
@@ -449,19 +481,191 @@ def scan_coingrated_market_pairs():
     results.sort(key=lambda x: abs(x["z_score"]), reverse=True)
     return results
 
-if __name__ == "__main__":
+# Correctly spelled alias (the historical name is kept for existing callers).
+scan_cointegrated_market_pairs = scan_coingrated_market_pairs
+
+# =============================================================================
+# CLI (read-only; stdout is a single JSON document with --json)
+# =============================================================================
+def _json_default(obj):
+    item = getattr(obj, "item", None)
+    if callable(item):
+        try:
+            return item()
+        except Exception:
+            pass
+    return str(obj)
+
+def emit_json(payload, stream=None):
+    stream = stream or sys.stdout
+    stream.write(json.dumps(payload, indent=2, default=_json_default) + "\n")
+    stream.flush()
+
+def _profile():
+    import user_profile as up
+    prof = up.load_user_profile()
+    return prof, up.get_leverage_ceiling(prof)
+
+def normalize_risk_pct(value, default=0.005):
+    """Profile risk as a fraction (accepts 0.005 or 0.5 meaning 0.5%); invalid values fall back to `default`."""
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return default
+    if val <= 0:
+        return default
+    return val if val <= 0.05 else val / 100.0
+
+def run_parity(args, env):
+    """Equity-% volatility parity: target risk = profile risk_pct_equity x account equity."""
+    prof, ceiling = _profile()
+    leverage = args.leverage if args.leverage is not None else int(prof.get("leverage_standard", 3))
+    leverage = max(1, min(int(leverage), ceiling))
+    risk_pct_equity = normalize_risk_pct(prof.get("risk_pct_equity", 0.005))
+    try:
+        max_margin_ratio = float(prof.get("max_margin_ratio", 0.30))
+    except (TypeError, ValueError):
+        max_margin_ratio = 0.30
+    sizing = calculate_dynamic_equity_sizing(
+        args.symbol.upper(), args.entry, args.sl, risk_pct_equity=risk_pct_equity,
+        leverage=leverage, target_env=env, max_margin_ratio=max_margin_ratio,
+    )
+    if not sizing or "error" in sizing:
+        return 1, {"error": (sizing or {}).get("error", "Empty sizing result")}
+    return 0, dict(sizing)
+
+def run_pairs(args, env):
+    pairs = scan_coingrated_market_pairs()
+    if not pairs:
+        return 1, {"error": "No pair could be evaluated (kline data unavailable for every candidate pair)."}
+    return 0, {
+        "count": len(pairs),
+        "actionable_count": sum(1 for p in pairs if p.get("is_actionable")),
+        "pairs": pairs,
+    }
+
+def run_kelly(args, env):
+    k = calculate_empirical_kelly(target_env=env)
+    if "error" in k:
+        return 1, {"error": k["error"]}
+    result = dict(k)
+    # The envelope owns `status`; the Kelly verdict is exposed as `kelly_status`.
+    result["kelly_status"] = result.pop("status", None)
+    return 0, result
+
+def print_text(command, result):
+    if command == "parity":
+        s = result
+        print("📊 VOLATILITY PARITY PROFILE (EQUITY-% MONETARY RISK)")
+        print(f"• Pair: {s['symbol']} ({s['direction']} {s['leverage']}x)")
+        print(f"• Entry: {s['entry_price']} | SL: {s['sl_price']} (-{s['risk_pct']}%)")
+        print(f"• TP1 (+1.8R): {s['tp1_price']} (Est gain: +${s['potential_gain_tp1']} USDT)")
+        print(f"• TP2 (+4.0R): {s['tp2_price']} (Est gain: +${s['potential_gain_tp2']} USDT)")
+        print(f"• Contracts: {s['step_qty']} units | Notional: ${s['actual_notional']} USDT")
+        print(f"• Required Margin: ${s['required_margin']} USDT (Isolated){' [capped by max_margin_ratio]' if s.get('margin_capped') else ''}")
+        print(f"• Monetary Risk: ${s['actual_dollar_risk']} USDT (Target: ${s['target_dollar_risk']} USDT = "
+              f"{s['risk_pct_equity'] * 100:.2f}% of ${s['account_equity']} equity)")
+        print(f"• R:R Ratio: {s['ratio_rr']}:1")
+    elif command == "pairs":
+        print("⚖️ COINTEGRATED PAIRS SCANNER (DELTA-0 STAT-ARB - MACKINNON EG + OU HALF-LIFE):\n")
+        for p in result["pairs"]:
+            coint_tag = "✅ COINTEGRATED" if p.get("is_cointegrated") else "❌ NOT COINTEGRATED"
+            tag = "🔥 ACTIONABLE" if p.get("is_actionable") else "⚖️ Equilibrium / Not actionable"
+            print(f"• [{tag}] {p['pair']} ({coint_tag})")
+            print(f"  Z-Score: {p['z_score']:+.2f}σ | Beta: {p['hedge_ratio_beta']} | ADF p-val: {p['adf_pvalue']} | "
+                  f"Coint p-val: {p['coint_pvalue']} | Half-Life: {p['half_life_hours']}h")
+            if p.get("recommendation"):
+                print(f"  {p['recommendation']}")
+    elif command == "kelly":
+        k = result
+        if k.get("kelly_status") == "INSUFFICIENT_DATA_CONSERVATIVE_MODE":
+            print(k["message"])
+            return
+        print("🔬 MATHEMATICAL KELLY AUDIT")
+        print(f"• Analyzed Trades: {k['total_trades_analyzed']} ({k['win_count']} Wins / {k['loss_count']} Losses)")
+        print(f"• Empirical Win Rate: {k['win_rate_pct']}% (SE {k['win_rate_std_error']}%)")
+        print(f"• Average Win: +${k['avg_win_usdt']} USDT | Average Loss: -${k['avg_loss_usdt']} USDT")
+        print(f"• Payoff Ratio (b): {k['payoff_ratio_b']}")
+        print(f"• Full Kelly Fraction (f*): {k['full_kelly_pct']}% | Quarter-Kelly: {k['quarter_kelly_pct']}%")
+        print(f"• Quantitative Diagnosis: {k['diagnosis']}")
+        print(f"• Suggested Dollar Risk per Trade: ${k['recommended_dollar_risk']} USDT")
+
+def legacy_report(env):
     print("🔬 QUANTITATIVE RISK & PAIRS TRADING (STAT-ARB) ENGINE 🔬\n")
     print("1. EMPIRICAL KELLY EVALUATION:")
-    k = calculate_empirical_kelly()
+    k = calculate_empirical_kelly(target_env=env)
     print(f"   Win Rate: {k.get('win_rate_pct')}% | Payoff b: {k.get('payoff_ratio_b')}")
-    print(f"   Diagnosis: {k.get('diagnosis')}")
+    print(f"   Diagnosis: {k.get('diagnosis', k.get('message', k.get('error')))}")
     print(f"   Suggested Dollar Risk: ${k.get('recommended_dollar_risk')} USDT per trade\n")
 
     print("2. COINTEGRATED PAIRS SCANNER (ADF TEST + OU HALF-LIFE):")
-    pairs = scan_coingrated_market_pairs()
-    for p in pairs:
+    _, res = run_pairs(None, env)
+    for p in res.get("pairs", []):
         coint_tag = "✅ COINTEGRATED" if p.get("is_cointegrated") else "❌ NOT COINTEGRATED"
         print(f"• {p['pair']} ({coint_tag})")
         print(f"  Z-Score: {p['z_score']:+.2f}σ | Beta: {p['hedge_ratio_beta']} | ADF p-val: {p['adf_pvalue']} | Half-Life: {p['half_life_hours']}h")
         if p.get("recommendation"):
             print(f"  {p['recommendation']}")
+    return 0
+
+def build_parser():
+    parser = argparse.ArgumentParser(description="Quantitative risk engine (read-only analytics, never places orders)")
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", help="Print a single JSON document on stdout (diagnostics go to stderr)")
+    common.add_argument("--env", default=None, help="prod|testnet (resolved via env_resolver)")
+    sub = parser.add_subparsers(dest="command")
+
+    p = sub.add_parser("parity", parents=[common], help="Equity-%% volatility parity sizing for one setup")
+    p.add_argument("--symbol", required=True, help="Futures symbol, e.g. SOLUSDT")
+    p.add_argument("--entry", type=float, required=True, help="Planned entry price")
+    p.add_argument("--sl", type=float, required=True, help="Technical stop loss price")
+    p.add_argument("--leverage", type=int, default=None, help="Leverage (default: profile leverage_standard, capped at leverage_ceiling)")
+
+    sub.add_parser("pairs", parents=[common], help="Cointegrated stat-arb pairs scan (Engle-Granger/MacKinnon, OU half-life, z-score)")
+    sub.add_parser("kelly", parents=[common], help="Empirical fractional Kelly audit from the ledger trade history")
+    # Legacy invocation without a subcommand
+    parser.add_argument("--env", dest="legacy_env", default=None, help=argparse.SUPPRESS)
+    return parser
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        from utils.env_resolver import resolve_env
+        env = resolve_env(getattr(args, "env", None) or args.legacy_env)
+    except ValueError as e:
+        sys.stderr.write(f"error: {e}\n")
+        return 2
+
+    if not args.command:
+        return legacy_report(env)
+
+    if args.command == "parity":
+        if args.entry <= 0 or args.sl <= 0 or args.entry == args.sl:
+            sys.stderr.write("error: --entry and --sl must be positive and different\n")
+            return 2
+        if args.leverage is not None and args.leverage < 1:
+            sys.stderr.write("error: --leverage must be >= 1\n")
+            return 2
+
+    runner = {"parity": run_parity, "pairs": run_pairs, "kelly": run_kelly}[args.command]
+    real_stdout = sys.stdout
+    try:
+        with contextlib.redirect_stdout(sys.stderr if args.json else real_stdout):
+            code, result = runner(args, env)
+    except Exception as e:
+        code, result = 1, {"error": f"{type(e).__name__}: {e}"}
+
+    if args.json:
+        payload = {"status": "ok" if code == 0 else "error", "command": args.command, "env": env}
+        payload.update(result)
+        emit_json(payload, real_stdout)
+    elif code == 0:
+        print_text(args.command, result)
+    else:
+        sys.stderr.write(f"{args.command} failed: {result.get('error')}\n")
+    return code
+
+if __name__ == "__main__":
+    sys.exit(main())

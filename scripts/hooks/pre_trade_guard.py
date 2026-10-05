@@ -15,17 +15,21 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
 1. DEFAULT-DENY ON UNRECOGNIZED/EMPTY INPUT:
    Empty payload, invalid JSON, or malformed payload shape immediately return 'deny'.
 2. SINGLE CHOKE POINT ENFORCEMENT:
-   Opening trades are permitted ONLY via 'crypto_radar:deploy_futures_trade' or 'scripts/execute_futures_trade.py'.
+   Opening trades are permitted ONLY via 'scripts/execute_futures_trade.py'.
    Binance MCP tools are checked against an ALLOWLIST of read-only tools (also when wrapped in the
    gateway meta-tool 'tool_execute'). Risk-reducing calls (reduceOnly=true, closePosition=true, cancel*)
    are allowed; every other Binance write tool is DENIED.
+   The retired 'crypto_radar' MCP server (and its legacy tool names on any server alias) is DENIED
+   outright, pointing to the CLI replacements (market-radar skill, executor flags, position guardian loop).
 3. INLINE-CODE / RAW API BYPASS PREVENTION:
    run_command calls that use trading primitives outside the sanctioned scripts (python -c, heredocs,
    piped interpreters, curl/wget writes to Binance, unsanctioned scripts importing the engine) are denied.
    Batch deploy scripts and auto-deploy loops are treated as trade openings.
 4. STRUCTURED RISK-REDUCING ACTION PARSING:
-   Requires exact structured flags (--close-position, --auto-heal, --audit-orphans, reduceOnly=true),
-   evaluated per shell sub-command. Never matches generic substrings like 'close'.
+   Requires exact structured flags (--close-position, --auto-heal, --audit-orphans, --move-breakeven with
+   exactly one --symbol, reduceOnly=true), evaluated per shell sub-command. Never matches generic substrings
+   like 'close'. `execute_futures_trade.py --positions` is read-only (ask). The position guardian loop never
+   opens positions: bounded runs (--once / --dry-run) are allowed, long-running ones require confirmation.
 5. FAIL-CLOSED SESSION STATE & STALENESS CHECK:
    logs/session_state.json must exist, be valid (is_valid=True) and NOT stale (<= 300s).
 6. EVALUATION DOSSIER PROVENANCE (scripts/utils/dossier_provenance.py):
@@ -93,7 +97,7 @@ except ImportError:  # pragma: no cover
 HOOK_NAME = "pre_trade_guard"
 HEARTBEAT_ENV_OVERRIDE = "PRE_TRADE_GUARD_HEARTBEAT_FILE"
 
-CHOKE_POINT = "'crypto_radar:deploy_futures_trade' or 'scripts/execute_futures_trade.py'"
+CHOKE_POINT = "'scripts/execute_futures_trade.py'"
 EVALUATOR_HINT = (
     "Invoke the clean-room evaluator via invoke_subagent with TypeName 'isolated_market_evaluator', "
     "then record its verdict with `python3 scripts/record_evaluation.py --from-subagent <conversationId>`."
@@ -105,12 +109,34 @@ EVALUATOR_HINT = (
 AGY_MCP_CALL_TOOLS = {"call_mcp_tool", "mcp_tool"}
 FILE_WRITE_TOOLS = {"write_to_file", "replace_file_content", "multi_replace_file_content"}
 CLAUDE_FILE_WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
+# Retired servers stay listed so eager names (mcp_crypto_radar_<tool>) still split correctly.
 KNOWN_MCP_SERVERS = ("crypto_radar", "binance")
 
-RADAR_TRADING_TOOLS = {"deploy_futures_trade", "place_order"}
-RADAR_RISK_REDUCING_TOOLS = {
-    "move_to_breakeven", "move_sl_to_breakeven", "close_position_market",
-    "close_position", "audit_orphan_positions",
+# The crypto_radar MCP server is retired: every call is denied (fail closed if a stale client config still
+# starts it). Its legacy tool names are denied on any server alias and mapped to their CLI replacements.
+RETIRED_MCP_SERVERS = {"crypto_radar"}
+LEGACY_RADAR_TOOL_REPLACEMENTS = {
+    "scan_intraday_market": "python3 scripts/broad_market_radar.py --json",
+    "scan_yolo_moonshot": "python3 scripts/broad_yolo_scanner.py --json",
+    "scan_delta_neutral_pairs": "python3 scripts/quant_risk_engine.py pairs --json",
+    "calculate_volatility_parity": "python3 scripts/quant_risk_engine.py parity --json",
+    "calculate_position_sizing": "python3 scripts/quant_risk_engine.py parity --json",
+    "get_empirical_kelly_audit": "python3 scripts/quant_risk_engine.py kelly --json",
+    "get_crypto_newsletters": "python3 scripts/fetch_newsletters.py --format json",
+    "deploy_futures_trade": "python3 scripts/execute_futures_trade.py --symbol <SYMBOL> --direction <LONG|SHORT> ... "
+                            "(after the clean-room evaluation)",
+    "place_order": "python3 scripts/execute_futures_trade.py --symbol <SYMBOL> --direction <LONG|SHORT> ... "
+                   "(after the clean-room evaluation)",
+    "get_open_positions": "python3 scripts/execute_futures_trade.py --positions --json",
+    "move_to_breakeven": "python3 scripts/execute_futures_trade.py --move-breakeven --symbol <SYMBOL>",
+    "move_sl_to_breakeven": "python3 scripts/execute_futures_trade.py --move-breakeven --symbol <SYMBOL>",
+    "close_position_market": "python3 scripts/execute_futures_trade.py --close-position --symbol <SYMBOL>",
+    "close_position": "python3 scripts/execute_futures_trade.py --close-position --symbol <SYMBOL>",
+    "audit_orphan_positions": "python3 scripts/execute_futures_trade.py --audit-orphans (or --auto-heal)",
+    "update_trailing_stop_structural": "python3 scripts/loops/position_guardian_loop.py --once",
+    "audit_and_trail_all_positions": "python3 scripts/loops/position_guardian_loop.py --once",
+    "check_dead_alpha": "python3 scripts/loops/position_guardian_loop.py --once --dry-run",
+    "report_agent_execution_issue": "./scripts/report_issue.sh --title ... --error ...",
 }
 
 # Binance MCP product namespaces (dotted names such as futures_usds.newOrder)
@@ -181,6 +207,7 @@ REDIRECT_TOKENS = {">", ">>", ">|", "&>", "&>>", ">&"}
 INSPECTION_PROGRAMS = {
     "git", "gh", "grep", "rg", "cat", "ls", "find", "diff", "pytest", "cp", "rm", "mkdir", "chmod",
     "echo", "printf", "head", "tail", "less", "wc", "stat", "file", "jq", "sort", "uniq", "awk",
+    "sed", "more", "nl", "cut", "tr", "od", "xxd", "strings",
 }
 BENIGN_PROGRAMS = {"cd", "pushd", "popd", "pwd", "true", "date", "sleep"}
 COMMAND_WRAPPERS = {"env", "nohup", "time", "exec", "nice", "stdbuf", "sudo", "command", "builtin"}
@@ -189,6 +216,12 @@ WRITE_PROGRAMS = {"cp", "mv", "rm", "tee", "truncate", "ln", "chmod", "chown", "
                   "unlink", "shred", "touch"}
 
 TRADE_ENGINE_RE = re.compile(r"\bexecute_futures_trade(?:\.py)?\b")
+# Executor modes that never open a position (dispatched by the engine before the trade path)
+EXECUTOR_MOVE_BREAKEVEN_FLAGS = {"--move-breakeven", "--move_breakeven"}
+EXECUTOR_READ_ONLY_FLAGS = {"--positions"}
+# Background position guardian (trailing stops, dead alpha, orphan audit): risk-reducing only
+GUARDIAN_LOOP_RE = re.compile(r"\bposition_guardian_loop(?:\.py)?\b")
+GUARDIAN_BOUNDED_FLAGS = {"--once", "--dry-run", "--dry_run", "--help", "-h"}
 DEPLOY_BATCH_RE = re.compile(r"\bdeploy_[A-Za-z0-9_]+\.py\b")
 AUTO_DEPLOY_LOOP_RE = re.compile(r"\bclimax_watcher_loop(?:\.py)?\b")
 RECORD_EVALUATION_RE = re.compile(r"\brecord_evaluation(?:\.py)?\b")
@@ -228,7 +261,8 @@ PIPE_TO_INTERPRETER_RE = re.compile(
     r"\|\s*(?:sudo\s+)?(?:python[0-9.]*|sh|bash|zsh|dash|node|perl|ruby)\b(?!\s+[^\s|;&-][^\s|;&]*\.(?:py|sh|js|pl|rb)\b)",
     re.IGNORECASE,
 )
-OTHER_INLINE_RE = re.compile(r"\b(?:node|perl|ruby)\s+-e\b|\b(?:sh|bash|zsh)\s+-c\b|\beval\b", re.IGNORECASE)
+# `eval` as a shell word only (not inside flags such as --bypass-eval-gate)
+OTHER_INLINE_RE = re.compile(r"\b(?:node|perl|ruby)\s+-e\b|\b(?:sh|bash|zsh)\s+-c\b|(?<![\w-])eval(?![\w-])", re.IGNORECASE)
 BASE64_EXEC_RE = re.compile(r"base64\s+(?:-d|--decode|-D)\b.*\|\s*(?:python[0-9.]*|sh|bash|zsh|node|perl)\b", re.IGNORECASE)
 
 BINANCE_HOST_RE = re.compile(
@@ -416,9 +450,11 @@ def is_risk_reducing_action(cmd_or_name: str, args_dict: dict = None) -> bool:
     """
     Verifies whether an action reduces or eliminates risk (NEVER blocked).
     Structured arguments ONLY:
-    - MCP: reduceOnly=true, closePosition=true, or risk-reducing tools (cancelOrder, close_position_market, etc.)
+    - MCP: reduceOnly=true, closePosition=true, or cancel / delete operations
     - CLI: exact --close-position / --auto-heal / --audit-orphans / --heal / --help tokens on scripts whose CLI
-      implements them, or dedicated risk-reduction scripts. Batch deploy scripts are never risk-reducing.
+      implements them, `execute_futures_trade.py --move-breakeven` with exactly one --symbol, bounded position
+      guardian runs (--once / --dry-run), or dedicated risk-reduction scripts. Batch deploy scripts are never
+      risk-reducing.
     Never relies on generic substring 'close' across the command line.
     """
     if args_dict:
@@ -429,7 +465,7 @@ def is_risk_reducing_action(cmd_or_name: str, args_dict: dict = None) -> bool:
             return True
         mcp_tool = _decode_str(args_dict.get("ToolName", "")).lower()
         op = mcp_tool.rsplit(".", 1)[-1]
-        if op in RADAR_RISK_REDUCING_TOOLS or "cancel" in op or op.startswith("delete"):
+        if "cancel" in op or op.startswith("delete"):
             return True
 
     if cmd_or_name:
@@ -758,6 +794,14 @@ def _program(tokens: List[str]) -> str:
     return os.path.basename(tokens[idx]).lower() if idx < len(tokens) else ""
 
 
+def _flags(tokens: List[str]) -> set:
+    return {tok.split("=", 1)[0].lower() for tok in tokens if tok.startswith("-")}
+
+
+def _symbol_count(text: str) -> int:
+    return len({m.group(2).upper() for m in re.finditer(r"--symbol(?:\s+|=)(['\"]?)([A-Za-z0-9_]+)\1", text)})
+
+
 def _subcommand_is_risk_reducing(tokens: List[str], text: str) -> bool:
     if not tokens:
         return False
@@ -765,12 +809,16 @@ def _subcommand_is_risk_reducing(tokens: List[str], text: str) -> bool:
         return False
     if RISK_REDUCING_SCRIPTS_RE.search(text):
         return True
+    flags = _flags(tokens)
+    if GUARDIAN_LOOP_RE.search(text) and not TRADE_ENGINE_RE.search(text):
+        # The guardian never opens positions; only bounded runs are auto-allowed.
+        return bool(flags & GUARDIAN_BOUNDED_FLAGS)
     if not RISK_FLAG_SCRIPTS_RE.search(text):
         return False
-    for tok in tokens:
-        flag = tok.split("=", 1)[0].lower()
-        if flag in RISK_REDUCING_FLAGS or flag in ("--help", "-h"):
-            return True
+    if flags & RISK_REDUCING_FLAGS or flags & {"--help", "-h"}:
+        return True
+    if TRADE_ENGINE_RE.search(text) and flags & EXECUTOR_MOVE_BREAKEVEN_FLAGS and _symbol_count(text) == 1:
+        return True
     return False
 
 
@@ -885,7 +933,8 @@ def analyze_run_command(command_line: str, cwd: str, base_dir: str) -> Dict[str,
             "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Choke Point Enforcement): Inline code (python -c, heredoc, piped interpreter) "
             "using trading primitives (execute_futures_trade, send_signed_request, /fapi/v1 write endpoints, MCP gateway) "
             f"is strictly forbidden. Orders must be routed exclusively through {CHOKE_POINT}; "
-            "risk reduction must use the sanctioned CLI flags (--close-position, --auto-heal, --audit-orphans)."
+            "risk reduction must use the sanctioned CLI flags (--close-position, --move-breakeven, --auto-heal, "
+            "--audit-orphans) or scripts/loops/position_guardian_loop.py."
         )
         return result
 
@@ -944,8 +993,17 @@ def analyze_run_command(command_line: str, cwd: str, base_dir: str) -> Dict[str,
             result["batch"].append(text)
             continue
         if TRADE_ENGINE_RE.search(text):
+            flags = _flags(tokens)
             if _subcommand_is_risk_reducing(tokens, text):
                 result["risk_reducing"] = True
+            elif flags & EXECUTOR_MOVE_BREAKEVEN_FLAGS:
+                result["deny"] = (
+                    "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Structured Risk Parsing): `execute_futures_trade.py "
+                    "--move-breakeven` requires exactly one --symbol (e.g. --move-breakeven --symbol BTCUSDT)."
+                )
+                return result
+            elif flags & EXECUTOR_READ_ONLY_FLAGS:
+                result["all_safe"] = False  # read-only position listing: normal permission policy (ask)
             else:
                 result["trading"].append(text)
             continue
@@ -1031,6 +1089,29 @@ def evaluate_binance_tool(tool: str, mcp_args: dict, depth: int = 0) -> Tuple[st
         if isinstance(batch, list) and batch and all(isinstance(o, dict) and _order_is_reduce_only(o) for o in batch):
             return "risk_reducing", f"Risk-reducing action / exit authorized (reduce-only batch '{name}').", info
     return "deny", deny_reason, info
+
+
+# =============================================================================
+# Retired crypto_radar MCP server
+# =============================================================================
+def is_retired_mcp_server(server: str) -> bool:
+    """True for the retired crypto_radar server, including plugin/alias prefixes (e.g. plugin_x_crypto_radar)."""
+    norm = (server or "").strip().lower().replace("-", "_")
+    return any(norm == s or norm.endswith("_" + s) for s in RETIRED_MCP_SERVERS)
+
+
+def retired_radar_reason(tool: str) -> str:
+    replacement = LEGACY_RADAR_TOOL_REPLACEMENTS.get(tool or "")
+    hint = f"Use `{replacement}` instead. " if replacement else ""
+    return (
+        f"🚨 BLOCKED BY PRE-TOOL-USE HOOK (Retired MCP Server): The 'crypto_radar' MCP server has been retired "
+        f"and tool '{tool or '?'}' is no longer available. {hint}"
+        "Read-only analytics are CLI scripts with --json output (see .agents/skills/market-radar/SKILL.md); "
+        f"orders and position management go exclusively through {CHOKE_POINT} "
+        "(--positions, --move-breakeven, --close-position, --audit-orphans, --auto-heal); trailing stops, dead-alpha "
+        "and orphan audits run in scripts/loops/position_guardian_loop.py. Remove the stale 'crypto_radar' entry "
+        "from your MCP client configuration."
+    )
 
 
 # =============================================================================
@@ -1250,6 +1331,10 @@ def evaluate_payload(payload: dict) -> Tuple[str, str, str]:
             "", _decode_str(_first(mcp_args, "toolName", "tool_name", "ToolName", "name"))
         )
 
+        # Retired crypto_radar MCP server (any tool) and its legacy tool names on any server alias.
+        if is_retired_mcp_server(server_norm) or mcp_tool in LEGACY_RADAR_TOOL_REPLACEMENTS:
+            return "deny", retired_radar_reason(mcp_tool), tool_label
+
         if is_binance_call(server, mcp_tool) or wrapped_binance:
             verdict, reason, info = evaluate_binance_tool(mcp_tool, mcp_args)
             if verdict == "read_only":
@@ -1275,16 +1360,6 @@ def evaluate_payload(payload: dict) -> Tuple[str, str, str]:
                                                   conversation_id=conversation_id)
             return ("allow" if allowed else "deny"), reason, tool_label
 
-        # crypto_radar choke point (matched by tool name on any server alias). A reduceOnly argument on
-        # deploy_futures_trade is NOT honored: the tool does not implement it.
-        if server_norm == "crypto_radar" or mcp_tool in RADAR_TRADING_TOOLS | RADAR_RISK_REDUCING_TOOLS:
-            if mcp_tool in RADAR_RISK_REDUCING_TOOLS:
-                return "allow", "Risk-reducing action / exit authorized.", tool_label
-            if mcp_tool in RADAR_TRADING_TOOLS:
-                wrapper_args = dict(call["raw_args"])
-                wrapper_args["Arguments"] = mcp_args
-                decision, reason = evaluate_trade_opening("", wrapper_args, mcp_args, base_dir, conversation_id)
-                return decision, reason, tool_label
         return "ask", "", tool_label
 
     # ---------------------------------------------------------------- shell commands

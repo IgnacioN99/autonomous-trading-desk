@@ -8,6 +8,7 @@ import urllib.request
 import json
 import time
 import math
+import os
 import sys
 import argparse
 
@@ -274,8 +275,9 @@ def analyze_symbol(symbol, interval="15m"):
         "reasons": reasons
     }
 
-def scan_market(top_n=5, interval="15m"):
-    symbols = get_top_crypto_pairs(limit=65)
+def scan_market(top_n=5, interval="15m", symbols=None):
+    if symbols is None:
+        symbols = get_top_crypto_pairs(limit=65)
     candidates = []
     for s in symbols:
         try:
@@ -289,16 +291,44 @@ def scan_market(top_n=5, interval="15m"):
     candidates.sort(key=lambda x: x["score"], reverse=True)
     return candidates[:top_n]
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Futures Intraday Scanner")
+def main(argv=None):
+    """Read-only public market data; never places orders. Exit codes: 0 ok, 1 data/API error, 2 bad usage.
+    --format json keeps its legacy shape (a bare list); --json emits the {status, ..., candidates} envelope."""
+    parser = argparse.ArgumentParser(description="Futures Intraday Scanner (read-only)")
     parser.add_argument("--interval", type=str, default="15m", choices=["5m", "15m", "1h"], help="Scanning timeframe")
     parser.add_argument("--top", type=int, default=5, help="Number of opportunities to return")
     parser.add_argument("--format", type=str, default="table", choices=["table", "json"], help="Output format")
-    args = parser.parse_args()
+    parser.add_argument("--json", action="store_true", help="Print a JSON envelope {status, command, env, interval, candidates}")
+    parser.add_argument("--env", default=None, help="prod|testnet (resolved via env_resolver; market data is always public mainnet)")
+    args = parser.parse_args(argv)
 
-    results = scan_market(top_n=args.top, interval=args.interval)
+    if args.top < 1:
+        parser.print_usage(sys.stderr)
+        sys.stderr.write("error: --top must be >= 1\n")
+        return 2
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from utils.env_resolver import resolve_env
+        env = resolve_env(args.env)
+    except ValueError as e:
+        sys.stderr.write(f"error: {e}\n")
+        return 2
 
-    if args.format == "json":
+    symbols = get_top_crypto_pairs(limit=65)
+    if not symbols:
+        if args.json:
+            print(json.dumps({"status": "error", "command": "intraday", "env": env,
+                              "error": "Unable to fetch the Binance Futures ticker universe."}, indent=2))
+        else:
+            print("Unable to fetch the Binance Futures ticker universe.", file=sys.stderr)
+        return 1
+
+    results = scan_market(top_n=args.top, interval=args.interval, symbols=symbols)
+
+    if args.json:
+        print(json.dumps({"status": "ok", "command": "intraday", "env": env, "interval": args.interval,
+                          "count": len(results), "candidates": results}, indent=2))
+    elif args.format == "json":
         print(json.dumps(results, indent=2))
     else:
         print(f"\n⚡ BINANCE FUTURES INTRADAY RADAR (Timeframe: {args.interval}) ⚡")
@@ -316,3 +346,7 @@ if __name__ == "__main__":
             print(f"   • R:R Ratio: {item['rr']}:1 | Estimated ROE (3x): +{roe_est}%")
             print(f"   • Confluence Factors: {', '.join(item['reasons'])}")
             print("-" * 80)
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

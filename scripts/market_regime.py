@@ -5,6 +5,9 @@ Analyzes Bitcoin structure (EMA 20/50, ATR), funding rate climate,
 and overall liquidity to recommend optimal quantitative strategies in real time.
 """
 
+import argparse
+import os
+import sys
 import urllib.request
 import json
 import math
@@ -130,11 +133,39 @@ def classify_regime():
         "rationale": rationale
     }
 
-if __name__ == "__main__":
+def main(argv=None):
+    """CLI: python3 scripts/market_regime.py [--json] [--env prod|testnet]
+    Read-only public market data. Exit codes: 0 ok, 1 BTC and funding data both unavailable, 2 bad usage."""
+    parser = argparse.ArgumentParser(description="Macro market regime classifier (read-only)")
+    parser.add_argument("--json", action="store_true", help="Print a single JSON document on stdout")
+    parser.add_argument("--env", default=None, help="prod|testnet (resolved via env_resolver; market data is always public mainnet)")
+    args = parser.parse_args(argv)
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from utils.env_resolver import resolve_env
+        env = resolve_env(args.env)
+    except ValueError as e:
+        sys.stderr.write(f"error: {e}\n")
+        return 2
+
     report = classify_regime()
+    failed = "error" in report["btc_state"] and "error" in report["funding_climate"]
+    if args.json:
+        payload = {"status": "error" if failed else "ok", "command": "regime", "env": env}
+        payload.update(report)
+        sys.stdout.write(json.dumps(payload, indent=2) + "\n")
+        return 1 if failed else 0
+
+    print_report(report)
+    return 1 if failed else 0
+
+def print_report(report):
     print("=== CURRENT MARKET REGIME ===")
     print(f"Recommended Strategy: {report['recommended_strategy']}")
     print(f"Diagnosis: {report['rationale']}")
     print(f"\nBitcoin State: {report['btc_state']['trend']} (Price: {report['btc_state']['price']}, EMA20: {report['btc_state']['ema20']}, EMA50: {report['btc_state']['ema50']})")
     print(f"Positive Funding Opportunities: {report['funding_climate']['high_positive_count']}")
     print(f"Negative Funding Opportunities: {report['funding_climate']['high_negative_count']}")
+
+if __name__ == "__main__":
+    sys.exit(main())

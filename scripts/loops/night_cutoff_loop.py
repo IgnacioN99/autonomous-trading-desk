@@ -86,14 +86,16 @@ def run_night_cutoff(target_env: str = None, auto_ratchet: bool = True, overnigh
             active_sl = [a for a in algos if a.get("orderType") in ["STOP_MARKET", "STOP"]] if isinstance(algos, list) else []
 
             if not active_sl:
-                print(f"     🚨 DANGER: {sym} HAS NO ACTIVE STOP LOSS. Placing emergency Stop Loss...")
-                exit_side = "SELL" if amt > 0 else "BUY"
-                emergency_sl = entry_p * (0.98 if amt > 0 else 1.02)
-                filters = eft.get_symbol_filters(sym, target_env=target_env)
-                sl_rounded = eft.round_price(emergency_sl, filters["tickSize"], filters["precision_price"])
-                eft.place_algo_stop_loss(sym, exit_side, sl_rounded, target_env=target_env)
-                print(f"     ✅ Emergency Stop Loss placed at {sl_rounded}")
-                sl_price = float(sl_rounded)
+                print(f"     🚨 DANGER: {sym} HAS NO ACTIVE STOP LOSS. Placing verified emergency Stop Loss...")
+                heal_res = eft.heal_orphan_position(p, target_env=target_env, close_on_failure=True)
+                if heal_res.get("closed"):
+                    print(f"     🚪 Emergency stop could not be verified; {sym} closed at market (reduce-only).")
+                    continue
+                if not heal_res.get("success"):
+                    print(f"     ❌ CRITICAL: {sym} remains unprotected ({heal_res.get('reason')}). Manual action required.")
+                    continue
+                sl_price = float(heal_res["healed_sl_price"])
+                print(f"     ✅ Emergency Stop Loss verified at {sl_price}")
             else:
                 sl_price = float(active_sl[0].get("triggerPrice", 0))
                 print(f"     🛡️ Confirmed active Stop Loss at: {sl_price:.5f}")
@@ -113,12 +115,14 @@ def run_night_cutoff(target_env: str = None, auto_ratchet: bool = True, overnigh
                 is_better = (be_rounded > sl_price) if direction == "LONG" else (be_rounded < sl_price)
                 if is_better:
                     print(f"     📈 Position in profit (+{roe_pct:.1f}% ROE). Ratcheting to True Net Break-Even...")
-                    be_res = eft.move_sl_to_breakeven(sym, target_env=target_env)
+                    # End-of-day ratchet is explicit policy (AGENTS.md Layer 7), so it overrides the intraday
+                    # TP1/2xATR anti-truncation rule; the move is still place-then-cancel and verified.
+                    be_res = eft.move_sl_to_breakeven(sym, target_env=target_env, force=True)
                     if be_res.get("success"):
                         print(f"     ✅ SL Shielded to Break-Even at {be_rounded} (+0.2% fees covered). ZERO RISK.")
                         ratcheted_to_be = True
                     else:
-                        print(f"     ⚠️  Warning tightening SL: {be_res.get('error')}")
+                        print(f"     ⚠️  Warning tightening SL: {be_res.get('error') or be_res.get('reason')}")
 
             # Mode 2: SWING_STRUCTURAL_STOP -> Allow positions with verified SL to remain open
             if overnight_mode == "SWING_STRUCTURAL_STOP":

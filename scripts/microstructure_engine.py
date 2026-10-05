@@ -283,12 +283,51 @@ def get_live_aggtrades_tape(symbol, limit=300):
     except Exception:
         return None
 
-if __name__ == "__main__":
-    test_syms = ["BTCUSDT", "SOLUSDT", "ETHUSDT", "1000BONKUSDT"]
+DEFAULT_SYMBOLS = ["BTCUSDT", "SOLUSDT", "ETHUSDT", "1000BONKUSDT"]
+
+def main(argv=None):
+    """CLI: python3 scripts/microstructure_engine.py [--symbols A,B] [--interval 15m] [--json] [--env prod|testnet]
+    Read-only public market data. Exit codes: 0 ok, 1 no data for any symbol, 2 bad usage."""
+    import argparse
+    import contextlib
+    parser = argparse.ArgumentParser(description="Order flow / microstructure snapshot (read-only)")
+    parser.add_argument("--symbols", default=",".join(DEFAULT_SYMBOLS), help="Comma-separated futures symbols")
+    parser.add_argument("--interval", default="15m", choices=["5m", "15m", "1h"], help="Period for taker/OI/klines windows")
+    parser.add_argument("--json", action="store_true", help="Print a single JSON document on stdout")
+    parser.add_argument("--env", default=None, help="prod|testnet (resolved via env_resolver; market data is always public mainnet)")
+    args = parser.parse_args(argv)
+
+    symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    if not symbols:
+        sys.stderr.write("error: --symbols must list at least one symbol\n")
+        return 2
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from utils.env_resolver import resolve_env
+        env = resolve_env(args.env)
+    except ValueError as e:
+        sys.stderr.write(f"error: {e}\n")
+        return 2
+
+    real_stdout = sys.stdout
+    results = []
+    with contextlib.redirect_stdout(sys.stderr if args.json else real_stdout):
+        for s in symbols:
+            results.append({"symbol": s, "micro": get_symbol_microstructure(s, period=args.interval),
+                            "tape": get_live_aggtrades_tape(s)})
+    ok = any(r["micro"] for r in results)
+
+    if args.json:
+        payload = {"status": "ok" if ok else "error", "command": "microstructure", "env": env,
+                   "interval": args.interval, "symbols": results}
+        if not ok:
+            payload["error"] = "No microstructure data could be fetched for any symbol."
+        real_stdout.write(json.dumps(payload, indent=2, default=lambda o: o.item() if hasattr(o, "item") else str(o)) + "\n")
+        return 0 if ok else 1
+
     print("🔬 MICROSTRUCTURE & ORDER FLOW ANALYSIS (BINANCE FUTURES) 🔬\n")
-    for s in test_syms:
-        m = get_symbol_microstructure(s)
-        t = get_live_aggtrades_tape(s)
+    for r in results:
+        m, t = r["micro"], r["tape"]
         if m:
             print(f"• {m['symbol']}:")
             print(f"  Regime: {m['regime']} -> {m['regime_desc']}")
@@ -298,3 +337,9 @@ if __name__ == "__main__":
             if t:
                 print(f"  Tape (p95 Whale: ${t['whale_threshold_usd']:,.0f}): Bias {t['live_bias']} (Imbalance: {t['imbalance_pct']:+.1f}% | Whales: +{t['whale_buys']}/-{t['whale_sells']})")
             print()
+        else:
+            print(f"• {r['symbol']}: no microstructure data\n")
+    return 0 if ok else 1
+
+if __name__ == "__main__":
+    sys.exit(main())

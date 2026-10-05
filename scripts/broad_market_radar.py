@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """
 broad_market_radar.py - Broad Market and Multi-Conviction Screener.
-Concurrently scans top Binance Futures contracts (15m and 1h), ranking opportunities
+Concurrently scans top Binance Futures contracts (5m, 15m or 1h), ranking opportunities
 by confidence tier: Tier S (Maximum), Tier A+ (High), Tier A (Strong), and Delta hedges.
+
+Read-only: uses public Binance Futures market data and never places orders.
+
+CLI:
+    python3 scripts/broad_market_radar.py [--json] [--top N] [--interval 15m|5m|1h]
+                                          [--universe N] [--env prod|testnet]
+Exit codes: 0 ok, 1 data/API error, 2 bad usage.
 """
 
 import urllib.request
@@ -11,11 +18,17 @@ import time
 import math
 import sys
 import os
+import argparse
+import contextlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import microstructure_engine as me
+
+SUPPORTED_INTERVALS = ("5m", "15m", "1h")
+DEFAULT_INTERVAL = "15m"
+DEFAULT_UNIVERSE = 80
 
 def calculate_ema(series, period):
     if len(series) < period:
@@ -71,23 +84,36 @@ def calculate_atr(highs, lows, closes, period=14):
         atr = (atr * (period - 1) + tr) / period
     return atr
 
-def analyze_single_symbol(symbol):
-    url_15m = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=15m&limit=55"
-    req_15m = urllib.request.Request(url_15m, headers={"User-Agent": "Mozilla/5.0"})
+def fetch_klines(symbol, interval=DEFAULT_INTERVAL, limit=55):
+    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=6) as resp:
+        return json.loads(resp.read().decode())
+
+def tier_code(confidence):
+    """Stable machine-readable tier code (the `tier` field is a human label)."""
+    if confidence >= 80:
+        return "S"
+    if confidence >= 65:
+        return "A+"
+    if confidence >= 55:
+        return "A"
+    return "B+"
+
+def analyze_single_symbol(symbol, interval=DEFAULT_INTERVAL):
     try:
-        with urllib.request.urlopen(req_15m, timeout=6) as resp:
-            klines_15m = json.loads(resp.read().decode())
+        klines = fetch_klines(symbol, interval=interval, limit=55)
     except Exception:
         return None
 
-    if len(klines_15m) < 35:
+    if not isinstance(klines, list) or len(klines) < 35:
         return None
 
-    opens = [float(k[1]) for k in klines_15m]
-    highs = [float(k[2]) for k in klines_15m]
-    lows = [float(k[3]) for k in klines_15m]
-    closes = [float(k[4]) for k in klines_15m]
-    volumes = [float(k[5]) for k in klines_15m]
+    opens = [float(k[1]) for k in klines]
+    highs = [float(k[2]) for k in klines]
+    lows = [float(k[3]) for k in klines]
+    closes = [float(k[4]) for k in klines]
+    volumes = [float(k[5]) for k in klines]
 
     current_price = closes[-1]
     candle_open = opens[-1]
@@ -144,16 +170,16 @@ def analyze_single_symbol(symbol):
     # 1. RSI Scoring
     if rsi_15m < 28:
         score_long += 35
-        long_reasons.append(f"RSI 15m extreme oversold ({rsi_15m:.1f})")
+        long_reasons.append(f"RSI {interval} extreme oversold ({rsi_15m:.1f})")
     elif rsi_15m < 35:
         score_long += 25
-        long_reasons.append(f"RSI 15m oversold ({rsi_15m:.1f})")
+        long_reasons.append(f"RSI {interval} oversold ({rsi_15m:.1f})")
     elif rsi_15m > 74:
         score_short += 35
-        short_reasons.append(f"RSI 15m extreme overbought ({rsi_15m:.1f})")
+        short_reasons.append(f"RSI {interval} extreme overbought ({rsi_15m:.1f})")
     elif rsi_15m > 66:
         score_short += 25
-        short_reasons.append(f"RSI 15m overbought ({rsi_15m:.1f})")
+        short_reasons.append(f"RSI {interval} overbought ({rsi_15m:.1f})")
 
     # 2. Institutional Absorption Wicks
     if effective_lower_wick >= 50:
@@ -266,6 +292,8 @@ def analyze_single_symbol(symbol):
         "direction": direction,
         "confidence": confidence,
         "tier": tier,
+        "tier_code": tier_code(confidence),
+        "interval": interval,
         "price": current_price,
         "trigger": trigger,
         "sl": sl,
@@ -273,7 +301,8 @@ def analyze_single_symbol(symbol):
         "tp2": tp2,
         "rr": round(rr, 2),
         "risk_pct": round(risk_pct, 2),
-        "rsi_15m": round(rsi_15m, 1),
+        "rsi": round(rsi_15m, 1),
+        "rsi_15m": round(rsi_15m, 1),  # legacy key, holds the RSI of `interval`
         "vol_ratio": round(vol_ratio, 1),
         "lower_wick": round(effective_lower_wick, 1),
         "upper_wick": round(effective_upper_wick, 1),
@@ -282,7 +311,7 @@ def analyze_single_symbol(symbol):
 
 def enrich_candidate_microstructure(cand):
     sym = cand['symbol']
-    micro = me.get_symbol_microstructure(sym)
+    micro = me.get_symbol_microstructure(sym, period=cand.get('interval', DEFAULT_INTERVAL))
     if not micro:
         return cand
     cand['micro'] = micro
@@ -337,9 +366,14 @@ def enrich_candidate_microstructure(cand):
         cand['tier'] = "Tier A (Strong Confluence / Hedge)"
     else:
         cand['tier'] = "Disqualified (<55%)"
+    cand['tier_code'] = tier_code(cand['confidence']) if cand['confidence'] >= 55 else "DISQUALIFIED"
     return cand
 
-def scan_all_liquid_pairs(top_n=80):
+def scan_all_liquid_pairs(top_n=DEFAULT_UNIVERSE, interval=DEFAULT_INTERVAL):
+    """Scans the `top_n` most liquid USDT-M perpetuals on `interval` candles.
+    Raises on exchangeInfo / ticker failures so callers can fail loudly instead of reporting 'no setups'."""
+    if interval not in SUPPORTED_INTERVALS:
+        raise ValueError(f"Unsupported interval '{interval}'. Must be one of: {', '.join(SUPPORTED_INTERVALS)}")
     # Fetch liquid symbols
     info_req = urllib.request.Request('https://fapi.binance.com/fapi/v1/exchangeInfo', headers={'User-Agent': 'Mozilla/5.0'})
     with urllib.request.urlopen(info_req, timeout=8) as r:
@@ -363,7 +397,7 @@ def scan_all_liquid_pairs(top_n=80):
 
     raw_results = []
     with ThreadPoolExecutor(max_workers=16) as executor:
-        future_to_symbol = {executor.submit(analyze_single_symbol, sym): sym for sym in sorted_symbols}
+        future_to_symbol = {executor.submit(analyze_single_symbol, sym, interval): sym for sym in sorted_symbols}
         for future in as_completed(future_to_symbol):
             res = future.result()
             if res:
@@ -378,12 +412,108 @@ def scan_all_liquid_pairs(top_n=80):
     qualified.sort(key=lambda x: x['confidence'], reverse=True)
     return qualified
 
-if __name__ == "__main__":
-    candidates = scan_all_liquid_pairs(80)
-    print(f"Total qualified candidates with microstructure: {len(candidates)}\n")
-    for c in candidates:
-        m = c.get('micro', {})
+def _json_default(obj):
+    """Serializes numpy scalars and any other non-JSON type deterministically."""
+    item = getattr(obj, "item", None)
+    if callable(item):
+        try:
+            return item()
+        except Exception:
+            pass
+    return str(obj)
+
+def emit_json(payload, stream=None):
+    stream = stream or sys.stdout
+    stream.write(json.dumps(payload, indent=2, default=_json_default) + "\n")
+    stream.flush()
+
+def _standard_leverage():
+    """Standard leverage from the user profile (used only for the informational ROE estimate)."""
+    try:
+        import user_profile as up
+        prof = up.load_user_profile()
+        return max(1, min(int(prof.get("leverage_standard", 3)), up.get_leverage_ceiling(prof)))
+    except Exception:
+        return 3
+
+def build_scan_payload(candidates, env, interval, universe, top, latency_ms):
+    leverage = _standard_leverage()
+    selected = candidates[:top] if top else candidates
+    out = []
+    for c in selected:
+        item = dict(c)
+        item["micro"] = c.get("micro")
+        item["roe_est_pct"] = round(c["risk_pct"] * c["rr"] * leverage, 1)
+        out.append(item)
+    return {
+        "status": "ok",
+        "command": "scan",
+        "env": env,
+        "interval": interval,
+        "universe_size": universe,
+        "leverage_standard": leverage,
+        "qualified_count": len(candidates),
+        "count": len(out),
+        "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "latency_ms": latency_ms,
+        "candidates": out,
+    }
+
+def print_text_report(payload):
+    print(f"Total qualified candidates with microstructure ({payload['interval']}, env={payload['env']}): "
+          f"{payload['qualified_count']}\n")
+    for c in payload["candidates"]:
+        m = c.get('micro') or {}
         print(f"• {c['tier']} | {c['symbol']} ({c['direction']}) -> {c['confidence']}%")
-        print(f"  Entry: {c['price']} | SL: {c['sl']:.4f} (-{c['risk_pct']}%) | TP1: {c['tp1']:.4f} | TP2: {c['tp2']:.4f}")
-        print(f"  Flow: Taker={m.get('taker_ratio', 1.0):.2f} | OI={m.get('oi_change_pct', 0.0):+.2f}% | Regime={m.get('regime', 'N/A')}")
+        print(f"  Entry: {c['price']} | Trigger: {c['trigger']:.4f} | SL: {c['sl']:.4f} (-{c['risk_pct']}%) | "
+              f"TP1: {c['tp1']:.4f} | TP2: {c['tp2']:.4f} | R:R {c['rr']}:1 | "
+              f"ROE est ({payload['leverage_standard']}x): +{c['roe_est_pct']}%")
+        print(f"  Flow: Taker={m.get('taker_ratio', 1.0):.2f} | OI={m.get('oi_change_pct', 0.0):+.2f}% | "
+              f"Regime={m.get('regime', 'N/A')} | Funding={m.get('funding_rate_pct', 0.0):.4f}%")
         print(f"  Factors: {', '.join(c['reasons'])}\n")
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Broad Binance Futures market radar (read-only, never places orders)")
+    parser.add_argument("--json", action="store_true", help="Print a single JSON document on stdout (diagnostics go to stderr)")
+    parser.add_argument("--top", type=int, default=0, help="Max candidates to return (default: all qualified)")
+    parser.add_argument("--interval", default=DEFAULT_INTERVAL, choices=SUPPORTED_INTERVALS, help="Candle interval (default 15m)")
+    parser.add_argument("--universe", type=int, default=DEFAULT_UNIVERSE, help="Number of most liquid pairs to scan (default 80)")
+    parser.add_argument("--env", default=None, help="prod|testnet (resolved via env_resolver; market data is always public mainnet)")
+    args = parser.parse_args(argv)
+
+    if args.top < 0 or args.universe < 1:
+        parser.print_usage(sys.stderr)
+        sys.stderr.write("error: --top must be >= 0 and --universe >= 1\n")
+        return 2
+    try:
+        from utils.env_resolver import resolve_env
+        env = resolve_env(args.env)
+    except ValueError as e:
+        sys.stderr.write(f"error: {e}\n")
+        return 2
+
+    real_stdout = sys.stdout
+    t0 = time.time()
+    try:
+        # Keep stdout pure JSON: anything printed by library code goes to stderr.
+        with contextlib.redirect_stdout(sys.stderr if args.json else real_stdout):
+            candidates = scan_all_liquid_pairs(top_n=args.universe, interval=args.interval)
+    except Exception as e:
+        err = {"status": "error", "command": "scan", "env": env, "interval": args.interval,
+               "error": f"{type(e).__name__}: {e}"}
+        if args.json:
+            emit_json(err, real_stdout)
+        else:
+            sys.stderr.write(f"Radar scan failed: {err['error']}\n")
+        return 1
+
+    payload = build_scan_payload(candidates, env, args.interval, args.universe, args.top,
+                                 int((time.time() - t0) * 1000))
+    if args.json:
+        emit_json(payload, real_stdout)
+    else:
+        print_text_report(payload)
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

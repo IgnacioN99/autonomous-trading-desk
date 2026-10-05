@@ -2,9 +2,7 @@
 requests>=2.31.0
 pydantic>=2.5.0
 
-# Agentic Protocols & Testing
-# radar_mcp_server.py uses mcp.server.mcpserver.MCPServer, which only exists in the 2.x SDK
-mcp>=2.0,<3
+# Testing
 pytest>=7.0.0
 
 # Quantitative Modeling, Cointegration & Microstructure

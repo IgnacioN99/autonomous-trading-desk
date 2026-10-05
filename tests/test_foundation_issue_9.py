@@ -126,15 +126,15 @@ class TestCentralizedEnvResolver(unittest.TestCase):
 class TestRequirementsDependencies(unittest.TestCase):
     """[Finding 11] Missing Dependencies in requirements.txt."""
 
-    def test_mcp_and_pytest_in_requirements(self):
+    def test_pytest_in_requirements_and_no_mcp_sdk(self):
         req_path = os.path.join(BASE_DIR, "requirements.txt")
         self.assertTrue(os.path.exists(req_path))
         with open(req_path, "r", encoding="utf-8") as f:
             content = f.read()
 
-        # radar_mcp_server.py imports mcp.server.mcpserver (2.x SDK only)
-        self.assertIn("mcp>=2.0,<3", content)
         self.assertIn("pytest>=7.0.0", content)
+        # The crypto_radar MCP server was retired; no script imports the MCP SDK anymore
+        self.assertNotRegex(content, r"(?m)^\s*mcp\b")
 
 
 class TestProdEnvExampleSafeDefaults(unittest.TestCase):

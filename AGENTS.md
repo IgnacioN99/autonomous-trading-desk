@@ -40,6 +40,8 @@ Whenever the user explicitly requests crypto trading operations, Binance Futures
      * Append-only ledger of forensic lessons and Stop Loss root causes for persistent cross-session learning.
    - **Layer 7: Night Cutoff Loop (`scripts/loops/night_cutoff_loop.py`):**
      * End-of-day protocol: ratchets winning positions to True Net Break-Even (+0.2%), reaps expired orphan limit orders (>90m), and guarantees Zero Overnight Risk.
+   - **Layer 8: Position Guardian Loop (`scripts/loops/position_guardian_loop.py`):**
+     * Risk-reducing only (never opens positions): structural trailing stops, dead alpha, orphan audit/heal. `--once` = one cycle, `--interval <s>` = background (cron/systemd), `--dry-run` = report only; state in `logs/guardian_state.json`.
 
 1. **Phase 1: Grounded Intelligence & Market Screening**
    - Consult your quantitative research notebooks (e.g. via NotebookLM using IDs configured in `config/user_context.json` or local research in `research/`) to ground strategies in mathematical principles:
@@ -47,12 +49,9 @@ Whenever the user explicitly requests crypto trading operations, Binance Futures
      2. `"Rate Arbitrage & Crypto Volatility Modeling"` (configured as `stat_arb_notebook_id` in `config/user_context.json` or see `research/04_funding_rate_arbitrage_and_liquidations.md`): Layer-1 dynamic cointegration (Engle-Granger MacKinnon, Johansen, Ornstein-Uhlenbeck half-life), Delta-Neutral Funding Rate arbitrage, and econometric liquidation cascade modeling.
      3. `"Anthropic Agentic Systems & Evaluator-Optimizer Workflows"` (configured as `agentic_systems_notebook_id` in `config/user_context.json`): Multi-agent orchestration, tool use error response engineering, parallel request decomposition, and MCP client/server contracts.
      4. `"Ingeniería de Prompts y Arquitectura Agéntica de Producción"` ("Prompt Engineering & Production Agentic Architecture"; configured as `prompt_engineering_notebook_id` in `config/user_context.json` or see `docs/agent_prompt_engineering_guide.md`): Canonical prompt guide: hierarchical XML delimiting, KV-cache optimization and negative few-shots.
-   - Ingest fresh news, newsletters, and macro/crypto catalysts: execute `python3 scripts/fetch_newsletters.py` (reads folder from `config/user_context.json`, `NEWSLETTERS_FOLDER` env var, or optional `--folder "<FOLDER>"`) or use MCP tool `crypto_radar:get_crypto_newsletters` to inspect tagged crypto emails (Glassnode, Blockworks, etc.) and reject late-stage euphoria or avoid entering right before scheduled high-impact events.
-   - **Market Rank & Institutional Flow Screening (Optional Web3 Skills Integration):**
-     * *Graceful Fallback:* If optional Web3 skills (`crypto-market-rank`, `binance-wallet-tracker`, `trading-signal`) are not installed or configured, the desk automatically and gracefully falls back to native Binance Futures market screener (`scripts/broad_market_radar.py`) and microstructure engine (`scripts/microstructure_engine.py`) with zero operational interruption.
-     * **Capital Inflow & Hype Radar (`crypto-market-rank`, Optional):** Smart-money net inflows, social hype and top-trader positioning, before technical filtering.
-     * **Smart Money & Whale Orderflow Confluence (`binance-wallet-tracker` & `trading-signal`, Optional):** On-chain accumulation/distribution and whale signals backing absorption wicks ($\ge 60\%$) and Order Flow Imbalance.
-   - Screen liquid Binance Futures contracts concurrently across 80+ pairs (15m/5m/1h via `python3 scripts/broad_market_radar.py` or MCP tools), targeting volume absorption wicks, RSI extremes, and distance to EMA 20.
+   - Ingest fresh news, newsletters, and macro/crypto catalysts: execute `python3 scripts/fetch_newsletters.py` (reads folder from `config/user_context.json`, `NEWSLETTERS_FOLDER` env var, or optional `--folder "<FOLDER>"`; `--format json` for structured output) to inspect tagged crypto emails (Glassnode, Blockworks, etc.) and reject late-stage euphoria or avoid entering right before scheduled high-impact events.
+   - **Native CLI screening is the only scan path** (read-only, `--json`; see `.agents/skills/market-radar/SKILL.md`): `broad_market_radar.py` screens 80+ Binance Futures pairs (15m/5m/1h, microstructure via `screening_pipeline.py`) for absorption wicks, RSI extremes and distance to EMA 20; `broad_yolo_scanner.py` screens memecoins; `quant_risk_engine.py {parity,pairs,kelly}` covers sizing, pairs and Kelly.
+   - Third-party Binance skills (`.agents/skills/binance*`, `crypto-market-rank`, `meme-rush`, `query-*`, etc.) may be installed locally but are not part of this flow: never use them to place orders, move funds or sign API requests (execution only via `scripts/execute_futures_trade.py`).
    - **Dual-Engine Operational Framework:**
       * **Engine 1: Disciplined Pure Intraday (Day Trading Desk):**
         - *Strategies:* Trend Following Momentum, Mean Reversion at Support/VWAP, Delta-Neutral Hedging, Conditional YOLO Moonshot.
@@ -82,7 +81,7 @@ Whenever the user explicitly requests crypto trading operations, Binance Futures
      * **Barbell Philosophy (Nassim Taleb):** 90% of capital allocated to rigorous quantitative and Stat-Arb strategies, and 10% strictly ring-fenced for convex moonshots.
      * **Objective:** Capture explosive breakout runs in memecoins (PEPE, WIF, BONK, DOGE, NEIRO, PENGU, BOME, MOODENG) at the profile's `leverage_yolo` (desk ceiling `leverage_ceiling`). Only when `yolo_slot_enabled` is true.
      * **Mandatory Hardened Quantitative Filters:** Climax volume $\ge 2.0\times$ moving average OR buyer absorption wick $\ge 50\%$. If no memecoin meets this threshold, **the YOLO slot must remain empty** (never force trades).
-      * **Narrative & Launchpad Acceleration (`meme-rush` / `topic-rush`, Optional):** If installed, cross-check memecoin candidates with real-time launchpad lifecycle and AI hot topics (`topic-rush` / `meme-rush`) to guarantee active speculative momentum and capital inflow velocity before entering. If not installed, fall back to 24h volume acceleration and CVD absorption wicks from `broad_market_radar.py`.
+      * **Momentum Confirmation:** Speculative momentum comes from 24h volume acceleration and CVD absorption wicks in `broad_yolo_scanner.py --json` / `broad_market_radar.py --json`.
       * **Right-Tail Skewness Preservation (Zero Truncation):** On YOLO memecoins, **do NOT move Stop Loss to Break-Even prematurely** (5m noise whipsaws). Ratchet to Break-Even only after **TP1** fills. Express TP/SL as price %; ROE = price % × `leverage_yolo`.
       * **Isolated Risk Control:** Ring-fenced YOLO margin from the profile and **mandatory Isolated Margin**, so the maximum loss is capped by software with zero contagion to the main balance.
 
@@ -94,7 +93,8 @@ Whenever the user explicitly requests crypto trading operations, Binance Futures
    - **Autonomous Immediate Execution Protocol (Fast-Track / Zero Latency):**
      * **Tier S** candidates (conviction $\ge 80\%$, `requires_user_confirmation: false`) are executed and shielded immediately without chat confirmation **only if** the profile enables `autonomous_execution_tier_s`; otherwise ask the user.
      * Tier A+ / Tier A candidates (`requires_user_confirmation: true`) always need the user's explicit confirmation in chat.
-   - **Technical Execution Engine (`execute_futures_trade.py` / `crypto_radar:deploy_futures_trade`):**
+   - **Technical Execution Engine (`scripts/execute_futures_trade.py`, the single choke point; no MCP wrapper):**
+     * Position management via the same CLI: `--positions --json` (read-only), `--move-breakeven --symbol <SYMBOL>`, `--close-position --symbol <SYMBOL>`, `--audit-orphans`, `--auto-heal`.
      * Margin: Mandatory Isolated
      * Leverage: profile `leverage_standard` (standard) / `leverage_yolo` (YOLO), ceiling `leverage_ceiling`, default 15x (5x on MCP sub-accounts)
      * Size: risk-based from `risk_pct_equity`, margin capped at `max_margin_ratio` of equity; YOLO margin from the profile
@@ -104,11 +104,11 @@ Whenever the user explicitly requests crypto trading operations, Binance Futures
        preventing premature stop-outs from spread widening in subcritical liquidation cascades ($\hat{\lambda} \approx 0.19$).
      * **Atomic Stop Loss Verification (Progressive Fail-Safe):** Verify on Binance ledger (`/fapi/v1/openAlgoOrders`) that the Stop Loss is confirmed. Perform up to 3 progressive retries (~2.8s) to absorb Mainnet indexing latency. If unconfirmed after 3 retries, **the bot triggers auto-destruct and immediately closes the position at market (`reduceOnly=true`)** guaranteeing ZERO unhedged exposure.
      * Orders 3 & 4: TP1 (30% at +1.8R to lock in fees and enter free-trade state) and TP2 (70% at +4.0R structural target to preserve positive right-tail skewness) Limit with `reduceOnly: true`.
-     * **Dynamic Exit Management (Right-Tail Preservation & True Net BE):**
+     * **Dynamic Exit Management (Right-Tail Preservation & True Net BE; guardian loop, Layer 8):**
        - Trailing Stop anchored to **15m Structural Swings** + Chandelier ATR (1.8x ATR_15m), filtering out 5m noise.
        - **Anti-Truncation:** Do NOT tighten to Break-Even on minor pullbacks. Only ratchet to **True Net Break-Even** (+0.2% roundtrip taker fee buffer) after confirmed expansion of at least **$+2.0 \times ATR_{15m}$** or after TP1 execution.
      * **Volatility Compression vs Dead Alpha:** Do not prematurely exit positions showing range compression on dry volume if structural stop is intact; treat as volatility coiling/accumulation.
-     * **Continuous Orphan Audit (`audit_orphan_positions`):** Regularly audit all open positions. If an unprotected position lacking an active Stop Loss is detected, trigger immediate auto-healing (`auto_heal`).
+     * **Continuous Orphan Audit (guardian loop or `execute_futures_trade.py --audit-orphans`):** Regularly audit all open positions. If an unprotected position lacking an active Stop Loss is detected, trigger immediate auto-healing (`--auto-heal`).
 
 4. **Phase 4: Notion Journal Sync**
    - Automatically synchronize with Notion database `"Trading Journal - Futures"` (configured via `database_id` in `config/user_context.json` or `NOTION_DATABASE_ID` in `.env` / environment variables; see `docs/notion_setup_guide.md`):

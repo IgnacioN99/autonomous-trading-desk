@@ -15,7 +15,7 @@ Default Parameters:
 - yolo_slot_enabled: False
 - leverage_standard: 3
 - leverage_yolo: 15 (Barbell YOLO slot; sub-accounts are auto-clamped to 5x by the executor on -4421)
-- leverage_ceiling: 15 (absolute desk ceiling enforced by the execution engine and the radar MCP server;
+- leverage_ceiling: 15 (absolute desk ceiling enforced by the execution engine and the pre-trade guard;
   raise it here, never above MAX_LEVERAGE_CEILING)
 """
 
@@ -31,7 +31,7 @@ CONFIG_DIR = os.path.join(BASE_DIR, "config")
 PROFILE_FILE = os.path.join(CONFIG_DIR, "user_profile.json")
 
 # Single source of truth for the absolute desk leverage ceiling.
-# execute_futures_trade.py (hard gate) and radar_mcp_server.py (pre-check) both read it through
+# execute_futures_trade.py (hard gate) and hooks/pre_trade_guard.py (pre-check) both read it through
 # get_leverage_ceiling(); users may raise it per profile via `leverage_ceiling` up to MAX_LEVERAGE_CEILING.
 DEFAULT_LEVERAGE_CEILING = 15
 MAX_LEVERAGE_CEILING = 125

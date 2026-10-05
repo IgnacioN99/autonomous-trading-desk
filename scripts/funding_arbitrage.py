@@ -4,6 +4,9 @@ funding_arbitrage.py - Delta-Neutral Funding Rate Arbitrage Engine and Simulatio
 Calculates exact return, payment intervals, collateral, and basis spread for Binance.
 """
 
+import argparse
+import os
+import sys
 import urllib.request
 import json
 import time
@@ -112,12 +115,58 @@ def simulate_funding_trade(symbol, total_capital_usdt=100.0):
         "strategy": target['strategy_type']
     }
 
-if __name__ == "__main__":
-    top = scan_top_funding_opportunities()
+def main(argv=None):
+    """CLI: python3 scripts/funding_arbitrage.py [--json] [--top N] [--min-volume USDT]
+                                                [--simulate SYMBOL --capital USDT] [--env prod|testnet]
+    Read-only public market data. Exit codes: 0 ok, 1 data/API error, 2 bad usage."""
+    parser = argparse.ArgumentParser(description="Funding rate / cash-and-carry scanner (read-only)")
+    parser.add_argument("--json", action="store_true", help="Print a single JSON document on stdout")
+    parser.add_argument("--top", type=int, default=6, help="Number of opportunities (default 6)")
+    parser.add_argument("--min-volume", type=float, default=20_000_000, help="Min 24h quote volume in USDT (default 20M)")
+    parser.add_argument("--simulate", default=None, metavar="SYMBOL", help="Also simulate a delta-neutral position for SYMBOL")
+    parser.add_argument("--capital", type=float, default=None, help="Total capital (USDT) for --simulate (required with --simulate)")
+    parser.add_argument("--env", default=None, help="prod|testnet (resolved via env_resolver; market data is always public mainnet)")
+    args = parser.parse_args(argv)
+
+    if args.top < 1 or args.min_volume < 0 or (args.simulate and (args.capital is None or args.capital <= 0)):
+        parser.print_usage(sys.stderr)
+        sys.stderr.write("error: --top >= 1, --min-volume >= 0, and --simulate requires --capital > 0\n")
+        return 2
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from utils.env_resolver import resolve_env
+        env = resolve_env(args.env)
+    except ValueError as e:
+        sys.stderr.write(f"error: {e}\n")
+        return 2
+
+    try:
+        top = scan_top_funding_opportunities(min_volume_usdt=args.min_volume, top_n=args.top)
+        sim = simulate_funding_trade(args.simulate.upper(), args.capital) if args.simulate else None
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        if args.json:
+            sys.stdout.write(json.dumps({"status": "error", "command": "funding", "env": env, "error": err}, indent=2) + "\n")
+        else:
+            sys.stderr.write(f"Funding scan failed: {err}\n")
+        return 1
+
+    if args.json:
+        payload = {"status": "ok", "command": "funding", "env": env, "count": len(top), "opportunities": top}
+        if sim is not None:
+            payload["simulation"] = sim
+        sys.stdout.write(json.dumps(payload, indent=2) + "\n")
+        return 0
+
     print("=== TOP FUNDING RATE ARBITRAGE OPPORTUNITIES (CASH-AND-CARRY) ===")
     for o in top:
         print(f"• {o['symbol']}: {o['funding_rate_8h']:+.4f}%/8h | APR: {o['apr']:+.1f}% | Vol: ${o['volume_24h_m']}M | Next in {o['mins_to_payout']//60}h {o['mins_to_payout']%60}m | {o['strategy_type']}")
-    
-    print("\n--- SAMPLE SIMULATION ($100 USDT) ---")
-    sim = simulate_funding_trade(top[0]['symbol'], 100.0)
-    print(json.dumps(sim, indent=2))
+    if not top:
+        print("No contract clears the volume filter right now.")
+    if sim is not None:
+        print(f"\n--- SIMULATION ({args.capital:.2f} USDT) ---")
+        print(json.dumps(sim, indent=2))
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

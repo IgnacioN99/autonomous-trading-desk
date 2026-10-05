@@ -142,7 +142,7 @@ class TestIssue9FinalFindings(unittest.TestCase):
     # =========================================================================
     def test_finding_15_mcp_configs_harmonized(self):
         """Claude Code (.mcp.json) and Antigravity (.agents/mcp_config.json) expose the same servers:
-        same names, same remote endpoints (each in its client's schema) and the same generic stdio script."""
+        same names and remote endpoints (each in its client's schema). The crypto_radar stdio server is retired."""
         root_mcp = os.path.join(BASE_DIR, ".mcp.json")
         agents_mcp = os.path.join(BASE_DIR, ".agents", "mcp_config.json")
 
@@ -154,8 +154,10 @@ class TestIssue9FinalFindings(unittest.TestCase):
             agy = json.load(f2)["mcpServers"]
 
         self.assertEqual(set(claude), set(agy))
-        for name in ("binance", "notion", "crypto_radar"):
+        for name in ("binance", "notion"):
             self.assertIn(name, claude)
+        self.assertNotIn("crypto_radar", claude)
+        self.assertNotIn("crypto_radar", agy)
 
         for name, spec in agy.items():
             if "command" in spec:
@@ -172,13 +174,10 @@ class TestIssue9FinalFindings(unittest.TestCase):
                 self.assertEqual(claude[name].get("type"), "http")
                 self.assertEqual(claude[name].get("url"), spec["serverUrl"])
 
-        radar_args = agy["crypto_radar"]["args"]
-        self.assertEqual(radar_args, ["scripts/radar_mcp_server.py"])
-        self.assertTrue(os.path.exists(os.path.join(BASE_DIR, *radar_args[0].split("/"))))
-
         for path in (root_mcp, agents_mcp):
             with open(path, "r", encoding="utf-8") as f:
                 raw = f.read()
+            self.assertNotIn("radar_mcp_server", raw)
             for needle in ("/mnt/", "/home/", "/Users/", "C:\\", "C:/", "/usr/bin/python3"):
                 self.assertNotIn(needle, raw, f"{os.path.basename(path)} contains machine-specific path '{needle}'")
 
