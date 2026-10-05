@@ -85,8 +85,8 @@ RSI ≥ 45, score ≥ 50. Margin comes from the profile (`yolo_margin_fixed`, el
  "sizing": {"margin_usdt": 12.0, "leverage": 15, "leverage_ceiling": 15, "margin_mode": "ISOLATED", "yolo_slot_enabled": true},
  "slot_status": "CANDIDATE",
  "recommendation": {"symbol": "WIFUSDT", "direction": "LONG", "score": 88.1, "price": 2.01, "trigger": 2.031,
-   "sl": 1.95, "risk_pct": 2.9, "tp1": 2.14, "tp2": 2.27, "roe_tp1_pct": 95.7, "roe_tp2_pct": 195.8,
-   "leverage": 15, "margin_usdt": 12.0, "notional_usdt": 180.0, "qty": 89.55, "max_loss_usdt": 5.22,
+   "sl": 1.972, "risk_pct": 2.9, "tp1": 2.161, "tp2": 2.296, "roe_tp1_pct": 95.7, "roe_tp2_pct": 195.8,
+   "leverage": 15, "margin_usdt": 12.0, "notional_usdt": 180.0, "qty": 88.63, "max_loss_usdt": 5.22,
    "gain_tp1_usdt": 11.48, "gain_tp2_usdt": 23.5, "rsi": 41.2, "vol_ratio": 3.4, "lower_wick": 61.0,
    "upper_wick": 4.0, "atr_pct": 1.8},
  "longs": ["<same shape as recommendation>"], "shorts": ["<same shape, direction SHORT>"],
@@ -96,6 +96,8 @@ RSI ≥ 45, score ≥ 50. Margin comes from the profile (`yolo_margin_fixed`, el
 - `slot_status`: `EMPTY` (no long qualifies — keep the slot empty, never force a trade),
   `CANDIDATE`, or `CANDIDATE_SLOT_DISABLED` (profile `yolo_slot_enabled` is false: report only).
 - `recommendation` is the best long (or `null`); shorts are hedges only.
+- Levels are measured from `trigger` (the breakout entry): `risk_pct`, TP1 = +2.2R, TP2 = +4.5R, ROE, `qty`
+  and `max_loss_usdt`.
 - Do not move a YOLO stop to break-even before TP1 fills.
 
 ## 3. Volatility parity sizing — `quant_risk_engine.py parity`

@@ -43,6 +43,9 @@ YOLO_DISABLED_STATUS = "DISABLED: yolo_slot_enabled is false in the user profile
 # and the Barbell YOLO loss cap (GATE 2, loss at SL <= 35% of the isolated margin: SL distance x leverage <= 0.35).
 YOLO_MIN_TP1_DISTANCE = 0.0035
 YOLO_MAX_LOSS_MARGIN_FRACTION = 0.35
+# Desk R:R floors measured from the trigger entry: TP1 must reach +1.8R (fees + free trade) and TP2 >= 3:1.
+YOLO_MIN_R_TP1 = 1.8
+YOLO_MIN_RR_TP2 = 3.0
 YOLO_SIG_DIGITS = 6  # forwarded floats are rounded to 6 significant digits (token budget)
 _last_yolo_future = None  # Future of the latest pipeline run's YOLO scan (CLI exit handling)
 
@@ -122,21 +125,18 @@ class StatArbPair(BaseModel):
     is_actionable: bool
 
 class YoloCandidate(BaseModel):
-    """Compact LONG-only subset of broad_yolo_scanner.build_levels() forwarded to the evaluator."""
+    """Compact LONG-only subset of broad_yolo_scanner.build_levels() forwarded to the evaluator (levels from the
+    trigger entry). No ROE / max loss figures: the evaluator derives them itself (RULE 6)."""
     symbol: str
     direction: Literal["LONG"]
-    score: float
-    price: float
     trigger: float
     sl: float
-    risk_pct: float
     tp1: float
     tp2: float
-    roe_tp1_pct: float
-    roe_tp2_pct: float
+    risk_pct: float
+    rr_tp2: float  # R multiple of TP2 from the trigger
     leverage: int
     margin_usdt: float
-    max_loss_usdt: float
     rsi: float
     vol_ratio: float
     lower_wick: float
@@ -336,8 +336,11 @@ def _start_yolo_scan(target_env: str) -> Future:
     threading.Thread(target=_run, name="yolo-scan", daemon=True).start()
     return fut
 
-def _yolo_unavailable(reason: str) -> Tuple[str, YoloSlot]:
-    reason = " ".join(str(reason).split())[:160]
+def _yolo_unavailable(reason: str, detail: Optional[str] = None) -> Tuple[str, YoloSlot]:
+    """`reason` is fixed desk text that reaches the brief. `detail` (exception messages, which may carry
+    server-controlled text) is only logged to stderr, never forwarded to the evaluator."""
+    if detail:
+        print(f"YOLO slot UNAVAILABLE ({reason}): {detail}", file=sys.stderr)
     return f"UNAVAILABLE: {reason}. YOLO slot kept empty.", YoloSlot(status="UNAVAILABLE", interval=YOLO_SCAN_INTERVAL)
 
 def _sig(x: float, digits: int = YOLO_SIG_DIGITS) -> float:
@@ -345,16 +348,16 @@ def _sig(x: float, digits: int = YOLO_SIG_DIGITS) -> float:
     return float(f"{float(x):.{digits}g}")
 
 def _to_yolo_candidate(raw: dict) -> Optional[YoloCandidate]:
-    """Plain-typed LONG candidate that passes the Barbell filters and the executor's YOLO gates when entered at its
-    trigger (the entry the evaluator uses), else None. risk_pct, ROE and max loss are recomputed from the trigger
-    (the scanner computes them from the current price)."""
+    """Plain-typed LONG candidate that passes the Barbell filters, the executor's YOLO gates and the desk R:R floors
+    when entered at its trigger (the entry the evaluator uses), else None. risk_pct and rr_tp2 are computed from
+    the trigger."""
     try:
         if raw.get("direction") != "LONG":
             return None
         symbol, price, trigger, sl = str(raw["symbol"]), float(raw["price"]), float(raw["trigger"]), float(raw["sl"])
         tp1, tp2 = float(raw["tp1"]), float(raw["tp2"])
         leverage, margin = int(raw["leverage"]), float(raw["margin_usdt"])
-        score, rsi = float(raw["score"]), float(raw["rsi"])
+        rsi = float(raw["rsi"])
         vol_ratio, lower_wick = float(raw["vol_ratio"]), float(raw["lower_wick"])
     except Exception:
         return None
@@ -364,26 +367,26 @@ def _to_yolo_candidate(raw: dict) -> Optional[YoloCandidate]:
     # LONG levels must be coherent around the current price and the trigger entry (also drops NaN levels).
     if not (0.0 < sl < price and sl < trigger < tp1 <= tp2 and leverage >= 1 and margin > 0.0):
         return None
-    risk_frac = (trigger - sl) / trigger
+    risk = trigger - sl
+    risk_frac = risk / trigger
     if (tp1 - trigger) / trigger < YOLO_MIN_TP1_DISTANCE:
         return None
     if risk_frac * leverage > YOLO_MAX_LOSS_MARGIN_FRACTION:
         return None
+    rr_tp2 = (tp2 - trigger) / risk
+    if (tp1 - trigger) / risk < YOLO_MIN_R_TP1 or rr_tp2 < YOLO_MIN_RR_TP2:
+        return None
     return YoloCandidate(
         symbol=symbol,
         direction="LONG",
-        score=_sig(score),
-        price=_sig(price),
         trigger=_sig(trigger),
         sl=_sig(sl),
-        risk_pct=round(risk_frac * 100, 2),
         tp1=_sig(tp1),
         tp2=_sig(tp2),
-        roe_tp1_pct=round((tp1 - trigger) / trigger * 100 * leverage, 1),
-        roe_tp2_pct=round((tp2 - trigger) / trigger * 100 * leverage, 1),
+        risk_pct=round(risk_frac * 100, 2),
+        rr_tp2=round(rr_tp2, 2),
         leverage=leverage,
         margin_usdt=round(margin, 2),
-        max_loss_usdt=round(margin * leverage * risk_frac, 2),
         rsi=_sig(rsi),
         vol_ratio=_sig(vol_ratio),
         lower_wick=_sig(lower_wick),
@@ -398,7 +401,7 @@ def build_yolo_slot(scan: dict) -> Tuple[str, YoloSlot]:
     if slot_status == "EMPTY":
         return YOLO_INACTIVE_STATUS, YoloSlot(status="INACTIVE", interval=interval)
     if slot_status != "CANDIDATE":
-        return _yolo_unavailable(f"unexpected scanner slot_status {slot_status!r}")
+        return _yolo_unavailable("unexpected scanner slot_status", detail=repr(slot_status)[:200])
 
     candidates: List[YoloCandidate] = []
     for raw in scan.get("longs") or []:
@@ -441,7 +444,7 @@ def execute_screening_pipeline(top_pairs_count: int = 80, target_env: Optional[s
             else:
                 yolo_result = (YOLO_DISABLED_STATUS, YoloSlot(status="DISABLED", interval=YOLO_SCAN_INTERVAL))
         except Exception as e:
-            yolo_result = _yolo_unavailable(f"user profile unavailable ({type(e).__name__})")
+            yolo_result = _yolo_unavailable(f"user profile unavailable ({type(e).__name__})", detail=str(e))
 
     with ThreadPoolExecutor(max_workers=5) as executor:
         f_macro = executor.submit(fetch_macro_btc)
@@ -534,7 +537,7 @@ def execute_screening_pipeline(top_pairs_count: int = 80, target_env: Optional[s
         except FutureTimeoutError:
             yolo_result = _yolo_unavailable(f"YOLO scan exceeded its {YOLO_SCAN_TIMEOUT_S}s budget")
         except Exception as e:
-            yolo_result = _yolo_unavailable(f"YOLO scan failed ({type(e).__name__}: {e})")
+            yolo_result = _yolo_unavailable(f"YOLO scan failed ({type(e).__name__})", detail=str(e))
     yolo_status, yolo_slot = yolo_result
 
     t1 = time.time()
@@ -613,7 +616,7 @@ def main(argv: Optional[list] = None) -> int:
         print(f"• YOLO Slot: {payload.yolo_slot_status}")
         for y in (payload.yolo_slot.candidates if payload.yolo_slot else []):
             print(f"  🚀 {y.symbol} (LONG {y.leverage}x): Trigger {y.trigger:.6g} | SL {y.sl:.6g} (-{y.risk_pct}%) | "
-                  f"TP1 {y.tp1:.6g} / TP2 {y.tp2:.6g} | Vol {y.vol_ratio}x | Wick {y.lower_wick}% | RSI {y.rsi}")
+                  f"TP1 {y.tp1:.6g} / TP2 {y.tp2:.6g} ({y.rr_tp2}R) | Vol {y.vol_ratio}x | Wick {y.lower_wick}% | RSI {y.rsi}")
     return 0
 
 def _run_cli(argv: Optional[list] = None) -> None:

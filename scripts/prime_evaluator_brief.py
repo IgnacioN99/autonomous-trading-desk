@@ -321,8 +321,9 @@ def format_markdown_brief(brief: dict) -> str:
     lines.append(f"**YOLO Slot:** {yolo.get('summary')}")
     for y in yolo.get("candidates") or []:
         lines.append(f"- **{y.get('symbol')}** LONG {y.get('leverage')}x | Trigger {y.get('trigger')} | "
-                     f"SL {y.get('sl')} (-{y.get('risk_pct')}%) | TP1 {y.get('tp1')} / TP2 {y.get('tp2')} | "
-                     f"Vol {y.get('vol_ratio')}x | Wick {y.get('lower_wick')}% | RSI {y.get('rsi')}")
+                     f"SL {y.get('sl')} (-{y.get('risk_pct')}%) | TP1 {y.get('tp1')} / TP2 {y.get('tp2')} "
+                     f"({y.get('rr_tp2')}R) | Margin {y.get('margin_usdt')} | Vol {y.get('vol_ratio')}x | "
+                     f"Wick {y.get('lower_wick')}% | RSI {y.get('rsi')}")
     return "\n".join(lines)
 
 

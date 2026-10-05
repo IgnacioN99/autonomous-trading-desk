@@ -190,29 +190,31 @@ def resolve_yolo_sizing(target_env):
     }
 
 def build_levels(r, direction, sizing):
-    """Trigger, SL, TP1/TP2 and bounded-capital sizing for a qualified candidate."""
+    """Trigger, SL, TP1/TP2 and bounded-capital sizing for a qualified candidate.
+    The entry is the breakout trigger, so the SL distance (risk_pct), TP1/TP2, ROE, qty and max loss are all
+    measured from the trigger, not from the current price (issue #52)."""
     cur_p = r['price']
     leverage = sizing["leverage"]
     margin = sizing["margin_usdt"]
     if direction == "LONG":
-        sl = max(cur_p * (1 - MAX_RISK_PCT / 100), r['low'] - (SL_ATR_MULT * r['atr']))
-        risk_pct = (cur_p - sl) / cur_p * 100
-        if risk_pct < MIN_RISK_PCT:
-            sl = cur_p * (1 - MIN_RISK_PCT / 100)
-            risk_pct = MIN_RISK_PCT
         trigger = r['high'] * (1 + TRIGGER_BUFFER)
-        tp1 = cur_p * (1 + risk_pct * TP1_R / 100)
-        tp2 = cur_p * (1 + risk_pct * TP2_R / 100)
+        sl = max(trigger * (1 - MAX_RISK_PCT / 100), r['low'] - (SL_ATR_MULT * r['atr']))
+        risk_pct = (trigger - sl) / trigger * 100
+        if risk_pct < MIN_RISK_PCT:
+            sl = trigger * (1 - MIN_RISK_PCT / 100)
+            risk_pct = MIN_RISK_PCT
+        tp1 = trigger * (1 + risk_pct * TP1_R / 100)
+        tp2 = trigger * (1 + risk_pct * TP2_R / 100)
         score = r['score_long']
     else:
-        sl = min(cur_p * (1 + MAX_RISK_PCT / 100), r['high'] + (SL_ATR_MULT * r['atr']))
-        risk_pct = (sl - cur_p) / cur_p * 100
-        if risk_pct < MIN_RISK_PCT:
-            sl = cur_p * (1 + MIN_RISK_PCT / 100)
-            risk_pct = MIN_RISK_PCT
         trigger = r['low'] * (1 - TRIGGER_BUFFER)
-        tp1 = cur_p * (1 - risk_pct * TP1_R / 100)
-        tp2 = cur_p * (1 - risk_pct * TP2_R / 100)
+        sl = min(trigger * (1 + MAX_RISK_PCT / 100), r['high'] + (SL_ATR_MULT * r['atr']))
+        risk_pct = (sl - trigger) / trigger * 100
+        if risk_pct < MIN_RISK_PCT:
+            sl = trigger * (1 + MIN_RISK_PCT / 100)
+            risk_pct = MIN_RISK_PCT
+        tp1 = trigger * (1 - risk_pct * TP1_R / 100)
+        tp2 = trigger * (1 - risk_pct * TP2_R / 100)
         score = r['score_short']
 
     notional = margin * leverage
@@ -233,7 +235,7 @@ def build_levels(r, direction, sizing):
         "leverage": leverage,
         "margin_usdt": margin,
         "notional_usdt": round(notional, 2),
-        "qty": notional / cur_p if cur_p > 0 else 0.0,
+        "qty": notional / trigger if trigger > 0 else 0.0,
         "max_loss_usdt": round(notional * risk_pct / 100, 2),
         "gain_tp1_usdt": round(margin * roe_tp1 / 100, 2),
         "gain_tp2_usdt": round(margin * roe_tp2 / 100, 2),

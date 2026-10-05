@@ -199,6 +199,38 @@ class TestEnforceEvaluationDossier(_TempWorkspace):
         ok, reason, _ = eft.enforce_evaluation_dossier("SOLUSDT", "LONG", "prod", confirmed=True, base_dir=self.root)
         self.assertTrue(ok, reason)
 
+    def test_prod_yolo_candidate_always_requires_confirmation(self):
+        """Issue #52: a YOLO dossier candidate is never fast-tracked, even with requires_user_confirmation false."""
+        for cand in ({"symbol": "PEPEUSDT", "direction": "LONG", "tier": "S", "is_yolo": True,
+                      "requires_user_confirmation": False},
+                     {"symbol": "PEPEUSDT", "direction": "LONG", "tier": "A", "is_yolo": "true"},
+                     {"symbol": "PEPEUSDT", "direction": "LONG", "tier": "YOLO Moonshot"}):
+            with self.subTest(cand=cand):
+                self.write_subagent_dossier([cand])
+                ok, reason, _ = eft.enforce_evaluation_dossier("PEPEUSDT", "LONG", "prod", base_dir=self.root)
+                self.assertFalse(ok)
+                self.assertIn("YOLO entry", reason)
+                self.assertIn("--confirmed", reason)
+                ok, reason, _ = eft.enforce_evaluation_dossier("PEPEUSDT", "LONG", "prod", confirmed=True,
+                                                               base_dir=self.root)
+                self.assertTrue(ok, reason)
+
+    def test_prod_yolo_order_flag_requires_confirmation(self):
+        self.write_subagent_dossier([{"symbol": "PEPEUSDT", "direction": "LONG", "tier": "S",
+                                      "requires_user_confirmation": False}])
+        ok, reason, _ = eft.enforce_evaluation_dossier("PEPEUSDT", "LONG", "prod", base_dir=self.root, is_yolo=True)
+        self.assertFalse(ok)
+        self.assertIn("YOLO entry", reason)
+        ok, reason, _ = eft.enforce_evaluation_dossier("PEPEUSDT", "LONG", "prod", confirmed=True,
+                                                       base_dir=self.root, is_yolo=True)
+        self.assertTrue(ok, reason)
+
+    def test_prod_non_yolo_tier_s_fast_track_unchanged(self):
+        self.write_subagent_dossier([{"symbol": "SOLUSDT", "direction": "LONG", "tier": "S", "is_yolo": False,
+                                      "requires_user_confirmation": False}])
+        ok, reason, _ = eft.enforce_evaluation_dossier("SOLUSDT", "LONG", "prod", base_dir=self.root)
+        self.assertTrue(ok, reason)
+
     def test_testnet_without_dossier_rejected_with_bypass_hint(self):
         ok, reason, _ = eft.enforce_evaluation_dossier("SOLUSDT", "LONG", "testnet", base_dir=self.root)
         self.assertFalse(ok)
