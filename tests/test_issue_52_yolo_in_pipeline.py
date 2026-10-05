@@ -350,9 +350,11 @@ class TestYoloLevelsFromTrigger(unittest.TestCase):
         # TP1 1.7R fails even with a long TP2.
         tp1_short = self._raw(price=0.995, trigger=1.0, sl=0.98, tp1=1.034, tp2=1.09)
         self.assertEqual(self._slot(tp1_short).status, "INACTIVE")
-        valid = self._raw(price=0.995, trigger=1.0, sl=0.98, tp1=1.037, tp2=1.0602)
+        # Just above both floors once the issue #64 adverse rounding margin (0.05%) is applied:
+        # worst-case TP1 ~1.83R, TP2 ~3.01R (nominal 1.9R / 3.11R).
+        valid = self._raw(price=0.995, trigger=1.0, sl=0.98, tp1=1.038, tp2=1.0622)
         cand = self._slot(valid).candidates[0]
-        self.assertEqual(cand.rr_tp2, 3.01)
+        self.assertEqual(cand.rr_tp2, 3.11)
         self.assertEqual((sp.YOLO_MIN_R_TP1, sp.YOLO_MIN_RR_TP2), (1.8, 3.0))
 
     def test_loss_cap_of_35pct_margin_drops_high_leverage_entries(self):
@@ -366,9 +368,10 @@ class TestYoloLevelsFromTrigger(unittest.TestCase):
         self.assertEqual(sp.YOLO_MAX_LOSS_MARGIN_FRACTION, 0.35)
 
     def test_tp1_friction_floor_measured_from_trigger(self):
-        # Tight 0.1% stop: TP1 at 3R is only 0.30% away (friction FAIL); at 4R it is 0.40% (PASS).
+        # Tight 0.1% stop: TP1 at 3R is only 0.30% away (friction FAIL); at 4.5R it is 0.45% (PASS, ~0.40% after
+        # the issue #64 adverse rounding margin of 0.05%).
         below = self._raw(price=0.9995, trigger=1.0, sl=0.999, tp1=1.003, tp2=1.006)
-        above = self._raw(price=0.9995, trigger=1.0, sl=0.999, tp1=1.004, tp2=1.006)
+        above = self._raw(price=0.9995, trigger=1.0, sl=0.999, tp1=1.0045, tp2=1.006)
         self.assertEqual(self._slot(below).status, "INACTIVE")
         self.assertEqual(len(self._slot(above).candidates), 1)
         self.assertEqual(sp.YOLO_MIN_TP1_DISTANCE, 0.0035)

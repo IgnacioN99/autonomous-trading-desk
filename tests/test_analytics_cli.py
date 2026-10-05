@@ -114,7 +114,8 @@ def radar_long_klines(n=55):
 
 
 def yolo_long_klines(n=40):
-    """Choppy drift then a 3x volume candle with a large buyer absorption wick."""
+    """Choppy drift then a 3x volume candle with a large buyer absorption wick. The wick is narrow enough (stop
+    ~4% from the trigger, x7 leverage = 0.28 of margin) for the 35% YOLO loss cap (issue #64)."""
     ks, price = [], 1.0
     for i in range(n - 1):
         o = price
@@ -122,7 +123,7 @@ def yolo_long_klines(n=40):
         ks.append([i, str(o), str(max(o, c) * 1.001), str(min(o, c) * 0.999), str(c), "100"])
         price = c
     o = price
-    ks.append([n, str(o), str(o * 1.005), str(o * 0.95), str(o * 1.001), "300"])
+    ks.append([n, str(o), str(o * 1.005), str(o * 0.975), str(o * 1.001), "300"])
     return ks
 
 

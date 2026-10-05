@@ -88,21 +88,31 @@ RSI ≥ 45, score ≥ 50. Margin comes from the profile (`yolo_margin_fixed`, el
 ```json
 {"status": "ok", "command": "yolo", "env": "prod", "interval": "15m", "universe_size": 96,
  "universe_from_live_ticker": true, "scanned": 94,
- "filters": {"min_vol_ratio": 2.0, "min_wick_pct": 50.0, "min_vol_floor": 1.0, "long_max_rsi": 65.0, "short_min_rsi": 45.0, "min_score": 50.0},
- "sizing": {"margin_usdt": 12.0, "leverage": 15, "leverage_ceiling": 15, "margin_mode": "ISOLATED", "yolo_slot_enabled": true},
+ "filters": {"min_vol_ratio": 2.0, "min_wick_pct": 50.0, "min_vol_floor": 1.0, "long_max_rsi": 65.0, "short_min_rsi": 45.0, "min_score": 50.0,
+   "min_tp1_distance": 0.0035, "max_loss_margin_fraction": 0.35, "min_r_tp1": 1.8, "min_rr_tp2": 3.0, "rounding_margin": 0.0005},
+ "sizing": {"margin_usdt": 12.0, "leverage": 10, "leverage_ceiling": 15, "margin_mode": "ISOLATED", "yolo_slot_enabled": true},
  "slot_status": "CANDIDATE",
  "recommendation": {"symbol": "WIFUSDT", "direction": "LONG", "score": 88.1, "price": 2.01, "trigger": 2.031,
-   "sl": 1.972, "risk_pct": 2.9, "tp1": 2.161, "tp2": 2.296, "roe_tp1_pct": 95.7, "roe_tp2_pct": 195.8,
-   "leverage": 15, "margin_usdt": 12.0, "notional_usdt": 180.0, "qty": 88.63, "max_loss_usdt": 5.22,
-   "gain_tp1_usdt": 11.48, "gain_tp2_usdt": 23.5, "rsi": 41.2, "vol_ratio": 3.4, "lower_wick": 61.0,
-   "upper_wick": 4.0, "atr_pct": 1.8},
+   "sl": 1.972, "risk_pct": 2.9, "tp1": 2.161, "tp2": 2.296, "roe_tp1_pct": 63.8, "roe_tp2_pct": 130.5,
+   "leverage": 10, "margin_usdt": 12.0, "notional_usdt": 120.0, "qty": 59.08, "max_loss_usdt": 3.48,
+   "gain_tp1_usdt": 7.66, "gain_tp2_usdt": 15.66, "rsi": 41.2, "vol_ratio": 3.4, "lower_wick": 61.0,
+   "upper_wick": 4.0, "atr_pct": 1.8, "gate_ok": true, "gate_failures": []},
  "longs": ["<same shape as recommendation>"], "shorts": ["<same shape, direction SHORT>"],
  "volume_surges": [{"symbol": "WIFUSDT", "vol_ratio": 3.4, "rsi": 41.2, "atr_pct": 1.8, "price": 2.01}]}
 ```
 
-- `slot_status`: `EMPTY` (no long qualifies — keep the slot empty, never force a trade),
-  `CANDIDATE`, or `CANDIDATE_SLOT_DISABLED` (profile `yolo_slot_enabled` is false: report only).
-- `recommendation` is the best long (or `null`); shorts are hedges only.
+- `slot_status`: `EMPTY` (no long passes the filters and the executor gates — keep the slot empty, never force a
+  trade), `CANDIDATE`, or `CANDIDATE_SLOT_DISABLED` (profile `yolo_slot_enabled` is false: report only).
+- Every long and short row carries `gate_ok` and `gate_failures` (`coherence`, `friction`, `loss_cap`, `rr_tp1`,
+  `rr_tp2`), mirroring the PROD executor gates it would face when entered at `trigger` (on TESTNET the executor
+  skips the GATE 2 YOLO cap and the GATE 3 friction floor; the flags stay at the PROD limits) — coherent levels (LONG SL below the
+  current price and `sl < trigger < tp1 <= tp2`, SHORT mirrored), TP1 ≥ 0.35% from the trigger (GATE 3), SL
+  distance × leverage ≤ 0.35 of the isolated margin (GATE 2 YOLO cap) and TP1 ≥ 1.8R / TP2 ≥ 3:1. They run on prices
+  rounded to 6 significant digits with an adverse 0.05% margin (SL farther, TPs closer). The gates run on every
+  qualified row before the `--top` cut: `longs` / `shorts` list gate-passing rows first (score order within each
+  group), then failing rows only when fewer than `--top` pass. Failing rows are never recommended: a
+  `gate_ok: false` row is not a trade.
+- `recommendation` is the top long with `gate_ok: true` (or `null`); shorts are hedges only.
 - Levels are measured from `trigger` (the breakout entry): `risk_pct`, TP1 = +2.2R, TP2 = +4.5R, ROE, `qty`
   and `max_loss_usdt`.
 - Do not move a YOLO stop to break-even before TP1 fills.

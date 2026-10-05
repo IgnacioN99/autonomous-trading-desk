@@ -121,6 +121,10 @@ try:
 except Exception:  # pragma: no cover - exercised only on broken installs
     validate_dossier_for_trade = None
 
+# GATE 2 (YOLO loss cap) and GATE 3 (friction floor) limits, shared with the YOLO scanner and the screening
+# pipeline (scripts/utils/gate_limits.py, issue #64).
+from utils.gate_limits import MIN_TP1_DISTANCE, YOLO_MAX_LOSS_MARGIN_FRACTION, YOLO_MIN_LOSS_CAP_USDT
+
 # Liquidation gate parameters
 DEFAULT_MAINT_MARGIN_RATIO = 0.01      # Conservative fallback when /fapi/v1/leverageBracket is unavailable
 LIQUIDATION_SAFETY_FRACTION = 0.80     # SL distance must be <= 80% of the entry->liquidation distance
@@ -1425,9 +1429,9 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
     if is_testnet:
         max_allowed_loss = max(account_equity * risk_fraction * 1.25, 50.0)
     elif is_yolo:
-        # Barbell YOLO Moonshot: strict software loss cap (35% of margin, min $3.75 USDT)
+        # Barbell YOLO Moonshot: strict software loss cap (35% of margin, min $3.75 USDT; utils/gate_limits.py)
         margin_est = (ref * total_qty / max(leverage, 1))
-        max_allowed_loss = max(3.75, margin_est * 0.35)
+        max_allowed_loss = max(YOLO_MIN_LOSS_CAP_USDT, margin_est * YOLO_MAX_LOSS_MARGIN_FRACTION)
     else:
         max_allowed_loss = account_equity * risk_fraction * 1.25
 
@@ -1438,8 +1442,8 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
     if tp1_price and not is_testnet:
         # Signed distance: a TP1 on the wrong side of the effective entry is negative and rejected
         profit_pct_tp1 = ((tp1_price - ref) / ref) if is_long else ((ref - tp1_price) / ref)
-        if profit_pct_tp1 < 0.0035:
-            return False, f"MECHANICAL HARD GATE REJECTION: Distance to TP1 ({profit_pct_tp1*100:.2f}%) below 0.35% friction floor or on the wrong side of entry (entry ref {ref}). Taker commissions erode statistical edge."
+        if profit_pct_tp1 < MIN_TP1_DISTANCE:
+            return False, f"MECHANICAL HARD GATE REJECTION: Distance to TP1 ({profit_pct_tp1*100:.2f}%) below {MIN_TP1_DISTANCE*100:.2f}% friction floor or on the wrong side of entry (entry ref {ref}). Taker commissions erode statistical edge."
 
     return True, None
 
