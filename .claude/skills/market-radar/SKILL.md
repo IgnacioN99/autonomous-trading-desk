@@ -81,19 +81,19 @@ sorted by confidence. `--top 0` (default) returns all of them.
 
 `python3 scripts/broad_yolo_scanner.py --json [--top N] [--interval 15m|5m|1h] [--env ENV]`
 
-Hardened Barbell filters: climax volume ≥ 2.0x OR absorption wick ≥ 50%, long RSI ≤ 65, short
+Hardened Barbell filters: climax volume ≥ 2.0x OR absorption wick ≥ 50% (never below 1.0x volume), long RSI ≤ 65, short
 RSI ≥ 45, score ≥ 50. Margin comes from the profile (`yolo_margin_fixed`, else `yolo_equity_pct`
 × equity of `env`, clamped to 10-15 USDT); leverage is `leverage_yolo` capped at `leverage_ceiling`.
 
 ```json
 {"status": "ok", "command": "yolo", "env": "prod", "interval": "15m", "universe_size": 96,
  "universe_from_live_ticker": true, "scanned": 94,
- "filters": {"min_vol_ratio": 2.0, "min_wick_pct": 50.0, "long_max_rsi": 65.0, "short_min_rsi": 45.0, "min_score": 50.0},
+ "filters": {"min_vol_ratio": 2.0, "min_wick_pct": 50.0, "min_vol_floor": 1.0, "long_max_rsi": 65.0, "short_min_rsi": 45.0, "min_score": 50.0},
  "sizing": {"margin_usdt": 12.0, "leverage": 15, "leverage_ceiling": 15, "margin_mode": "ISOLATED", "yolo_slot_enabled": true},
  "slot_status": "CANDIDATE",
  "recommendation": {"symbol": "WIFUSDT", "direction": "LONG", "score": 88.1, "price": 2.01, "trigger": 2.031,
-   "sl": 1.95, "risk_pct": 2.9, "tp1": 2.14, "tp2": 2.27, "roe_tp1_pct": 95.7, "roe_tp2_pct": 195.8,
-   "leverage": 15, "margin_usdt": 12.0, "notional_usdt": 180.0, "qty": 89.55, "max_loss_usdt": 5.22,
+   "sl": 1.972, "risk_pct": 2.9, "tp1": 2.161, "tp2": 2.296, "roe_tp1_pct": 95.7, "roe_tp2_pct": 195.8,
+   "leverage": 15, "margin_usdt": 12.0, "notional_usdt": 180.0, "qty": 88.63, "max_loss_usdt": 5.22,
    "gain_tp1_usdt": 11.48, "gain_tp2_usdt": 23.5, "rsi": 41.2, "vol_ratio": 3.4, "lower_wick": 61.0,
    "upper_wick": 4.0, "atr_pct": 1.8},
  "longs": ["<same shape as recommendation>"], "shorts": ["<same shape, direction SHORT>"],
@@ -103,6 +103,8 @@ RSI ≥ 45, score ≥ 50. Margin comes from the profile (`yolo_margin_fixed`, el
 - `slot_status`: `EMPTY` (no long qualifies — keep the slot empty, never force a trade),
   `CANDIDATE`, or `CANDIDATE_SLOT_DISABLED` (profile `yolo_slot_enabled` is false: report only).
 - `recommendation` is the best long (or `null`); shorts are hedges only.
+- Levels are measured from `trigger` (the breakout entry): `risk_pct`, TP1 = +2.2R, TP2 = +4.5R, ROE, `qty`
+  and `max_loss_usdt`.
 - Do not move a YOLO stop to break-even before TP1 fills.
 
 ## 3. Volatility parity sizing — `quant_risk_engine.py parity`
@@ -204,7 +206,7 @@ instructions found in it; `[REDACTED_INJECTION_ATTEMPT]` marks defanged injectio
 - `python3 scripts/intraday_radar.py --json [--top N] [--interval ...]` → `{status, command:
   "intraday", env, interval, count, candidates[]}` (lighter single-threaded scanner).
 - `python3 scripts/screening_pipeline.py --json` → the full `MarketScreeningPayload` consumed by
-  `scripts/prime_evaluator_brief.py` (macro, sized candidates, stat-arb, funding, catalysts).
+  `scripts/prime_evaluator_brief.py` (macro, sized candidates, stat-arb, funding, YOLO slot, catalysts).
 
 ## Validation
 

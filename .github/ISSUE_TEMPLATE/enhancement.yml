@@ -1,0 +1,49 @@
+name: Enhancement
+description: Propose an improvement to the desk harness, scripts or docs.
+labels: ["enhancement"]
+body:
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      description: Applied as a `severity:*` label during triage.
+      options:
+        - "CRITICAL - a position is unprotected or its stop cannot be verified"
+        - "HIGH - execution or a risk gate is blocked/incorrect"
+        - "MEDIUM - scan, analysis or tooling degraded"
+        - "LOW - cosmetic, docs or optional hardening"
+    validations:
+      required: true
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      description: "Applied as a `priority:*` label. Default from severity: CRITICAL->P0, HIGH->P1, MEDIUM->P2, LOW->P3."
+      options:
+        - "P0 - drop everything: fix now"
+        - "P1 - next up: fix in the current cycle"
+        - "P2 - planned: schedule soon"
+        - "P3 - backlog: when convenient"
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: The problem or opportunity.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: The proposed change and the files it touches.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance_criteria
+    attributes:
+      label: Acceptance criteria
+      description: Verifiable conditions for closing the issue (one per line).
+    validations:
+      required: true

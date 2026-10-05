@@ -80,7 +80,7 @@ Whenever the user explicitly requests crypto trading operations, Binance Futures
    - **Barbell YOLO Moonshot Slot (Strict Asymmetric Convexity):**
      * **Barbell Philosophy (Nassim Taleb):** 90% of capital allocated to rigorous quantitative and Stat-Arb strategies, and 10% strictly ring-fenced for convex moonshots.
      * **Objective:** Capture explosive breakout runs in memecoins (PEPE, WIF, BONK, DOGE, NEIRO, PENGU, BOME, MOODENG) at the profile's `leverage_yolo` (desk ceiling `leverage_ceiling`). Only when `yolo_slot_enabled` is true.
-     * **Mandatory Hardened Quantitative Filters:** Climax volume $\ge 2.0\times$ moving average OR buyer absorption wick $\ge 50\%$. If no memecoin meets this threshold, **the YOLO slot must remain empty** (never force trades).
+     * **Mandatory Hardened Quantitative Filters:** Climax volume $\ge 2.0\times$ MA OR buyer absorption wick $\ge 50\%$ (volume $\ge 1.0\times$). If no memecoin meets it, **the YOLO slot must remain empty** (never force trades).
       * **Momentum Confirmation:** Speculative momentum comes from 24h volume acceleration and CVD absorption wicks in `broad_yolo_scanner.py --json` / `broad_market_radar.py --json`.
       * **Right-Tail Skewness Preservation (Zero Truncation):** On YOLO memecoins, **do NOT move Stop Loss to Break-Even prematurely** (5m noise whipsaws). Ratchet to Break-Even only after **TP1** fills. Express TP/SL as price %; ROE = price % × `leverage_yolo`.
       * **Isolated Risk Control:** Ring-fenced YOLO margin from the profile and **mandatory Isolated Margin**, so the maximum loss is capped by software with zero contagion to the main balance.
@@ -117,8 +117,8 @@ Whenever the user explicitly requests crypto trading operations, Binance Futures
      * Archive with `TP Hit` or `SL Hit` and exact realized PnL upon position close.
 
 5. **Phase 5: Automated GitHub Issue Reporting (Self-Healing & Observability)**
-   - If at any operational stage (screening, evaluation, execution, hooks, or background loops) the agent encounters an unrecoverable failure, unexpected exception, anomalous API rejection, or harness misconfiguration, it MUST immediately execute via bash shell (`run_command`):
-     `./scripts/report_issue.sh --title "..." --error "..." --category "..." --severity "HIGH" --remediation "..."`
-   - The script automatically publishes the issue to GitHub with forensic telemetry or safely enqueues it in `logs/issues_backlog.jsonl` if offline.
+   - On any unrecoverable failure, exception, anomalous API rejection or harness misconfiguration at any stage, the agent MUST immediately run (`run_command`):
+     `./scripts/report_issue.sh --title "..." --error "..." --category tool_error --severity HIGH --priority P1`
+   - Always pass the structured flags (`--repro`, `--root-cause`, `--affected-files`, `--context`/`--context-file`, `--output-file`, `--acceptance-criteria`); full contract in `.agents/rules/trading-code-freeze.md`. Offline it queues to `logs/issues_backlog.jsonl`.
 
 6. **PR Review:** Run the `/pr-review` skill (`.agents/skills/pr-review/SKILL.md`): one `invoke_subagent` call with the read-only `*_reviewer` subagents listed by `scripts/ci/triage_pr.py`. The Stop hook starts it after `gh pr create` or a feature-branch push.
