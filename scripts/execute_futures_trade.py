@@ -1443,12 +1443,21 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
 
     return True, None
 
-def enforce_evaluation_dossier(symbol, direction, target_env=None, bypass_eval_gate=False, confirmed=False, base_dir=None):
+def _dossier_candidate_is_yolo(cand):
+    """Same notion as pre_trade_guard._candidate_is_yolo: is_yolo truthy, or 'yolo' in the tier/strategy label."""
+    if not isinstance(cand, dict):
+        return False
+    return (_truthy(cand.get('is_yolo')) or 'yolo' in str(cand.get('tier', '')).lower()
+            or 'yolo' in str(cand.get('strategy', '')).lower())
+
+def enforce_evaluation_dossier(symbol, direction, target_env=None, bypass_eval_gate=False, confirmed=False, base_dir=None,
+                               is_yolo=False):
     """
     Clean-room evaluation gate for NEW positions (never used by close/breakeven/trailing/audit/heal/cancel paths).
     Delegates to utils.dossier_provenance.validate_dossier_for_trade (same gate as the PreToolUse hook).
     - PROD: fail closed. --bypass-eval-gate is refused. If the evaluator flagged the candidate as requiring
-      user confirmation, `confirmed=True` is required.
+      user confirmation, `confirmed=True` is required. YOLO entries (dossier candidate flagged YOLO, or the order
+      itself sent as YOLO) always require `confirmed=True`, even if `requires_user_confirmation` is false/missing.
     - TESTNET: same validation (provenance/direction only when present); explicit bypass_eval_gate is allowed.
     Returns (ok, reason, candidate).
     """
@@ -1488,6 +1497,13 @@ def enforce_evaluation_dossier(symbol, direction, target_env=None, bypass_eval_g
             return False, (
                 f"MECHANICAL HARD GATE REJECTION (Evaluation Gate, {label}): the evaluator approved {str(symbol).upper()} "
                 "pending explicit user confirmation. Re-run with confirmed=True / --confirmed after the user confirms."
+            ), cand
+        # Barbell YOLO entries are never fast-tracked, whatever the dossier says (issue #52).
+        if (_dossier_candidate_is_yolo(cand) or _truthy(is_yolo)) and not confirmed:
+            return False, (
+                f"MECHANICAL HARD GATE REJECTION (Evaluation Gate, {label}): {str(symbol).upper()} is a YOLO entry; "
+                "YOLO entries are never fast-tracked and always require explicit user confirmation. "
+                "Re-run with confirmed=True / --confirmed after the user confirms."
             ), cand
 
     return True, reason, cand
@@ -2285,7 +2301,8 @@ def execute_complete_trade(
     # 0. Clean-room evaluation dossier gate (before ANY write: margin type, leverage or orders)
     bypass_eval_gate = (bypass_eval_gate is True) or (str(bypass_eval_gate).lower() in ['true', '1', 'yes'])
     eval_ok, eval_reason, _eval_cand = enforce_evaluation_dossier(
-        symbol, direction, target_env=target_env, bypass_eval_gate=bypass_eval_gate, confirmed=confirmed
+        symbol, direction, target_env=target_env, bypass_eval_gate=bypass_eval_gate, confirmed=confirmed,
+        is_yolo=is_yolo
     )
     if not eval_ok:
         return {"success": False, "hard_gate_rejection": True, "evaluation_gate_rejection": True, "error": eval_reason}

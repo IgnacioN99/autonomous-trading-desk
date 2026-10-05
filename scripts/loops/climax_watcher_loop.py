@@ -124,7 +124,8 @@ def scan_for_climax_setups(target_env: str = None, min_vol: float = 1.4, min_wic
     Returns list of qualified candidates respecting delta gates.
     """
     target_env = resolve_env(target_env)
-    payload = execute_screening_pipeline(target_env=target_env)
+    # Only top_candidates are used here: skip the YOLO memecoin scan and its latency (issue #52).
+    payload = execute_screening_pipeline(target_env=target_env, include_yolo=False)
     
     portfolio_ctx = payload.portfolio_context or {}
     if isinstance(portfolio_ctx, dict):
