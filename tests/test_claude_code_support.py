@@ -129,6 +129,49 @@ class TestGeneratedClaudeAssets(unittest.TestCase):
             self.assertIn(f"--from-claude-subagent {rev}=<agentId>", text)
             self.assertNotIn("Bash", frontmatter(text)["tools"])
 
+    def test_evaluator_uses_visible_precondition_checklist_not_scratch_tags(self):
+        """Issue #18: Claude rejects XML-tagged scratch sections; the evaluator publishes a visible checklist."""
+        scratch_tags = ("<" + "thinking", "</" + "thinking")
+        agent_files = sorted((REPO_ROOT / ".agents" / "agents").glob("*/agent.md")) + \
+            sorted((REPO_ROOT / ".claude" / "agents").glob("*.md"))
+        self.assertGreaterEqual(len(agent_files), 10)
+        for path in agent_files:
+            text = path.read_text(encoding="utf-8")
+            for tag in scratch_tags:
+                self.assertNotIn(tag, text, str(path))
+        for rel in (".agents/agents/isolated_market_evaluator/agent.md",
+                    f".claude/agents/{dp.EVALUATOR_NAME}.md"):
+            text = (REPO_ROOT / rel).read_text(encoding="utf-8")
+            self.assertIn("## Precondition Checklist", text, rel)
+            self.assertIn("<deliberation_protocol>", text, rel)
+            self.assertIn("</deliberation_protocol>", text, rel)
+        # Every few-shot final response: checklist first, then exactly one <dossier_json> block, which stays
+        # extractable by the recorder regex (the checklist never contains the tag or any XML tag).
+        source = (REPO_ROOT / ".agents/agents/isolated_market_evaluator/agent.md").read_text(encoding="utf-8")
+        finals = re.findall(r"<final_response>([\s\S]*?)</final_response>", source)
+        self.assertGreaterEqual(len(finals), 6)
+        for final in finals:
+            self.assertEqual(final.count("<dossier_json>"), 1)
+            self.assertEqual(final.count("</dossier_json>"), 1)
+            self.assertLess(final.index("## Precondition Checklist"), final.index("<dossier_json>"))
+            self.assertLess(final.index("# QUANTITATIVE EVALUATION MASTER DOSSIER"),
+                            final.index("## Precondition Checklist"))
+            self.assertEqual(len(dp.DOSSIER_RE.findall(final)), 1)
+            self.assertTrue(final.rstrip().endswith("</dossier_json>"))
+            dossier = json.loads(dp.DOSSIER_RE.search(final).group(1))
+            # The checklist region (up to the next markdown heading) is plain markdown: no <tag> patterns.
+            region = re.search(r"## Precondition Checklist\n([\s\S]*?)(?=\n\s*## |\n\s*\(sent to the parent)", final).group(1)
+            self.assertIsNone(re.search(r"</?[A-Za-z_][\w-]*[^>\n]*>", region), region)
+            # C4.2 equals the dossier status.
+            c42 = re.findall(r"C4\.2 Overall status:.*-> (APPROVED|REJECTED|NEUTRAL)\s*$", region, re.M)
+            self.assertEqual(c42, [dossier["status"]])
+            # Approved candidates never have an unchecked K1-K3 or C3.1 line.
+            for symbol in dossier["approved_symbols"]:
+                for line in region.splitlines():
+                    if symbol in line and re.search(r"\b(K1|K2|K3|K4|C3\.1)\b", line):
+                        self.assertTrue(line.strip().startswith("- [x]"), line)
+            self.assertEqual([c["symbol"] for c in dossier["approved_candidates"]], dossier["approved_symbols"])
+
     def test_claude_skills(self):
         for skill in gen.SKILLS:
             path = REPO_ROOT / ".claude" / "skills" / skill / "SKILL.md"

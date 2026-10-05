@@ -443,6 +443,9 @@ Query B: "Based on the balance fetched 10 seconds ago, what is my free margin?"
 
 # 4. Deliberation, Inner Monologue, and Scratchpads (`<thinking>` / `<scratchpad>`)
 
+> [!IMPORTANT]
+> **Repository convention (Claude-compatible deliberation):** the `<thinking>` blocks in this guide are the generic pattern. In this repo, agents that run on Claude (notably `isolated_market_evaluator`) MUST NOT emit XML-tagged scratch sections: Claude rejects them. Deliberation is a **visible, plain-markdown `## Precondition Checklist`** published as the first section of the output: short yes/no checks (`- [x] <ID> <check>: <value from the brief> -> PASS/FAIL`), followed by the dossier and exactly one `<dossier_json>` block. The checklist never contains XML tags and must agree with the verdict that follows it.
+
 ## 4.1 Strict Separation Between Inner Deliberation and External Action Dispatch
 
 One of the primary causes of hallucinations and unintended tool calls is **"Token-Level Premature Commitment"**:
@@ -610,6 +613,9 @@ To prevent token runaways during third-party service outages:
 ---
 
 # 6. Production-Ready System Prompt Template
+
+> [!NOTE]
+> **Claude compatibility:** in this repo the `<deliberation_protocol>` block below is implemented as a visible, plain-markdown `## Precondition Checklist` published in the output (yes/no checks with the brief value and PASS/FAIL), not as tagged `<thinking>` scratch output. See the repository convention note in section 4.
 
 ```xml
 <system_prompt>
@@ -827,7 +833,7 @@ Before deploying any agentic System Prompt to production, verify compliance acro
 - [ ] **Strict Delimitation:** All sections are encapsulated in distinct semantic XML tags (`<role>`, `<rules>`, `<negative_constraints>`, `<output_format>`).
 - [ ] **KV Cache Partitioning:** Dynamic values (timestamps, balances, user queries) reside strictly after the static System Prompt cache breakpoint.
 - [ ] **Contrastive Few-Shots:** Includes at least two positive execution traces and two negative abstention/rejection traces.
-- [ ] **Enforced Deliberation:** Requires step-by-step reasoning via `<thinking>` or "Think Tool" before mutating actions.
+- [ ] **Enforced Deliberation:** Requires step-by-step reasoning via `<thinking>` or "Think Tool" before mutating actions. (In this repo for Claude agents: a visible `## Precondition Checklist` inside `<deliberation_protocol>`, no tagged scratch output.)
 - [ ] **Assertive Formulation:** Prohibitions follow "Verify X; if violated ABORT" without ambiguous advisory wording.
 - [ ] **Actionable Error Feedback:** Tool execution backend returns structured, human-and-model-readable remediation guidance.
 - [ ] **Circuit Breakers Configured:** Hard turn counters prevent infinite retry loops during external outages.

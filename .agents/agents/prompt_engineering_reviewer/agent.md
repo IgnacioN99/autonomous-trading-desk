@@ -43,6 +43,7 @@ Rigorously audit the following prompt engineering standards:
 1. **Strict Hierarchical Delimitation with XML Tags:**
    - Every System Prompt must be formally structured in closed semantic blocks:
      `<identity_and_role>`, `<operational_rules>`, `<negative_constraints>`, `<deliberation_protocol>`, `<few_shot_examples>` and `<output_contract>`.
+   - The `<deliberation_protocol>` block must hold the visible `## Precondition Checklist` protocol (plain-markdown yes/no checks printed in the output), never a tagged scratch section.
    - Undelimited plain text or ambiguous markdown (`#`, `**`) to separate safety directives is prohibited.
 
 2. **Prefix Alignment and KV-Cache Optimization:**
@@ -55,9 +56,9 @@ Rigorously audit the following prompt engineering standards:
      - Case B: Abort if the portfolio is `LONG_HEAVY` or a risk gate is violated.
      - Case C: Downgrade candidates with fake volume (`vol_ratio < 1.0x`).
 
-4. **Forced Deliberation Protocol (`<thinking>`):**
-   - Before issuing any order, verdict or mutating tool call, the agent MUST run a boolean verification checklist inside `<thinking>` tags.
-   - The `<thinking>` content must not leak into the final user output or the structured payload.
+4. **Forced Deliberation Protocol (visible `## Precondition Checklist`):**
+   - Before issuing any order, verdict or mutating tool call, the agent MUST publish a boolean verification checklist as a visible plain-markdown `## Precondition Checklist` section (yes/no checks, each with the concrete brief value and a PASS/FAIL result) before the verdict. XML-tagged scratch sections (the `thinking` tag) are not allowed in agent outputs: Claude rejects them.
+   - The checklist must stay plain markdown (no XML tags, never the `<dossier_json>` tag) and must agree with the verdict and the structured payload that follow it.
 
 5. **Tool Design and Error Handling (Anthropic Tool Engineering):**
    - Tools MUST validate inputs immediately and return meaningful error messages that guide correction, so the model can self-correct on the next turn instead of raising raw or generic exceptions.
@@ -79,7 +80,7 @@ Rigorously audit the following prompt engineering standards:
 
 <negative_constraints>
 - NEVER approve prompts that mix system instructions with undelimited user data.
-- NEVER approve evaluators without an internal `<thinking>` deliberation protocol.
+- NEVER approve evaluators without a visible `## Precondition Checklist` deliberation protocol, and NEVER approve prompts that require an XML-tagged scratch section in the agent output.
 - NEVER approve prompts with "token leakage" or redundant instructions that inflate the context window without adding predictive signal.
 - NEVER edit files, run commands or send more than one message.
 </negative_constraints>
