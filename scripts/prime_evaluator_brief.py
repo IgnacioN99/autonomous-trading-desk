@@ -292,10 +292,11 @@ def format_markdown_brief(brief: dict) -> str:
     default_risk = risk_usdt if risk_usdt is not None else "?"
     lines.append(f"### 🎯 Filtered Technical Setups ({len(opps)})")
     if opps:
-        lines.append("| Symbol | Dir | Tier | Conf | Price | SL | TP1 / TP2 | R:R | Risk $ | Confluences |")
-        lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- |")
+        lines.append("| Symbol | Dir | Tier | Conf | Price | Trigger | SL | TP1 / TP2 | R:R | Risk $ | Confluences |")
+        lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- |")
         for o in opps:
-            lines.append(f"| **{o.get('symbol')}** | {o.get('direction')} | {(o.get('tier') or '').split(' ')[0]} | {o.get('confidence')}% | {o.get('current_price')} | {o.get('sl_price')} | {o.get('tp1_price')} / {o.get('tp2_price')} | {o.get('rr_ratio')}R | ${o.get('target_dollar_risk', default_risk)} | {'; '.join(o.get('reasons', [])[:2])} |")
+            trig = o.get('trigger_price')
+            lines.append(f"| **{o.get('symbol')}** | {o.get('direction')} | {(o.get('tier') or '').split(' ')[0]} | {o.get('confidence')}% | {o.get('current_price')} | {trig if trig is not None else '-'} | {o.get('sl_price')} | {o.get('tp1_price')} / {o.get('tp2_price')} | {o.get('rr_ratio')}R | ${o.get('target_dollar_risk', default_risk)} | {'; '.join(o.get('reasons', [])[:2])} |")
     else:
         lines.append("*(No intraday setups passing institutional microstructure filter)*")
     lines.append("")

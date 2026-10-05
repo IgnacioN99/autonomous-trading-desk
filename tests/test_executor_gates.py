@@ -538,6 +538,159 @@ class TestLiquidationGateUsesEffectiveLeverage(unittest.TestCase):
         self.assertFalse([c for c in calls if c[1] == "/fapi/v1/order"])
 
 
+class TestEntryBasedRiskGates(unittest.TestCase):
+    """Issue #22: PROD risk (GATE 2) and friction (GATE 3) gates are measured from the effective entry."""
+
+    STATE_FILE = os.path.join(BASE_DIR, "logs", "session_state.json")
+
+    def setUp(self):
+        os.makedirs(os.path.dirname(self.STATE_FILE), exist_ok=True)
+        self._orig = _read_bytes(self.STATE_FILE) if os.path.exists(self.STATE_FILE) else None
+        with open(self.STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"is_valid": True, "last_updated_ts": int(time.time()),
+                       "portfolio_exposure": {"delta_bias": "NEUTRAL"}}, f)
+        # equity 1000 x 0.5% x 1.25 buffer = $6.25 PROD loss cap
+        self._patches = [patch("quant_risk_engine.get_account_equity", return_value=1000.0),
+                         patch("user_profile.load_user_profile", return_value=dict(PROFILE))]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+        if self._orig is not None:
+            with open(self.STATE_FILE, "wb") as f:
+                f.write(self._orig)
+        elif os.path.exists(self.STATE_FILE):
+            os.remove(self.STATE_FILE)
+
+    def test_long_loss_measured_from_trigger_above_current(self):
+        # At cur_price 100: |100-95|*1.2 = $6.00 <= $6.25; from trigger 101: $7.20 > $6.25
+        ok, msg = eft.check_mechanical_gates("LONG", 100.0, 95.0, 110.0, 1.2, 3, target_env="prod")
+        self.assertTrue(ok, msg)
+        ok, msg = eft.check_mechanical_gates("LONG", 100.0, 95.0, 110.0, 1.2, 3, target_env="prod", entry_price=101.0)
+        self.assertFalse(ok)
+        self.assertIn("Monetary risk exceeds allowed cap", msg)
+        self.assertIn("entry ref 101.0", msg)
+
+    def test_short_loss_measured_from_trigger_below_current(self):
+        ok, msg = eft.check_mechanical_gates("SHORT", 100.0, 105.0, 90.0, 1.2, 3, target_env="prod")
+        self.assertTrue(ok, msg)
+        ok, msg = eft.check_mechanical_gates("SHORT", 100.0, 105.0, 90.0, 1.2, 3, target_env="prod", entry_price=99.0)
+        self.assertFalse(ok)
+        self.assertIn("Monetary risk exceeds allowed cap", msg)
+
+    def test_friction_floor_measured_from_entry(self):
+        # TP1 100.4 is 0.40% from the current price but 0.30% from the 100.1 trigger
+        ok, msg = eft.check_mechanical_gates("LONG", 100.0, 98.0, 100.4, 1.0, 3, target_env="prod")
+        self.assertTrue(ok, msg)
+        ok, msg = eft.check_mechanical_gates("LONG", 100.0, 98.0, 100.4, 1.0, 3, target_env="prod", entry_price=100.1)
+        self.assertFalse(ok)
+        self.assertIn("below 0.35% friction floor", msg)
+        self.assertIn("entry ref 100.1", msg)
+
+    def test_long_tp1_below_trigger_rejected(self):
+        # TP1 102.5 is 0.49% away from the 103 trigger but on the wrong side of a LONG entry
+        ok, msg = eft.check_mechanical_gates("LONG", 100.0, 98.0, 102.5, 1.0, 3, target_env="prod", entry_price=103.0)
+        self.assertFalse(ok)
+        self.assertIn("below 0.35% friction floor", msg)
+        self.assertIn("wrong side of entry", msg)
+
+    def test_short_tp1_above_trigger_rejected(self):
+        ok, msg = eft.check_mechanical_gates("SHORT", 100.0, 102.0, 97.5, 1.0, 3, target_env="prod", entry_price=97.0)
+        self.assertFalse(ok)
+        self.assertIn("below 0.35% friction floor", msg)
+        self.assertIn("wrong side of entry", msg)
+
+
+class TestExecutorSizesAtEffectiveEntry(unittest.TestCase):
+    """Issue #22: execute_complete_trade sizes and gates from the limit/trigger price of the order it sends."""
+
+    def _execute(self, **kwargs):
+        calls = []
+        def fake(method, endpoint, params=None, target_env=None):
+            calls.append((method, endpoint, dict(params or {})))
+            if endpoint == "/fapi/v1/marginType":
+                return {"code": 200, "msg": "success"}
+            if endpoint == "/fapi/v1/leverage":
+                return {"symbol": params["symbol"], "leverage": params["leverage"]}
+            if endpoint == "/fapi/v1/leverageBracket":
+                return {"error": "unavailable"}
+            if endpoint == "/fapi/v1/ticker/price":
+                return {"price": "100.0"}
+            if endpoint == "/fapi/v1/order" and method == "POST":
+                status = "NEW" if params.get("type") in ("LIMIT", "STOP_MARKET") else "FILLED"
+                return {"orderId": 7, "avgPrice": "100.0", "status": status}
+            return {}
+        args = dict(symbol="SOLUSDT", direction="LONG", leverage=3, margin_usdt=10.0,
+                    sl_price=97.0, tp1_price=110.0, tp2_price=120.0, target_env="testnet", bypass_eval_gate=True)
+        args.update(kwargs)
+        gates = MagicMock(wraps=eft.check_mechanical_gates)
+        with patch("execute_futures_trade.send_signed_request", side_effect=fake), \
+             patch("execute_futures_trade.check_mechanical_gates", gates), \
+             patch("execute_futures_trade.get_symbol_filters", return_value=FILTERS), \
+             patch("execute_futures_trade.place_algo_stop_loss", return_value={"algoId": 9}), \
+             patch("execute_futures_trade.verify_algo_stop_loss", return_value=(True, {"algoId": 9})), \
+             patch("quant_risk_engine.get_account_equity", return_value=10000.0), \
+             patch("user_profile.load_user_profile", return_value=dict(PROFILE)), \
+             patch("builtins.print"), \
+             patch("utils.atomic_writer.atomic_append_jsonl"), \
+             patch("provenance_stamp.stamp_trade_record", side_effect=lambda rec, **kw: rec):
+            res = eft.execute_complete_trade(**args)
+        orders = [c[2] for c in calls if c[1] == "/fapi/v1/order" and c[0] == "POST"]
+        return res, orders, gates
+
+    def _gate_kwargs(self, gates):
+        gates.assert_called_once()
+        return gates.call_args.kwargs
+
+    def test_stop_market_not_breached_sized_and_gated_at_trigger(self):
+        res, orders, gates = self._execute(order_type="STOP_MARKET", trigger_price=102.347)
+        self.assertTrue(res["success"], res.get("error"))
+        self.assertTrue(res.get("conditional_entry"))
+        expected = eft.round_step(10.0 * 3 / 102.34, FILTERS["stepSize"], FILTERS["precision_qty"])
+        self.assertEqual(expected, 0.293)
+        self.assertEqual(orders[0]["type"], "STOP_MARKET")
+        self.assertEqual(orders[0]["quantity"], expected)
+        self.assertLess(orders[0]["quantity"], eft.round_step(30.0 / 100.0, FILTERS["stepSize"], FILTERS["precision_qty"]))
+        kw = self._gate_kwargs(gates)
+        self.assertEqual(kw.get("entry_price"), 102.34)
+        self.assertEqual(kw.get("liq_entry_price"), 102.34)
+
+    def test_default_sl_anchored_at_trigger(self):
+        res, orders, gates = self._execute(order_type="STOP_MARKET", trigger_price=102.347,
+                                           sl_price=None, tp1_price=None, tp2_price=None)
+        self.assertTrue(res["success"], res.get("error"))
+        self.assertAlmostEqual(gates.call_args.args[2], 102.34 * 0.98)
+        self.assertAlmostEqual(gates.call_args.args[3], 102.34 * 1.03)
+
+    def test_breached_trigger_uses_current_price(self):
+        res, orders, gates = self._execute(order_type="STOP_MARKET", trigger_price=99.5)
+        self.assertTrue(res["success"], res.get("error"))
+        self.assertEqual(orders[0]["type"], "MARKET")
+        self.assertEqual(orders[0]["quantity"], 0.3)
+        kw = self._gate_kwargs(gates)
+        self.assertEqual(kw.get("entry_price"), 100.0)
+        self.assertEqual(kw.get("liq_entry_price"), 100.0)
+
+    def test_limit_entry_uses_rounded_limit_price(self):
+        res, orders, gates = self._execute(order_type="LIMIT", limit_price=98.767)
+        self.assertTrue(res["success"], res.get("error"))
+        self.assertTrue(res.get("pending_limit_entry"))
+        expected = eft.round_step(30.0 / 98.76, FILTERS["stepSize"], FILTERS["precision_qty"])
+        self.assertEqual(expected, 0.303)
+        self.assertEqual(orders[0]["price"], 98.76)
+        self.assertEqual(orders[0]["quantity"], expected)
+        self.assertEqual(self._gate_kwargs(gates).get("entry_price"), 98.76)
+
+    def test_market_entry_quantity_unchanged(self):
+        res, orders, gates = self._execute(order_type="MARKET")
+        self.assertTrue(res["success"], res.get("error"))
+        self.assertEqual(orders[0]["type"], "MARKET")
+        self.assertEqual(orders[0]["quantity"], 0.3)
+        self.assertEqual(self._gate_kwargs(gates).get("entry_price"), 100.0)
+
+
 # =====================================================================================
 # 5. Leverage configuration (single source of truth)
 # =====================================================================================

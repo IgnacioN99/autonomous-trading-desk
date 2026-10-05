@@ -72,6 +72,7 @@ class CandidateSetup(BaseModel):
     actual_notional: float
     target_dollar_risk: float
     reasons: List[str]
+    sizing_entry_price: Optional[float] = None  # entry the sizing was computed from (trigger, else current price)
 
 class StatArbPair(BaseModel):
     pair: str
@@ -176,11 +177,15 @@ def enrich_and_size_candidate(c: dict, target_env: Optional[str] = None) -> Opti
         sl = float(c["sl"])
         direction = c["direction"]
         lev, max_margin_ratio = _profile_standard_sizing()
+        # Issue #22: size from the conditional entry (breakout trigger). It is always farther from the SL
+        # than the current price, so it is also conservative for MARKET deployments.
+        # Single expression for both sizing and trigger_price (a 0/None trigger falls back to the price).
+        sizing_entry = float(c.get("trigger") or entry)
 
         target_env = resolve_env(target_env)
 
         # Calculate dynamic equity sizing (user profile risk_pct_equity x equity, margin capped at max_margin_ratio)
-        sizing = qre.calculate_dynamic_equity_sizing(sym, entry, sl, risk_pct_equity=None, leverage=lev,
+        sizing = qre.calculate_dynamic_equity_sizing(sym, sizing_entry, sl, risk_pct_equity=None, leverage=lev,
                                                      target_env=target_env, max_margin_ratio=max_margin_ratio)
         if not sizing or "error" in sizing or sizing.get("step_qty", 0.0) <= 0.0:
             print(f"Invalid or non-quantizable sizing for {sym}: {sizing.get('error') if sizing else 'Empty sizing'}", file=sys.stderr)
@@ -200,12 +205,13 @@ def enrich_and_size_candidate(c: dict, target_env: Optional[str] = None) -> Opti
             tier=c.get("tier", "Tier A"),
             confidence=int(c.get("confidence", 60)),
             current_price=entry,
-            trigger_price=float(c.get("trigger", entry)),
+            trigger_price=sizing_entry,
             sl_price=sl,
             tp1_price=float(c.get("tp1", entry * 1.02)),
             tp2_price=float(c.get("tp2", entry * 1.04)),
             rr_ratio=float(c.get("rr", 3.0)),
-            risk_pct=float(c.get("risk_pct", 1.5)),
+            risk_pct=round(abs(sizing_entry - sl) / sizing_entry * 100, 2),
+            sizing_entry_price=sizing_entry,
             rsi_15m=float(c.get("rsi_15m", 50)),
             vol_ratio=float(c.get("vol_ratio", 1.0)),
             lower_wick_pct=float(c.get("lower_wick", 0)),

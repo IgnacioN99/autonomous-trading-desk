@@ -1275,13 +1275,16 @@ def check_liquidation_gate(direction, entry_price, sl_price, leverage, maint_mar
 
 
 def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty, leverage, bypass_delta_gate=False, target_env=None, bypass_all_gates=False, is_yolo=False,
-                           maint_margin_ratio=None, maint_amount=0.0, mmr_source=None, liq_entry_price=None):
+                           maint_margin_ratio=None, maint_amount=0.0, mmr_source=None, liq_entry_price=None, entry_price=None):
     """
     Mechanical Software Gates (Deterministic Precondition Validation).
     Verifies mathematical invariants and physically prevents execution if risk rules are violated.
     In TESTNET, free bypass of gates is permitted for testing, experiments, and stress tests.
     In PROD, gates are strict and inviolable.
+    `entry_price` is the effective entry of the order actually sent (limit/trigger price for conditional
+    entries); the risk, YOLO cap and friction gates are measured from it (falls back to cur_price).
     """
+    ref = entry_price if entry_price else cur_price
     target_env = resolve_env(target_env)
     is_testnet = str(target_env).lower() == 'testnet'
     is_long = str(direction).upper() == 'LONG'
@@ -1345,7 +1348,7 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
     # --- GATE 0D: Liquidation Gate (computed with the leverage that will actually apply) ---
     liq_ok, liq_err, _ = check_liquidation_gate(
         direction,
-        liq_entry_price if liq_entry_price else cur_price,
+        liq_entry_price or entry_price or cur_price,
         sl_price,
         leverage,
         maint_margin_ratio=maint_margin_ratio,
@@ -1399,7 +1402,7 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
             return False, "MECHANICAL HARD GATE REJECTION: Portfolio is in SHORT_HEAVY state (-Delta imbalanced). Opening additional Shorts is strictly prohibited. Long hedge or neutral portfolio required."
 
     # --- GATE 2: Dynamic Equity Risk Gate (Finding 13) ---
-    potential_dollar_loss = abs(cur_price - sl_price) * total_qty
+    potential_dollar_loss = abs(ref - sl_price) * total_qty
     try:
         import quant_risk_engine as qre
         account_equity = qre.get_account_equity(target_env)
@@ -1423,19 +1426,20 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
         max_allowed_loss = max(account_equity * risk_fraction * 1.25, 50.0)
     elif is_yolo:
         # Barbell YOLO Moonshot: strict software loss cap (35% of margin, min $3.75 USDT)
-        margin_est = (cur_price * total_qty / max(leverage, 1))
+        margin_est = (ref * total_qty / max(leverage, 1))
         max_allowed_loss = max(3.75, margin_est * 0.35)
     else:
         max_allowed_loss = account_equity * risk_fraction * 1.25
 
     if potential_dollar_loss > max_allowed_loss:
-        return False, f"MECHANICAL HARD GATE REJECTION: Monetary risk exceeds allowed cap (${potential_dollar_loss:.2f} > ${max_allowed_loss:.2f} USDT, equity: ${account_equity:.2f}, risk fraction: {risk_fraction*100:.2f}% + buffer). Adjust margin or position size."
+        return False, f"MECHANICAL HARD GATE REJECTION: Monetary risk exceeds allowed cap (${potential_dollar_loss:.2f} > ${max_allowed_loss:.2f} USDT, entry ref {ref}, equity: ${account_equity:.2f}, risk fraction: {risk_fraction*100:.2f}% + buffer). Adjust margin or position size."
 
     # --- GATE 3: Financial Friction and Fee Gate ---
     if tp1_price and not is_testnet:
-        profit_pct_tp1 = abs(tp1_price - cur_price) / cur_price
+        # Signed distance: a TP1 on the wrong side of the effective entry is negative and rejected
+        profit_pct_tp1 = ((tp1_price - ref) / ref) if is_long else ((ref - tp1_price) / ref)
         if profit_pct_tp1 < 0.0035:
-            return False, f"MECHANICAL HARD GATE REJECTION: Distance to TP1 ({profit_pct_tp1*100:.2f}%) below 0.35% friction floor. Taker commissions erode statistical edge."
+            return False, f"MECHANICAL HARD GATE REJECTION: Distance to TP1 ({profit_pct_tp1*100:.2f}%) below 0.35% friction floor or on the wrong side of entry (entry ref {ref}). Taker commissions erode statistical edge."
 
     return True, None
 
@@ -1574,13 +1578,29 @@ def execute_complete_trade(
     entry_side = 'BUY' if is_long else 'SELL'
     exit_side = 'SELL' if is_long else 'BUY'
 
-    # Fallback / default SL and TP calculations if not provided or 0
+    # Effective entry (Issue #22): worst-case fill reference of the order that will actually be sent,
+    # using the same rounded prices submitted below. Sizing and PROD gates are measured from it.
+    #   LIMIT -> rounded limit (a buy fills at <= limit, a sell at >= limit);
+    #   STOP_MARKET with trigger not breached -> rounded trigger;
+    #   breached trigger (falls through to MARKET) or plain MARKET -> current price.
+    trigger_p = None
+    trigger_breached = True
+    if trigger_price is not None and trigger_price > 0:
+        trigger_p = round_price(trigger_price, filters['tickSize'], filters['precision_price'])
+        trigger_breached = (cur_price >= trigger_p) if is_long else (cur_price <= trigger_p)
+    effective_entry = cur_price
+    if str(order_type).upper() == 'LIMIT' and limit_price:
+        effective_entry = float(round_price(limit_price, filters['tickSize'], filters['precision_price']))
+    elif str(order_type).upper() == 'STOP_MARKET' and trigger_p is not None and not trigger_breached:
+        effective_entry = float(trigger_p)
+
+    # Fallback / default SL and TP calculations if not provided or 0 (anchored at the effective entry)
     if sl_price is None or float(sl_price) <= 0:
-        sl_price = cur_price * (1.0 - 0.02) if is_long else cur_price * (1.0 + 0.02)
+        sl_price = effective_entry * (1.0 - 0.02) if is_long else effective_entry * (1.0 + 0.02)
     if tp1_price is None or float(tp1_price) <= 0:
-        tp1_price = cur_price * (1.0 + 0.03) if is_long else cur_price * (1.0 - 0.03)
+        tp1_price = effective_entry * (1.0 + 0.03) if is_long else effective_entry * (1.0 - 0.03)
     if tp2_price is None or float(tp2_price) <= 0:
-        tp2_price = cur_price * (1.0 + 0.06) if is_long else cur_price * (1.0 - 0.06)
+        tp2_price = effective_entry * (1.0 + 0.06) if is_long else effective_entry * (1.0 - 0.06)
 
     # 2. Configure Isolated margin and leverage first (Fail-Closed & Auto-Clamp for Subaccounts)
     setup_res = setup_margin_and_leverage(symbol, leverage, target_env=target_env)
@@ -1608,30 +1628,26 @@ def execute_complete_trade(
 
     effective_leverage = int(confirmed_leverage) if confirmed_leverage else leverage
 
-    # 3. Calculate exact token quantity using verified effective leverage
+    # 3. Calculate exact token quantity using verified effective leverage, sized at the effective entry
     notional_target = margin_usdt * effective_leverage
-    raw_qty = notional_target / cur_price
+    raw_qty = notional_target / effective_entry
     total_qty = round_step(raw_qty, filters['stepSize'], filters['precision_qty'])
     min_notional = filters.get('minNotional', 5.0)
-    if total_qty * cur_price < min_notional:
+    if total_qty * effective_entry < min_notional:
         bumped_qty = round_step(total_qty + filters['stepSize'], filters['stepSize'], filters['precision_qty'])
-        if bumped_qty * cur_price >= min_notional:
+        if bumped_qty * effective_entry >= min_notional:
             total_qty = bumped_qty
     if total_qty < filters['minQty']:
         return {"success": False, "error": f"Quantity {total_qty} lower than minimum allowed {filters['minQty']}"}
 
     # 4. MECHANICAL HARD GATES VERIFICATION (incl. liquidation gate with the confirmed effective leverage)
-    liq_entry_price = cur_price
-    if str(order_type).upper() == 'LIMIT' and limit_price:
-        liq_entry_price = float(limit_price)
-    elif str(order_type).upper() == 'STOP_MARKET' and trigger_price:
-        liq_entry_price = float(trigger_price)
+    liq_entry_price = effective_entry
     mmr, maint_amount, mmr_source = get_maint_margin_bracket(symbol, total_qty * liq_entry_price, target_env=target_env)
     gate_ok, gate_err = check_mechanical_gates(
         direction, cur_price, sl_price, tp1_price, total_qty, effective_leverage,
         bypass_delta_gate=bypass_delta_gate, target_env=target_env, is_yolo=is_yolo,
         maint_margin_ratio=mmr, maint_amount=maint_amount, mmr_source=mmr_source,
-        liq_entry_price=liq_entry_price
+        liq_entry_price=liq_entry_price, entry_price=effective_entry
     )
     if not gate_ok:
         return {"success": False, "hard_gate_rejection": True, "error": gate_err}
@@ -1658,10 +1674,8 @@ def execute_complete_trade(
     tp2_p = round_price(tp2_price, filters['tickSize'], filters['precision_price'])
 
     # 7. Technical Trigger Validation (Confirmation breakout)
-    if trigger_price is not None and trigger_price > 0:
-        trigger_p = round_price(trigger_price, filters['tickSize'], filters['precision_price'])
-        trigger_breached = (cur_price >= trigger_p) if is_long else (cur_price <= trigger_p)
-
+    # (trigger_p / trigger_breached were computed with the effective entry, before sizing and gates)
+    if trigger_p is not None:
         if not trigger_breached:
             if order_type.upper() == 'STOP_MARKET':
                 entry_params = {
