@@ -41,10 +41,45 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    Writes into logs/evaluations/, Antigravity brain transcripts or Claude Code subagent transcripts
    are denied, and so are agent-set transcript-root overrides (AGY_BRAIN_DIRS / CLAUDE_PROJECTS_DIRS);
    harness files (incl. .claude/agents/) require explicit confirmation (force_ask).
-8. PASS-THROUGH:
+8. GROUND TRUTH PROTECTION (GROUND_TRUTH_FILES):
+   Runtime state that gates PROD orders has exactly one sanctioned writer, which writes it from Python:
+   logs/session_state.json <- scripts/sync_session_state.py; logs/guardian_state.json (guardian liveness
+   attestation for resting entries) <- scripts/loops/position_guardian_loop.py; logs/pending_entries.json
+   (resting-entry registry / post-fill protection) <- scripts/execute_futures_trade.py (registration and
+   --protect-pending). File tools targeting them are denied: relative, absolute and Windows paths, NTFS aliases
+   (trailing dot/space, ::$DATA streams) and targets whose os.path.realpath / samefile is a protected file
+   (symlinked directory, hard link). In shell commands, a sub-command naming a protected file (literally or via
+   a logs/ glob/brace word) is denied unless its program is read-only (GROUND_TRUTH_READ_PROGRAMS, jq without
+   --in-place, python3 -m json.tool without an output file, git read sub-commands such as diff/log/commit,
+   gh pr|issue, find judged below, python -c / node -e / python|node heredocs judged by write markers) and has no
+   write/exec option (git --output / --open-files-in-pager / --ext-diff / --upload-pack / --receive-pack /
+   --exec and their unique-prefix abbreviations (--op=, --upl=), short clusters with O (-nOrm), git -c /
+   --config-env / --exec-path, rg --pre / --hostname-bin, less -o / -O / --log-file / +cmd) and no leading VAR=
+   assignment (LESSOPEN, GIT_*). Any redirect to a protected file is denied (including ')>', ';>', '<>').
+   Nested command strings are judged like top-level ones: sh/bash -c, eval, cmd /c, powershell -Command,
+   git -c values, values of command-running options (git -O<cmd> / --upload-pack / --receive-pack / --exec,
+   rg --pre, less +!cmd), whether or not a protected file is named, and find -exec commands ({} = a root the
+   filters can match or logs/ under it). A command-running option that runs on files (rg --pre, git grep -O) or
+   on a local repository (git fetch --upload-pack, push --receive-pack / --exec) is denied when an operand (or the
+   default '.') is logs/ or one of its ancestors (rg --pre rm . logs, git fetch --upl=CMD .). $(pwd), `pwd`,
+   $PWD and $(git rev-parse --show-toplevel) count as '.', and $(cmd)/path as ./path (cmd judged separately).
+   Also denied: inline interpreters with write calls naming them, or with destructive calls next to a 'logs'
+   literal / logs/ glob (rmtree, rmSync, unlink, rename...) or recursive deletes/moves next to an ancestor
+   literal ('.', '..', the repo). Both are checked on the whole command line, so a `git commit -m "$(cat <<EOF
+   ...)"` or `gh ... --body "$(...)"` text naming a protected file next to a write marker such as `.write(` is
+   denied: use -F <file> / --body-file. Heredoc bodies are only exempt from the line-by-line check when fed to
+   python/node. Also: destructive find whose filters can match them or that is unfiltered/negated over a root that
+   is or contains logs/ (., .., /, ~, the repo), recursive rm / rd / del / Remove-Item / mv / move of logs/ or an
+   ancestor (globs and braces expanded: log*, {logs,build}), copies into logs/ (incl. -t/--target-directory),
+   symlinks/hard links (ln, mklink) aliasing logs/, git clean -x/-X and git stash --all.
+   Reads by allowlisted programs keep the normal permission policy (ask). Not covered: variable indirection,
+   xargs, archives, bare globs without a logs/ component (cd logs && rm *.json), cp -r src/. . / rsync src/ .
+   into the repo root, rsync --files-from, powershell -EncodedCommand, and a missing pending_entries.json still
+   reads as empty in the executor (tracked as a follow-up).
+9. PASS-THROUGH:
    Tool calls unrelated to trading return "ask" so the runtime's normal permission policy applies.
    "allow" is reserved for calls that passed every trading gate or are purely risk-reducing.
-9. HEARTBEAT:
+10. HEARTBEAT:
    Every invocation refreshes logs/hook_heartbeat.json (best effort, never alters the decision).
 
 Target latency: < 15ms (plus dossier provenance re-verification on trade openings).
@@ -56,6 +91,8 @@ import json
 import time
 import re
 import shlex
+import fnmatch
+import posixpath
 import datetime
 from typing import Dict, Any, Tuple, Optional, List
 
@@ -207,7 +244,11 @@ BINANCE_BATCH_ORDER_OPS = {"placemultipleorders"}
 # run_command classification
 # -----------------------------------------------------------------------------
 SHELL_SEPARATORS = {"&&", "||", ";", "|", "&", "\n", ";;", "|&", "(", ")"}
-REDIRECT_TOKENS = {">", ">>", ">|", "&>", "&>>", ">&"}
+REDIRECT_TOKENS = {">", ">>", ">|", "&>", "&>>", ">&", "<>"}
+SHELL_PUNCTUATION = "();<>|&\n"
+# bash operators, longest first: shlex returns punctuation runs (')>', ';>', '<>') as one token
+SHELL_OPERATORS = ("&>>", "<<<", "&&", "||", ";;", "|&", ">>", ">|", ">&", "&>", "<>", "<<", "<&",
+                   "(", ")", ";", "|", "&", "\n", ">", "<")
 INSPECTION_PROGRAMS = {
     "git", "gh", "grep", "rg", "cat", "ls", "find", "diff", "pytest", "cp", "rm", "mkdir", "chmod",
     "echo", "printf", "head", "tail", "less", "wc", "stat", "file", "jq", "sort", "uniq", "awk",
@@ -292,13 +333,100 @@ EVALUATION_TRAIL_CMD_RE = re.compile(
 TRANSCRIPT_ROOT_OVERRIDE_RE = re.compile(
     r"\b(?:AGY_BRAIN_DIRS|CLAUDE_PROJECTS_DIRS)\b(?:['\"]\]?)?\s*=|\b(?:AGY_BRAIN_DIRS|CLAUDE_PROJECTS_DIRS)['\"]\s*[,:]"
 )
-SESSION_STATE_RE = re.compile(r"session_state\.json", re.IGNORECASE)
+# Ground-truth runtime state: each file gates PROD orders and has exactly one sanctioned writer, a desk script
+# that writes it from Python (atomic_write_json), never through a shell command or a file tool.
+GROUND_TRUTH_FILES = {
+    "logs/session_state.json": "`python3 scripts/sync_session_state.py`",
+    "logs/guardian_state.json": "`python3 scripts/loops/position_guardian_loop.py`",
+    "logs/pending_entries.json": "`python3 scripts/execute_futures_trade.py` (resting-entry registration and --protect-pending)",
+}
+GROUND_TRUTH_BASENAMES = {path.rsplit("/", 1)[-1].lower(): path for path in GROUND_TRUTH_FILES}
+GROUND_TRUTH_RE = re.compile("|".join(re.escape(n) for n in GROUND_TRUTH_BASENAMES), re.IGNORECASE)
+GROUND_TRUTH_TARGET_RE = re.compile(
+    r"(?:^|/)logs/(" + "|".join(re.escape(n) for n in GROUND_TRUTH_BASENAMES) + r")$", re.IGNORECASE
+)
+SHELL_GLOB_RE = re.compile(r"[*?\[{]")
+# A shell sub-command that names a protected file (literally or through a logs/ glob / brace word) is denied unless
+# its program is one of these read-only tools (plus the special cases in _ground_truth_read_only).
+GROUND_TRUTH_READ_PROGRAMS = {"cat", "head", "tail", "less", "more", "grep", "egrep", "rg", "jq", "wc", "stat",
+                              "ls", "file", "diff", "cmp", "md5sum", "sha256sum"}
+# Programs that destroy the logs/ directory itself (rm -rf logs, shred -u logs/*)
+LOGS_DIR_DESTRUCTIVE_PROGRAMS = {"rm", "shred", "unlink", "truncate"}
+# Programs that can overwrite files inside logs/ with sources whose names are not visible (cp -r src/. logs)
+LOGS_DIR_COPY_PROGRAMS = {"cp", "rsync", "install"}
+# Programs accepting -t DIR / --target-directory=DIR (GNU coreutils)
+TARGET_DIR_PROGRAMS = {"cp", "mv", "install", "ln"}
+# git sub-commands that never modify working-tree files (anything else naming a protected file is denied)
+GIT_READ_SUBCOMMANDS = {"status", "diff", "log", "show", "grep", "blame", "commit", "add", "ls-files", "ls-tree",
+                        "check-ignore", "rev-parse", "branch", "shortlog", "describe", "cat-file", "fetch", "push"}
+GIT_GLOBAL_VALUE_OPTIONS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
+# Options that turn an allowlisted read into a write or a command run (git log --output=F, git grep -O<cmd>,
+# git -c core.fsmonitor=<cmd>, rg --pre CMD, less -o F); leading VAR= assignments (LESSOPEN, GIT_*) too.
+GIT_RUN_GLOBAL_OPTIONS = ("--config-env", "--exec-path")
+# Sub-command long options that write a file or run a command -> shortest abbreviation counted. git's parse-options
+# accepts any unique prefix (--op= for --open-files-in-pager, --upl=, --rece=, --exe=), so every prefix counts
+# (config-env from 4 letters: --co/--con abbreviate --contains/--color...). Longer spellings count too (--output-*).
+GIT_RUN_LONG_OPTIONS = {"output": 1, "open-files-in-pager": 1, "ext-diff": 1, "upload-pack": 1, "receive-pack": 1,
+                        "exec": 1, "exec-path": 1, "config-env": 4}
+# ...of which these run a shell command (their value, or the pager on matched files); the last three need a value
+GIT_EXEC_LONG_OPTIONS = ("open-files-in-pager", "upload-pack", "receive-pack", "exec")
+GIT_EXEC_VALUE_OPTIONS = ("upload-pack", "receive-pack", "exec")
+# Short clusters with O (git grep -O<cmd>, -nOrm; diff -O<orderfile>) or, for diff/log/show, o void the exemption
+GIT_LOWER_O_SUBCOMMANDS = {"diff", "log", "show"}
+RG_EXEC_OPTIONS = ("--pre", "--hostname-bin")
+ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# Windows / PowerShell programs that delete or move directories (cmd //c rd /s /q logs, Remove-Item -Recurse logs)
+WINDOWS_DELETE_PROGRAMS = {"rd", "rmdir", "del", "erase", "remove-item", "ri"}
+WINDOWS_MOVE_PROGRAMS = {"move", "ren", "rename", "move-item", "mi", "rename-item", "rni"}
+WINDOWS_SWITCH_RE = re.compile(r"^/[A-Za-z?](?::\S*)?$")
+SHELL_VALUE_OPTIONS = {"-o", "+o", "-O", "+O", "--rcfile", "--init-file"}
+NESTED_DEPTH_LIMIT = 6
+# Command substitutions that expand to the working directory / repo root, or that prefix a path ($(x)/logs)
+CWD_SUBSTITUTION_RE = re.compile(
+    r"\$\(\s*(?:pwd(?:\s+-[LP])?|git\s+rev-parse\s+--show-toplevel)\s*\)|"
+    r"`\s*(?:pwd(?:\s+-[LP])?|git\s+rev-parse\s+--show-toplevel)\s*`|\$\{PWD\}|\$PWD(?![A-Za-z0-9_])"
+)
+HOME_VAR_RE = re.compile(r"\$\{HOME\}|\$HOME(?![A-Za-z0-9_])")
+PATH_SUBSTITUTION_RE = re.compile(r"\$\(([^()\n]*)\)(?=/)|`([^`\n]*)`(?=/)")
+FIND_DELETE_ACTIONS = {"-delete"}
+FIND_OUTPUT_ACTIONS = {"-fprint", "-fprint0", "-fprintf", "-fls"}
+FIND_EXEC_ACTIONS = {"-exec", "-execdir", "-ok", "-okdir"}
+FIND_NAME_FILTERS = {"-name", "-iname"}
+FIND_PATH_FILTERS = {"-path", "-ipath", "-wholename", "-iwholename"}
+HEREDOC_RE = re.compile(r"(?<!<)<<(-?)\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
+# Heredoc bodies are dropped from the line-by-line check only when they feed python/node (judged by markers)
+CODE_INTERPRETER_PROGRAM_RE = re.compile(r"^(?:python[0-9.]*|node|nodejs)$", re.IGNORECASE)
+PIPE_TO_CODE_INTERPRETER_RE = re.compile(
+    r"^[^|;&\n]*\|\s*(?:python[0-9.]*|node)\b(?!\s+[^\s|;&-][^\s|;&]*\.(?:py|js)\b)", re.IGNORECASE)
 HARNESS_PATH_CMD_RE = re.compile(
     r"scripts[\\/]+hooks[\\/]|\.agents[\\/]+hooks\.json|dossier_provenance\.py|record_evaluation\.py|"
     r"\.agents[\\/]+agents[\\/]|\.claude[\\/]+agents[\\/]|\.claude[\\/]+settings|config[\\/]+user_profile\.json",
     re.IGNORECASE,
 )
-INLINE_WRITE_MARKERS_RE = re.compile(r"\.write\s*\(|dump\s*\(|open\s*\([^)]*['\"][wax]\+?b?['\"]|os\.(?:remove|unlink|replace|rename)|shutil\.", re.IGNORECASE)
+INLINE_WRITE_MARKERS_RE = re.compile(
+    r"\.write\s*\(|write_text\s*\(|write_bytes\s*\(|dump\s*\(|open\s*\([^)]*['\"][rwabxt+]*[wax+][rwabxt+]*['\"]|"
+    r"os\.(?:remove|unlink|replace|rename|truncate|system|popen|open|symlink|link)\b|\.unlink\s*\(|\.rename\s*\(|"
+    r"\.replace\s*\(|\.touch\s*\(|\.(?:symlink|hardlink|link)_to\s*\(|\bO_(?:WRONLY|RDWR|CREAT|TRUNC|APPEND)\b|"
+    r"FileIO\s*\(|shutil\.|subprocess\.|\.system\s*\(|\.popen\s*\(|\bexec\s*\(|__import__|"
+    r"\bos\.(?:exec|spawn|posix_spawn)\w*|\bpty\.|"
+    r"writeFileSync|writeFile\s*\(|unlinkSync|rmSync|openSync|"
+    r"(?:\bfs|require\s*\(\s*['\"](?:node:)?fs(?:/promises)?['\"]\s*\))\.(?:rm|rmdir|write\w*|open\w*)\s*\(|"
+    r"\b(?:rm|rmdir|rmdirSync|writeSync)\s*\(|"
+    r"\b(?:appendFile|copyFile|rename|symlink|truncate|cp)(?:Sync)?\s*\(|createWriteStream",
+    re.IGNORECASE,
+)
+# Inline code acting on the logs/ directory itself (shutil.rmtree('logs'), fs.rmSync('logs', {recursive: true})):
+# the destructive markers apply to a 'logs' string literal (or a logs/ glob reaching a protected file); the strong
+# markers also apply to literals naming an ancestor of logs/ ('.', '..', '/', the repo root) or a glob ('*', 'log*').
+INLINE_STRING_LITERAL_RE = re.compile(r"(['\"])([^'\"\s]+)\1")
+INLINE_LOGS_DIR_MARKERS_RE = re.compile(
+    r"rmtree|removedirs|\brename\w*\s*\(|\.replace\s*\(|\bremove\s*\(|unlink|\brm(?:dir)?(?:Sync)?\s*\(|rmSync|"
+    r"symlink|\.(?:hardlink|symlink)_to\s*\(|\blink(?:Sync)?\s*\(|shutil\.(?:move|copytree)|\bcp(?:Sync)?\s*\(|copyFile",
+    re.IGNORECASE,
+)
+INLINE_ANCESTOR_MARKERS_RE = re.compile(
+    r"rmtree|removedirs|rmSync|\brm\s*\([^)]*recursive|shutil\.move|\brename(?:s|Sync)?\s*\(", re.IGNORECASE
+)
 
 # File-tool targets
 HARNESS_FILES = {
@@ -748,13 +876,26 @@ def check_leverage_gate(symbol: str, requested_leverage: int, base_dir: str, use
 # =============================================================================
 # Shell command analysis
 # =============================================================================
+def _split_operators(tok: str) -> List[str]:
+    """Splits a shlex punctuation run into bash operators: ')>' -> ')', '>'; ';>' -> ';', '>'; '&&\\n' -> '&&', '\\n'."""
+    if not tok or any(c not in SHELL_PUNCTUATION for c in tok):
+        return [tok]
+    out: List[str] = []
+    i = 0
+    while i < len(tok):
+        op = next((o for o in SHELL_OPERATORS if tok.startswith(o, i)), tok[i])
+        out.append(op)
+        i += len(op)
+    return out
+
+
 def _tokenize(command_line: str) -> List[str]:
     try:
-        lexer = shlex.shlex(command_line, posix=True, punctuation_chars="();<>|&\n")
+        lexer = shlex.shlex(command_line, posix=True, punctuation_chars=SHELL_PUNCTUATION)
         lexer.whitespace = " \t\r"
         lexer.whitespace_split = True
         lexer.commenters = ""
-        return list(lexer)
+        return [part for tok in lexer for part in _split_operators(tok)]
     except Exception:
         return re.split(r"\s+|(?=[;&|<>\n])|(?<=[;&|<>\n])", command_line)
 
@@ -834,10 +975,15 @@ def _subcommand_is_risk_reducing(tokens: List[str], text: str) -> bool:
     return False
 
 
+def _is_redirect(tok: str) -> bool:
+    """Output redirect operator: >, >>, >|, &>, >&, <> and any other punctuation-only run containing '>'."""
+    return tok in REDIRECT_TOKENS or (">" in (tok or "") and all(c in SHELL_PUNCTUATION for c in tok))
+
+
 def _redirect_targets(tokens: List[str]) -> List[str]:
     targets = []
     for i, tok in enumerate(tokens):
-        if tok in REDIRECT_TOKENS and i + 1 < len(tokens):
+        if _is_redirect(tok) and i + 1 < len(tokens):
             targets.append(tokens[i + 1])
     return targets
 
@@ -866,6 +1012,615 @@ def _subcommand_writes_path(tokens: List[str], text: str, path_re: re.Pattern, i
     if inline and path_re.search(text) and INLINE_WRITE_MARKERS_RE.search(text):
         return True
     return False
+
+
+# -----------------------------------------------------------------------------
+# Ground-truth runtime state (session_state / guardian_state / pending_entries)
+# -----------------------------------------------------------------------------
+def ground_truth_denial(paths: List[str]) -> str:
+    """Denial reason naming each protected file and its sole sanctioned writer (GROUND_TRUTH_FILES order)."""
+    keys = [p for p in GROUND_TRUTH_FILES if p in set(paths)]
+    return "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Ground Truth Protection): " + "; ".join(
+        f"{p} may only be written by {GROUND_TRUTH_FILES[p]}" for p in keys
+    ) + "."
+
+
+def _ground_truth_named(text: str) -> List[str]:
+    return [GROUND_TRUTH_BASENAMES[m.group(0).lower()] for m in GROUND_TRUTH_RE.finditer(text or "")]
+
+
+def _shell_path(word: str) -> str:
+    """Forward slashes, no Windows drive prefix, '.', '..' and trailing slashes collapsed."""
+    p = re.sub(r"^[A-Za-z]:(?=/|$)", "", (word or "").replace("\\", "/"))
+    return posixpath.normpath(p) if p else ""
+
+
+def _expand_braces(word: str, limit: int = 64) -> List[str]:
+    """Minimal bash brace expansion ({a,b}) so logs/{guardian_state,x}.json is seen as two words."""
+    m = re.search(r"\{([^{}]*,[^{}]*)\}", word)
+    if not m:
+        return [word]
+    out: List[str] = []
+    for alt in m.group(1).split(","):
+        out.extend(_expand_braces(word[:m.start()] + alt + word[m.end():], limit))
+        if len(out) >= limit:
+            break
+    return out[:limit]
+
+
+def _glob_ground_truth(word: str) -> List[str]:
+    """Protected files a glob / brace word inside a logs/ directory can expand to (logs/*.json, logs/*state*)."""
+    if not SHELL_GLOB_RE.search(word or ""):
+        return []
+    hits: List[str] = []
+    for expanded in _expand_braces(word):
+        head, _, name = _shell_path(expanded).rpartition("/")
+        if not head or not fnmatch.fnmatchcase("logs", head.rpartition("/")[2].lower()):
+            continue
+        hits.extend(key for base, key in GROUND_TRUTH_BASENAMES.items() if fnmatch.fnmatchcase(base, name.lower()))
+    return hits
+
+
+def _is_logs_dir(word: str, cwd: str = "", base_dir: str = "") -> bool:
+    """True when a word (braces expanded) names a `logs` directory: last component `logs` (logs, ./logs/,
+    /abs/repo/logs) or a glob that can expand to it (log*, lo[g]s, *). A glob with a directory part (build/*) only
+    counts when it can expand to the workspace logs/ (resolved against cwd / base_dir)."""
+    for expanded in _expand_braces(word or ""):
+        sp = _shell_path(expanded)
+        head, _, last = sp.rpartition("/")
+        last = last.lower()
+        if last == "logs":
+            return True
+        if not (SHELL_GLOB_RE.search(last) and fnmatch.fnmatchcase("logs", last)):
+            continue
+        if not head or not base_dir or head.startswith("~"):
+            return True
+        logs = _canon_path(base_dir).rstrip("/") + "/logs"
+        if fnmatch.fnmatchcase(logs, _canon_path(sp, cwd or base_dir)):
+            return True
+    return False
+
+
+def _word_value(word: str) -> str:
+    """Value of option/assignment words (of=..., --output=...), otherwise the word itself."""
+    m = re.match(r"^-*[A-Za-z_][A-Za-z0-9_-]*=(.*)$", word)
+    return m.group(1) if m else word
+
+
+def _canon_path(path: str, cwd: str = "") -> str:
+    """Lower-case absolute POSIX path without the Windows drive / WSL /mnt/<d> / Git Bash /<d> prefix."""
+    p = (path or "").replace("\\", "/")
+    m = re.match(r"^(?:/mnt/[A-Za-z]|/[A-Za-z]|[A-Za-z]:)(?=/|$)", p)
+    if m:
+        p = p[m.end():] or "/"
+    if not p.startswith("/"):
+        p = (_canon_path(cwd) if cwd else "") + "/" + p
+    return "/" + posixpath.normpath(p).lstrip("/").lower()
+
+
+def _reaches_logs_dir(word: str, cwd: str, base_dir: str) -> bool:
+    """True when a word (braces/globs expanded) is the logs dir or one of its ancestors (., .., /, ~, the repo...)."""
+    logs = _canon_path(base_dir).rstrip("/") + "/logs" if base_dir else "/logs"
+    ancestors = [logs]
+    while ancestors[-1] != "/":
+        ancestors.append(posixpath.dirname(ancestors[-1]))
+    for expanded in _expand_braces(word or ""):
+        if not expanded:
+            continue
+        if _is_logs_dir(expanded, cwd, base_dir):
+            return True
+        sp = _shell_path(expanded)
+        if sp in (".", "..", "/", "~") or sp.endswith("/.."):
+            return True
+        if sp.startswith("~/"):
+            # Home is unknown to the hook: ~/Documents reaches the repo when that segment is one of its ancestors
+            pattern = "*/" + sp[2:].lower()
+        else:
+            pattern = _canon_path(sp, cwd or base_dir)
+        if any(fnmatch.fnmatchcase(a, pattern) for a in ancestors):
+            return True
+    return False
+
+
+def _plain_args(args: List[str]) -> List[str]:
+    """Arguments without redirect operators, their targets and the fd number glued before them (2>&1)."""
+    out: List[str] = []
+    skip = False
+    for i, a in enumerate(args):
+        if skip:
+            skip = False
+            continue
+        if _is_redirect(a) or a in ("<", "<<", "<<<", "<&"):
+            skip = True
+            continue
+        if a.isdigit() and i + 1 < len(args) and (_is_redirect(args[i + 1]) or args[i + 1] in ("<", "<&")):
+            continue
+        out.append(a)
+    return out
+
+
+def _split_operands(prog: str, args: List[str]) -> Tuple[List[str], Optional[str]]:
+    """(operands, target directory) for coreutils-style args; -t DIR, -tDIR, -rtDIR, --target-directory[=]DIR."""
+    operands: List[str] = []
+    target: Optional[str] = None
+    skip = end_of_options = False
+    for i, a in enumerate(args):
+        if skip:
+            skip = False
+            continue
+        if end_of_options or not a.startswith("-") or a == "-":
+            operands.append(a)
+            continue
+        if a == "--":
+            end_of_options = True
+            continue
+        if prog not in TARGET_DIR_PROGRAMS:
+            continue
+        m = re.match(r"^--(t[\w-]*)(?:=(.*))?$", a, re.DOTALL)
+        if m and "target-directory".startswith(m.group(1)):
+            if m.group(2) is not None:
+                target = m.group(2)
+            elif i + 1 < len(args):
+                target, skip = args[i + 1], True
+            continue
+        if a.startswith("--"):
+            continue
+        letters = a[1:]
+        for j, ch in enumerate(letters):
+            if ch == "t":
+                if letters[j + 1:]:
+                    target = letters[j + 1:]
+                elif i + 1 < len(args):
+                    target, skip = args[i + 1], True
+                break
+            if ch in "Smog":  # options taking a value (-S suffix, install -m/-o/-g)
+                skip = not letters[j + 1:]
+                break
+    return operands, target
+
+
+def _is_recursive(args: List[str]) -> bool:
+    return any(re.match(r"^-[A-Za-z]*[rRa]", a) or a in ("--recursive", "--archive") for a in args)
+
+
+def _exec_writes(args: List[str]) -> bool:
+    """True when a find -exec/-ok command line (program + args) can modify files."""
+    if not args:
+        return False
+    prog = os.path.basename(args[0]).lower()
+    if prog in GROUND_TRUTH_READ_PROGRAMS:
+        return False
+    if prog in ("sed", "perl"):
+        return any(re.match(r"^-[A-Za-z]*i", t) or t.startswith("--in-place") for t in args[1:])
+    return True
+
+
+def _find_roots(args: List[str]) -> List[str]:
+    i = 0
+    while i < len(args) and (args[i] in ("-H", "-L", "-P", "-D") or args[i].startswith("-O")):
+        i += 2 if args[i] == "-D" else 1
+    roots = []
+    while i < len(args) and not args[i].startswith("-") and args[i] not in ("(", ")", "!", ","):
+        roots.append(args[i])
+        i += 1
+    return roots or ["."]
+
+
+def _find_ground_truth(args: List[str], cwd: str = "", base_dir: str = "", depth: int = 0) -> List[str]:
+    """Protected files a `find` can write (-fprint ...) or delete (-delete, -exec rm, -exec sh ...)."""
+    hits: List[str] = []
+    for i, a in enumerate(args):
+        if a in FIND_OUTPUT_ACTIONS and i + 1 < len(args):
+            hits += _ground_truth_named(args[i + 1]) + _glob_ground_truth(args[i + 1])
+    destructive = any(a in FIND_DELETE_ACTIONS for a in args)
+    roots = _find_roots(args)
+    unfiltered = any(a in ("-not", "!", "-o", "-or", ",") for a in args)
+    filters = [(a.lower(), args[i + 1]) for i, a in enumerate(args)
+               if a.lower() in FIND_NAME_FILTERS | FIND_PATH_FILTERS and i + 1 < len(args)]
+
+    def can_match(name: str, path: str) -> bool:
+        """Whether the (ANDed) -name/-path filters can match an entry with this name and path."""
+        if unfiltered or not filters:
+            return True
+        return all(fnmatch.fnmatchcase((name if flt in FIND_NAME_FILTERS else path).lower(), pat.lower())
+                   for flt, pat in filters)
+
+    # {} expands to matched entries: a root the filters can match (-maxdepth 0 -name .) or the workspace logs/ dir
+    # under a root that reaches it (-name 'lo*'); every -exec command is also judged with its literal operands
+    # (find . -name x -exec rm -rf logs \;), before the name-filter shortcut below.
+    matches = [r for r in roots if can_match(posixpath.basename(_shell_path(r)) or r, r)]
+    matches += [posixpath.join(r, "logs") for r in roots
+                if _reaches_logs_dir(r, cwd, base_dir) and not _is_logs_dir(r, cwd, base_dir)
+                and can_match("logs", posixpath.join(r, "logs"))]
+    exec_words: List[str] = []
+    for i, a in enumerate(args):
+        if a in FIND_EXEC_ACTIONS:
+            end = next((j for j in range(i + 1, len(args)) if args[j] in (";", "+")), len(args))
+            command = args[i + 1:end]
+            if _exec_writes(command):
+                destructive = True
+                exec_words += args[i + 2:end]
+            for value in ["__find_match__"] + matches:
+                sub = [t.replace("{}", value) for t in command]
+                hits += _ground_truth_writes(sub, " ".join(sub), cwd, base_dir, depth + 1)
+    if not destructive:
+        return hits
+    hits += _ground_truth_named(" ".join(args))
+    if filters and not unfiltered:
+        # Name/path filters are ANDed: only files they can match are reachable
+        for flt, pattern in filters:
+            pat = pattern.lower()
+            for base, key in GROUND_TRUTH_BASENAMES.items():
+                candidates = [base] if flt in FIND_NAME_FILTERS else (
+                    [f"logs/{base}", f"./logs/{base}", f"/x/logs/{base}"]
+                    + [posixpath.join(r, "logs", base).lower() for r in roots])
+                if any(fnmatch.fnmatchcase(c, pat) for c in candidates):
+                    hits.append(key)
+        return hits
+    # Negated / alternated filters or only -type, -mmin, -regex ...: every file under the roots is reachable,
+    # and so is logs/ when the -exec command writes into it (find /tmp/f -type f -exec cp {} logs/ \;)
+    if (any(_reaches_logs_dir(r, cwd, base_dir) for r in roots)
+            or any(_is_logs_dir(w, cwd, base_dir) for w in exec_words)):
+        hits.extend(GROUND_TRUTH_FILES)
+    return hits
+
+
+def _ground_truth_read_only(prog: str, args: List[str], assigned: bool = False) -> bool:
+    """True when a sub-command that names a protected file can only read it (read-only allowlist). Options that make
+    an allowlisted program write a file or run a command (git --output / -O / -c, rg --pre, less -o) and leading
+    VAR= assignments (LESSOPEN, GIT_EXTERNAL_DIFF, NODE_OPTIONS...) void the exemption."""
+    if assigned:
+        return False
+    if prog in GROUND_TRUTH_READ_PROGRAMS:
+        if prog == "jq":
+            return not any(a == "-i" or a.startswith("--in-place") for a in args)
+        if prog == "rg":
+            return not any(a in RG_EXEC_OPTIONS or a.startswith(tuple(o + "=" for o in RG_EXEC_OPTIONS))
+                           for a in args)
+        if prog == "less":
+            return not any(a.startswith(("+", "--log-file", "--LOG-FILE")) or re.match(r"^-[^-]*[oO]", a)
+                           for a in args)
+        return True
+    if prog == "find":
+        return True  # judged by _find_ground_truth (destructive actions, -fprint outputs, -exec commands)
+    if prog == "git":
+        # commit messages, greps and diffs may name them
+        return _git_subcommand(args)[0] in GIT_READ_SUBCOMMANDS and not _git_runs_commands(args)
+    if prog == "gh":
+        return bool(args) and args[0] in ("pr", "issue")
+    if prog.startswith("python"):
+        if "-m" in args and "json.tool" in args:
+            rest = args[args.index("json.tool") + 1:]
+            positional = [a for i, a in enumerate(rest) if not a.startswith("-") and (i == 0 or rest[i - 1] != "--indent")]
+            return len(positional) <= 1  # a second positional is the output file
+        # python -c / python - (heredoc): inline code is judged by INLINE_WRITE_MARKERS_RE on the whole command
+        for a in args:
+            if a == "-" or re.match(r"^-[A-Za-z]*c$", a):
+                return True
+            if not a.startswith("-"):
+                return False  # a script (python3 tool.py logs/...) is not read-only
+        return False
+    if prog in ("node", "nodejs"):
+        return any(a in ("-e", "--eval", "-p", "--print") for a in args)
+    return False
+
+
+def _git_subcommand(args: List[str]) -> Tuple[str, List[str]]:
+    """(sub-command, its args) after git's global options (git -C dir -c k=v clean -fdx -> 'clean', ['-fdx'])."""
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        i += 2 if args[i] in GIT_GLOBAL_VALUE_OPTIONS else 1
+    return (args[i].lower(), args[i + 1:]) if i < len(args) else ("", [])
+
+
+def _git_long_options(arg: str) -> List[str]:
+    """GIT_RUN_LONG_OPTIONS an argument can select: the exact name, a longer spelling (--output-directory) or a
+    unique-prefix abbreviation parse-options accepts (--op='cmd', --upl=cmd, --rece=, --exe=)."""
+    m = re.match(r"^--([A-Za-z][\w-]*)(?:=|$)", arg)
+    if not m:
+        return []
+    name = m.group(1).lower()
+    return [o for o, shortest in GIT_RUN_LONG_OPTIONS.items()
+            if name.startswith(o) or (len(name) >= shortest and o.startswith(name))]
+
+
+def _git_short_cluster_runs(sub: str, arg: str) -> bool:
+    """A short-option cluster with O (grep -O<cmd>, -nOrm: n, then O takes 'rm') or, for diff/log/show, o."""
+    if not re.match(r"^-[^-]", arg):
+        return False
+    return "O" in arg[1:] or (sub in GIT_LOWER_O_SUBCOMMANDS and "o" in arg[1:])
+
+
+def _git_runs_commands(args: List[str]) -> bool:
+    """git -c / --config-env / --exec-path (core.fsmonitor, core.pager, diff.external...) or a sub-command option
+    that writes a file or runs a command (log/show/diff --output=F, grep -O<cmd> / -nOrm / --op=<cmd>, --ext-diff,
+    fetch --upload-pack / --upl=, push --receive-pack / --exec), abbreviations included."""
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        if args[i] == "-c" or args[i].startswith(GIT_RUN_GLOBAL_OPTIONS):
+            return True
+        i += 2 if args[i] in GIT_GLOBAL_VALUE_OPTIONS else 1
+    sub = args[i].lower() if i < len(args) else ""
+    return any(_git_long_options(a) or _git_short_cluster_runs(sub, a) for a in args[i + 1:])
+
+
+def _git_exec_options(args: List[str]) -> Tuple[List[str], List[str]]:
+    """(shell-command values, operands the commands act on) of git's command-running sub-command options:
+    grep -O<cmd> / -nOrm / --open-files-in-pager[=cmd] (abbreviations: --op=) run the pager on the matched files,
+    whose operands default to '.'; fetch/ls-remote --upload-pack, push --receive-pack / --exec (--upl=, --rece=,
+    --exe=) run on a local repository operand (git fetch --upl='rm -rf logs;:' .). Operands are [] when no such
+    option is present; patterns (-e .) are kept as operands, which errs toward denying."""
+    sub, rest = _git_subcommand(args)
+    runs = False
+    values: List[str] = []
+    operands: List[str] = []
+    skip = False
+    for j, a in enumerate(rest):
+        if skip:
+            skip = False
+            continue
+        if a == "--":
+            operands += rest[j + 1:]
+            break
+        names = [n for n in _git_long_options(a) if n in GIT_EXEC_LONG_OPTIONS]
+        if names:
+            runs = True
+            if "=" in a:
+                values.append(a.split("=", 1)[1])
+            elif any(n in GIT_EXEC_VALUE_OPTIONS for n in names) and j + 1 < len(rest):
+                values.append(rest[j + 1])
+                skip = True
+        elif re.match(r"^-[^-]", a) and "O" in a:
+            runs = runs or sub == "grep"  # diff/log/show -O<orderfile> only reads a file
+            if a[a.index("O") + 1:]:
+                values.append(a[a.index("O") + 1:])
+        elif not a.startswith("-"):
+            operands.append(a)
+    if not runs:
+        return values, []
+    if sub == "grep" and len(operands) <= 1:
+        operands.append(".")  # only a pattern: git grep searches the working directory
+    return values, operands
+
+
+def _rg_exec_options(args: List[str]) -> Tuple[List[str], List[str]]:
+    """(command values, operands) of rg --pre CMD (run on every searched file, operands default to '.') and
+    --hostname-bin CMD; operands are [] without --pre. The pattern is kept as an operand (errs toward denying)."""
+    pre = False
+    values: List[str] = []
+    operands: List[str] = []
+    skip = False
+    for j, a in enumerate(args):
+        if skip:
+            skip = False
+            continue
+        if a == "--":
+            operands += args[j + 1:]
+            break
+        if a in RG_EXEC_OPTIONS:
+            pre = pre or a == "--pre"
+            if j + 1 < len(args):
+                values.append(args[j + 1])
+                skip = True
+        elif a.startswith(tuple(o + "=" for o in RG_EXEC_OPTIONS)):
+            pre = pre or a.startswith("--pre=")
+            values.append(a.split("=", 1)[1])
+        elif not a.startswith("-"):
+            operands.append(a)
+    if not pre:
+        return values, []
+    return values, operands + (["."] if len(operands) <= 1 else [])
+
+
+def _command_option_operands(prog: str, args: List[str]) -> List[str]:
+    """Operands of an allowlisted program whose command-running option acts on them (rg --pre, git grep -O,
+    git fetch --upload-pack ...); [] when no such option is present."""
+    if prog == "rg":
+        return _rg_exec_options(args)[1]
+    if prog == "git":
+        return _git_exec_options(args)[1]
+    return []
+
+
+def _git_wipes_logs(args: List[str]) -> bool:
+    """git clean -x/-X and git stash --all delete the ignored runtime state under logs/."""
+    sub, rest = _git_subcommand(args)
+    if sub == "clean":
+        return any(re.match(r"^-[A-Za-z]*[xX]", a) for a in rest)
+    if sub == "stash":
+        return any(a == "--all" or re.match(r"^-[A-Za-z]*a", a) for a in rest)
+    return False
+
+
+def _nested_commands(prog: str, args: List[str]) -> List[str]:
+    """Command strings a sub-command runs through another shell: sh/bash -c '...', eval ..., cmd /c ...,
+    powershell -Command ..., git -c values (core.fsmonitor='rm -rf logs', alias.x='!cmd') and the values of
+    command-running options (git grep -O<cmd> / --op=, fetch --upload-pack / --upl=, push --receive-pack / --exec,
+    rg --pre / --hostname-bin, less +!cmd / +|<mark>cmd)."""
+    if prog == "git":
+        values = []
+        for i, a in enumerate(args[:-1]):
+            if a == "-c" and "=" in args[i + 1]:
+                values.append(args[i + 1].split("=", 1)[1].lstrip("!"))
+            elif not a.startswith("-") and (i == 0 or args[i - 1] not in GIT_GLOBAL_VALUE_OPTIONS):
+                break  # the sub-command: its own -c options (git grep -c) are not config values
+        return values + _git_exec_options(args)[0]
+    if prog == "rg":
+        return _rg_exec_options(args)[0]
+    if prog == "less":
+        values = []
+        for a in args:
+            m = re.search(r"!(.*)|\|.(.*)", a[1:], re.DOTALL) if a.startswith("+") else None
+            if m:
+                values.append(m.group(1) if m.group(1) is not None else m.group(2))
+        return values
+    if prog in SHELL_INTERPRETERS:
+        has_c = skip = False
+        for a in args:
+            if skip:
+                skip = False
+            elif a in SHELL_VALUE_OPTIONS:
+                skip = True
+            elif a == "--":
+                continue
+            elif a.startswith(("-", "+")) and len(a) > 1:
+                has_c = has_c or (not a.startswith("--") and "c" in a[1:])
+            else:
+                return [a] if has_c else []  # without -c the first operand is a script file
+        return []
+    if prog == "eval":
+        return [" ".join(args)] if args else []
+    if prog == "cmd":
+        return next(([" ".join(args[i + 1:])] for i, a in enumerate(args) if re.match(r"^/+[cCkK]$", a)), [])
+    if prog in ("powershell", "pwsh"):
+        return next(([" ".join(args[i + 1:])] for i, a in enumerate(args)
+                     if re.match(r"^-(?:c|com|comm|comma|comman|command)$", a, re.IGNORECASE)), [])
+    return []
+
+
+def _ground_truth_writes(tokens: List[str], text: str, cwd: str = "", base_dir: str = "", depth: int = 0) -> List[str]:
+    """Protected ground-truth files a single shell sub-command can create, modify, move, delete or alias."""
+    if depth > NESTED_DEPTH_LIMIT:
+        return list(GROUND_TRUTH_FILES)  # pathological nesting: fail closed
+    hits: List[str] = []
+    for target in _redirect_targets(tokens):
+        hits += _ground_truth_named(target) + _glob_ground_truth(target)
+    idx = _program_index(tokens)
+    prog = re.sub(r"\.exe$", "", _program(tokens))
+    args = _plain_args(tokens[idx + 1:] if idx < len(tokens) else [])
+    assigned = any(ASSIGNMENT_RE.match(t) for t in tokens[:idx])
+    mentioned = _ground_truth_named(text)
+    for a in tokens:
+        mentioned += _glob_ground_truth(_word_value(a))
+    if mentioned and not _ground_truth_read_only(prog, args, assigned):
+        hits += mentioned
+    # Nested shells (bash -c 'rm -rf logs', eval, cmd //c rd /s /q logs): the inner command line is judged too
+    for nested in _nested_commands(prog, args):
+        for sub in _ground_truth_subcommands(nested):
+            hits += _ground_truth_writes(sub, " ".join(sub), cwd, base_dir, depth + 1)
+    # A command-running option over logs/ or an ancestor (rg --pre rm . logs, git fetch --upl=CMD .): the command
+    # runs on the protected files (or the local repository) whatever its value names
+    if any(_reaches_logs_dir(o, cwd, base_dir) for o in _command_option_operands(prog, args)):
+        hits.extend(GROUND_TRUTH_FILES)
+    operands, target_dir = _split_operands(prog, args)
+    if prog in WINDOWS_DELETE_PROGRAMS | WINDOWS_MOVE_PROGRAMS:
+        operands = [o for o in operands if not WINDOWS_SWITCH_RE.match(o)]  # rd /s /q: switches, not paths
+    globbed = any(SHELL_GLOB_RE.search(a) for a in operands)
+    recursive = _is_recursive(args) or (prog in WINDOWS_DELETE_PROGRAMS and any(a.lower() == "/s" for a in args))
+    if prog in {"rm"} | WINDOWS_DELETE_PROGRAMS and recursive:
+        if any(_reaches_logs_dir(a, cwd, base_dir) for a in operands):
+            hits.extend(GROUND_TRUTH_FILES)
+    elif (prog in LOGS_DIR_DESTRUCTIVE_PROGRAMS | WINDOWS_DELETE_PROGRAMS
+          and any(_is_logs_dir(a, cwd, base_dir) for a in operands)):
+        hits.extend(GROUND_TRUTH_FILES)
+    if prog in {"mv"} | WINDOWS_MOVE_PROGRAMS and operands:
+        sources, dest = (operands, target_dir) if target_dir is not None else (operands[:-1], operands[-1])
+        # Moving the logs directory (or an ancestor) away, or a glob of unseen names into it;
+        # `mv report.txt logs/` stays allowed.
+        if (any(_reaches_logs_dir(s, cwd, base_dir) for s in sources)
+                or (dest and globbed and _is_logs_dir(dest, cwd, base_dir))):
+            hits.extend(GROUND_TRUTH_FILES)
+    if prog in LOGS_DIR_COPY_PROGRAMS and operands and (_is_recursive(args) or globbed):
+        sources, dest = (operands, target_dir) if target_dir is not None else (operands[:-1], operands[-1])
+        # Into logs/ (cp -r src/. logs, cp -t logs src/*), or a source dir named logs (any glob that can expand to
+        # one: /tmp/f/*) into logs/ or one of its ancestors (cp -r /tmp/f/* .)
+        if ((dest and _is_logs_dir(dest, cwd, base_dir))
+                or any(_shell_path(s).rpartition("/")[2].lower() == "logs" for s in sources)
+                or (dest and _reaches_logs_dir(dest, cwd, base_dir) and any(_is_logs_dir(s) for s in sources))):
+            hits.extend(GROUND_TRUTH_FILES)
+    if prog == "ln" and any(_is_logs_dir(a, cwd, base_dir) for a in operands + ([target_dir] if target_dir else [])):
+        # A symlink/hard link to the logs dir is an alias that file tools would not recognise (ln -s logs st)
+        hits.extend(GROUND_TRUTH_FILES)
+    if re.search(r"\bmklink\b", text, re.IGNORECASE) and any(_is_logs_dir(w, cwd, base_dir) for w in text.split()):
+        hits.extend(GROUND_TRUTH_FILES)
+    if prog == "find":
+        hits += _find_ground_truth(args, cwd, base_dir, depth)
+    if prog == "git" and _git_wipes_logs(args):
+        hits.extend(GROUND_TRUTH_FILES)
+    return [p for p in GROUND_TRUTH_FILES if p in set(hits)]
+
+
+def _heredoc_feeds_interpreter(line: str, m: "re.Match") -> bool:
+    """True when the heredoc operator m belongs to a python/node sub-command (python3 - <<EOF, node <<EOF) or to
+    `cat <<EOF | python3`; any other program (perl, bash, cat...) keeps its body in the line-by-line check."""
+    head = split_subcommands(line[:m.start()])
+    prog = re.sub(r"\.exe$", "", _program(head[-1])) if head else ""
+    if CODE_INTERPRETER_PROGRAM_RE.match(prog):
+        return True
+    return prog == "cat" and bool(PIPE_TO_CODE_INTERPRETER_RE.match(line[m.end():]))
+
+
+def _strip_interpreter_heredocs(command_line: str) -> str:
+    """Drops heredoc bodies fed to python/node: their code is judged by INLINE_WRITE_MARKERS_RE on the whole
+    command line, not line by line as shell sub-commands."""
+    lines = command_line.split("\n")
+    out: List[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        i += 1
+        for m in HEREDOC_RE.finditer(line):
+            interpreter = _heredoc_feeds_interpreter(line, m)
+            delim, strip_tabs = m.group(3), m.group(1) == "-"
+            while i < len(lines) and (lines[i].lstrip("\t") if strip_tabs else lines[i]) != delim:
+                if not interpreter:
+                    out.append(lines[i])
+                i += 1
+            if i < len(lines):
+                if not interpreter:
+                    out.append(lines[i])
+                i += 1
+    return "\n".join(out)
+
+
+def _inline_logs_dir_writes(command_line: str, cwd: str = "", base_dir: str = "") -> List[str]:
+    """Protected files inline code can destroy through the logs/ directory: a 'logs' string literal (or a logs/ glob
+    reaching a protected file) next to a destructive call (shutil.rmtree('logs'), fs.rmSync('logs'), os.remove over
+    glob('logs/*')), or an ancestor / glob literal ('.', '..', the repo root, '*') next to a recursive delete or move."""
+    broad = bool(INLINE_LOGS_DIR_MARKERS_RE.search(command_line) or INLINE_WRITE_MARKERS_RE.search(command_line))
+    strong = bool(INLINE_ANCESTOR_MARKERS_RE.search(command_line))
+    if not broad:
+        return []
+    hits: List[str] = []
+    for m in INLINE_STRING_LITERAL_RE.finditer(command_line):
+        literal = m.group(2)
+        if not SHELL_GLOB_RE.search(literal) and _is_logs_dir(literal, cwd, base_dir):
+            hits.extend(GROUND_TRUTH_FILES)
+        hits += _glob_ground_truth(literal)
+        if strong and _reaches_logs_dir(literal, cwd, base_dir):
+            hits.extend(GROUND_TRUTH_FILES)
+    return [p for p in GROUND_TRUTH_FILES if p in set(hits)]
+
+
+def _lift_path_substitutions(command_line: str) -> str:
+    """Rewrites working-directory substitutions ($(pwd), `pwd`, $PWD, $(git rev-parse --show-toplevel)) to '.' and
+    $HOME to '~', and replaces a command substitution used as a path prefix ($(cmd)/logs) by '.', appending its
+    command as a separate line: unquoted, the tokenizer would split `$(pwd)/logs` into '$', '(', 'pwd', ')', '/logs'
+    and the path would never reach the rm / ln operand checks."""
+    line = HOME_VAR_RE.sub("~", CWD_SUBSTITUTION_RE.sub(".", command_line))
+    lifted: List[str] = []
+
+    def lift(m: "re.Match") -> str:
+        inner = m.group(1) if m.group(1) is not None else m.group(2)
+        if inner.strip():
+            lifted.append(inner)
+        return "."
+
+    line = PATH_SUBSTITUTION_RE.sub(lift, line)
+    return line + "".join("\n" + c for c in lifted)
+
+
+def _ground_truth_subcommands(command_line: str) -> List[List[str]]:
+    """Sub-commands for the ground-truth check: path substitutions lifted, interpreter heredoc bodies dropped and
+    `find` predicates split off by escaped parentheses / `\\;` re-attached to their find (find . \\( -type f \\) -delete)."""
+    merged: List[List[str]] = []
+    for tokens in split_subcommands(_strip_interpreter_heredocs(_lift_path_substitutions(command_line))):
+        if merged and _program(merged[-1]) == "find" and (tokens[0].startswith("-") or tokens[0] in ("!", ",")):
+            merged[-1] = merged[-1] + tokens
+        else:
+            merged.append(list(tokens))
+    return merged
 
 
 def _resolve_script_path(token: str, cwd: str, base_dir: str) -> Optional[str]:
@@ -965,17 +1720,30 @@ def analyze_run_command(command_line: str, cwd: str, base_dir: str) -> Dict[str,
         )
         return result
 
+    # 4a. Ground-truth state written from inline code. Checked on the whole command line because heredoc bodies
+    #     are split into many sub-commands (newlines, parentheses), separating the path from the write call.
+    if inline and INLINE_WRITE_MARKERS_RE.search(command_line):
+        named = _ground_truth_named(command_line)
+        if named:
+            result["deny"] = ground_truth_denial(named)
+            return result
+    #     ... and inline code destroying / moving / aliasing the logs/ directory itself (shutil.rmtree('logs'))
+    if inline:
+        protected = _inline_logs_dir_writes(command_line, cwd, base_dir)
+        if protected:
+            result["deny"] = ground_truth_denial(protected)
+            return result
+
+    # 4b. Ground-truth state (GROUND_TRUTH_FILES) may only be written by its sanctioned desk script
+    for tokens in _ground_truth_subcommands(command_line):
+        protected = _ground_truth_writes(tokens, " ".join(tokens), cwd, base_dir)
+        if protected:
+            result["deny"] = ground_truth_denial(protected)
+            return result
+
     for tokens in subcommands:
         text = " ".join(tokens)
         prog = _program(tokens)
-
-        # 4. Ground truth ledger must only be written by sync_session_state.py
-        if SESSION_STATE_RE.search(text) and _subcommand_writes_path(tokens, text, SESSION_STATE_RE, inline):
-            result["deny"] = (
-                "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Ground Truth Protection): logs/session_state.json may only be "
-                "written by `python3 scripts/sync_session_state.py`."
-            )
-            return result
 
         # 5. Harness files require explicit confirmation
         if HARNESS_PATH_CMD_RE.search(text) and _subcommand_writes_path(tokens, text, HARNESS_PATH_CMD_RE, inline):
@@ -1135,7 +1903,12 @@ def retired_radar_reason(tool: str) -> str:
 
 
 # =============================================================================
-# File writes (evaluation trail & harness protection)
+# File writes (evaluation trail, ground-truth state & harness protection)
+# Ground-truth files are matched by suffix (logs/<name>) on the workspace-relative path, the normalised absolute
+# path and the raw target (backslashes converted, Windows drive stripped), so `logs/x`, `./logs/x`, POSIX
+# absolute paths and `C:\...\logs\x` (Claude Code on Windows feeding the WSL hook) are all denied. NTFS aliases
+# (trailing dots/spaces, `::$DATA` streams) are stripped first, and the target is also resolved with
+# os.path.realpath / os.path.samefile so symlinked directories and hard links to the files are denied too.
 # =============================================================================
 def _normalize_target(path: str, base_dir: str) -> Tuple[str, str]:
     """Returns (absolute normalized path with forward slashes, workspace-relative path or '')."""
@@ -1157,6 +1930,66 @@ def _normalize_target(path: str, base_dir: str) -> Tuple[str, str]:
     return abs_norm, rel
 
 
+def _strip_windows_aliases(path: str) -> str:
+    """NTFS aliases of the same file: trailing dots/spaces of each component and alternate data streams
+    (guardian_state.json. / guardian_state.json::$DATA / name:stream). The drive letter is kept."""
+    p = re.sub(r"^/(?=[A-Za-z]:)", "", (path or "").replace("\\", "/"))
+    m = re.match(r"^[A-Za-z]:", p)
+    drive, rest = (p[:2], p[2:]) if m else ("", p)
+    parts = []
+    for comp in rest.split("/"):
+        comp = comp.split(":", 1)[0]
+        parts.append(comp if comp in (".", "..") else comp.rstrip(". "))
+    return drive + "/".join(parts)
+
+
+def _ground_truth_file_target(target: str, abs_norm: str, rel: str) -> Optional[str]:
+    """GROUND_TRUTH_FILES key when a file-tool target ends with logs/<protected name>, else None."""
+    raw = re.sub(r"^file:/*", "/", (target or "").strip(), flags=re.IGNORECASE)
+    for candidate in (rel, abs_norm, raw):
+        path = _shell_path(_strip_windows_aliases(candidate or ""))
+        m = GROUND_TRUTH_TARGET_RE.search(path) if path else None
+        if m:
+            return GROUND_TRUTH_BASENAMES[m.group(1).lower()]
+    return None
+
+
+def _host_path(target: str, base_dir: str) -> str:
+    """File-tool target as a path on the hook's own filesystem (C:\\x -> /mnt/c/x and /c/x -> /mnt/c/x under WSL)."""
+    p = re.sub(r"^file:/*", "/", (target or "").strip(), flags=re.IGNORECASE)
+    p = re.sub(r"^/(?=[A-Za-z]:)", "", p)
+    if os.name != "nt":
+        m = re.match(r"^([A-Za-z]):[\\/]", p)
+        if m:
+            p = f"/mnt/{m.group(1).lower()}/" + p[3:].replace("\\", "/")
+        m = re.match(r"^/([A-Za-z])(?=/)", p)
+        if m and not os.path.isdir(p[:2]) and os.path.isdir(f"/mnt/{m.group(1).lower()}"):
+            p = f"/mnt/{m.group(1).lower()}" + p[2:]
+    p = os.path.expanduser(p)
+    return p if os.path.isabs(p) else os.path.join(base_dir, p)
+
+
+def _ground_truth_alias_target(target: str, base_dir: str) -> Optional[str]:
+    """GROUND_TRUTH_FILES key when a target reaches a protected file through a symlinked directory or file
+    (ln -s logs st; Write st/guardian_state.json) or a hard link (os.path.realpath / os.path.samefile)."""
+    try:
+        host = _host_path(target, base_dir)
+        real = os.path.realpath(host)
+    except (OSError, ValueError):
+        return None
+    for key in GROUND_TRUTH_FILES:
+        protected = os.path.join(base_dir, *key.split("/"))
+        try:
+            if os.path.normcase(real) == os.path.normcase(os.path.realpath(protected)):
+                return key
+            if os.path.exists(host) and os.path.exists(protected) and os.path.samefile(host, protected):
+                return key
+        except (OSError, ValueError):
+            continue
+    m = GROUND_TRUTH_TARGET_RE.search(_shell_path(_strip_windows_aliases(real)))
+    return GROUND_TRUTH_BASENAMES[m.group(1).lower()] if m else None
+
+
 def evaluate_file_write(target: str, content: str, base_dir: str) -> Tuple[str, str]:
     if not target:
         return "force_ask", "File write without a resolvable target path."
@@ -1168,11 +2001,9 @@ def evaluate_file_write(target: str, content: str, base_dir: str) -> Tuple[str, 
             "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Evaluation Trail Protection): Writing to logs/evaluations/, "
             "Antigravity brain transcripts or Claude Code subagent transcripts is forbidden. " + EVALUATOR_HINT
         )
-    if rel_l == "logs/session_state.json":
-        return "deny", (
-            "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Ground Truth Protection): logs/session_state.json may only be "
-            "written by `python3 scripts/sync_session_state.py`."
-        )
+    protected = _ground_truth_file_target(target, abs_norm, rel) or _ground_truth_alias_target(target, base_dir)
+    if protected:
+        return "deny", ground_truth_denial([protected])
     if rel_l in HARNESS_FILES or any(rel_l.startswith(d) for d in HARNESS_DIRS):
         return "force_ask", f"'{rel}' is a trading harness file (hooks / dossier provenance / evaluator). Explicit confirmation required."
     if content and WRITE_ENDPOINT_PRIMITIVES_RE.search(content):
