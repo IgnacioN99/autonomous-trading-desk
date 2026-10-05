@@ -2,6 +2,14 @@
 """
 fetch_newsletters.py - Gmail IMAP Newsletter Ingestion Engine for Trading Radar.
 Optimized to parse and inspect user newsletter labels/folders (e.g., Newsletters/Crypto).
+
+Read-only: opens the mailbox with readonly=True and never modifies it. All external text is
+sanitized against prompt injection and wrapped in <untrusted_newsletter_data> tags.
+
+CLI:
+    python3 scripts/fetch_newsletters.py [--json | --format json|md] [--limit N] [--sender S]
+                                         [--query Q] [--folder F] [--test] [--list-folders]
+Exit codes: 0 ok, 1 credentials/IMAP error, 2 bad usage.
 """
 
 import imaplib
@@ -338,8 +346,8 @@ def fetch_emails(folder=None, query=None, sender=None, limit=5, test_only=False,
         }
         print(json.dumps(output, ensure_ascii=False, indent=2))
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Gmail IMAP Newsletter Reader")
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Gmail IMAP Newsletter Reader (read-only)")
     parser.add_argument("--test", action="store_true", help="Test IMAP authentication")
     parser.add_argument("--list-folders", action="store_true", help="List all mailbox labels/folders")
     parser.add_argument("--folder", type=str, default=None, help="Folder/label to inspect (default: configured in config/user_context.json or Newsletters/Crypto)")
@@ -347,7 +355,34 @@ if __name__ == "__main__":
     parser.add_argument("--query", type=str, default="", help="Search specific text query")
     parser.add_argument("--limit", type=int, default=5, help="Number of emails to fetch")
     parser.add_argument("--format", type=str, choices=["json", "md"], default="json", help="Output format (json or md)")
-    args = parser.parse_args()
+    parser.add_argument("--json", action="store_true", help="Alias for --format json")
+    parser.add_argument("--env", default=None, help="Accepted for CLI uniformity (prod|testnet); newsletters do not depend on it")
+    args = parser.parse_args(argv)
 
-    fetch_emails(folder=args.folder, query=args.query, sender=args.sender, limit=args.limit, test_only=args.test, list_all_folders=args.list_folders, output_format=args.format)
+    if args.limit < 1:
+        parser.print_usage(sys.stderr)
+        sys.stderr.write("error: --limit must be >= 1\n")
+        return 2
+    if args.env is not None:
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from utils.env_resolver import resolve_env
+            resolve_env(args.env)
+        except ValueError as e:
+            sys.stderr.write(f"error: {e}\n")
+            return 2
+    output_format = "json" if args.json else args.format
+
+    try:
+        fetch_emails(folder=args.folder, query=args.query, sender=args.sender, limit=args.limit,
+                     test_only=args.test, list_all_folders=args.list_folders, output_format=output_format)
+    except SystemExit as e:
+        return e.code if isinstance(e.code, int) else 1
+    except Exception as e:
+        print(json.dumps({"status": "error", "message": f"Newsletter fetch failed: {type(e).__name__}: {e}"}, indent=2))
+        return 1
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
 

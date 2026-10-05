@@ -9,11 +9,16 @@ Ground Truth (session_state.json) remains permanently fresh.
 If an opening order was placed, it immediately runs an orphan audit with auto-heal.
 
 Recognized tool calls (Antigravity and Claude Code payloads):
-  * run_command / Bash invoking the sanctioned trading scripts.
+  * run_command / Bash executing the sanctioned trading scripts (inspection commands such as grep/cat
+    that merely mention them are ignored):
+      - scripts/execute_futures_trade.py: trade openings, --close-position, --move-breakeven,
+        --audit-orphans, --auto-heal (read-only --positions and --help are ignored);
+      - scripts/loops/position_guardian_loop.py (except --dry-run), night_cutoff_loop.py,
+        dynamic_exit_manager.py and batch deploy scripts.
   * call_mcp_tool, mcp_tool, mcp_<server>_<tool>, mcp__<server>__<tool>:
-      - crypto_radar trading/position tools (scans, newsletters and sizing helpers are ignored);
       - Binance write tools (anything outside the read-only allowlist), including calls wrapped
         in the gateway meta-tool 'tool_execute', placeMultipleOrders and newAlgoOrder.
+    The retired crypto_radar MCP server is denied by pre_trade_guard and never triggers a sync.
 
 Contract:
   Input (stdin): JSON with step metadata.
@@ -35,22 +40,25 @@ if HOOKS_DIR not in sys.path:
 SYNC_TIMEOUT_S = 10
 AUDIT_TIMEOUT_S = 12
 
-RADAR_OPENING_TOOLS = {"deploy_futures_trade", "place_order"}
-RADAR_POSITION_TOOLS = RADAR_OPENING_TOOLS | {
-    "move_to_breakeven", "move_sl_to_breakeven", "close_position_market", "close_position",
-    "update_trailing_stop_structural", "audit_and_trail_all_positions",
-}
 BINANCE_OPENING_OPS = {"neworder", "newalgoorder", "placemultipleorders", "marginaccountneworder",
                        "modifyorder", "modifymultipleorders"}
 
-TRADING_SCRIPT_KEYWORDS = [
-    "execute_futures_trade",
-    "close_position_market",
-    "move_sl_to_breakeven",
-    "deploy_futures_trade",
-    "night_cutoff_loop",
-    "dynamic_exit_manager",
-]
+EXECUTOR_RE = re.compile(r"\bexecute_futures_trade(?:\.py)?\b")
+DEPLOY_BATCH_RE = re.compile(r"\bdeploy_[A-Za-z0-9_]+\.py\b")
+GUARDIAN_RE = re.compile(r"\bposition_guardian_loop(?:\.py)?\b")
+POSITION_SCRIPTS_RE = re.compile(r"\b(?:night_cutoff_loop|dynamic_exit_manager)(?:\.py)?\b")
+
+HELP_FLAGS = {"--help", "-h"}
+EXECUTOR_NON_OPENING_FLAGS = {
+    "--close-position", "--close_position", "--audit-orphans", "--audit_orphans", "--auto-heal", "--auto_heal",
+    "--move-breakeven", "--move_breakeven",
+}
+EXECUTOR_READ_ONLY_FLAGS = {"--positions"}
+GUARDIAN_NO_WRITE_FLAGS = {"--dry-run", "--dry_run"}
+INSPECTION_PROGRAMS = {
+    "git", "gh", "grep", "rg", "cat", "ls", "find", "diff", "echo", "printf", "head", "tail", "less", "wc",
+    "stat", "file", "jq", "sort", "uniq", "awk", "sed", "cp", "mv", "rm", "mkdir", "chmod", "pytest",
+}
 
 try:
     import pre_trade_guard as _guard
@@ -126,9 +134,6 @@ def _normalize(payload: dict) -> dict:
         elif name.startswith("mcp_"):
             rest = name[4:]
             server, _, tool = rest.partition("_")
-            for known in ("crypto_radar", "binance"):
-                if rest.startswith(known + "_"):
-                    server, tool = known, rest[len(known) + 1:]
             out.update(kind="mcp", server=server, tool=tool, args=_decode_dict(args.get("Arguments", args)))
         return out
 
@@ -170,6 +175,55 @@ def classify_binance_call(tool: str, mcp_args: dict):
     return False, False
 
 
+def _split_subcommands(command_line: str):
+    if _guard is not None:
+        try:
+            return _guard.split_subcommands(command_line)
+        except Exception:
+            pass
+    parts = re.split(r"&&|\|\||[;|&\n]", command_line)
+    return [p.split() for p in parts if p.strip()]
+
+
+def _program(tokens) -> str:
+    if _guard is not None:
+        try:
+            return _guard._program(tokens)
+        except Exception:
+            pass
+    for tok in tokens:
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tok):
+            return os.path.basename(tok).lower()
+    return ""
+
+
+def classify_command(command_line: str):
+    """Returns (order_placed, is_opening) for a shell command, evaluated per sub-command."""
+    order_placed = False
+    is_opening = False
+    for tokens in _split_subcommands(command_line or ""):
+        if not tokens or _program(tokens) in INSPECTION_PROGRAMS:
+            continue
+        text = " ".join(tokens)
+        flags = {t.split("=", 1)[0].lower() for t in tokens if t.startswith("-")}
+        if DEPLOY_BATCH_RE.search(text):
+            order_placed = is_opening = True
+        elif EXECUTOR_RE.search(text):
+            if flags & EXECUTOR_NON_OPENING_FLAGS:
+                order_placed = True
+            elif flags & (EXECUTOR_READ_ONLY_FLAGS | HELP_FLAGS):
+                continue
+            else:
+                order_placed = is_opening = True
+        elif GUARDIAN_RE.search(text):
+            if not flags & (GUARDIAN_NO_WRITE_FLAGS | HELP_FLAGS):
+                order_placed = True
+        elif POSITION_SCRIPTS_RE.search(text):
+            if not flags & HELP_FLAGS:
+                order_placed = True
+    return order_placed, is_opening
+
+
 def handle_post_trade_sync(payload: dict) -> dict:
     """
     Inspects toolCall payload and executes necessary sync / audit operations.
@@ -192,20 +246,9 @@ def handle_post_trade_sync(payload: dict) -> dict:
 
         if is_binance:
             order_placed, is_opening = classify_binance_call(tool, mcp_args)
-        elif server == "crypto_radar" or tool in RADAR_POSITION_TOOLS:
-            if tool in RADAR_POSITION_TOOLS:
-                order_placed = True
-                is_opening = tool in RADAR_OPENING_TOOLS
-            elif tool == "audit_orphan_positions" and _is_true(mcp_args.get("auto_heal")):
-                order_placed = True
 
     elif call["kind"] == "run_command":
-        if any(kw in command_line for kw in TRADING_SCRIPT_KEYWORDS) or re.search(r"\bdeploy_[A-Za-z0-9_]+\.py\b", command_line):
-            order_placed = True
-            if (("execute_futures_trade" in command_line or re.search(r"\bdeploy_[A-Za-z0-9_]+\.py\b", command_line))
-                    and not re.search(r"--(?:close[-_]position|audit[-_]orphans|auto[-_]heal|help)\b", command_line)
-                    and "close_position_market" not in command_line):
-                is_opening = True
+        order_placed, is_opening = classify_command(command_line)
 
     result = {
         "order_placed": order_placed,

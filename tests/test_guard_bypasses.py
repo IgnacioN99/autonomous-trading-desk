@@ -142,16 +142,38 @@ class GuardHarness(unittest.TestCase):
 
 class TestMcpBypasses(GuardHarness):
 
-    def test_mcp_tool_named_deploy_without_dossier_denied(self):
-        args = {"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3}
-        self.assertDenied(self.agy(self.mcp("crypto_radar", "deploy_futures_trade", args, name="mcp_tool")),
-                          "Clean-Room Evaluator Required")
-        eager = {"toolCall": {"name": "mcp_crypto_radar_deploy_futures_trade", "args": args}}
-        self.assertDenied(self.agy(eager), "Clean-Room Evaluator Required")
+    def test_retired_radar_server_denied_in_every_naming_form(self):
+        self.write_legacy_dossier()
+        args = {"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3, "target_env": "testnet"}
+        forms = [
+            self.mcp("crypto_radar", "deploy_futures_trade", args, name="mcp_tool"),
+            self.mcp("\"crypto_radar\"", "\"get_open_positions\"", {}),
+            self.mcp("crypto-radar", "scan_intraday_market", {}),
+            {"toolCall": {"name": "mcp_crypto_radar_deploy_futures_trade", "args": args}},
+            {"toolCall": {"name": "mcp_crypto_radar_get_crypto_newsletters", "args": {}}},
+        ]
+        for payload in forms:
+            res = self.agy(payload)
+            self.assertDenied(res, "Retired MCP Server")
+            self.assertEqual(res.get("__exit_code__"), 0)
+        claude = self.run_guard({"tool_name": "mcp__crypto_radar__close_position_market",
+                                 "tool_input": {"symbol": "BTCUSDT"}})
+        self.assertEqual(claude.get("__exit_code__"), 2)
+        self.assertIn("--close-position --symbol", claude["__stderr__"])
+        plugin = self.run_guard({"tool_name": "mcp__plugin_desk_crypto_radar__audit_and_trail_all_positions",
+                                 "tool_input": {}})
+        self.assertEqual(plugin.get("__exit_code__"), 2)
+        self.assertIn("position_guardian_loop.py", plugin["__stderr__"])
 
-    def test_deploy_reduce_only_argument_is_not_an_exemption(self):
+    def test_retired_radar_reduce_only_argument_is_not_an_exemption(self):
         args = {"symbol": "BTCUSDT", "direction": "LONG", "reduceOnly": True}
-        self.assertDenied(self.agy(self.mcp("crypto_radar", "deploy_futures_trade", args)))
+        self.assertDenied(self.agy(self.mcp("crypto_radar", "deploy_futures_trade", args)), "Retired MCP Server")
+
+    def test_legacy_radar_tool_names_denied_on_any_server_alias(self):
+        for tool in ("deploy_futures_trade", "move_to_breakeven", "close_position_market", "audit_orphan_positions"):
+            self.assertDenied(self.agy(self.mcp("some-alias", tool, {"symbol": "BTCUSDT"})), "Retired MCP Server")
+        # Unrelated MCP tools keep the normal permission policy
+        self.assertEqual(self.agy(self.mcp("notion", "notion-search", {"query": "x"})).get("decision"), "ask")
 
     def test_tool_execute_wrapping_new_order_denied(self):
         inner = {"toolName": "futures_usds.newOrder",
@@ -268,6 +290,13 @@ class TestRunCommandBypasses(GuardHarness):
         self.assertDenied(self.agy(self.cmd("python3 scripts/deploy_fomc_batch.py --env prod")), "Batch deploy")
         self.assertDenied(self.agy(self.cmd("python3 scripts/loops/climax_watcher_loop.py --once --auto-deploy --env prod")))
 
+    def test_reading_executor_source_is_not_a_trade(self):
+        for c in ("sed -n 1,40p scripts/execute_futures_trade.py",
+                  "nl scripts/execute_futures_trade.py | head -20",
+                  "cut -c1-80 scripts/execute_futures_trade.py"):
+            out = self.agy(self.cmd(c))
+            self.assertNotEqual(out.get("decision"), "deny", c)
+
     def test_multiple_trade_openings_in_one_command_denied(self):
         self.write_legacy_dossier()
         c = ("python3 scripts/execute_futures_trade.py --symbol BTCUSDT --direction LONG --env testnet; "
@@ -316,10 +345,9 @@ class TestRunCommandBypasses(GuardHarness):
 
 class TestDossierProvenance(GuardHarness):
 
-    def deploy(self, direction="LONG", env="prod", **extra):
-        return self.agy(self.mcp("crypto_radar", "deploy_futures_trade",
-                                 {"symbol": "BTCUSDT", "direction": direction, "leverage": 3, "target_env": env},
-                                 **extra))
+    def deploy(self, direction="LONG", env="prod", symbol="BTCUSDT", **extra):
+        return self.agy(self.cmd(f"python3 scripts/execute_futures_trade.py --symbol {symbol} --direction {direction} "
+                                 f"--leverage 3 --env {env}", **extra))
 
     def test_forged_legacy_dossier_rejected_in_prod(self):
         self.write_legacy_dossier()
@@ -341,9 +369,7 @@ class TestDossierProvenance(GuardHarness):
         with open(self.dossier_path, "w", encoding="utf-8") as f:
             json.dump(record, f)
         # Hash still matches the transcript, but the tampered symbol list is not what the evaluator emitted
-        res = self.agy(self.mcp("crypto_radar", "deploy_futures_trade",
-                                {"symbol": "ETHUSDT", "direction": "LONG", "target_env": "prod"}))
-        self.assertDenied(res, "from what the evaluator")
+        self.assertDenied(self.deploy(symbol="ETHUSDT"), "from what the evaluator")
         os.remove(os.path.join(self.brain, EVALUATOR_CONV_ID, ".system_generated", "logs", "transcript.jsonl"))
         self.assertDenied(self.deploy(), "transcript not found")
 
@@ -463,11 +489,39 @@ class TestPostTradeSync(GuardHarness):
         self.assertFalse(res["is_opening"])
 
     @patch("post_trade_sync.subprocess.run")
-    def test_newsletters_and_scans_do_not_sync(self, mock_run):
-        for tool in ("get_crypto_newsletters", "scan_intraday_market", "calculate_position_sizing"):
+    def test_scans_inspection_and_retired_radar_do_not_sync(self, mock_run):
+        for tool in ("get_crypto_newsletters", "scan_intraday_market", "deploy_futures_trade", "move_to_breakeven"):
             res = post_trade_sync.handle_post_trade_sync(self.mcp("crypto_radar", tool, {}))
             self.assertFalse(res["order_placed"], tool)
+        for c in ("python3 scripts/broad_market_radar.py --json",
+                  "python3 scripts/fetch_newsletters.py --format json",
+                  "grep -n move-breakeven scripts/execute_futures_trade.py",
+                  "git diff scripts/execute_futures_trade.py | cat",
+                  "python3 scripts/execute_futures_trade.py --positions --json",
+                  "python3 scripts/execute_futures_trade.py --help",
+                  "python3 scripts/loops/position_guardian_loop.py --once --dry-run"):
+            res = post_trade_sync.handle_post_trade_sync(self.cmd(c))
+            self.assertFalse(res["order_placed"], c)
         mock_run.assert_not_called()
+
+    @patch("post_trade_sync.subprocess.run")
+    def test_executor_position_management_syncs_without_audit(self, mock_run):
+        os.makedirs(os.path.join(self.root, "scripts"), exist_ok=True)
+        open(os.path.join(self.root, "scripts", "sync_session_state.py"), "w").close()
+        with patch("execute_futures_trade.audit_orphan_positions") as mock_audit, \
+                patch("post_trade_sync.find_workspace_root", return_value=self.root):
+            for c in ("python3 scripts/execute_futures_trade.py --move-breakeven --symbol BTCUSDT --env testnet",
+                      "python3 scripts/execute_futures_trade.py --close-position --symbol BTCUSDT --env testnet",
+                      "python3 scripts/loops/position_guardian_loop.py --once --env testnet"):
+                res = post_trade_sync.handle_post_trade_sync(self.cmd(c))
+                self.assertTrue(res["order_placed"], c)
+                self.assertFalse(res["is_opening"], c)
+                self.assertTrue(res["synced"], c)
+            mock_audit.assert_not_called()
+            res = post_trade_sync.handle_post_trade_sync(
+                self.cmd("python3 scripts/execute_futures_trade.py --symbol BTCUSDT --direction LONG --env testnet"))
+            self.assertTrue(res["is_opening"])
+            mock_audit.assert_called_once_with(target_env="testnet", auto_heal=True)
 
     @patch("post_trade_sync.subprocess.run")
     def test_tool_execute_and_mcp_tool_names_recognized(self, mock_run):

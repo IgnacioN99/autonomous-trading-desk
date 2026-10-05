@@ -399,17 +399,14 @@ def run_doctor(target_env: str = None, auto_heal: bool = False) -> int:
                 print(f"🚨 [ORPHAN AUDIT] {err_msg} — TRIGGERING AUTO-HEAL...")
                 for op in orphan_positions:
                     sym = op["symbol"]
-                    amt = float(op["positionAmt"])
-                    entry_p = float(op["entryPrice"])
-                    exit_side = "SELL" if amt > 0 else "BUY"
-                    emergency_sl = entry_p * (0.975 if amt > 0 else 1.025)
-                    heal_res = eft.place_algo_stop_loss(sym, exit_side, emergency_sl, target_env=target_env)
-                    if heal_res.get("algoId"):
-                        print(f"   🛡️ Auto-Heal successful for {sym}: Algo SL placed at {emergency_sl:.5f}")
+                    # Verified emergency stop (place + confirm on openAlgoOrders); never opens exposure
+                    heal_res = eft.heal_orphan_position(op, target_env=target_env, close_on_failure=False)
+                    if heal_res.get("success"):
+                        print(f"   🛡️ Auto-Heal successful for {sym}: verified Algo SL at {heal_res.get('healed_sl_price')}")
                         ok_items.append(f"Auto-Heal applied to {sym}")
                     else:
-                        critical_failures.append(f"Auto-Heal failure on {sym}: {heal_res}")
-                        print(f"   ❌ Failed to apply Auto-Heal on {sym}: {heal_res}")
+                        critical_failures.append(f"Auto-Heal failure on {sym}: {heal_res.get('reason')}")
+                        print(f"   ❌ Failed to apply Auto-Heal on {sym}: {heal_res.get('reason')}")
             else:
                 critical_failures.append(err_msg)
                 print(f"❌ [ORPHAN AUDIT] FAIL CLOSED: {err_msg}")

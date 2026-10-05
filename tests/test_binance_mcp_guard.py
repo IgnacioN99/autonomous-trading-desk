@@ -117,11 +117,17 @@ class TestBinanceMCPGuard(unittest.TestCase):
             sys.stdin = stdin_backup
             sys.stdout = stdout_backup
 
+    @staticmethod
+    def _cli_payload(flags: str) -> dict:
+        """Trade opening through the single choke point (executor CLI)."""
+        return {"toolCall": {"name": "run_command",
+                             "args": {"CommandLine": f"python3 scripts/execute_futures_trade.py {flags}"}}}
+
     # -------------------------------------------------------------------------
     # 1. INTERCEPTION OF OPENING ORDERS VIA APPROVED CHOKE POINT (BUY & SELL)
     # -------------------------------------------------------------------------
     def test_intercept_binance_new_order_buy_and_sell(self):
-        """Verifies deploy_futures_trade is intercepted and allowed under neutral conditions."""
+        """Verifies executor trade openings are intercepted and allowed under neutral conditions."""
         self._write_dossier([
             {"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3},
             {"symbol": "ETHUSDT", "direction": "SHORT", "leverage": 3}
@@ -129,30 +135,12 @@ class TestBinanceMCPGuard(unittest.TestCase):
         self._write_session_state(delta_bias="NEUTRAL", net_delta=0.0)
 
         # BUY order on approved symbol
-        payload_buy = {
-            "toolCall": {
-                "name": "call_mcp_tool",
-                "args": {
-                    "ServerName": "crypto_radar",
-                    "ToolName": "deploy_futures_trade",
-                    "Arguments": {"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3}
-                }
-            }
-        }
+        payload_buy = self._cli_payload("--symbol BTCUSDT --direction LONG --leverage 3")
         res_buy = self._run_guard(payload_buy)
         self.assertEqual(res_buy.get("decision"), "allow")
 
         # SELL order on approved symbol
-        payload_sell = {
-            "toolCall": {
-                "name": "call_mcp_tool",
-                "args": {
-                    "ServerName": "crypto_radar",
-                    "ToolName": "deploy_futures_trade",
-                    "Arguments": {"symbol": "ETHUSDT", "direction": "SHORT", "leverage": 3}
-                }
-            }
-        }
+        payload_sell = self._cli_payload("--symbol ETHUSDT --direction SHORT --leverage 3")
         res_sell = self._run_guard(payload_sell)
         self.assertEqual(res_sell.get("decision"), "allow")
 
@@ -164,16 +152,7 @@ class TestBinanceMCPGuard(unittest.TestCase):
         self._write_dossier([{"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3}])
         self._write_session_state(delta_bias="LONG_HEAVY", net_delta=150.0)
 
-        payload = {
-            "toolCall": {
-                "name": "call_mcp_tool",
-                "args": {
-                    "ServerName": "crypto_radar",
-                    "ToolName": "deploy_futures_trade",
-                    "Arguments": {"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3}
-                }
-            }
-        }
+        payload = self._cli_payload("--symbol BTCUSDT --direction LONG --leverage 3")
         res = self._run_guard(payload)
         self.assertEqual(res.get("decision"), "deny")
         self.assertIn("Delta-Neutral Hard Gate", res.get("reason", ""))
@@ -187,16 +166,7 @@ class TestBinanceMCPGuard(unittest.TestCase):
         self._write_dossier([{"symbol": "ETHUSDT", "direction": "SHORT", "leverage": 3}])
         self._write_session_state(delta_bias="LONG_HEAVY", net_delta=150.0)
 
-        payload = {
-            "toolCall": {
-                "name": "call_mcp_tool",
-                "args": {
-                    "ServerName": "crypto_radar",
-                    "ToolName": "deploy_futures_trade",
-                    "Arguments": {"symbol": "ETHUSDT", "direction": "SHORT", "leverage": 3}
-                }
-            }
-        }
+        payload = self._cli_payload("--symbol ETHUSDT --direction SHORT --leverage 3")
         res = self._run_guard(payload)
         self.assertEqual(res.get("decision"), "allow")
 
@@ -212,31 +182,13 @@ class TestBinanceMCPGuard(unittest.TestCase):
         self._write_session_state(delta_bias="SHORT_HEAVY", net_delta=-200.0)
 
         # SELL order should be blocked
-        payload_sell = {
-            "toolCall": {
-                "name": "call_mcp_tool",
-                "args": {
-                    "ServerName": "crypto_radar",
-                    "ToolName": "deploy_futures_trade",
-                    "Arguments": {"symbol": "ETHUSDT", "direction": "SHORT", "leverage": 3}
-                }
-            }
-        }
+        payload_sell = self._cli_payload("--symbol ETHUSDT --direction SHORT --leverage 3")
         res_sell = self._run_guard(payload_sell)
         self.assertEqual(res_sell.get("decision"), "deny")
         self.assertIn("SHORT_HEAVY", res_sell.get("reason", ""))
 
         # BUY order should be allowed (acts as long hedge)
-        payload_buy = {
-            "toolCall": {
-                "name": "call_mcp_tool",
-                "args": {
-                    "ServerName": "crypto_radar",
-                    "ToolName": "deploy_futures_trade",
-                    "Arguments": {"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3}
-                }
-            }
-        }
+        payload_buy = self._cli_payload("--symbol BTCUSDT --direction LONG --leverage 3")
         res_buy = self._run_guard(payload_buy)
         self.assertEqual(res_buy.get("decision"), "allow")
 
@@ -338,16 +290,7 @@ class TestBinanceMCPGuard(unittest.TestCase):
         self._write_dossier([{"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3}])
         self._write_session_state(delta_bias="NEUTRAL", net_delta=0.0)
 
-        payload = {
-            "toolCall": {
-                "name": "call_mcp_tool",
-                "args": {
-                    "ServerName": "crypto_radar",
-                    "ToolName": "deploy_futures_trade",
-                    "Arguments": {"symbol": "SOLUSDT", "direction": "LONG", "leverage": 3}
-                }
-            }
-        }
+        payload = self._cli_payload("--symbol SOLUSDT --direction LONG --leverage 3")
         res = self._run_guard(payload)
         self.assertEqual(res.get("decision"), "deny")
         self.assertIn("Asset 'SOLUSDT' was NOT approved", res.get("reason", ""))
@@ -417,20 +360,20 @@ class TestBinanceMCPGuard(unittest.TestCase):
     def test_prod_invariant_blocks_gate_bypasses(self):
         """Verifies gate bypass flags are strictly denied in PROD environment."""
         with patch.dict(os.environ, {"BINANCE_API_ENV": "PROD"}):
-            payload = {
-                "toolCall": {
-                    "name": "call_mcp_tool",
-                    "args": {
-                        "ServerName": "crypto_radar",
-                        "ToolName": "deploy_futures_trade",
-                        "Arguments": {"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3},
-                        "bypass_eval_gate": True
-                    }
-                }
-            }
+            payload = self._cli_payload("--symbol BTCUSDT --direction LONG --leverage 3 --bypass-eval-gate")
             res = self._run_guard(payload)
             self.assertEqual(res.get("decision"), "deny")
             self.assertIn("PROD INVARIANT VIOLATION", res.get("reason", ""))
+
+    def test_testnet_bypass_flag_is_not_mistaken_for_inline_eval(self):
+        """`--bypass-eval-gate` is a sanctioned TESTNET flag, not a shell `eval`; real `eval` stays denied."""
+        self._write_session_state(delta_bias="NEUTRAL", net_delta=0.0)
+        res = self._run_guard(self._cli_payload("--symbol BTCUSDT --direction LONG --leverage 3 --bypass-eval-gate --env testnet"))
+        self.assertEqual(res.get("decision"), "allow")
+        res = self._run_guard({"toolCall": {"name": "run_command", "args": {
+            "CommandLine": "eval \"python3 scripts/execute_futures_trade.py --symbol BTCUSDT --direction LONG\""}}})
+        self.assertEqual(res.get("decision"), "deny")
+        self.assertIn("Inline code", res.get("reason", ""))
 
     # -------------------------------------------------------------------------
     # 9. MARGIN ACCOUNT NEW ORDER ENFORCEMENT
@@ -526,16 +469,7 @@ class TestBinanceMCPGuard(unittest.TestCase):
         self._write_dossier([])  # Empty approved list
         self._write_session_state(delta_bias="NEUTRAL", net_delta=0.0)
 
-        payload = {
-            "toolCall": {
-                "name": "call_mcp_tool",
-                "args": {
-                    "ServerName": "crypto_radar",
-                    "ToolName": "deploy_futures_trade",
-                    "Arguments": {"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3}
-                }
-            }
-        }
+        payload = self._cli_payload("--symbol BTCUSDT --direction LONG --leverage 3")
         res = self._run_guard(payload)
         self.assertEqual(res.get("decision"), "deny")
         self.assertIn("Asset 'BTCUSDT' was NOT approved", res.get("reason", ""))
@@ -545,16 +479,7 @@ class TestBinanceMCPGuard(unittest.TestCase):
         self._write_dossier([{"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3}])
         self._write_session_state(delta_bias="NEUTRAL", net_delta=0.0)
 
-        payload = {
-            "toolCall": {
-                "name": "call_mcp_tool",
-                "args": {
-                    "ServerName": "crypto_radar",
-                    "ToolName": "deploy_futures_trade",
-                    "Arguments": {"direction": "LONG", "leverage": 3}
-                }
-            }
-        }
+        payload = self._cli_payload("--direction LONG --leverage 3")
         res = self._run_guard(payload)
         self.assertEqual(res.get("decision"), "deny")
         self.assertIn("Unable to determine the order symbol deterministically", res.get("reason", ""))
@@ -578,6 +503,30 @@ class TestBinanceMCPGuard(unittest.TestCase):
         # Without reduceOnly, this must NOT be automatically allowed
         self.assertEqual(res.get("decision"), "deny")
 
+    # -------------------------------------------------------------------------
+    # 11. RETIRED crypto_radar MCP SERVER
+    # -------------------------------------------------------------------------
+    def test_retired_radar_server_denied_even_with_valid_gates(self):
+        """Every crypto_radar call is denied (fail closed if a stale config still starts the server)."""
+        self._write_dossier([{"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3}])
+        self._write_session_state(delta_bias="NEUTRAL", net_delta=0.0)
+        for tool, args in (("deploy_futures_trade", {"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3}),
+                           ("move_to_breakeven", {"symbol": "BTCUSDT"}),
+                           ("scan_intraday_market", {})):
+            res = self._run_guard({"toolCall": {"name": "call_mcp_tool", "args": {
+                "ServerName": "crypto_radar", "ToolName": tool, "Arguments": args}}})
+            self.assertEqual(res.get("decision"), "deny", tool)
+            self.assertIn("Retired MCP Server", res.get("reason", ""))
+
+    @patch("post_trade_sync.subprocess.run")
+    def test_post_trade_sync_ignores_retired_radar_calls(self, mock_subprocess):
+        payload = {"toolCall": {"name": "call_mcp_tool", "args": {
+            "ServerName": "crypto_radar", "ToolName": "deploy_futures_trade",
+            "Arguments": {"symbol": "BTCUSDT", "direction": "LONG"}}}}
+        res = post_trade_sync.handle_post_trade_sync(payload)
+        self.assertFalse(res["order_placed"])
+        mock_subprocess.assert_not_called()
+
     def test_delta_gate_fail_closed_on_corrupt_session_state(self):
         """Verifies order is blocked fail-closed if session_state.json is corrupt or unreadable."""
         self._write_dossier([{"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3}])
@@ -585,16 +534,7 @@ class TestBinanceMCPGuard(unittest.TestCase):
         with open(self.state_path, "w", encoding="utf-8") as f:
             f.write("{corrupt_json: invalid}")
 
-        payload = {
-            "toolCall": {
-                "name": "call_mcp_tool",
-                "args": {
-                    "ServerName": "crypto_radar",
-                    "ToolName": "deploy_futures_trade",
-                    "Arguments": {"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3}
-                }
-            }
-        }
+        payload = self._cli_payload("--symbol BTCUSDT --direction LONG --leverage 3")
         res = self._run_guard(payload)
         self.assertEqual(res.get("decision"), "deny")
         self.assertIn("FAIL-CLOSED", res.get("reason", ""))

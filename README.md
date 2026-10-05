@@ -67,7 +67,7 @@ graph TD
 
 ### 1. Deterministic Mechanical Hard Gates (PreToolUse Interception)
 Natural language instructions are not a reliable safety barrier in live financial trading. ATD rejects the antipattern of relying on the LLM's stochastic memory to enforce risk boundaries. Instead, runtime **PreToolUse hooks physically intercept every order execution attempt at the OS level**:
-- **Single Choke Point Enforcement:** Direct calls to exchange order tools are mechanically blocked. All orders must pass through `scripts/execute_futures_trade.py` or the approved MCP wrapper (`crypto_radar:deploy_futures_trade`).
+- **Single Choke Point Enforcement:** Direct calls to exchange order tools are mechanically blocked. All orders must pass through `scripts/execute_futures_trade.py`; there is no MCP wrapper (calls to the retired `crypto_radar` MCP server are denied).
 - **Mandatory Clean-Room Evaluation:** Orders require a non-expired (<20m) dossier in `logs/evaluations/latest_dossier.json`, recorded from the evaluator subagent transcript with `record_evaluation.py --from-subagent` and re-verified (sha256 provenance), approving the symbol and direction. Hand-written dossiers are rejected in PROD.
 - **Delta-Neutral Gate:** If the portfolio marks `LONG_HEAVY`, attempts to execute a `LONG` order are rejected with `hard_gate_rejection: True` before any network packet reaches the exchange API. If `SHORT_HEAVY`, additional `SHORT` orders are blocked.
 - **Dynamic Equity Risk Gate:** Maximum monetary loss is capped to the user's calibrated equity risk profile (default 0.5% of Account Equity + 1.25x buffer, e.g. ~$50 on $10k, $5 on $1k, $0.50 on $100), dynamically verified against live balance.
@@ -210,11 +210,16 @@ python3 scripts/sync_session_state.py
 ```
 
 ### 2. Screen Market & Prime Context (Layers 2 & 3)
-Run concurrent radar across 80+ contracts with Order Flow, CVD, and Taker volume analysis:
+Run concurrent radar across 80+ contracts with Order Flow, CVD, and Taker volume analysis. All scanners are read-only CLI scripts with machine-readable `--json` output, documented in the [`market-radar` skill](.agents/skills/market-radar/SKILL.md); they are the only screening path:
 ```bash
-python3 scripts/broad_market_radar.py
-python3 scripts/prime_evaluator_brief.py --json   # writes logs/primed_brief.json (add --out <path> for a copy)
+python3 scripts/broad_market_radar.py --json             # 80+ pair intraday screener
+python3 scripts/broad_yolo_scanner.py --json             # memecoin / YOLO moonshot screener
+python3 scripts/quant_risk_engine.py parity --json       # also: pairs, kelly
+python3 scripts/fetch_newsletters.py --format json       # research newsletters & catalysts
+python3 scripts/prime_evaluator_brief.py --json          # writes logs/primed_brief.json (add --out <path> for a copy)
 ```
+
+Third-party Binance skills (under `.agents/skills/`) may be installed locally but are not part of the flow; agents must never use them to place orders, move funds or sign API requests.
 
 ### 3. Clean-Room Evaluation & Dossier Recording (Layer 4)
 Every new trade goes through the evaluator subagent; the dossier is never written by hand:
@@ -225,11 +230,54 @@ Every new trade goes through the evaluator subagent; the dossier is never writte
    python3 scripts/record_evaluation.py --from-subagent <conversationId>
    ```
    The recorder prints approved symbols, directions, `requires_user_confirmation` flags and the validity window (20 min from evaluation). Tier A/A+ candidates require explicit user confirmation.
-4. Execute through `crypto_radar:deploy_futures_trade` or `python3 scripts/execute_futures_trade.py` only.
+4. Execute through `python3 scripts/execute_futures_trade.py` only (the single choke point).
 
 In TESTNET, the legacy manual recorder (`--env testnet --symbols ... --directions ...`) remains available for experiments; it is refused in PROD.
 
-### 4. Automated GitHub Issue Reporting & Observability
+### 4. Position Management & Guardian Loop
+Open positions are managed through the same executor CLI (risk-reducing actions are always allowed by the hook):
+```bash
+python3 scripts/execute_futures_trade.py --positions --json                 # read-only snapshot
+python3 scripts/execute_futures_trade.py --move-breakeven --symbol BTCUSDT  # ratchet SL to True Net Break-Even
+python3 scripts/execute_futures_trade.py --close-position --symbol BTCUSDT  # reduce-only market close
+python3 scripts/execute_futures_trade.py --audit-orphans                    # or --auto-heal
+```
+
+Structural trailing stops, dead-alpha checks and the orphan audit run in the background **position guardian** (`scripts/loops/position_guardian_loop.py`). It never opens positions; state lives in `logs/guardian_state.json`:
+```bash
+python3 scripts/loops/position_guardian_loop.py --once --dry-run --json   # report only
+python3 scripts/loops/position_guardian_loop.py --once --env prod         # one protective cycle
+python3 scripts/loops/position_guardian_loop.py --interval 300 --env prod # long-running
+```
+
+Schedule it outside the agent session, for example with cron (`crontab -e`):
+```cron
+*/5 * * * * cd /path/to/repo && python3 scripts/loops/position_guardian_loop.py --once --env prod >> logs/guardian.log 2>&1
+```
+or with a systemd user service:
+```ini
+# ~/.config/systemd/user/position-guardian.service
+[Unit]
+Description=Trading desk position guardian
+
+[Service]
+WorkingDirectory=/path/to/repo
+ExecStart=/usr/bin/env python3 scripts/loops/position_guardian_loop.py --interval 300 --env prod
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+Enable it with `systemctl --user enable --now position-guardian.service`.
+
+### 5. Migration from the `crypto_radar` MCP server
+The `crypto_radar` MCP server (`scripts/radar_mcp_server.py`) has been retired. Scans are now CLI scripts (`--json`), execution and position management go through `scripts/execute_futures_trade.py`, and trailing / dead-alpha / orphan checks run in the position guardian loop. The pre-trade guard denies any remaining `crypto_radar` tool call. If you registered the server outside this repository, remove it:
+1. **Antigravity (agy):** delete the `crypto_radar` entry from the global MCP config (`~/.gemini/config/mcp_config.json`) and restart agy.
+2. **Claude Code:** `claude mcp remove crypto_radar -s local` (and `-s user` if you added it globally).
+3. Optionally uninstall the MCP SDK (`pip uninstall mcp`); it is no longer a dependency.
+4. Schedule the position guardian (see above) to replace the old trailing / dead-alpha MCP tools.
+
+### 6. Automated GitHub Issue Reporting & Observability
 If subagents, hooks, or loops encounter unexpected failures, unhandled exceptions, or infrastructure drift, the system directly invokes the native bash reporter (`report_issue.sh`):
 ```bash
 ./scripts/report_issue.sh --title "Endpoint timeout in ticker stream" --error "ReadTimeout at /fapi/v1/ticker/24hr" --severity "HIGH" --category "infra"
@@ -238,7 +286,7 @@ If subagents, hooks, or loops encounter unexpected failures, unhandled exception
 ./scripts/report_issue.sh --sync
 ```
 
-### 5. PR Review with Native Subagents
+### 7. PR Review with Native Subagents
 Pull Requests are audited inside the same agy session by four isolated, read-only reviewer subagents (`.agents/agents/<domain>_reviewer/agent.md`: `trading_risk`, `binance_microstructure`, `agentic_harness`, `prompt_engineering`). Each starts with a clean context, can only `view_file` / `grep_search` / `list_dir` (`commandExecutionPolicy: "off"`) and returns one `### Verdict: <reviewer>` section with `send_message`.
 
 * **Manual:** type `/pr-review` (optionally with the PR number). The [`pr-review` skill](.agents/skills/pr-review/SKILL.md) asks before posting the comment.
@@ -268,9 +316,12 @@ autonomous-trading-desk/
 │   ├── hooks.json                     # Antigravity PreToolUse/PostToolUse/Stop hooks (paths relative to .agents/)
 │   ├── rules/
 │   │   └── trading.md                 # Always-on safety invariants
+│   ├── mcp_config.json                # Workspace MCP servers for agy (Notion, Binance gateway)
 │   └── skills/
+│       ├── market-radar/              # Read-only CLI scanners with --json output
 │       ├── pr-review/                 # /pr-review: multi-agent PR review orchestration
 │       └── trade-execution-planner/   # Core execution & market radar skill
+│                                      # (third-party Binance skills may also live here; not part of the flow)
 ├── .claude/
 │   └── settings.json                  # Claude Code PreToolUse/PostToolUse safety hooks
 ├── config/
@@ -303,7 +354,8 @@ autonomous-trading-desk/
 │   │   ├── post_pr_review_hook.py     # Arms the PR review after gh pr create / push
 │   │   └── pr_review_stop_hook.py     # Stop hook: runs /pr-review in the same session
 │   ├── loops/
-│   │   └── night_cutoff_loop.py       # Zero overnight risk manager & order reaper
+│   │   ├── night_cutoff_loop.py       # Zero overnight risk manager & order reaper
+│   │   └── position_guardian_loop.py  # Trailing stops, dead alpha & orphan audit (never opens positions)
 │   ├── utils/
 │   │   ├── atomic_writer.py           # POSIX atomic ledger persistence
 │   │   ├── dossier_provenance.py      # Dossier extraction & provenance verification
@@ -317,7 +369,6 @@ autonomous-trading-desk/
 │   ├── microstructure_engine.py       # CVD, taker ratios, tape imbalance
 │   ├── prime_evaluator_brief.py       # Context packing engine (<1,800 tokens)
 │   ├── quant_risk_engine.py           # MacKinnon 2010 cointegration & dynamic equity sizing
-│   ├── radar_mcp_server.py            # Official MCP server for trading radar
 │   ├── record_evaluation.py           # Records the evaluator dossier (--from-subagent)
 │   ├── remember_trade_lesson.py       # Append-only immutable memory
 │   ├── report_agent_issue.py          # Python issue reporter module

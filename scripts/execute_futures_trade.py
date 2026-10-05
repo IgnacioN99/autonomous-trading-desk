@@ -2,6 +2,74 @@
 """
 execute_futures_trade.py - Execution Engine and Risk Management Harness for Binance Futures.
 Supports Testnet and Prod, strict filter calculations, symmetric orders, and verified Algo Stop Loss.
+
+CLI usage (every mode accepts --env {prod,testnet}, resolved via utils.env_resolver.resolve_env,
+and --json; modes are mutually exclusive):
+
+  # Read-only position listing (exit 0 ok, 1 API error)
+  python3 scripts/execute_futures_trade.py --positions [--env prod] [--json]
+
+  # Move the Stop Loss to True Net Break-Even (exit 0 success, 1 failure, 2 refused by rule)
+  python3 scripts/execute_futures_trade.py --move-breakeven --symbol BTCUSDT [--force] [--is-yolo] [--env prod] [--json]
+
+  # Risk-reducing maintenance (always emit JSON)
+  python3 scripts/execute_futures_trade.py --close-position --symbol BTCUSDT [--env prod]
+  python3 scripts/execute_futures_trade.py --audit-orphans [--env prod]
+  python3 scripts/execute_futures_trade.py --auto-heal [--env prod]
+
+  # New position (requires an APPROVED clean-room dossier; always emits JSON)
+  python3 scripts/execute_futures_trade.py --symbol BTCUSDT --direction LONG --sl-price ... --tp1-price ... --tp2-price ...
+
+JSON schemas (stable; extra keys may be added, existing keys are never renamed):
+
+  --positions:
+    {
+      "success": bool,                 # false on positionRisk failure or when any order query failed
+      "env": "prod" | "testnet",
+      "timestamp": int,                # unix seconds
+      "count": int,
+      "all_protected": bool,           # every position has a verified protective stop
+      "error": str | null,
+      "positions": [{
+        "symbol": str, "side": "LONG" | "SHORT", "size": float, "entry_price": float,
+        "mark_price": float, "leverage": int, "margin_type": str, "isolated_margin": float,
+        "unrealized_pnl": float, "roe_pct": float, "liquidation_price": float,
+        "protected": bool,             # a protective stop is present on /fapi/v1/openAlgoOrders
+        "stop_orders": [{"algo_id", "type", "side", "trigger_price": float, "quantity": float | null,
+                         "close_position": bool, "reduce_only": bool}],
+        "take_profit_orders": [{"order_id", "source": "algo" | "order", "type", "side",
+                                "price": float, "quantity": float | null, "reduce_only": bool}],
+        "orders_error": str | null
+      }]
+    }
+
+  --move-breakeven:
+    {
+      "success": bool,
+      "refused": bool,                 # true when a rule declined the move (exit code 2)
+      "reason": str,                   # moved | already_at_breakeven | dry_run | no_position |
+                                       # position_query_failed | orders_query_failed | filters_unavailable |
+                                       # mark_price_unavailable | yolo_tp1_not_filled | insufficient_expansion |
+                                       # breakeven_would_trigger_immediately | new_stop_unverified | invalid_env
+      "message": str, "error": str (only when success is false),
+      "symbol": str, "env": str, "direction": "LONG" | "SHORT" | null,
+      "entry_price": float | null, "mark_price": float | null, "breakeven_price": float | null,
+      "old_stop": {"algo_id", "type", "side", "trigger_price"} | null,   # tightest stop before the move
+      "old_stops": [ ...same shape... ],
+      "new_stop": {"algo_id", "type", "side", "trigger_price"} | null,   # verified on openAlgoOrders
+      "cancelled_old_stop_ids": [...], "warnings": [str],
+      "rules": {"force": bool, "is_yolo": bool, "yolo_source": str | null, "tp1_filled": bool | null,
+                "tp1_source": str | null, "atr_15m": float | null, "expansion_atr_multiple": float | null},
+      "dry_run": bool
+    }
+
+  --close-position: {"success": bool, "closed": {...exchange response...}, "error"?: str}
+  --audit-orphans / --auto-heal: {"total_active": int, "orphans_count": int, "all_protected": bool,
+      "positions": [{"symbol", "direction", "amount", "entry_price", "mark_price", "leverage", "unpnl",
+                     "is_protected", "active_sl_orders", "sl_triggers", "auto_heal_attempted"?,
+                     "auto_heal_verified"?, "healed_sl_price"?}], "error"?: str}
+  trade deployment: {"success": bool, "symbol", "direction", "leverage", "entry_price", "total_qty",
+      "sl_price", "tp1_price", "tp2_price", ..., "error"?: str, "hard_gate_rejection"?: bool}
 """
 
 import os
@@ -584,7 +652,13 @@ def setup_margin_and_leverage(symbol, leverage, target_env=None):
     return lev_res, margin_res, confirmed_leverage
 
 
-def place_algo_stop_loss(symbol, exit_side, sl_price, target_env=None):
+def place_algo_stop_loss(symbol, exit_side, sl_price, target_env=None, quantity=None):
+    """
+    Places a protective STOP_MARKET algo order.
+    - quantity=None: closePosition=true (initial stop on a fresh position).
+    - quantity set: quantity-based reduceOnly=true stop. Used by place-then-cancel replacements, because
+      Binance rejects a second closePosition stop on the same side while the old one is still active.
+    """
     target_env = resolve_env(target_env)
     try:
         filters = get_symbol_filters(symbol, target_env=target_env)
@@ -598,12 +672,17 @@ def place_algo_stop_loss(symbol, exit_side, sl_price, target_env=None):
         'side': exit_side,
         'type': 'STOP_MARKET',
         'triggerPrice': sl_price,
-        'closePosition': 'true'
     }
+    if quantity:
+        params['quantity'] = quantity
+        params['reduceOnly'] = 'true'
+    else:
+        params['closePosition'] = 'true'
     res = send_signed_request('POST', '/fapi/v1/algoOrder', params, target_env=target_env)
     if isinstance(res, dict) and ('algoId' in res or 'orderId' in res):
         return res
     profile = 'testnet' if target_env == 'testnet' else 'prod'
+    size_args = ['--quantity', str(quantity), '--reduce-only', 'true'] if quantity else ['--close-position', 'true']
     cmd = [
         'binance-cli', 'futures-usds', 'new-algo-order',
         '--algo-type', 'CONDITIONAL',
@@ -611,7 +690,7 @@ def place_algo_stop_loss(symbol, exit_side, sl_price, target_env=None):
         '--side', exit_side,
         '--type', 'STOP_MARKET',
         '--trigger-price', str(sl_price),
-        '--close-position', 'true',
+        *size_args,
         '--recv-window', '60000',
         '--profile', profile
     ]
@@ -646,9 +725,344 @@ def verify_algo_stop_loss(symbol, exit_side, sl_price=None, target_env=None):
     except Exception as e:
         return False, str(e)
 
+
+# -----------------------------------------------------------------------------
+# Protective stop helpers (shared by break-even, structural trailing, orphan healing and the guardian)
+# -----------------------------------------------------------------------------
+STOP_ORDER_TYPES = ('STOP_MARKET', 'STOP')
+TAKE_PROFIT_ORDER_TYPES = ('TAKE_PROFIT_MARKET', 'TAKE_PROFIT')
+TRUE_NET_BE_FEE_BUFFER = 0.002          # True Net Break-Even: entry +/- 0.2% roundtrip taker fee buffer
+BE_MIN_EXPANSION_ATR = 2.0              # Anti-truncation: standard positions move to BE only after >= 2x ATR_15m
+STOP_VERIFY_RETRY_DELAYS = (0.8, 1.0, 1.2)  # Progressive verification (~3s) to absorb Mainnet indexing latency
+ORPHAN_HEAL_SL_DISTANCE = 0.025         # Emergency stop distance for orphan positions (2.5%)
+
+
+def _workspace_dir():
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _truthy(value):
+    return value is True or str(value).strip().lower() in ('true', '1', 'yes')
+
+
+def _to_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _is_api_error(res):
+    if not isinstance(res, (dict, list)):
+        return True
+    if isinstance(res, dict):
+        if res.get('isError') or 'error' in res:
+            return True
+        try:
+            return 'code' in res and int(res.get('code')) < 0
+        except (TypeError, ValueError):
+            return False
+    return False
+
+
+def _order_type(order):
+    return str(order.get('orderType') or order.get('type') or '').upper()
+
+
+def _trigger_price(order):
+    return _to_float(order.get('triggerPrice') or order.get('stopPrice') or 0)
+
+
+def _order_id(order):
+    oid = order.get('algoId')
+    if oid is None:
+        oid = order.get('orderId')
+    return oid
+
+
+def is_protective_stop(order, exit_side, symbol=None):
+    """A STOP/STOP_MARKET on the exit side with a positive trigger. Conditional ENTRY stops on the same side
+    (neither closePosition nor reduceOnly) are not protective and are never touched."""
+    if not isinstance(order, dict) or _order_type(order) not in STOP_ORDER_TYPES:
+        return False
+    if str(order.get('side', '')).upper() != str(exit_side).upper():
+        return False
+    if symbol and order.get('symbol') and str(order.get('symbol')).upper() != str(symbol).upper():
+        return False
+    if _trigger_price(order) <= 0:
+        return False
+    if ('closePosition' in order or 'reduceOnly' in order) and not (
+            _truthy(order.get('closePosition')) or _truthy(order.get('reduceOnly'))):
+        return False
+    return True
+
+
+def get_open_stop_orders(symbol, exit_side, target_env=None):
+    """Read-only. Returns (protective_stops, error_or_None) from /fapi/v1/openAlgoOrders."""
+    try:
+        algos = send_signed_request('GET', '/fapi/v1/openAlgoOrders', {'symbol': symbol}, target_env=target_env)
+    except Exception as e:
+        return [], f"openAlgoOrders query failed: {e}"
+    if not isinstance(algos, list):
+        return [], f"openAlgoOrders query failed: {algos}"
+    return [ao for ao in algos if is_protective_stop(ao, exit_side, symbol)], None
+
+
+def tightest_stop(stops, is_long):
+    """The stop closest to price (highest trigger for LONG, lowest for SHORT)."""
+    if not stops:
+        return None
+    return max(stops, key=_trigger_price) if is_long else min(stops, key=_trigger_price)
+
+
+def stop_summary(order):
+    if not isinstance(order, dict):
+        return None
+    return {
+        'algo_id': _order_id(order),
+        'type': _order_type(order) or None,
+        'side': order.get('side'),
+        'trigger_price': _trigger_price(order),
+    }
+
+
+def is_tighter_stop(new_price, old_price, is_long):
+    """True only if new_price strictly reduces risk vs old_price (never loosens)."""
+    if not old_price or old_price <= 0:
+        return True
+    return new_price > old_price if is_long else new_price < old_price
+
+
+def wait_for_stop_confirmation(symbol, exit_side, price, exclude_ids=(), algo_id=None, tick_size=None,
+                               target_env=None, retry_delays=STOP_VERIFY_RETRY_DELAYS):
+    """
+    Progressive verification on /fapi/v1/openAlgoOrders that a protective stop at `price` exists and is not one
+    of `exclude_ids` (the stops being replaced). Matches by algo id when known, otherwise by trigger price within
+    one tick (or 0.05%). A tight tolerance avoids mistaking the OLD stop for the new one.
+    Returns (verified, order_or_None).
+    """
+    excluded = {str(x) for x in exclude_ids if x is not None}
+    price = float(price)
+    tol = max(_to_float(tick_size) * 1.01, abs(price) * 0.0005)
+    for delay in (0.0,) + tuple(retry_delays):
+        if delay:
+            time.sleep(delay)
+        stops, err = get_open_stop_orders(symbol, exit_side, target_env=target_env)
+        if err:
+            continue
+        for ao in stops:
+            oid = _order_id(ao)
+            if oid is not None and str(oid) in excluded:
+                continue
+            if algo_id is not None and oid is not None and str(oid) == str(algo_id):
+                return True, ao
+            if abs(_trigger_price(ao) - price) <= tol:
+                return True, ao
+    return False, None
+
+
+def replace_protective_stop(symbol, exit_side, new_price, quantity, old_stops, target_env=None, tick_size=None):
+    """
+    PLACE-THEN-CANCEL stop replacement. The position is never left without a stop:
+      1. place the new reduce-only stop,
+      2. verify it on /fapi/v1/openAlgoOrders (progressive retries),
+      3. only then cancel the old stop(s).
+    If the new stop cannot be verified, NOTHING is cancelled and success is False.
+    Returns {success, reason, new_stop, placement, cancelled_old_stop_ids, cancel_errors}.
+    """
+    old_ids = [_order_id(ao) for ao in (old_stops or []) if isinstance(ao, dict) and _order_id(ao) is not None]
+    try:
+        placement = place_algo_stop_loss(symbol, exit_side, new_price, target_env=target_env, quantity=quantity)
+    except Exception as e:
+        placement = {"error": f"placement exception: {e}"}
+    placed_id = _order_id(placement) if isinstance(placement, dict) else None
+
+    verified, info = wait_for_stop_confirmation(
+        symbol, exit_side, new_price, exclude_ids=old_ids, algo_id=placed_id,
+        tick_size=tick_size, target_env=target_env,
+    )
+    if not verified:
+        return {
+            "success": False,
+            "reason": "new_stop_unverified",
+            "new_stop": None,
+            "placement": placement,
+            "cancelled_old_stop_ids": [],
+            "cancel_errors": [],
+        }
+
+    new_id = _order_id(info)
+    cancelled, cancel_errors = [], []
+    for oid in old_ids:
+        if new_id is not None and str(oid) == str(new_id):
+            continue
+        try:
+            res = send_signed_request('DELETE', '/fapi/v1/algoOrder', {'symbol': symbol, 'algoId': oid}, target_env=target_env)
+        except Exception as e:
+            res = {"error": str(e)}
+        if isinstance(res, dict) and _is_api_error(res):
+            cancel_errors.append({"algo_id": oid, "error": res.get('error') or res.get('msg') or str(res)})
+        else:
+            cancelled.append(oid)
+    return {
+        "success": True,
+        "reason": "replaced",
+        "new_stop": stop_summary(info),
+        "placement": placement,
+        "cancelled_old_stop_ids": cancelled,
+        "cancel_errors": cancel_errors,
+    }
+
+
+def latest_trade_audit_record(symbol, base_dir=None):
+    """Most recent entry record for `symbol` in logs/trades_audit.jsonl (failsafe/abort events are skipped)."""
+    path = os.path.join(base_dir or _workspace_dir(), 'logs', 'trades_audit.jsonl')
+    if not os.path.exists(path):
+        return None
+    symbol = str(symbol).upper()
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict) or rec.get('event') or str(rec.get('symbol', '')).upper() != symbol:
+            continue
+        if 'total_qty' in rec:
+            return rec
+    return None
+
+
+def detect_yolo_position(symbol, leverage=None, explicit=None, base_dir=None):
+    """
+    Returns (is_yolo, source). A position is YOLO if any of:
+      - explicit flag (can only mark a position as YOLO, never un-mark it),
+      - the evaluation dossier candidate for the symbol has is_yolo,
+      - the latest trades_audit entry for the symbol has is_yolo,
+      - leverage >= profile leverage_yolo, or leverage > profile leverage_standard (the executor refuses
+        leverage above leverage_standard for non-YOLO trades).
+    """
+    if _truthy(explicit):
+        return True, 'explicit_flag'
+    base = base_dir or _workspace_dir()
+    try:
+        from utils.dossier_provenance import default_dossier_path, load_dossier, find_candidate
+        cand = find_candidate(load_dossier(default_dossier_path(base)), symbol)
+        if isinstance(cand, dict) and _truthy(cand.get('is_yolo')):
+            return True, 'dossier_candidate'
+    except Exception:
+        pass
+    rec = latest_trade_audit_record(symbol, base)
+    if rec and _truthy(rec.get('is_yolo')):
+        return True, 'trade_audit'
+    if leverage:
+        try:
+            import user_profile as up
+            prof = up.load_user_profile()
+        except Exception:
+            prof = {}
+        try:
+            lev = int(float(leverage))
+            lev_yolo = int(prof.get('leverage_yolo', 15))
+            lev_std = int(prof.get('leverage_standard', 3))
+            if lev >= lev_yolo or lev > lev_std:
+                return True, 'leverage'
+        except (TypeError, ValueError):
+            pass
+    return False, None
+
+
+def detect_tp1_filled(symbol, current_qty, base_dir=None):
+    """
+    Returns (filled, source). TP1 is considered filled when the live position size has been reduced by at least
+    half of the TP1 quantity recorded at entry in logs/trades_audit.jsonl. Returns (None, ...) when unknown.
+    """
+    rec = latest_trade_audit_record(symbol, base_dir)
+    if not rec:
+        return None, 'no_audit_record'
+    total = _to_float(rec.get('total_qty'))
+    if total <= 0:
+        return None, 'no_audit_record'
+    tp1_qty = _to_float(rec.get('tp1_qty')) or total * 0.30
+    current_qty = abs(_to_float(current_qty))
+    if current_qty > total * 1.0001:
+        return None, 'audit_record_mismatch'
+    if current_qty <= total - 0.5 * tp1_qty:
+        return True, 'position_reduced'
+    return False, 'position_not_reduced'
+
+
+def get_atr_15m(symbol):
+    """ATR(14) on 15m candles (structural reference for anti-truncation). Returns None on failure."""
+    try:
+        import dynamic_exit_manager as dem
+        k15m = dem.get_klines_data(symbol, interval="15m", limit=35)
+        highs = [float(k[2]) for k in k15m]
+        lows = [float(k[3]) for k in k15m]
+        closes = [float(k[4]) for k in k15m]
+        atr = dem.calculate_atr(highs, lows, closes, period=14)
+        return atr if atr and atr > 0 else None
+    except Exception:
+        return None
+
+
+def heal_orphan_position(position, target_env=None, close_on_failure=False):
+    """
+    Places a verified emergency stop on a position that has none. The stop sits ORPHAN_HEAL_SL_DISTANCE away
+    from the worse of entry/mark so it can never trigger on placement. If it cannot be verified and
+    close_on_failure=True, the position is closed with a reduce-only market order (fail-safe auto-destruct).
+    Never opens or increases exposure.
+    """
+    target_env = resolve_env(target_env)
+    sym = position['symbol']
+    amt = _to_float(position.get('positionAmt'))
+    is_long = amt > 0
+    exit_side = 'SELL' if is_long else 'BUY'
+    entry_p = _to_float(position.get('entryPrice'))
+    mark_p = _to_float(position.get('markPrice')) or entry_p
+    out = {"symbol": sym, "success": False, "verified": False, "healed_sl_price": None, "closed": False, "close_result": None}
+
+    filters = get_symbol_filters(sym, target_env=target_env)
+    if not filters:
+        out["reason"] = "filters_unavailable"
+    else:
+        anchor = min(entry_p, mark_p) if is_long else max(entry_p, mark_p)
+        raw_sl = anchor * (1 - ORPHAN_HEAL_SL_DISTANCE) if is_long else anchor * (1 + ORPHAN_HEAL_SL_DISTANCE)
+        heal_sl = round_price(raw_sl, filters['tickSize'], filters['precision_price'])
+        out["healed_sl_price"] = heal_sl
+        try:
+            out["placement"] = place_algo_stop_loss(sym, exit_side, heal_sl, target_env=target_env)
+        except Exception as e:
+            out["placement"] = {"error": str(e)}
+        placed_id = _order_id(out["placement"]) if isinstance(out["placement"], dict) else None
+        verified, info = wait_for_stop_confirmation(sym, exit_side, heal_sl, algo_id=placed_id,
+                                                    tick_size=filters.get('tickSize'), target_env=target_env)
+        out["verified"] = verified
+        out["new_stop"] = stop_summary(info) if verified else None
+        if verified:
+            out["success"] = True
+            out["reason"] = "healed"
+            return out
+        out["reason"] = "heal_stop_unverified"
+
+    if close_on_failure:
+        close_res = emergency_abort_market_close(sym, exit_side, abs(amt), target_env=target_env)
+        log_emergency_abort(sym, 'LONG' if is_long else 'SHORT', abs(amt), out.get("healed_sl_price"),
+                            out.get("placement") or out.get("reason"), close_res, target_env)
+        out["closed"] = bool(close_res.get("confirmed"))
+        out["close_result"] = close_res
+        out["success"] = out["closed"]
+        out["reason"] = "closed_after_failed_heal" if out["closed"] else "heal_and_close_failed"
+    return out
+
+
 def log_emergency_abort(symbol, direction, qty, sl_p, sl_order, abort_exit, target_env=None):
     target_env = resolve_env(target_env)
-    log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'logs')
+    log_dir = os.path.join(_workspace_dir(), 'logs')
     os.makedirs(log_dir, exist_ok=True)
     record = {
         'timestamp': int(time.time()),
@@ -725,7 +1139,7 @@ def emergency_abort_market_close(symbol, exit_side, total_qty, target_env=None):
         err_msg = f"🚨 CRITICAL ALARM: Emergency auto-destruct liquidation FAILED for {symbol} ({exit_side} {total_qty}) after {max_retries} attempts! Response: {last_res}"
         print(err_msg, file=sys.stderr)
         try:
-            log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'logs')
+            log_dir = os.path.join(_workspace_dir(), 'logs')
             os.makedirs(log_dir, exist_ok=True)
             with open(os.path.join(log_dir, 'emergency_aborts.jsonl'), 'a', encoding='utf-8') as f:
                 f.write(json.dumps({
@@ -1395,6 +1809,9 @@ def execute_complete_trade(
             'sl_algo_id': sl_info.get('algoId') if sl_info else (sl_order.get('algoId') if isinstance(sl_order, dict) else None),
             'tp1_price': tp1_p,
             'tp2_price': tp2_p,
+            'tp1_qty': tp1_qty,
+            'tp2_qty': tp2_qty,
+            'is_yolo': is_yolo,
             'entry_order_id': entry_order.get('orderId'),
             'sl_order': sl_order,
             'tp1_order_id': tp1_order.get('orderId') if isinstance(tp1_order, dict) else None,
@@ -1446,59 +1863,259 @@ def execute_complete_trade(
             "abort_exit": abort_exit
         }
 
-def move_sl_to_breakeven(symbol, target_env=None):
-    target_env = resolve_env(target_env)
+def move_sl_to_breakeven(symbol, target_env=None, force=False, is_yolo=None, dry_run=False, base_dir=None):
+    """
+    Moves the protective stop to True Net Break-Even (entry +/- 0.2% fee buffer) using PLACE-THEN-CANCEL:
+    the new reduce-only stop is placed and verified on /fapi/v1/openAlgoOrders BEFORE the old stop(s) are
+    cancelled. If the new stop cannot be verified, the old stop is kept and nothing is cancelled.
+
+    Rules (bypassed only with force=True):
+      - YOLO positions (explicit flag, dossier candidate is_yolo, trade audit is_yolo, or YOLO leverage):
+        only after TP1 has filled (right-tail preservation).
+      - Standard positions: only after TP1 has filled or price expanded >= 2x ATR_15m (anti-truncation).
+    Never loosens an existing stop and never places a stop that would trigger immediately (even with force).
+    Returns the --move-breakeven JSON schema documented in the module docstring.
+    """
+    force = _truthy(force)
+    dry_run = _truthy(dry_run)
+    symbol = str(symbol).upper()
+    result = {
+        "success": False, "refused": False, "reason": None, "message": "",
+        "symbol": symbol, "env": None, "direction": None,
+        "entry_price": None, "mark_price": None, "breakeven_price": None,
+        "old_stop": None, "old_stops": [], "new_stop": None,
+        "cancelled_old_stop_ids": [], "warnings": [],
+        "rules": {"force": force, "is_yolo": False, "yolo_source": None, "tp1_filled": None,
+                  "tp1_source": None, "atr_15m": None, "expansion_atr_multiple": None},
+        "dry_run": dry_run,
+    }
+
+    def finish(success, reason, message, refused=False):
+        result.update(success=success, reason=reason, message=message, refused=refused)
+        if not success:
+            result["error"] = message
+        return result
+
+    try:
+        target_env = resolve_env(target_env)
+    except ValueError as e:
+        return finish(False, "invalid_env", str(e))
+    result["env"] = target_env
+
     pos_res = send_signed_request('GET', '/fapi/v2/positionRisk', {'symbol': symbol}, target_env=target_env)
-    active = [p for p in pos_res if float(p.get('positionAmt', 0)) != 0] if isinstance(pos_res, list) else []
+    if not isinstance(pos_res, list):
+        return finish(False, "position_query_failed", f"Position query failed for {symbol}: {pos_res}")
+    active = [p for p in pos_res if _to_float(p.get('positionAmt')) != 0 and str(p.get('symbol', symbol)).upper() == symbol]
     if not active:
-        return {"success": False, "error": f"No active open position for {symbol}"}
+        return finish(False, "no_position", f"No active open position for {symbol}")
 
     pos = active[0]
-    entry_p = float(pos['entryPrice'])
-    amt = float(pos['positionAmt'])
-    exit_side = 'SELL' if amt > 0 else 'BUY'
-
-    # Query prior active SL algo orders
-    open_algos = send_signed_request('GET', '/fapi/v1/openAlgoOrders', {'symbol': symbol}, target_env=target_env)
-    old_sl_orders = []
-    if isinstance(open_algos, list):
-        for ao in open_algos:
-            if ao.get('orderType') in ['STOP_MARKET', 'STOP'] and ao.get('algoId'):
-                old_sl_orders.append(ao)
-
-    # Round BE price with fee buffer (True Net Break-Even: covers taker fees 0.10% + slippage 0.02%)
-    fee_buffer = 0.0012
+    amt = _to_float(pos.get('positionAmt'))
     is_long = amt > 0
-    raw_be = entry_p * (1.0 + fee_buffer) if is_long else entry_p * (1.0 - fee_buffer)
+    exit_side = 'SELL' if is_long else 'BUY'
+    qty = str(pos.get('positionAmt')).strip().lstrip('-')
+    entry_p = _to_float(pos.get('entryPrice'))
+    mark_p = _to_float(pos.get('markPrice'))
+    result.update(direction='LONG' if is_long else 'SHORT', entry_price=entry_p, mark_price=mark_p or None)
+
+    old_stops, err = get_open_stop_orders(symbol, exit_side, target_env=target_env)
+    if err:
+        return finish(False, "orders_query_failed", f"Cannot read current stops for {symbol} ({err}); nothing changed.")
+    old = tightest_stop(old_stops, is_long)
+    result["old_stops"] = [stop_summary(ao) for ao in old_stops]
+    result["old_stop"] = stop_summary(old)
+    old_trigger = _trigger_price(old) if old else 0.0
+
     filters = get_symbol_filters(symbol, target_env=target_env)
-    be_price = round_price(raw_be, filters['tickSize'], filters['precision_price']) if filters else raw_be
+    if not filters:
+        return finish(False, "filters_unavailable", f"Symbol filters unavailable for {symbol}; nothing changed.")
+    raw_be = entry_p * (1.0 + TRUE_NET_BE_FEE_BUFFER) if is_long else entry_p * (1.0 - TRUE_NET_BE_FEE_BUFFER)
+    be_price = round_price(raw_be, filters['tickSize'], filters['precision_price'])
+    result["breakeven_price"] = be_price
 
-    # Cancel previous SL
-    for ao in old_sl_orders:
-        send_signed_request('DELETE', '/fapi/v1/algoOrder', {'symbol': symbol, 'algoId': ao['algoId']}, target_env=target_env)
+    # Never loosen: an existing stop at or beyond break-even is kept as is.
+    if old and not is_tighter_stop(be_price, old_trigger, is_long):
+        return finish(True, "already_at_breakeven",
+                      f"Existing stop {old_trigger} for {symbol} is already at or beyond True Net Break-Even ({be_price}). Unchanged.")
 
-    # Place new SL at Breakeven
-    new_sl = place_algo_stop_loss(symbol, exit_side, be_price, target_env=target_env)
-    verified, _ = verify_algo_stop_loss(symbol, exit_side, be_price, target_env=target_env)
+    # Rule checks (YOLO right-tail preservation / anti-truncation)
+    if not force:
+        yolo, yolo_src = detect_yolo_position(symbol, leverage=pos.get('leverage'), explicit=is_yolo, base_dir=base_dir)
+        tp1_filled, tp1_src = detect_tp1_filled(symbol, abs(amt), base_dir=base_dir)
+        result["rules"].update(is_yolo=yolo, yolo_source=yolo_src, tp1_filled=tp1_filled, tp1_source=tp1_src)
+        if yolo and tp1_filled is not True:
+            return finish(False, "yolo_tp1_not_filled",
+                          f"REFUSED: {symbol} is a YOLO position ({yolo_src}); its stop moves to break-even only after TP1 "
+                          f"has filled (TP1 status: {tp1_src}). Use force=True / --force to override.", refused=True)
+        if not yolo and tp1_filled is not True:
+            atr = get_atr_15m(symbol)
+            result["rules"]["atr_15m"] = atr
+            favorable = (mark_p - entry_p) if is_long else (entry_p - mark_p)
+            multiple = (favorable / atr) if atr else None
+            result["rules"]["expansion_atr_multiple"] = round(multiple, 3) if multiple is not None else None
+            if multiple is None or multiple < BE_MIN_EXPANSION_ATR:
+                shown = f"{multiple:.2f}x" if multiple is not None else "unknown (ATR unavailable)"
+                return finish(False, "insufficient_expansion",
+                              f"REFUSED: {symbol} has not filled TP1 ({tp1_src}) and favorable expansion is {shown} ATR_15m "
+                              f"(< {BE_MIN_EXPANSION_ATR:.1f}x required, anti-truncation). Use force=True / --force to override.",
+                              refused=True)
 
-    # SAFETY ROLLBACK: If placing new SL fails, immediately restore previous SL
-    if not verified and old_sl_orders:
-        prev_trig = float(old_sl_orders[0].get('triggerPrice', 0))
-        if prev_trig > 0:
-            rollback_sl = place_algo_stop_loss(symbol, exit_side, prev_trig, target_env=target_env)
-            return {
-                "success": False,
-                "error": f"Failed to move to Break-Even ({new_sl}). Rollback executed: Stop Loss restored at {prev_trig}."
-            }
+    # Never place a stop that would trigger immediately (applies even with force).
+    if mark_p <= 0:
+        return finish(False, "mark_price_unavailable", f"Mark price unavailable for {symbol}; nothing changed.")
+    if (is_long and mark_p <= be_price) or (not is_long and mark_p >= be_price):
+        return finish(False, "breakeven_would_trigger_immediately",
+                      f"REFUSED: mark price {mark_p} has not cleared True Net Break-Even {be_price} for {symbol}; a stop there "
+                      f"would trigger immediately.", refused=True)
 
-    return {
-        "success": True,
-        "symbol": symbol,
-        "message": f"Stop Loss moved to Break-Even ({be_price}) for position {pos['positionAmt']} {symbol}",
-        "entry_price": entry_p,
-        "new_sl_price": be_price,
-        "algo_order": new_sl
-    }
+    if dry_run:
+        result["new_stop"] = {"algo_id": None, "type": "STOP_MARKET", "side": exit_side, "trigger_price": be_price}
+        return finish(True, "dry_run", f"DRY RUN: would move {symbol} stop from {old_trigger or 'none'} to {be_price}.")
+
+    rep = replace_protective_stop(symbol, exit_side, be_price, qty, old_stops, target_env=target_env,
+                                  tick_size=filters.get('tickSize'))
+    if not rep["success"]:
+        return finish(False, "new_stop_unverified",
+                      f"New break-even stop for {symbol} at {be_price} could not be verified on openAlgoOrders "
+                      f"({rep.get('placement')}). Old stop {old_trigger or 'none'} kept; nothing cancelled.")
+    result["new_stop"] = rep["new_stop"]
+    result["cancelled_old_stop_ids"] = rep["cancelled_old_stop_ids"]
+    for ce in rep["cancel_errors"]:
+        result["warnings"].append(f"Old stop {ce['algo_id']} could not be cancelled ({ce['error']}); it remains active "
+                                  f"below the new stop (still reduce-only protection).")
+    return finish(True, "moved",
+                  f"Stop Loss moved to True Net Break-Even ({be_price}) for position {pos.get('positionAmt')} {symbol} "
+                  f"(place-then-cancel; previous stop {old_trigger or 'none'}).")
+
+
+def _f(value, default=0.0):
+    return _to_float(value, default)
+
+
+def get_positions_report(target_env=None):
+    """
+    Read-only listing of open positions with their attached SL/TP orders (--positions JSON schema).
+    Never sends a write request.
+    """
+    target_env = resolve_env(target_env)
+    report = {"success": False, "env": target_env, "timestamp": int(time.time()), "count": 0,
+              "all_protected": True, "error": None, "positions": []}
+    try:
+        pos_res = send_signed_request('GET', '/fapi/v2/positionRisk', target_env=target_env)
+    except Exception as e:
+        pos_res = {"error": str(e)}
+    if not isinstance(pos_res, list):
+        report["error"] = f"Error querying positions: {pos_res}"
+        report["all_protected"] = False
+        return report
+
+    order_errors = []
+    for p in pos_res:
+        amt = _f(p.get('positionAmt'))
+        if amt == 0:
+            continue
+        sym = p.get('symbol')
+        is_long = amt > 0
+        exit_side = 'SELL' if is_long else 'BUY'
+        margin = _f(p.get('isolatedMargin'))
+        unpnl = _f(p.get('unRealizedProfit'))
+        try:
+            lev = int(_f(p.get('leverage')))
+        except (TypeError, ValueError):
+            lev = 0
+        entry = {
+            "symbol": sym,
+            "side": 'LONG' if is_long else 'SHORT',
+            "size": abs(amt),
+            "entry_price": _f(p.get('entryPrice')),
+            "mark_price": _f(p.get('markPrice')),
+            "leverage": lev,
+            "margin_type": str(p.get('marginType', '')).upper(),
+            "isolated_margin": margin,
+            "unrealized_pnl": unpnl,
+            "roe_pct": round(unpnl / margin * 100, 2) if margin > 0 else 0.0,
+            "liquidation_price": _f(p.get('liquidationPrice')),
+            "protected": False,
+            "stop_orders": [],
+            "take_profit_orders": [],
+            "orders_error": None,
+        }
+        errs = []
+        try:
+            algos = send_signed_request('GET', '/fapi/v1/openAlgoOrders', {'symbol': sym}, target_env=target_env)
+        except Exception as e:
+            algos = {"error": str(e)}
+        if isinstance(algos, list):
+            for ao in algos:
+                if not isinstance(ao, dict) or (ao.get('symbol') and ao.get('symbol') != sym):
+                    continue
+                if is_protective_stop(ao, exit_side, sym):
+                    entry["stop_orders"].append({
+                        "algo_id": _order_id(ao), "type": _order_type(ao), "side": ao.get('side'),
+                        "trigger_price": _trigger_price(ao),
+                        "quantity": _f(ao.get('quantity'), None) if ao.get('quantity') is not None else None,
+                        "close_position": _truthy(ao.get('closePosition')),
+                        "reduce_only": _truthy(ao.get('reduceOnly')),
+                    })
+                elif _order_type(ao) in TAKE_PROFIT_ORDER_TYPES and str(ao.get('side', '')).upper() == exit_side:
+                    entry["take_profit_orders"].append({
+                        "order_id": _order_id(ao), "source": "algo", "type": _order_type(ao), "side": ao.get('side'),
+                        "price": _trigger_price(ao),
+                        "quantity": _f(ao.get('quantity'), None) if ao.get('quantity') is not None else None,
+                        "reduce_only": _truthy(ao.get('reduceOnly')) or _truthy(ao.get('closePosition')),
+                    })
+        else:
+            errs.append(f"openAlgoOrders: {algos}")
+        try:
+            orders = send_signed_request('GET', '/fapi/v1/openOrders', {'symbol': sym}, target_env=target_env)
+        except Exception as e:
+            orders = {"error": str(e)}
+        if isinstance(orders, list):
+            for o in orders:
+                if not isinstance(o, dict) or (o.get('symbol') and o.get('symbol') != sym):
+                    continue
+                if str(o.get('side', '')).upper() == exit_side and _truthy(o.get('reduceOnly')) and \
+                        _order_type(o) in ('LIMIT',) + TAKE_PROFIT_ORDER_TYPES:
+                    entry["take_profit_orders"].append({
+                        "order_id": o.get('orderId'), "source": "order", "type": _order_type(o), "side": o.get('side'),
+                        "price": _f(o.get('price')) or _f(o.get('stopPrice')),
+                        "quantity": _f(o.get('origQty'), None) if o.get('origQty') is not None else None,
+                        "reduce_only": True,
+                    })
+        else:
+            errs.append(f"openOrders: {orders}")
+        entry["protected"] = bool(entry["stop_orders"])
+        if errs:
+            entry["orders_error"] = "; ".join(errs)
+            order_errors.append(f"{sym}: {entry['orders_error']}")
+        report["positions"].append(entry)
+
+    report["count"] = len(report["positions"])
+    report["all_protected"] = all(p["protected"] for p in report["positions"])
+    if order_errors:
+        report["error"] = "Order queries failed: " + " | ".join(order_errors)
+    else:
+        report["success"] = True
+    return report
+
+
+def format_positions_report(report):
+    if report.get("error") and not report.get("positions"):
+        return f"Error querying positions: {report['error']}"
+    if not report.get("positions"):
+        return f"No active positions currently open ({str(report.get('env', '')).upper()})."
+    lines = [f"ACTIVE POSITIONS ({str(report.get('env', '')).upper()}):"]
+    for p in report["positions"]:
+        stops = ", ".join(str(s["trigger_price"]) for s in p["stop_orders"]) or "NONE"
+        tps = ", ".join(str(t["price"]) for t in p["take_profit_orders"]) or "none"
+        lines.append(f"- {p['symbol']} {p['side']} {p['leverage']}x {p['margin_type']} | size {p['size']} | "
+                     f"entry {p['entry_price']} | mark {p['mark_price']} | uPnL {p['unrealized_pnl']:+.2f} USDT "
+                     f"({p['roe_pct']:+.2f}% ROE) | liq {p['liquidation_price']}")
+        lines.append(f"  protected: {'yes' if p['protected'] else 'NO'} | SL: {stops} | TP: {tps}"
+                     + (f" | orders error: {p['orders_error']}" if p.get('orders_error') else ""))
+    if report.get("error"):
+        lines.append(f"Error: {report['error']}")
+    return "\n".join(lines)
 
 def get_positions_summary(target_env=None):
     target_env = resolve_env(target_env)
@@ -1559,13 +2176,8 @@ def audit_orphan_positions(target_env=None, auto_heal=False):
         margin = float(p.get('isolatedMargin', 0))
         unpnl = float(p.get('unRealizedProfit', 0))
 
-        # Query active algo orders on exchange
-        algos = send_signed_request('GET', '/fapi/v1/openAlgoOrders', {'symbol': sym}, target_env=target_env)
-        active_sls = []
-        if isinstance(algos, list):
-            for ao in algos:
-                if ao.get('orderType') in ['STOP_MARKET', 'STOP'] and ao.get('side') == exit_side:
-                    active_sls.append(ao)
+        # Query active protective stop algo orders on exchange
+        active_sls, orders_err = get_open_stop_orders(sym, exit_side, target_env=target_env)
 
         is_protected = len(active_sls) > 0
         info = {
@@ -1577,26 +2189,22 @@ def audit_orphan_positions(target_env=None, auto_heal=False):
             "leverage": lev,
             "unpnl": unpnl,
             "is_protected": is_protected,
-            "active_sl_orders": [ao.get('algoId') for ao in active_sls],
-            "sl_triggers": [float(ao.get('triggerPrice', 0)) for ao in active_sls]
+            "active_sl_orders": [_order_id(ao) for ao in active_sls],
+            "sl_triggers": [_trigger_price(ao) for ao in active_sls]
         }
+        if orders_err:
+            info["orders_error"] = orders_err
 
         if not is_protected:
             orphans.append(info)
             if auto_heal:
-                filters = get_symbol_filters(sym, target_env=target_env)
-                if filters:
-                    # 2.5% emergency buffer
-                    dist = 0.025
-                    raw_sl = entry_p * (1 - dist) if pos_dir == 'LONG' else entry_p * (1 + dist)
-                    heal_sl = round_price(raw_sl, filters['tickSize'], filters['precision_price'])
-                    heal_res = place_algo_stop_loss(sym, exit_side, heal_sl, target_env=target_env)
-                    verified, _ = verify_algo_stop_loss(sym, exit_side, heal_sl, target_env=target_env)
-                    info["auto_heal_attempted"] = True
-                    info["auto_heal_verified"] = verified
-                    info["healed_sl_price"] = heal_sl
-                    if verified:
-                        info["is_protected"] = True
+                # 2.5% emergency stop, verified with progressive retries (no market close from this path)
+                heal = heal_orphan_position(p, target_env=target_env, close_on_failure=False)
+                info["auto_heal_attempted"] = True
+                info["auto_heal_verified"] = bool(heal.get("verified"))
+                info["healed_sl_price"] = heal.get("healed_sl_price")
+                if heal.get("verified"):
+                    info["is_protected"] = True
 
         positions_report.append(info)
 
@@ -1702,7 +2310,7 @@ def main():
     parser.add_argument("--tp2-price", "--tp2_price", type=float, default=None, dest="tp2_price", help="Take Profit 2 price (70%% position)")
     parser.add_argument("--order-type", "--order_type", type=str, choices=["MARKET", "LIMIT", "STOP_MARKET", "market", "limit", "stop_market"], default="MARKET", dest="order_type", help="Order type")
     parser.add_argument("--limit-price", "--limit_price", type=float, default=None, dest="limit_price", help="Limit price when order_type=LIMIT")
-    parser.add_argument("--env", type=str, choices=["prod", "testnet"], default=None, help="Target environment ('prod' or 'testnet')")
+    parser.add_argument("--env", type=str, choices=["prod", "testnet"], default=None, help="Target environment ('prod' or 'testnet'); defaults to utils.env_resolver.resolve_env()")
     parser.add_argument("--bypass-eval-gate", "--bypass_eval_gate", action="store_true", dest="bypass_eval_gate", help="Bypass clean-room evaluation gate (TESTNET only; refused in PROD)")
     parser.add_argument("--bypass-delta-gate", "--bypass_delta_gate", action="store_true", dest="bypass_delta_gate", help="Bypass delta-neutral gate (Testnet only)")
     parser.add_argument("--is-yolo", "--is_yolo", action="store_true", dest="is_yolo", help="Mark trade as YOLO moonshot (authorizes leverage > 5x)")
@@ -1710,10 +2318,50 @@ def main():
     parser.add_argument("--close-position", "--close_position", action="store_true", dest="close_position", help="Close open position at market with reduceOnly")
     parser.add_argument("--audit-orphans", "--audit_orphans", action="store_true", dest="audit_orphans", help="Audit all open positions for missing Stop Loss")
     parser.add_argument("--auto-heal", "--auto_heal", action="store_true", dest="auto_heal", help="Audit and automatically heal orphan positions lacking Stop Loss")
+    parser.add_argument("--positions", action="store_true", help="Read-only list of open positions with attached SL/TP orders")
+    parser.add_argument("--move-breakeven", "--move_breakeven", action="store_true", dest="move_breakeven", help="Move the Stop Loss of --symbol to True Net Break-Even (place-then-cancel)")
+    parser.add_argument("--force", action="store_true", help="With --move-breakeven: override the YOLO-before-TP1 and anti-truncation rules")
+    parser.add_argument("--json", action="store_true", dest="json_output", help="Emit machine-readable JSON (schemas in the module docstring)")
 
     args = parser.parse_args()
 
-    target_env = resolve_env(args.env)
+    new_modes = [m for m in ("positions", "move_breakeven") if getattr(args, m)]
+    other_modes = [m for m in ("close_position", "audit_orphans", "auto_heal") if getattr(args, m)]
+    if new_modes and (len(new_modes) > 1 or other_modes or args.direction):
+        print(json.dumps({"success": False, "error": "--positions and --move-breakeven are exclusive modes; they cannot be combined with other modes or --direction."}, indent=2))
+        sys.exit(1)
+        return
+
+    try:
+        target_env = resolve_env(args.env)
+    except ValueError as e:
+        print(json.dumps({"success": False, "error": f"Invalid environment: {e}"}, indent=2))
+        sys.exit(1)
+        return
+
+    # 0a. Read-only positions listing
+    if args.positions:
+        res = get_positions_report(target_env=target_env)
+        print(json.dumps(res, indent=2) if args.json_output else format_positions_report(res))
+        sys.exit(0 if res.get("success") else 1)
+        return
+
+    # 0b. Move Stop Loss to True Net Break-Even (risk-reducing, place-then-cancel)
+    if args.move_breakeven:
+        if not args.symbol:
+            print(json.dumps({"success": False, "refused": False, "reason": "missing_symbol", "error": "--symbol is required for --move-breakeven"}, indent=2))
+            sys.exit(1)
+            return
+        res = move_sl_to_breakeven(args.symbol.upper(), target_env=target_env, force=args.force,
+                                   is_yolo=True if args.is_yolo else None)
+        if args.json_output:
+            print(json.dumps(res, indent=2))
+        else:
+            print(res.get("message", ""))
+            for w in res.get("warnings", []):
+                print(f"WARNING: {w}")
+        sys.exit(0 if res.get("success") else (2 if res.get("refused") else 1))
+        return
 
     # 1. Close Position
     if args.close_position:

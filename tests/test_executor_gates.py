@@ -2,7 +2,7 @@
 """
 test_executor_gates.py - Offline tests for the execution-engine hard gates:
 1. Clean-room dossier gate inside the executor (PROD fail-closed, --bypass-eval-gate refused in PROD,
-   radar MCP deploy path, climax watcher never self-signs in PROD).
+   climax watcher never self-signs in PROD).
 3. Isolated margin fail-closed (only -4046 tolerated) + sub-account -4421 auto-clamp.
 4. Liquidation gate (LONG/SHORT, 3x/15x/50x) computed with the leverage that actually applies.
 5. Single-source desk leverage ceiling (user_profile.get_leverage_ceiling) + --set-leverage-yolo validation.
@@ -244,56 +244,6 @@ class TestExecutorDossierIntegration(_TempWorkspace):
             eft.main()
         mock_exit.assert_called_once_with(1)
         mock_send.assert_not_called()
-
-
-class TestRadarDeployGoesThroughExecutorGate(_TempWorkspace):
-
-    @classmethod
-    def setUpClass(cls):
-        try:
-            import radar_mcp_server  # noqa: F401
-            cls.radar = radar_mcp_server
-        except Exception as e:  # mcp SDK missing in this interpreter
-            raise unittest.SkipTest(f"radar_mcp_server not importable: {e}")
-
-    def test_prod_deploy_without_dossier_is_rejected_by_executor(self):
-        with patch("execute_futures_trade.find_workspace_root", return_value=self.root), \
-             patch("execute_futures_trade.load_env", return_value={"LIVE_TRADING_ARMED": "true"}), \
-             patch("execute_futures_trade.send_signed_request") as mock_send, \
-             patch("radar_mcp_server.importlib.reload", side_effect=lambda m: m), \
-             patch("quant_risk_engine.get_account_equity", return_value=1000.0), \
-             patch("user_profile.load_user_profile", return_value=dict(PROFILE)):
-            out = self.radar.deploy_futures_trade(symbol="SOLUSDT", direction="LONG", leverage=3, margin_usdt=10.0, target_env="prod")
-        self.assertIn("Evaluation Gate, PROD", out)
-        mock_send.assert_not_called()
-
-    def test_radar_never_forwards_a_bypass(self):
-        captured = {}
-        def fake_exec(**kw):
-            captured.update(kw)
-            return {"success": False, "error": "stop"}
-        with patch("execute_futures_trade.execute_complete_trade", side_effect=fake_exec), \
-             patch("radar_mcp_server.importlib.reload", side_effect=lambda m: m), \
-             patch("quant_risk_engine.get_account_equity", return_value=1000.0), \
-             patch("user_profile.load_user_profile", return_value=dict(PROFILE)):
-            self.radar.deploy_futures_trade(symbol="SOLUSDT", direction="LONG", leverage=3, margin_usdt=10.0, target_env="testnet")
-        self.assertIs(captured.get("bypass_eval_gate"), False)
-
-    def test_radar_uses_profile_leverage_ceiling(self):
-        prof = dict(PROFILE, leverage_ceiling=20, leverage_yolo=20)
-        with patch("user_profile.load_user_profile", return_value=prof):
-            out = self.radar.deploy_futures_trade(symbol="SOLUSDT", direction="LONG", leverage=21, is_yolo=True, target_env="testnet")
-        self.assertIn("ceiling of 20x", out)
-        captured = {}
-        def fake_exec(**kw):
-            captured.update(kw)
-            return {"success": False, "error": "stop"}
-        with patch("user_profile.load_user_profile", return_value=prof), \
-             patch("execute_futures_trade.execute_complete_trade", side_effect=fake_exec), \
-             patch("radar_mcp_server.importlib.reload", side_effect=lambda m: m), \
-             patch("quant_risk_engine.get_account_equity", return_value=1000.0):
-            self.radar.deploy_futures_trade(symbol="SOLUSDT", direction="LONG", leverage=18, margin_usdt=10.0, is_yolo=True, target_env="testnet")
-        self.assertEqual(captured.get("leverage"), 18)
 
 
 class TestClimaxWatcherNeverSelfSignsInProd(_TempWorkspace):
@@ -612,7 +562,7 @@ class TestLeverageCeilingSingleSource(unittest.TestCase):
         self.assertEqual(example["leverage_yolo"], 15)
 
     def test_no_hardcoded_15x_ceiling_left(self):
-        for rel in ("scripts/execute_futures_trade.py", "scripts/radar_mcp_server.py"):
+        for rel in ("scripts/execute_futures_trade.py", "scripts/hooks/pre_trade_guard.py"):
             with open(os.path.join(BASE_DIR, rel), encoding="utf-8") as f:
                 src = f.read()
             self.assertNotIn("leverage > 15", src, rel)

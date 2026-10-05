@@ -109,6 +109,12 @@ class TestPreTradeGuardHardening(unittest.TestCase):
     def _run_guard_payload(self, payload: dict) -> dict:
         return self._run_guard(json.dumps(payload))
 
+    @staticmethod
+    def _cli_payload(flags: str) -> dict:
+        """Trade opening through the single choke point (executor CLI)."""
+        return {"toolCall": {"name": "run_command",
+                             "args": {"CommandLine": f"python3 scripts/execute_futures_trade.py {flags}"}}}
+
     # =========================================================================
     # 1. DEFAULT-DENY ON UNRECOGNIZED/EMPTY INPUT (Finding 1)
     # =========================================================================
@@ -226,22 +232,28 @@ class TestPreTradeGuardHardening(unittest.TestCase):
         self.assertEqual(res.get("code"), 2)
         self.assertIn("Choke Point Enforcement", res.get("reason", ""))
 
-    def test_approved_choke_point_deploy_futures_trade_allowed(self):
-        """Opening orders via crypto_radar:deploy_futures_trade choke point are permitted when gates pass."""
+    def test_retired_radar_deploy_denied_even_when_gates_pass(self):
+        """The retired crypto_radar:deploy_futures_trade wrapper is no longer a choke point: always denied."""
         self._write_dossier([{"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3}])
         self._write_session_state(delta_bias="NEUTRAL")
+        args = {"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3}
+        payloads = [
+            {"toolCall": {"name": "call_mcp_tool", "args": {"ServerName": "crypto_radar",
+                                                             "ToolName": "deploy_futures_trade", "Arguments": args}}},
+            {"toolCall": {"name": "mcp_crypto_radar_deploy_futures_trade", "args": args}},
+            # Legacy tool name behind an unknown server alias
+            {"toolCall": {"name": "call_mcp_tool", "args": {"ServerName": "radar-alias",
+                                                             "ToolName": "deploy_futures_trade", "Arguments": args}}},
+        ]
+        for payload in payloads:
+            res = self._run_guard_payload(payload)
+            self.assertEqual(res.get("decision"), "deny", payload)
+            self.assertEqual(res.get("code"), 2)
+            self.assertIn("Retired MCP Server", res.get("reason", ""))
+            self.assertIn("scripts/execute_futures_trade.py", res.get("reason", ""))
 
-        payload = {
-            "toolCall": {
-                "name": "call_mcp_tool",
-                "args": {
-                    "ServerName": "crypto_radar",
-                    "ToolName": "deploy_futures_trade",
-                    "Arguments": {"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3}
-                }
-            }
-        }
-        res = self._run_guard_payload(payload)
+        # The same order through the executor CLI passes the gates
+        res = self._run_guard_payload(self._cli_payload("--symbol BTCUSDT --direction LONG --leverage 3"))
         self.assertEqual(res.get("decision"), "allow")
         self.assertEqual(res.get("__exit_code__"), 0)
 
@@ -334,6 +346,53 @@ class TestPreTradeGuardHardening(unittest.TestCase):
         res = self._run_guard_payload(payload)
         self.assertEqual(res.get("decision"), "allow")
 
+    def _cmd(self, command_line: str) -> dict:
+        return self._run_guard_payload({"toolCall": {"name": "run_command", "args": {"CommandLine": command_line}}})
+
+    def test_cli_move_breakeven_with_symbol_allowed(self):
+        """--move-breakeven with exactly one --symbol is risk-reducing (no dossier / session state needed)."""
+        for cmd in ("python3 scripts/execute_futures_trade.py --move-breakeven --symbol BTCUSDT",
+                    "python3 scripts/execute_futures_trade.py --move-breakeven --symbol=BTCUSDT --force --env prod",
+                    "python3 scripts/execute_futures_trade.py --move_breakeven --symbol BTCUSDT --env testnet"):
+            res = self._cmd(cmd)
+            self.assertEqual(res.get("decision"), "allow", cmd)
+            self.assertIn("Risk-reducing", res.get("reason", ""))
+
+    def test_cli_move_breakeven_without_single_symbol_denied(self):
+        """--move-breakeven needs exactly one --symbol; it never falls through to the trade-opening path."""
+        for cmd in ("python3 scripts/execute_futures_trade.py --move-breakeven",
+                    "python3 scripts/execute_futures_trade.py --move-breakeven --symbol BTCUSDT --symbol ETHUSDT"):
+            res = self._cmd(cmd)
+            self.assertEqual(res.get("decision"), "deny", cmd)
+            self.assertIn("requires exactly one --symbol", res.get("reason", ""))
+
+    def test_cli_move_breakeven_does_not_whitelist_chained_trade(self):
+        """A risk-reducing sub-command never whitelists a trade opening chained after it."""
+        res = self._cmd("python3 scripts/execute_futures_trade.py --move-breakeven --symbol BTCUSDT && "
+                        "python3 scripts/execute_futures_trade.py --symbol SOLUSDT --direction LONG")
+        self.assertEqual(res.get("decision"), "deny")
+        self.assertIn("Clean-Room Evaluator Required", res.get("reason", ""))
+
+    def test_cli_positions_is_read_only_ask(self):
+        """--positions is a read-only listing: normal permission policy (ask), never trade-gated."""
+        for cmd in ("python3 scripts/execute_futures_trade.py --positions",
+                    "python3 scripts/execute_futures_trade.py --positions --json --env prod"):
+            res = self._cmd(cmd)
+            self.assertEqual(res.get("decision"), "ask", cmd)
+            self.assertEqual(res.get("__exit_code__"), 0)
+
+    def test_position_guardian_loop_classification(self):
+        """The guardian never opens positions: bounded runs are allowed, long-running ones ask."""
+        for cmd in ("python3 scripts/loops/position_guardian_loop.py --once",
+                    "python3 scripts/loops/position_guardian_loop.py --once --env prod --json",
+                    "python3 scripts/loops/position_guardian_loop.py --dry-run --interval 60",
+                    "python3 scripts/loops/position_guardian_loop.py --help"):
+            self.assertEqual(self._cmd(cmd).get("decision"), "allow", cmd)
+        for cmd in ("python3 scripts/loops/position_guardian_loop.py",
+                    "python3 scripts/loops/position_guardian_loop.py --interval 300 --env prod",
+                    "nohup python3 scripts/loops/position_guardian_loop.py --interval 300 &"):
+            self.assertEqual(self._cmd(cmd).get("decision"), "ask", cmd)
+
     def test_generic_close_keyword_in_note_not_risk_reducing(self):
         """CLI command with keyword 'close' in a note or comment is NOT classified as risk-reducing."""
         # Unapproved asset, so if it were misclassified as risk-reducing it would be allowed
@@ -373,41 +432,23 @@ class TestPreTradeGuardHardening(unittest.TestCase):
     # =========================================================================
     # 4. STRICT DELTA DIRECTION PARSING (Finding 1)
     # =========================================================================
-    def test_delta_direction_conflicting_in_mcp_args_denied(self):
-        """Conflicting trade directions in tool arguments (both LONG and SHORT) fails closed."""
+    def test_delta_direction_conflicting_direction_and_side_denied(self):
+        """Conflicting --direction / --side flags (both LONG and SHORT) fail closed."""
         self._write_dossier([{"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3}])
         self._write_session_state(delta_bias="NEUTRAL")
 
-        payload = {
-            "toolCall": {
-                "name": "call_mcp_tool",
-                "args": {
-                    "ServerName": "crypto_radar",
-                    "ToolName": "deploy_futures_trade",
-                    "Arguments": {"symbol": "BTCUSDT", "direction": "LONG", "side": "SELL"}
-                }
-            }
-        }
+        payload = self._cli_payload("--symbol BTCUSDT --direction LONG --side SELL")
         res = self._run_guard_payload(payload)
         self.assertEqual(res.get("decision"), "deny")
         self.assertEqual(res.get("code"), 2)
         self.assertIn("Conflicting trade directions", res.get("reason", ""))
 
-    def test_delta_direction_missing_in_mcp_args_denied(self):
-        """Missing trade direction in tool arguments fails closed."""
+    def test_delta_direction_missing_in_cli_denied(self):
+        """Missing trade direction on the executor command line fails closed."""
         self._write_dossier([{"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3}])
         self._write_session_state(delta_bias="NEUTRAL")
 
-        payload = {
-            "toolCall": {
-                "name": "call_mcp_tool",
-                "args": {
-                    "ServerName": "crypto_radar",
-                    "ToolName": "deploy_futures_trade",
-                    "Arguments": {"symbol": "BTCUSDT", "leverage": 3}
-                }
-            }
-        }
+        payload = self._cli_payload("--symbol BTCUSDT --leverage 3")
         res = self._run_guard_payload(payload)
         self.assertEqual(res.get("decision"), "deny")
         self.assertEqual(res.get("code"), 2)
@@ -440,16 +481,7 @@ class TestPreTradeGuardHardening(unittest.TestCase):
         if os.path.exists(self.state_path):
             os.remove(self.state_path)
 
-        payload = {
-            "toolCall": {
-                "name": "call_mcp_tool",
-                "args": {
-                    "ServerName": "crypto_radar",
-                    "ToolName": "deploy_futures_trade",
-                    "Arguments": {"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3}
-                }
-            }
-        }
+        payload = self._cli_payload("--symbol BTCUSDT --direction LONG --leverage 3")
         res = self._run_guard_payload(payload)
         self.assertEqual(res.get("decision"), "deny")
         self.assertEqual(res.get("code"), 2)
@@ -460,16 +492,7 @@ class TestPreTradeGuardHardening(unittest.TestCase):
         self._write_dossier([{"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3}])
         self._write_session_state(delta_bias="NEUTRAL", is_valid=False, error="Binance API connection timeout")
 
-        payload = {
-            "toolCall": {
-                "name": "call_mcp_tool",
-                "args": {
-                    "ServerName": "crypto_radar",
-                    "ToolName": "deploy_futures_trade",
-                    "Arguments": {"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3}
-                }
-            }
-        }
+        payload = self._cli_payload("--symbol BTCUSDT --direction LONG --leverage 3")
         res = self._run_guard_payload(payload)
         self.assertEqual(res.get("decision"), "deny")
         self.assertEqual(res.get("code"), 2)
@@ -481,16 +504,7 @@ class TestPreTradeGuardHardening(unittest.TestCase):
         self._write_dossier([{"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3}])
         self._write_session_state(delta_bias="NEUTRAL", is_valid=True, last_updated_ts=now_ts - 350)
 
-        payload = {
-            "toolCall": {
-                "name": "call_mcp_tool",
-                "args": {
-                    "ServerName": "crypto_radar",
-                    "ToolName": "deploy_futures_trade",
-                    "Arguments": {"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3}
-                }
-            }
-        }
+        payload = self._cli_payload("--symbol BTCUSDT --direction LONG --leverage 3")
         res = self._run_guard_payload(payload)
         self.assertEqual(res.get("decision"), "deny")
         self.assertEqual(res.get("code"), 2)
@@ -502,16 +516,7 @@ class TestPreTradeGuardHardening(unittest.TestCase):
         self._write_dossier([{"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3}])
         self._write_session_state(delta_bias="NEUTRAL", is_valid=True, last_updated_ts=now_ts - 30)
 
-        payload = {
-            "toolCall": {
-                "name": "call_mcp_tool",
-                "args": {
-                    "ServerName": "crypto_radar",
-                    "ToolName": "deploy_futures_trade",
-                    "Arguments": {"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3}
-                }
-            }
-        }
+        payload = self._cli_payload("--symbol BTCUSDT --direction LONG --leverage 3")
         res = self._run_guard_payload(payload)
         self.assertEqual(res.get("decision"), "allow")
 
@@ -531,16 +536,7 @@ class TestPreTradeGuardHardening(unittest.TestCase):
         )
         self._write_session_state(delta_bias="NEUTRAL")
 
-        payload = {
-            "toolCall": {
-                "name": "call_mcp_tool",
-                "args": {
-                    "ServerName": "crypto_radar",
-                    "ToolName": "deploy_futures_trade",
-                    "Arguments": {"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3}
-                }
-            }
-        }
+        payload = self._cli_payload("--symbol BTCUSDT --direction LONG --leverage 3")
         res = self._run_guard_payload(payload)
         self.assertEqual(res.get("decision"), "deny")
         self.assertEqual(res.get("code"), 2)
@@ -559,16 +555,7 @@ class TestPreTradeGuardHardening(unittest.TestCase):
             json.dump(dossier, f)
         self._write_session_state(delta_bias="NEUTRAL")
 
-        payload = {
-            "toolCall": {
-                "name": "call_mcp_tool",
-                "args": {
-                    "ServerName": "crypto_radar",
-                    "ToolName": "deploy_futures_trade",
-                    "Arguments": {"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3}
-                }
-            }
-        }
+        payload = self._cli_payload("--symbol BTCUSDT --direction LONG --leverage 3")
         res = self._run_guard_payload(payload)
         self.assertEqual(res.get("decision"), "deny")
         self.assertEqual(res.get("code"), 2)
@@ -584,16 +571,7 @@ class TestPreTradeGuardHardening(unittest.TestCase):
         )
         self._write_session_state(delta_bias="NEUTRAL")
 
-        payload = {
-            "toolCall": {
-                "name": "call_mcp_tool",
-                "args": {
-                    "ServerName": "crypto_radar",
-                    "ToolName": "deploy_futures_trade",
-                    "Arguments": {"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3}
-                }
-            }
-        }
+        payload = self._cli_payload("--symbol BTCUSDT --direction LONG --leverage 3")
         res = self._run_guard_payload(payload)
         self.assertEqual(res.get("decision"), "deny")
         self.assertEqual(res.get("code"), 2)
@@ -609,16 +587,7 @@ class TestPreTradeGuardHardening(unittest.TestCase):
         )
         self._write_session_state(delta_bias="NEUTRAL")
 
-        payload = {
-            "toolCall": {
-                "name": "call_mcp_tool",
-                "args": {
-                    "ServerName": "crypto_radar",
-                    "ToolName": "deploy_futures_trade",
-                    "Arguments": {"symbol": "BTCUSDT", "direction": "LONG", "leverage": 3}
-                }
-            }
-        }
+        payload = self._cli_payload("--symbol BTCUSDT --direction LONG --leverage 3")
         res = self._run_guard_payload(payload)
         self.assertEqual(res.get("decision"), "allow")
 

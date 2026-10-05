@@ -12,7 +12,6 @@ import os
 import sys
 import json
 import time
-import re
 from typing import List, Literal, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pydantic import BaseModel, Field
@@ -23,8 +22,9 @@ import broad_market_radar as bmr
 import microstructure_engine as me
 import quant_risk_engine as qre
 import funding_arbitrage as fa
-import execute_futures_trade as eft
 import sync_session_state as sss
+import fetch_newsletters as fn
+from utils.env_resolver import resolve_env
 
 # ==========================================
 # 1. TYPED PYDANTIC SCHEMAS (DATA CONTRACTS)
@@ -121,7 +121,8 @@ def fetch_macro_btc() -> MacroContext:
     try:
         btc_micro = me.get_symbol_microstructure("BTCUSDT") or {}
         btc_tape = me.get_live_aggtrades_tape("BTCUSDT") or {}
-        ticker = eft.send_signed_request("GET", "/fapi/v1/ticker/price", {"symbol": "BTCUSDT"}, target_env="testnet")
+        # Public mainnet ticker: market data is environment-independent (testnet prices are not representative).
+        ticker = me.fetch_json(f"{me.BASE_FAPI}/fapi/v1/ticker/price?symbol=BTCUSDT")
         cur_price = float(ticker.get("price", 0)) if isinstance(ticker, dict) else 0.0
 
         regime = btc_micro.get("regime", "UNKNOWN")
@@ -157,6 +158,16 @@ def fetch_macro_btc() -> MacroContext:
             allows_alt_shorts=True
         )
 
+def _profile_standard_sizing():
+    """(leverage_standard capped at the desk ceiling, max_margin_ratio) from config/user_profile.json."""
+    try:
+        import user_profile as up
+        prof = up.load_user_profile()
+        lev = max(1, min(int(prof.get("leverage_standard", 3)), up.get_leverage_ceiling(prof)))
+        return lev, float(prof.get("max_margin_ratio", 0.30))
+    except Exception:
+        return 3, 0.30
+
 def enrich_and_size_candidate(c: dict, target_env: Optional[str] = None) -> Optional[CandidateSetup]:
     """Calculates volatility parity sizing and encapsulates into Pydantic model."""
     try:
@@ -164,16 +175,15 @@ def enrich_and_size_candidate(c: dict, target_env: Optional[str] = None) -> Opti
         entry = float(c["price"])
         sl = float(c["sl"])
         direction = c["direction"]
-        lev = 3
+        lev, max_margin_ratio = _profile_standard_sizing()
 
-        if target_env is None:
-            cfg = eft.load_env()
-            target_env = (os.environ.get("BINANCE_API_ENV") or cfg.get("BINANCE_API_ENV", "prod")).lower()
+        target_env = resolve_env(target_env)
 
-        # Calculate dynamic equity sizing (default 0.5% equity risk per trade, or user profile)
-        sizing = qre.calculate_dynamic_equity_sizing(sym, entry, sl, risk_pct_equity=None, leverage=lev, target_env=target_env)
+        # Calculate dynamic equity sizing (user profile risk_pct_equity x equity, margin capped at max_margin_ratio)
+        sizing = qre.calculate_dynamic_equity_sizing(sym, entry, sl, risk_pct_equity=None, leverage=lev,
+                                                     target_env=target_env, max_margin_ratio=max_margin_ratio)
         if not sizing or "error" in sizing or sizing.get("step_qty", 0.0) <= 0.0:
-            logger.warning(f"Invalid or non-quantizable sizing for {sym}: {sizing.get('error') if sizing else 'Empty sizing'}")
+            print(f"Invalid or non-quantizable sizing for {sym}: {sizing.get('error') if sizing else 'Empty sizing'}", file=sys.stderr)
             return None
 
         req_margin = sizing["required_margin"]
@@ -217,22 +227,9 @@ def enrich_and_size_candidate(c: dict, target_env: Optional[str] = None) -> Opti
     except Exception:
         return None
 
-PROMPT_INJECTION_PATTERNS = [
-    re.compile(r'(?i)\bignore\s+(all\s+)?(previous|prior)\s+instructions\b'),
-    re.compile(r'(?i)\bdisregard\s+(all\s+)?(previous|prior)\s+instructions\b'),
-    re.compile(r'(?i)\b(system|developer|assistant|human)\s*:'),
-    re.compile(r'(?i)<\s*/?\s*(system|instruction|prompt)\s*>'),
-    re.compile(r'(?i)\byou\s+are\s+now\s+(a|an|in)\b'),
-]
-
-def sanitize_untrusted_text(text: str) -> str:
-    """Strips or defangs potential prompt injection overrides from untrusted external text."""
-    if not text:
-        return ""
-    sanitized = text
-    for pattern in PROMPT_INJECTION_PATTERNS:
-        sanitized = pattern.sub("[REDACTED_INJECTION_ATTEMPT]", sanitized)
-    return sanitized
+# Prompt-injection defense is shared with the newsletter reader (single source of truth).
+PROMPT_INJECTION_PATTERNS = fn.PROMPT_INJECTION_PATTERNS
+sanitize_untrusted_text = fn.sanitize_untrusted_text
 
 def fetch_news_summary() -> List[str]:
     """Reads and filters news catalysts or recent newsletter mentions deterministically."""
@@ -272,9 +269,7 @@ def execute_screening_pipeline(top_pairs_count: int = 80, target_env: Optional[s
     """
     t0 = time.time()
 
-    if target_env is None:
-        cfg = eft.load_env()
-        target_env = (os.environ.get("BINANCE_API_ENV") or cfg.get("BINANCE_API_ENV", "prod")).lower()
+    target_env = resolve_env(target_env)
 
     with ThreadPoolExecutor(max_workers=5) as executor:
         f_macro = executor.submit(fetch_macro_btc)
@@ -386,9 +381,28 @@ if __name__ == "__main__":
     parser.add_argument("--env", default=None, help="Target execution environment (prod/testnet)")
     args = parser.parse_args()
 
-    payload = execute_screening_pipeline(target_env=args.env)
+    try:
+        env = resolve_env(args.env)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    import contextlib
+    real_stdout = sys.stdout
+    try:
+        # Keep stdout pure JSON with --json: library diagnostics go to stderr.
+        with contextlib.redirect_stdout(sys.stderr if args.json else real_stdout):
+            payload = execute_screening_pipeline(target_env=env)
+    except Exception as e:
+        if args.json:
+            real_stdout.write(json.dumps({"status": "error", "command": "screening", "env": env,
+                                          "error": f"{type(e).__name__}: {e}"}, indent=2) + "\n")
+        else:
+            print(f"Screening pipeline failed: {type(e).__name__}: {e}", file=sys.stderr)
+        sys.exit(1)
+
     if args.json:
-        print(payload.model_dump_json(indent=2))
+        real_stdout.write(payload.model_dump_json(indent=2) + "\n")
     else:
         print(f"⚡ PIPELINE COMPLETED IN {payload.pipeline_latency_ms} ms ({payload.timestamp_utc})")
         print(f"• Macro BTC: {payload.macro.btc_regime} | Price: ${payload.macro.btc_price:,.1f} | Allows Shorts: {payload.macro.allows_alt_shorts}")

@@ -504,7 +504,7 @@ class TestNightCutoffLoopOvernightModes(unittest.TestCase):
             # Must NOT close position
             mock_close.assert_not_called()
             # Must ratchet winning position (+50% ROE) to BE
-            mock_be.assert_called_once_with("BTCUSDT", target_env="testnet")
+            mock_be.assert_called_once_with("BTCUSDT", target_env="testnet", force=True)
 
     @patch("execute_futures_trade.send_signed_request")
     @patch("execute_futures_trade.close_position_market")

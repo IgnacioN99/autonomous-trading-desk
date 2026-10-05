@@ -21,8 +21,8 @@ Activate whenever the user:
 
 ## Phase 1: Grounded Research & Market Screening
 1. Consult quantitative research notebooks (configured via `config/user_context.json` or local research files in `research/`) for mathematical rules on candlestick absorption wicks, Spot CVD divergence, Open Interest washouts, and Kelly / Volatility Parity sizing.
-2. Ingest fresh newsletters & macro catalysts: run `python3 scripts/fetch_newsletters.py` (reads folder from `config/user_context.json`, `NEWSLETTERS_FOLDER` env var, or `--folder`) to ingest research feeds (Glassnode, Blockworks, etc.) and reject late-stage euphoria or avoid entering right before scheduled high-impact events.
-3. Screen top liquid Binance Futures pairs (RSI, distance to 24h lows/highs, volume wicks, EMA 20/50).
+2. Ingest fresh newsletters & macro catalysts: run `python3 scripts/fetch_newsletters.py --format json` (reads folder from `config/user_context.json`, `NEWSLETTERS_FOLDER` env var, or `--folder`) to ingest research feeds (Glassnode, Blockworks, etc.) and reject late-stage euphoria or avoid entering right before scheduled high-impact events.
+3. Screen top liquid Binance Futures pairs (RSI, distance to 24h lows/highs, volume wicks, EMA 20/50) with the native read-only CLI scanners documented in the `market-radar` skill (`.agents/skills/market-radar/SKILL.md`): `python3 scripts/broad_market_radar.py --json`, `python3 scripts/broad_yolo_scanner.py --json` and `python3 scripts/quant_risk_engine.py {parity,pairs,kelly} --json`. These are the only screening path; third-party Binance skills are not part of this flow and must never be used to place orders, move funds or sign API requests.
 
 ## Phase 2: TOP 5-6 Opportunities Ranking
 Generate a clear, ranked table with 5 to 6 setups ordered by confluence and probability:
@@ -44,7 +44,7 @@ Follow these steps in order. Skipping one is a hard failure: the PreToolUse hook
 3. **Wait for its message** containing the Master Dossier and its `<dossier_json>` block. Keep the subagent `conversationId` returned by `invoke_subagent`.
 4. **Record the verdict:** `python3 scripts/record_evaluation.py --from-subagent <conversationId>`. It extracts the block from the subagent transcript, stamps provenance (sha256) and writes `logs/evaluations/latest_dossier.json` (valid 20 min from when the evaluator emitted it). If it exits non-zero (expired, env mismatch, no block), re-run steps 1-4. **Never write or edit the dossier by hand** and never use `--symbols` / `--json-file` in PROD (refused).
 5. **Confirmation policy:** candidates with `requires_user_confirmation: true` (Tier A+ / Tier A) need the user's explicit "yes" in chat before execution. Tier S candidates with `requires_user_confirmation: false` may be fast-tracked only if the profile enables `autonomous_execution_tier_s`.
-6. **Execute only through the gated engine:** `crypto_radar:deploy_futures_trade` (MCP) or `python3 scripts/execute_futures_trade.py`, with the symbol and direction exactly as approved. Never call Binance order tools directly.
+6. **Execute only through the gated engine:** `python3 scripts/execute_futures_trade.py --symbol <SYMBOL> --direction <LONG|SHORT> ...` with the symbol and direction exactly as approved (add `--confirmed` only after the user's explicit "yes"). It is the single choke point; there is no MCP wrapper (the retired `crypto_radar` server is denied by the hook). Never call Binance order tools directly.
 7. Field-by-field checklist the engine enforces:
    - Margin: Mandatory Isolated
    - Leverage: profile `leverage_standard` (standard) / `leverage_yolo` (YOLO), ceiling `leverage_ceiling` (default 15x); MCP sub-accounts are clamped to 5x by Binance (-4421)
@@ -53,6 +53,11 @@ Follow these steps in order. Skipping one is a hard failure: the PreToolUse hook
    - Order 1: Entry + SL (Algo Order with `closePosition: true`), SL verified on the ledger or the position is closed `reduceOnly`
    - Order 2: TP1 (30% size at +1.8R) Limit with `Reduce-Only: Checked`
    - Order 3: TP2 (70% size at +4.0R) Limit with `Reduce-Only: Checked`
+8. **Manage open positions** with the same CLI (risk-reducing actions are never blocked):
+   - `python3 scripts/execute_futures_trade.py --positions --json` (read-only snapshot)
+   - `python3 scripts/execute_futures_trade.py --move-breakeven --symbol <SYMBOL>` (only after TP1 or a confirmed +2.0×ATR_15m expansion)
+   - `python3 scripts/execute_futures_trade.py --close-position --symbol <SYMBOL>`, `--audit-orphans`, `--auto-heal`
+9. **Trailing stops, dead alpha and orphan audits** run in `scripts/loops/position_guardian_loop.py` (never opens positions): `--once` for a single cycle (allowed by the hook), `--dry-run` to only report, `--interval <seconds>` to run in the background (requires confirmation). Schedule it outside the chat session, e.g. cron: `*/5 * * * * cd <repo> && python3 scripts/loops/position_guardian_loop.py --once --env prod >> logs/guardian.log 2>&1`.
 
 ## Phase 4: Notion Journal Sync
 Sync the chosen position to Notion:

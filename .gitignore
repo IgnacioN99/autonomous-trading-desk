@@ -45,6 +45,7 @@ skills-lock.json
 !.agents/skills/trade-execution-planner/**
 !.agents/skills/pr-review/
 !.agents/skills/pr-review/**
+!.agents/skills/market-radar/
 
 # =================================================================
 # ONE-OFF DEPLOYMENT BATCHES & LOCAL OPERATIONAL SESSIONS
