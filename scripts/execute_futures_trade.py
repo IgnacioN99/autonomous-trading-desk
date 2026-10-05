@@ -16,6 +16,7 @@ and --json; modes are mutually exclusive):
   python3 scripts/execute_futures_trade.py --close-position --symbol BTCUSDT [--env prod]
   python3 scripts/execute_futures_trade.py --audit-orphans [--env prod]
   python3 scripts/execute_futures_trade.py --auto-heal [--env prod]
+  python3 scripts/execute_futures_trade.py --protect-pending [--env prod]   # also run by the position guardian
 
   # New position (requires an APPROVED clean-room dossier; always emits JSON)
   python3 scripts/execute_futures_trade.py --symbol BTCUSDT --direction LONG --sl-price ... --tp1-price ... --tp2-price ...
@@ -68,8 +69,16 @@ JSON schemas (stable; extra keys may be added, existing keys are never renamed):
       "positions": [{"symbol", "direction", "amount", "entry_price", "mark_price", "leverage", "unpnl",
                      "is_protected", "active_sl_orders", "sl_triggers", "auto_heal_attempted"?,
                      "auto_heal_verified"?, "healed_sl_price"?}], "error"?: str}
+  --protect-pending (exit 0 iff ok): {"ok": bool, "env": str, "dry_run": bool,
+      "actions": [{"type": "pending_protect_sl" | "pending_tp_placed" | "pending_abort" | "pending_timeout_cancel" |
+                           "pending_dropped" | "pending_sl_crossed_close", "key", "symbol", "success": bool,
+                "dry_run": bool, "detail": {...}}],
+      "errors": [{"key", "symbol", "stage", "error"}]}
   trade deployment: {"success": bool, "symbol", "direction", "leverage", "entry_price", "total_qty",
       "sl_price", "tp1_price", "tp2_price", ..., "error"?: str, "hard_gate_rejection"?: bool}
+      Resting entries (untriggered STOP_MARKET via the algo order API, resting LIMIT) return
+      "conditional_entry" / "pending_limit_entry": true and "pending_entry_key"; they are recorded in
+      logs/pending_entries.json and require a live position guardian in PROD.
 """
 
 import os
@@ -340,7 +349,7 @@ def send_mcp_gateway_request(method, endpoint, params=None):
                         'side': a.get('side'),
                         'triggerPrice': float(a.get('triggerPrice') or a.get('stopPrice') or 0),
                         'orderType': o_type,
-                        'closePosition': bool(a.get('closePosition', False) or a.get('reduceOnly', False))
+                        'closePosition': _truthy(a.get('closePosition', False)) or _truthy(a.get('reduceOnly', False))
                     })
             return res_list
         return algos
@@ -707,14 +716,15 @@ def verify_algo_stop_loss(symbol, exit_side, sl_price=None, target_env=None):
     """
     Verifies that the Algo Stop Loss order actually exists and is active on the exchange.
     Ensures that if sl_price is specified, True is ONLY returned if the price matches within 3% tolerance.
+    Only real protective stops count (is_protective_stop): a resting conditional ENTRY on the same side
+    (neither closePosition nor reduceOnly) never verifies as a Stop Loss.
     """
     target_env = resolve_env(target_env)
     try:
         algos = send_signed_request('GET', '/fapi/v1/openAlgoOrders', {'symbol': symbol}, target_env=target_env)
         if isinstance(algos, list):
             for ao in algos:
-                o_type = ao.get('orderType') or ao.get('type')
-                if o_type in ['STOP_MARKET', 'STOP'] and ao.get('side') == exit_side:
+                if is_protective_stop(ao, exit_side, symbol):
                     if sl_price is not None:
                         trig = float(ao.get('triggerPrice') or ao.get('stopPrice') or 0)
                         if trig > 0 and abs(trig - float(sl_price)) / trig < 0.03:
@@ -1493,6 +1503,643 @@ def enforce_evaluation_dossier(symbol, direction, target_env=None, bypass_eval_g
     return True, reason, cand
 
 
+# -----------------------------------------------------------------------------
+# Take-profit sizing / placement and audit ledger (shared by fresh entries and filled resting entries)
+# -----------------------------------------------------------------------------
+def split_take_profit_quantities(total_qty, filters, ref_price):
+    """
+    Asymmetric 30% TP1 / 70% TP2 split (positive right-tail skewness, no premature truncation). TP1 is bumped
+    to the exchange minNotional at ref_price when possible; falls back to 50/50 when 30/70 cannot respect minQty.
+    Returns (tp1_qty, tp2_qty).
+    """
+    min_notional = filters.get('minNotional', 5.0)
+    tp1_qty = round_step(total_qty * 0.30, filters['stepSize'], filters['precision_qty'])
+    if tp1_qty < filters['minQty']:
+        tp1_qty = filters['minQty']
+    if tp1_qty * ref_price < min_notional:
+        needed_qty = round_step(math.ceil(min_notional / ref_price / filters['stepSize']) * filters['stepSize'], filters['stepSize'], filters['precision_qty'])
+        if needed_qty < total_qty:
+            tp1_qty = needed_qty
+
+    tp2_qty = round_step(total_qty - tp1_qty, filters['stepSize'], filters['precision_qty'])
+    if tp2_qty < filters['minQty']:
+        # Fallback to 50/50 if position size is too small to split 30/70 while respecting minQty
+        tp1_qty = round_step(total_qty / 2, filters['stepSize'], filters['precision_qty'])
+        tp2_qty = round_step(total_qty - tp1_qty, filters['stepSize'], filters['precision_qty'])
+    return tp1_qty, tp2_qty
+
+
+def place_take_profit_orders(symbol, exit_side, tp1_price, tp2_price, tp1_qty, tp2_qty, target_env=None):
+    """TP1 / TP2 as reduce-only GTC LIMIT orders on the exit side. Returns (tp1_order, tp2_order)."""
+    placed = []
+    for price, qty in ((tp1_price, tp1_qty), (tp2_price, tp2_qty)):
+        order = None
+        if qty > 0:
+            tp_params = {
+                'symbol': symbol,
+                'side': exit_side,
+                'type': 'LIMIT',
+                'price': price,
+                'quantity': qty,
+                'timeInForce': 'GTC',
+                'reduceOnly': 'true'
+            }
+            order = send_signed_request('POST', '/fapi/v1/order', tp_params, target_env=target_env)
+        placed.append(order)
+    return placed[0], placed[1]
+
+
+def append_trade_audit_record(record, margin_usdt):
+    """Appends an entry record to logs/trades_audit.jsonl with canonical provenance (atomic append)."""
+    log_dir = os.path.join(_workspace_dir(), 'logs')
+    os.makedirs(log_dir, exist_ok=True)
+    audit_file = os.path.join(log_dir, 'trades_audit.jsonl')
+    try:
+        from provenance_stamp import stamp_trade_record
+        from utils.atomic_writer import atomic_append_jsonl
+        record = stamp_trade_record(
+            record,
+            evaluator="isolated_market_evaluator",
+            strategy="microstructure_wick_reversion",
+            sizing_model=f"volatility_parity_margin_{margin_usdt}"
+        )
+        atomic_append_jsonl(audit_file, record)
+    except Exception:
+        with open(audit_file, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(record) + "\n")
+    return record
+
+
+# -----------------------------------------------------------------------------
+# Resting entries (Issue #33): untriggered conditional STOP_MARKET and resting LIMIT entries.
+# Binance cannot attach a Stop Loss to a conditional/resting order, so each one is recorded in
+# logs/pending_entries.json and protect_pending_entries() (--protect-pending, run by the position
+# guardian at the start of every cycle) places the planned SL/TPs once it fills.
+# -----------------------------------------------------------------------------
+PENDING_ENTRY_TIMEOUT_SECONDS = 5400    # desk order timeout (60-90 min) for unfilled resting entries
+GUARDIAN_MAX_INTERVAL_FOR_RESTING = 120 # resting entries require a guardian LOOP (--interval <= 120s) for the env
+PENDING_MISSING_GRACE_SECONDS = 60      # "entry gone, no position" must persist this long before a record is dropped
+PENDING_ENTRIES_SCHEMA_VERSION = 1
+
+
+def pending_entries_path():
+    return os.path.join(_workspace_dir(), 'logs', 'pending_entries.json')
+
+
+def pending_entry_key(target_env, symbol, entry_id):
+    return f"{target_env}:{str(symbol).upper()}:{entry_id}"
+
+
+def load_pending_entries():
+    """Returns (entries, error). A missing registry is empty; an unreadable or malformed one is an error
+    (callers fail closed: no new resting entry is accepted and no record is ever dropped)."""
+    path = pending_entries_path()
+    if not os.path.exists(path):
+        return {}, None
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        return {}, f"pending entries registry unreadable ({e})"
+    if not isinstance(data, dict) or not isinstance(data.get('entries'), dict):
+        return {}, "pending entries registry malformed"
+    return data['entries'], None
+
+
+def update_pending_entries(mutate):
+    """Read-modify-write of logs/pending_entries.json: re-reads the registry, applies mutate(entries) and writes
+    it atomically. Raises on an unreadable registry or a failed write."""
+    entries, err = load_pending_entries()
+    if err:
+        raise IOError(err)
+    mutate(entries)
+    from utils.atomic_writer import atomic_write_json
+    atomic_write_json(pending_entries_path(), {"schema_version": PENDING_ENTRIES_SCHEMA_VERSION, "entries": entries})
+    return entries
+
+
+def register_resting_entry(kind, entry_id, symbol, direction, entry_side, exit_side, target_env, price, total_qty,
+                           sl_price, tp1_price, tp2_price, leverage, is_yolo, margin_usdt):
+    """Records a resting entry in logs/pending_entries.json. Returns (key, record); raises on failure."""
+    now = int(time.time())
+    key = pending_entry_key(target_env, symbol, entry_id)
+    record = {
+        'kind': kind,
+        'entry_id': str(entry_id),
+        'symbol': str(symbol).upper(),
+        'direction': str(direction).upper(),
+        'entry_side': entry_side,
+        'exit_side': exit_side,
+        'target_env': target_env,
+        'trigger_or_limit_price': price,
+        'total_qty': total_qty,
+        'sl_price': sl_price,
+        'tp1_price': tp1_price,
+        'tp2_price': tp2_price,
+        'leverage': leverage,
+        'is_yolo': bool(is_yolo),
+        'margin_usdt': margin_usdt,
+        'placed_at_ts': now,
+        'expires_at_ts': now + PENDING_ENTRY_TIMEOUT_SECONDS,
+    }
+    update_pending_entries(lambda entries: entries.__setitem__(key, record))
+    return key, record
+
+
+def cancel_resting_entry(symbol, kind, entry_id, target_env=None):
+    """Cancels a resting entry (algo order for STOP_MARKET, regular order for LIMIT). Returns (ok, response)."""
+    try:
+        oid = int(entry_id)
+    except (TypeError, ValueError):
+        oid = entry_id
+    try:
+        if kind == 'STOP_MARKET':
+            res = send_signed_request('DELETE', '/fapi/v1/algoOrder', {'symbol': symbol, 'algoId': oid}, target_env=target_env)
+        else:
+            res = send_signed_request('DELETE', '/fapi/v1/order', {'symbol': symbol, 'orderId': oid}, target_env=target_env)
+    except Exception as e:
+        res = {"error": str(e)}
+    return not _is_api_error(res), res
+
+
+def check_guardian_alive(target_env, now=None):
+    """(ok, reason): logs/guardian_state.json was written by a running guardian LOOP (mode "loop", not a single
+    --once run) for target_env, not in --dry-run, with interval_seconds <= GUARDIAN_MAX_INTERVAL_FOR_RESTING and a
+    last cycle no older than 2 * interval_seconds + 30s. Read-only."""
+    now = int(now if now is not None else time.time())
+    path = os.path.join(_workspace_dir(), 'logs', 'guardian_state.json')
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            state = json.load(f)
+    except FileNotFoundError:
+        return False, "logs/guardian_state.json not found"
+    except (OSError, ValueError) as e:
+        return False, f"logs/guardian_state.json unreadable ({e})"
+    if not isinstance(state, dict):
+        return False, "logs/guardian_state.json malformed"
+    if state.get('env') != target_env:
+        return False, f"guardian state is for env {state.get('env')!r}, not {target_env!r}"
+    if state.get('dry_run') is not False:
+        return False, "guardian is running in --dry-run mode"
+    if state.get('mode') != 'loop':
+        return False, "guardian state was not written by a running loop (a single --once run does not count)"
+    try:
+        interval = int(state.get('interval_seconds'))
+    except (TypeError, ValueError):
+        return False, "guardian state has no valid interval_seconds"
+    if interval <= 0 or interval > GUARDIAN_MAX_INTERVAL_FOR_RESTING:
+        return False, f"guardian loop interval {interval}s exceeds {GUARDIAN_MAX_INTERVAL_FOR_RESTING}s"
+    try:
+        ts = int(state.get('timestamp'))
+    except (TypeError, ValueError):
+        return False, "guardian state has no valid timestamp"
+    age = now - ts
+    max_age = 2 * interval + 30
+    if ts <= 0 or age > max_age or age < -60:
+        return False, f"guardian state is stale ({age}s old, limit {max_age}s for a {interval}s loop)"
+    return True, f"guardian alive ({age}s old, {interval}s loop)"
+
+
+def check_pending_entry_conflict(symbol, target_env):
+    """
+    PROD gate for EVERY new entry (MARKET, breached-trigger fallthrough, LIMIT, STOP_MARKET): the symbol must have
+    no pending resting entry for target_env, and the registry must be readable (fail closed). A second entry on the
+    symbol would make the fill detection of the pending one ambiguous. Returns (ok, message_or_None). Read-only.
+    """
+    symbol = str(symbol).upper()
+    entries, err = load_pending_entries()
+    if err:
+        return False, f"ENTRY REJECTED: FAIL-CLOSED — {err}; cannot verify pending resting entries for {symbol}."
+    for key, rec in entries.items():
+        if isinstance(rec, dict) and rec.get('target_env') == target_env and str(rec.get('symbol', '')).upper() == symbol:
+            return False, (f"ENTRY REJECTED: {symbol} has a pending resting entry ({key}) in logs/pending_entries.json; "
+                           "wait until it fills (protected by --protect-pending / the guardian) or expires.")
+    return True, None
+
+
+def check_resting_entry_gates(symbol, target_env):
+    """
+    PROD gates for entries that rest on the book (untriggered STOP_MARKET, LIMIT), evaluated before any write.
+    Their SL/TPs are only placed on fill by protect_pending_entries, so:
+      1. a guardian loop must be alive for this env (fail closed, see check_guardian_alive);
+      2. the symbol must have no open position (keeps fill detection unambiguous).
+    (No pending entry on the symbol is enforced for every entry by check_pending_entry_conflict.)
+    Returns (ok, message_or_None). Read-only.
+    """
+    symbol = str(symbol).upper()
+    alive, why = check_guardian_alive(target_env)
+    if not alive:
+        return False, (
+            f"CONDITIONAL ENTRY REJECTED: FAIL-CLOSED — the position guardian is not alive ({why}). A resting entry "
+            "only gets its Stop Loss on fill; start the guardian first: "
+            f"`python3 scripts/loops/position_guardian_loop.py --interval 60 --env {target_env}`."
+        )
+    try:
+        pos_res = send_signed_request('GET', '/fapi/v2/positionRisk', {'symbol': symbol}, target_env=target_env)
+    except Exception as e:
+        pos_res = {"error": str(e)}
+    if not isinstance(pos_res, list):
+        return False, f"CONDITIONAL ENTRY REJECTED: FAIL-CLOSED — cannot verify open positions for {symbol} ({pos_res})."
+    for p in pos_res:
+        if isinstance(p, dict) and str(p.get('symbol', symbol)).upper() == symbol and _to_float(p.get('positionAmt')) != 0:
+            return False, (f"CONDITIONAL ENTRY REJECTED: {symbol} already has an open position ({p.get('positionAmt')}); "
+                           "a resting entry cannot share the symbol with it.")
+    return True, None
+
+
+def uses_mcp_gateway(target_env=None):
+    """True when orders route through the Binance Agentic MCP gateway (get_client_config auth-mode detection).
+    On a detection error returns True: the quantity-based reduce-only stop it implies is valid in both modes."""
+    try:
+        return get_client_config(target_env)[0] == "MCP_OAUTH_ACTIVE"
+    except Exception:
+        return True
+
+
+def _is_immediate_trigger(res):
+    """Binance -2021 'Order would immediately trigger' (the stop price is already crossed)."""
+    if not isinstance(res, dict):
+        return False
+    text = f"{res.get('code', '')} {res.get('msg', '')} {res.get('error', '')}".lower()
+    return '-2021' in text or 'immediately trigger' in text
+
+
+def _market_order_accepted(res):
+    if not isinstance(res, dict) or 'orderId' not in res or _is_api_error(res):
+        return False
+    status = str(res.get('status', '')).upper()
+    return status in ('', 'FILLED', 'NEW', 'PARTIALLY_FILLED')
+
+
+def _wait_until_flat(symbol, is_long, target_env=None, retry_delays=STOP_VERIFY_RETRY_DELAYS):
+    """Progressive check that no position in the given direction remains on symbol."""
+    for delay in (0.0,) + tuple(retry_delays):
+        if delay:
+            time.sleep(delay)
+        try:
+            pos_res = send_signed_request('GET', '/fapi/v2/positionRisk', {'symbol': symbol}, target_env=target_env)
+        except Exception:
+            continue
+        if not isinstance(pos_res, list):
+            continue
+        if not any(isinstance(p, dict) and str(p.get('symbol', symbol)).upper() == symbol and
+                   ((_to_float(p.get('positionAmt')) > 0) if is_long else (_to_float(p.get('positionAmt')) < 0))
+                   for p in pos_res):
+            return True
+    return False
+
+
+def _cancel_symbol_orders(symbol, target_env=None):
+    """Cancels every open order and algo order of a FLAT symbol (leftover stops, TPs). Returns a list of errors."""
+    errors = []
+    try:
+        res = send_signed_request('DELETE', '/fapi/v1/allOpenOrders', {'symbol': symbol}, target_env=target_env)
+        if isinstance(res, dict) and _is_api_error(res):
+            errors.append(f"allOpenOrders: {res}")
+    except Exception as e:
+        errors.append(f"allOpenOrders: {e}")
+    try:
+        algos = send_signed_request('GET', '/fapi/v1/openAlgoOrders', {'symbol': symbol}, target_env=target_env)
+    except Exception as e:
+        algos = {"error": str(e)}
+    if not isinstance(algos, list):
+        return errors + [f"openAlgoOrders: {algos}"]
+    for ao in algos:
+        aid = _order_id(ao) if isinstance(ao, dict) else None
+        if aid is None:
+            continue
+        try:
+            res = send_signed_request('DELETE', '/fapi/v1/algoOrder', {'symbol': symbol, 'algoId': aid}, target_env=target_env)
+        except Exception as e:
+            res = {"error": str(e)}
+        if isinstance(res, dict) and _is_api_error(res):
+            errors.append(f"algo {aid}: {res}")
+    return errors
+
+
+def protect_pending_entries(target_env=None, dry_run=False, keys=None):
+    """
+    Strictly risk-reducing follow-up of logs/pending_entries.json (never opens or increases a position).
+    For every record of target_env (only `keys` when given):
+      - filled (position in the entry direction): ensure a verified protective stop, NEVER loosening one:
+          * no stop at all -> place the planned SL (closePosition); if it cannot be verified, cancel the entry and
+            close the position reduce-only (auto-destruct);
+          * every existing stop looser than the plan (e.g. the 2.5% orphan heal) -> replace with the planned SL,
+            place-then-cancel;
+          * an existing stop at or tighter than the plan (trailing, break-even) -> kept; when a partial LIMIT fill
+            grew beyond the quantity covered (or once when the coverage is unknown, i.e. no sl_qty yet), it is
+            resized place-then-cancel at that tighter price for the full current size.
+          A replace/resize that cannot be verified keeps the existing stop(s) (no auto-destruct) and is retried.
+          If the planned SL is already crossed (mark beyond it, or -2021 on placement), the position is closed
+          reduce-only at MARKET without cancelling existing stops first; leftovers are cancelled only once flat.
+        Once the entry order is gone, TP1/TP2 are placed reduce-only from the ACTUAL position size (idempotent:
+        placed TP ids are saved first and only a missing TP is retried), an audit record is appended and the record
+        dropped. A partially filled LIMIT keeps its record (remainder cancelled at expiry, TPs on a later run).
+      - not filled and still open: cancelled once expires_at_ts is reached, else kept.
+      - not filled and no longer open: marked missing_since_ts and dropped only if still so on a run at least
+        PENDING_MISSING_GRACE_SECONDS later (positionRisk can lag behind a trigger).
+    Any query error keeps the record (fail closed). dry_run reports the decisions without any write.
+    Returns {"ok", "env", "dry_run", "actions": [{"type", "key", "symbol", "success", "dry_run", "detail"}],
+             "errors": [{"key", "symbol", "stage", "error"}]}
+    with action types pending_protect_sl | pending_tp_placed | pending_abort | pending_timeout_cancel | pending_dropped |
+    pending_sl_crossed_close.
+    """
+    dry_run = _truthy(dry_run)
+    out = {"ok": False, "env": None, "dry_run": dry_run, "actions": [], "errors": []}
+    try:
+        target_env = resolve_env(target_env)
+    except ValueError as e:
+        out["errors"].append({"key": None, "symbol": None, "stage": "env", "error": str(e)})
+        return out
+    out["env"] = target_env
+    entries, err = load_pending_entries()
+    if err:
+        out["errors"].append({"key": None, "symbol": None, "stage": "registry", "error": err})
+        return out
+    now = int(time.time())
+    for key in sorted(entries):
+        rec = entries[key]
+        if keys is not None and key not in keys:
+            continue
+        if not isinstance(rec, dict) or rec.get('target_env') != target_env:
+            continue
+        try:
+            _protect_pending_entry(key, rec, target_env, dry_run, now, out)
+        except Exception as e:
+            out["errors"].append({"key": key, "symbol": rec.get('symbol'), "stage": "exception",
+                                  "error": f"{type(e).__name__}: {e}"})
+    out["ok"] = not out["errors"]
+    return out
+
+
+def _protect_pending_entry(key, rec, target_env, dry_run, now, out):
+    sym = str(rec['symbol']).upper()
+    kind = 'STOP_MARKET' if str(rec.get('kind', '')).upper() == 'STOP_MARKET' else 'LIMIT'
+    entry_id = str(rec['entry_id'])
+    is_long = str(rec.get('direction', '')).upper() == 'LONG'
+    direction = 'LONG' if is_long else 'SHORT'
+    exit_side = 'SELL' if is_long else 'BUY'
+    sl_p = float(rec['sl_price'])
+    expires = _to_float(rec.get('expires_at_ts'))
+
+    def act(action_type, success, **detail):
+        if dry_run:
+            success = False
+            detail.setdefault('planned', True)
+        out["actions"].append({"type": action_type, "key": key, "symbol": sym, "success": bool(success),
+                               "dry_run": dry_run, "detail": detail})
+
+    def fail(stage, error):
+        out["errors"].append({"key": key, "symbol": sym, "stage": stage, "error": str(error)})
+
+    def drop():
+        if not dry_run:
+            update_pending_entries(lambda entries: entries.pop(key, None))
+
+    def save(**fields):
+        """Updates the registry record (a None value removes the field). No-op in dry run."""
+        def mutate(entries):
+            if isinstance(entries.get(key), dict):
+                for k, v in fields.items():
+                    if v is None:
+                        entries[key].pop(k, None)
+                    else:
+                        entries[key][k] = v
+        if not dry_run:
+            update_pending_entries(mutate)
+
+    # Open orders first, then positions: a trigger between the two reads shows up as a position.
+    orders_ep = '/fapi/v1/openAlgoOrders' if kind == 'STOP_MARKET' else '/fapi/v1/openOrders'
+    open_res = send_signed_request('GET', orders_ep, {'symbol': sym}, target_env=target_env)
+    if not isinstance(open_res, list):
+        return fail("orders_query", f"{orders_ep} query failed: {open_res}")
+    entry_open = any(isinstance(o, dict) and str(_order_id(o)) == entry_id for o in open_res)
+    pos_res = send_signed_request('GET', '/fapi/v2/positionRisk', {'symbol': sym}, target_env=target_env)
+    if not isinstance(pos_res, list):
+        return fail("position_query", f"Position query failed: {pos_res}")
+    position = None
+    for p in pos_res:
+        if not isinstance(p, dict) or str(p.get('symbol', sym)).upper() != sym:
+            continue
+        amt = _to_float(p.get('positionAmt'))
+        if (amt > 0) if is_long else (amt < 0):
+            position = p
+            break
+
+    # The entry (or a position) is visible again: clear a previous "missing" mark.
+    if rec.get('missing_since_ts') is not None and (entry_open or position is not None):
+        save(missing_since_ts=None)
+
+    # --- Not filled ---------------------------------------------------------
+    if position is None:
+        if not entry_open:
+            # positionRisk can lag behind a trigger: drop only if still missing on a run >= the grace period later.
+            since = rec.get('missing_since_ts')
+            if since is None:
+                save(missing_since_ts=now)
+                return None
+            if now - _to_float(since) < PENDING_MISSING_GRACE_SECONDS:
+                return None
+            act("pending_dropped", True, reason="entry_not_open_no_position", kind=kind, entry_id=entry_id,
+                missing_since_ts=since,
+                message="Entry no longer open and no position: cancelled or expired outside the desk.")
+            return drop()
+        if now < expires:
+            return None
+        if dry_run:
+            return act("pending_timeout_cancel", False, kind=kind, entry_id=entry_id, expires_at_ts=expires)
+        ok, res = cancel_resting_entry(sym, kind, entry_id, target_env=target_env)
+        act("pending_timeout_cancel", ok, kind=kind, entry_id=entry_id, expires_at_ts=expires, result=res)
+        if not ok:
+            return fail("timeout_cancel", f"Cancel of expired entry {entry_id} failed: {res}")
+        return drop()
+
+    # --- Filled (fully or partially): planned Stop Loss first ----------------
+    qty_str = str(position.get('positionAmt')).strip().lstrip('-')
+    qty = abs(_to_float(position.get('positionAmt')))
+    entry_px = _to_float(position.get('entryPrice')) or _to_float(rec.get('trigger_or_limit_price'))
+    filters = get_symbol_filters(sym, target_env=target_env)
+    tick = filters.get('tickSize') if filters else None
+    tol = max(_to_float(tick) * 1.01, abs(sl_p) * 0.0005)
+
+    stops, err = get_open_stop_orders(sym, exit_side, target_env=target_env)
+    if err:
+        return fail("stops_query", err)
+    # Never loosen: the reference is the TIGHTEST existing protective stop (trailing / break-even may have moved it).
+    tightest = tightest_stop(stops, is_long)
+    ex_p = _trigger_price(tightest) if tightest else None
+    covered = _to_float(rec.get('sl_qty'))
+    if not stops:
+        mode, target_p, old_stops = 'place', sl_p, []
+    elif abs(ex_p - sl_p) > tol and is_tighter_stop(sl_p, ex_p, is_long):
+        mode, target_p, old_stops = 'replace', sl_p, stops   # every stop looser than plan (e.g. 2.5% orphan heal)
+    elif not covered or qty > covered * 1.000001:
+        # Kept (tighter) stop, resized place-then-cancel at ITS price for the full current size when the partial fill
+        # grew, or once when its coverage is unknown (a stop not placed here, e.g. an MCP orphan heal sized
+        # reduce-only for a partial fill); sl_qty is then the baseline.
+        mode, target_p, old_stops = 'resize', ex_p, stops
+    else:
+        mode, target_p, old_stops = None, ex_p, []           # existing stop at or tighter than plan: keep it
+    sl_stop = stop_summary(tightest) if tightest else None
+    mark_p = _to_float(position.get('markPrice'))
+
+    def crossed_close(reason, placement=None):
+        """The planned SL is already crossed: close reduce-only at MARKET for the actual size WITHOUT cancelling the
+        existing stops first; only once flat are leftover stops/TPs and the entry remainder cancelled."""
+        detail = dict(reason=reason, planned_sl_price=sl_p, mark_price=mark_p or None, quantity=qty,
+                      kept_stops=[stop_summary(s) for s in stops], placement=placement)
+        if dry_run:
+            return act("pending_sl_crossed_close", False, **detail)
+        try:
+            close = send_signed_request('POST', '/fapi/v1/order', {'symbol': sym, 'side': exit_side, 'type': 'MARKET',
+                                                                  'quantity': qty, 'reduceOnly': 'true'}, target_env=target_env)
+        except Exception as e:
+            close = {"error": str(e)}
+        flat = _market_order_accepted(close) and _wait_until_flat(sym, is_long, target_env)
+        if not flat:
+            act("pending_sl_crossed_close", False, close=close, flat=False, **detail)
+            return fail("sl_crossed_close", f"Planned SL {sl_p} crossed for {sym} but the reduce-only close was not "
+                                            f"confirmed flat ({close}); existing stop(s) and record kept.")
+        entry_cancel_ok, entry_cancel_res = (cancel_resting_entry(sym, kind, entry_id, target_env=target_env)
+                                             if entry_open else (True, None))
+        cleanup_errors = _cancel_symbol_orders(sym, target_env)
+        act("pending_sl_crossed_close", True, close=close, flat=True, entry_cancelled=entry_cancel_ok if entry_open else None,
+            cleanup_errors=cleanup_errors, **detail)
+        for ce in cleanup_errors:
+            fail("sl_crossed_cleanup", ce)
+        if not entry_cancel_ok:
+            return fail("sl_crossed_entry_cancel", f"Position closed but the resting entry {entry_id} could not be "
+                                                   f"cancelled ({entry_cancel_res}); record kept.")
+        return drop()
+
+    if mode in ('place', 'replace') and mark_p > 0 and ((mark_p <= sl_p) if is_long else (mark_p >= sl_p)):
+        return crossed_close("mark_beyond_planned_sl")
+
+    if mode and dry_run:
+        act("pending_protect_sl", False, mode=mode, sl_price=target_p, planned_sl_price=sl_p, quantity=qty,
+            old_stops=[stop_summary(s) for s in stops])
+    elif mode:
+        cancelled_old = []
+        if mode == 'place':
+            try:
+                placement = place_algo_stop_loss(sym, exit_side, target_p, target_env=target_env)
+            except Exception as e:
+                placement = {"error": f"placement exception: {e}"}
+            placed_id = _order_id(placement) if isinstance(placement, dict) else None
+            verified, info = wait_for_stop_confirmation(sym, exit_side, target_p, algo_id=placed_id, tick_size=tick,
+                                                        target_env=target_env)
+            new_stop = stop_summary(info) if verified else None
+        else:
+            rep = replace_protective_stop(sym, exit_side, target_p, qty_str, old_stops, target_env=target_env, tick_size=tick)
+            placement, verified, new_stop = rep.get('placement'), bool(rep.get('success')), rep.get('new_stop')
+            cancelled_old = rep.get('cancelled_old_stop_ids', [])
+            for ce in rep.get('cancel_errors', []):
+                fail("protect_sl_cancel_old", ce)
+        act("pending_protect_sl", verified, mode=mode, sl_price=target_p, planned_sl_price=sl_p, quantity=qty,
+            verified=verified, new_stop=new_stop, cancelled_old_stop_ids=cancelled_old, placement=placement,
+            coverage_unknown=(mode == 'resize' and not covered))
+        if not verified and mode in ('place', 'replace') and _is_immediate_trigger(placement):
+            return crossed_close("sl_rejected_would_immediately_trigger", placement)
+        if not verified and mode != 'place':
+            # A verified stop already protects the position and nothing was cancelled: keep it. Never auto-destruct
+            # here (the abort cancels every stop first; a failed close would leave the position with none).
+            return fail("protect_sl", f"{mode} of the stop for {sym} at {target_p} unverified; existing stop(s) kept, "
+                                      "record kept for the next run.")
+        if not verified:
+            # No stop existed and the planned SL cannot be verified: fail-safe auto-destruct.
+            entry_cancel_ok, entry_cancel_res = True, None
+            if entry_open:
+                entry_cancel_ok, entry_cancel_res = cancel_resting_entry(sym, kind, entry_id, target_env=target_env)
+            abort = emergency_abort_market_close(sym, exit_side, qty, target_env=target_env)
+            log_emergency_abort(sym, direction, qty, sl_p, placement, abort, target_env)
+            act("pending_abort", abort.get("confirmed"), reason="planned_sl_unverified", quantity=qty, abort_exit=abort,
+                entry_cancelled=entry_cancel_ok if entry_open else None)
+            if not abort.get("confirmed"):
+                return fail("abort", f"Planned SL unverified and auto-destruct NOT confirmed for {sym} ({abort.get('order')}).")
+            if not entry_cancel_ok:
+                return fail("abort_entry_cancel", f"Position closed but the resting entry {entry_id} could not be "
+                                                  f"cancelled ({entry_cancel_res}); record kept.")
+            return drop()
+        sl_stop = new_stop
+        save(sl_qty=qty, sl_algo_id=(new_stop or {}).get('algo_id'))
+
+    if entry_open:
+        # Partial LIMIT fill: keep the record; at expiry cancel the remainder (TPs once the entry is gone).
+        if now >= expires:
+            if dry_run:
+                act("pending_timeout_cancel", False, kind=kind, entry_id=entry_id, expires_at_ts=expires, partial_fill=True)
+            else:
+                ok, res = cancel_resting_entry(sym, kind, entry_id, target_env=target_env)
+                act("pending_timeout_cancel", ok, kind=kind, entry_id=entry_id, expires_at_ts=expires,
+                    partial_fill=True, result=res)
+                if not ok:
+                    fail("timeout_cancel", f"Cancel of partially filled entry {entry_id} failed: {res}")
+        return None
+    if mode and dry_run:
+        return None  # TPs are planned once the SL is actually verified
+
+    # --- Entry fully done: take profits from the ACTUAL position size (idempotent) ----------
+    tp1_p, tp2_p = _to_float(rec.get('tp1_price')), _to_float(rec.get('tp2_price'))
+    ids = {'tp1_order_id': rec.get('tp1_order_id'), 'tp2_order_id': rec.get('tp2_order_id')}
+    if rec.get('tp1_qty') is not None and rec.get('tp2_qty') is not None:
+        tp1_qty, tp2_qty = _to_float(rec['tp1_qty']), _to_float(rec['tp2_qty'])   # split fixed on the first attempt
+    elif not filters:
+        return fail("filters", f"Symbol filters unavailable for {sym}; TPs deferred to the next run.")
+    else:
+        tp1_qty, tp2_qty = split_take_profit_quantities(qty, filters, entry_px)
+    if not rec.get('tp_placed'):
+        need1 = tp1_qty > 0 and ids['tp1_order_id'] is None
+        need2 = tp2_qty > 0 and ids['tp2_order_id'] is None
+        if dry_run:
+            return act("pending_tp_placed", False, tp1_price=tp1_p, tp1_qty=tp1_qty, tp2_price=tp2_p, tp2_qty=tp2_qty,
+                       quantity=qty, place_tp1=need1, place_tp2=need2)
+        retried = ids['tp1_order_id'] is not None or ids['tp2_order_id'] is not None
+        o1, o2 = place_take_profit_orders(sym, exit_side, tp1_p, tp2_p, tp1_qty if need1 else 0, tp2_qty if need2 else 0,
+                                          target_env=target_env)
+        for name, order in (('tp1_order_id', o1), ('tp2_order_id', o2)):
+            if isinstance(order, dict) and 'orderId' in order and not _is_api_error(order):
+                ids[name] = order['orderId']
+        tp_ok = (tp1_qty <= 0 or ids['tp1_order_id'] is not None) and (tp2_qty <= 0 or ids['tp2_order_id'] is not None)
+        # Persist what was placed BEFORE anything else, so a later run never duplicates a TP.
+        save(tp1_qty=tp1_qty, tp2_qty=tp2_qty, tp_placed=tp_ok, **ids)
+        act("pending_tp_placed", tp_ok, tp1_price=tp1_p, tp1_qty=tp1_qty, tp2_price=tp2_p, tp2_qty=tp2_qty, quantity=qty,
+            retried=retried, record_dropped=tp_ok, **ids)
+        if not tp_ok:
+            return fail("take_profit", f"TP placement failed for {sym} (tp1={o1}, tp2={o2}); SL is in place, only the "
+                                       "missing TP is retried next run.")
+    if dry_run:
+        return None
+    if not rec.get('audit_done'):
+        record = {
+            'timestamp': int(time.time()),
+            'symbol': sym,
+            'direction': direction,
+            'leverage': rec.get('leverage'),
+            'entry_price': entry_px,
+            'total_qty': qty,
+            'sl_price': target_p,
+            'sl_verified': True,
+            'sl_algo_id': (sl_stop or {}).get('algo_id'),
+            'tp1_price': tp1_p,
+            'tp2_price': tp2_p,
+            'tp1_qty': tp1_qty,
+            'tp2_qty': tp2_qty,
+            'is_yolo': bool(rec.get('is_yolo')),
+            'entry_order_id': rec.get('entry_id'),
+            'sl_order': sl_stop,
+            'tp1_order_id': ids['tp1_order_id'],
+            'tp2_order_id': ids['tp2_order_id'],
+            'target_env': target_env,
+            'pending_entry_key': key,
+        }
+        try:
+            append_trade_audit_record(record, rec.get('margin_usdt'))
+        except Exception as e:
+            return fail("audit", f"Audit append failed ({e}); record kept, only the audit/drop is retried.")
+        save(audit_done=True)
+    return drop()
+
+
 def execute_complete_trade(
     symbol,
     direction,
@@ -1602,6 +2249,23 @@ def execute_complete_trade(
     if tp2_price is None or float(tp2_price) <= 0:
         tp2_price = effective_entry * (1.0 + 0.06) if is_long else effective_entry * (1.0 - 0.06)
 
+    # 1b. Pending resting entries (Issue #33, PROD): no new entry of any type on a symbol with a pending resting
+    # entry (or an unreadable registry). An untriggered STOP_MARKET or a LIMIT entry rests on the book and only gets
+    # its SL/TPs on fill (--protect-pending / position guardian loop). Checked before any write.
+    if is_prod:
+        pend_ok, pend_err = check_pending_entry_conflict(symbol, target_env)
+        if not pend_ok:
+            return {"success": False, "hard_gate_rejection": True, "error": pend_err}
+    resting_kind = None
+    if str(order_type).upper() == 'STOP_MARKET' and trigger_p is not None and not trigger_breached:
+        resting_kind = 'STOP_MARKET'
+    elif str(order_type).upper() == 'LIMIT' and limit_price and (trigger_p is None or trigger_breached):
+        resting_kind = 'LIMIT'
+    if resting_kind and is_prod:
+        rest_ok, rest_err = check_resting_entry_gates(symbol, target_env)
+        if not rest_ok:
+            return {"success": False, "hard_gate_rejection": True, "error": rest_err}
+
     # 2. Configure Isolated margin and leverage first (Fail-Closed & Auto-Clamp for Subaccounts)
     setup_res = setup_margin_and_leverage(symbol, leverage, target_env=target_env)
     confirmed_leverage = leverage
@@ -1654,41 +2318,56 @@ def execute_complete_trade(
 
     # 5. Split TPs asymmetrically (30% TP1 / 70% TP2) to preserve positive right-tail skewness
     # and prevent premature profit truncation.
-    tp1_qty = round_step(total_qty * 0.30, filters['stepSize'], filters['precision_qty'])
-    if tp1_qty < filters['minQty']:
-        tp1_qty = filters['minQty']
-    if tp1_qty * cur_price < min_notional:
-        needed_qty = round_step(math.ceil(min_notional / cur_price / filters['stepSize']) * filters['stepSize'], filters['stepSize'], filters['precision_qty'])
-        if needed_qty < total_qty:
-            tp1_qty = needed_qty
-
-    tp2_qty = round_step(total_qty - tp1_qty, filters['stepSize'], filters['precision_qty'])
-    if tp2_qty < filters['minQty']:
-        # Fallback to 50/50 if position size is too small to split 30/70 while respecting minQty
-        tp1_qty = round_step(total_qty / 2, filters['stepSize'], filters['precision_qty'])
-        tp2_qty = round_step(total_qty - tp1_qty, filters['stepSize'], filters['precision_qty'])
+    tp1_qty, tp2_qty = split_take_profit_quantities(total_qty, filters, cur_price)
 
     # 6. Round SL and TP prices
     sl_p = round_price(sl_price, filters['tickSize'], filters['precision_price'])
     tp1_p = round_price(tp1_price, filters['tickSize'], filters['precision_price'])
     tp2_p = round_price(tp2_price, filters['tickSize'], filters['precision_price'])
 
+    def register_or_cancel(kind, entry_id, price):
+        """Records the resting entry for post-fill protection; if that fails the entry is cancelled (fail closed)."""
+        try:
+            key, rec = register_resting_entry(
+                kind, entry_id, symbol, direction, entry_side, exit_side, target_env, price, total_qty,
+                sl_p, tp1_p, tp2_p, effective_leverage, is_yolo, margin_usdt)
+            return key, rec, None
+        except Exception as e:
+            cancelled, cancel_res = cancel_resting_entry(symbol, kind, entry_id, target_env=target_env)
+            state = "the entry was cancelled" if cancelled else "CANCEL ALSO FAILED: cancel it manually now"
+            return None, None, {
+                "success": False,
+                "pending_registry_failure": True,
+                "orderId": entry_id,
+                "entry_cancelled": cancelled,
+                "cancel_result": cancel_res,
+                "error": (f"FAIL-CLOSED: {kind} entry {entry_id} for {symbol} was placed but could not be registered "
+                          f"for post-fill protection in logs/pending_entries.json ({e}); {state}."),
+            }
+
     # 7. Technical Trigger Validation (Confirmation breakout)
     # (trigger_p / trigger_breached were computed with the effective entry, before sizing and gates)
     if trigger_p is not None:
         if not trigger_breached:
             if order_type.upper() == 'STOP_MARKET':
+                # Conditional orders must use the Algo Order API (POST /fapi/v1/order rejects them with -4120).
+                # closePosition='false' + quantity: an opening order, never reduce-only.
                 entry_params = {
+                    'algoType': 'CONDITIONAL',
                     'symbol': symbol,
                     'side': entry_side,
                     'type': 'STOP_MARKET',
-                    'stopPrice': trigger_p,
+                    'triggerPrice': trigger_p,
                     'quantity': total_qty,
-                    'closePosition': 'false'
+                    'closePosition': 'false',
+                    'workingType': 'CONTRACT_PRICE'
                 }
-                cond_order = send_signed_request('POST', '/fapi/v1/order', entry_params, target_env=target_env)
-                order_id = cond_order.get('algoId') or cond_order.get('orderId') if isinstance(cond_order, dict) else None
+                cond_order = send_signed_request('POST', '/fapi/v1/algoOrder', entry_params, target_env=target_env)
+                order_id = _order_id(cond_order) if isinstance(cond_order, dict) and not _is_api_error(cond_order) else None
                 if order_id:
+                    key, rec, failure = register_or_cancel('STOP_MARKET', order_id, trigger_p)
+                    if failure:
+                        return failure
                     return {
                         "success": True,
                         "conditional_entry": True,
@@ -1697,7 +2376,12 @@ def execute_complete_trade(
                         "direction": str(direction).upper(),
                         "trigger_price": trigger_p,
                         "cur_price": cur_price,
-                        "message": f"Conditional STOP_MARKET order placed at {trigger_p}. Will trigger upon institutional wick breakout. SL/TP deferred to fill."
+                        "quantity": total_qty,
+                        "pending_entry_key": key,
+                        "expires_at_ts": rec['expires_at_ts'],
+                        "message": (f"Conditional STOP_MARKET entry placed at {trigger_p} (algo order {order_id}). "
+                                    "Its SL/TPs are placed on fill by `execute_futures_trade.py --protect-pending` / the "
+                                    f"position guardian loop; unfilled after {PENDING_ENTRY_TIMEOUT_SECONDS // 60} min it is cancelled.")
                     }
                 else:
                     return {"success": False, "error": f"Failed to place conditional order: {cond_order}"}
@@ -1730,9 +2414,14 @@ def execute_complete_trade(
     if not isinstance(entry_order, dict) or 'orderId' not in entry_order:
         return {"success": False, "error": f"Entry order failed: {entry_order}"}
 
-    # Protection against premature reduceOnly orders on resting LIMIT orders (Finding 9)
-    if order_type.upper() == 'LIMIT' and entry_order.get('status') == 'NEW':
-        return {
+    # Protection against premature reduceOnly orders on resting LIMIT orders (Finding 9). A PARTIALLY_FILLED LIMIT
+    # still rests too: it is registered and its partial position gets the planned SL right away (TPs once filled).
+    entry_status = str(entry_order.get('status', '')).upper()
+    if order_type.upper() == 'LIMIT' and entry_status in ('NEW', 'PARTIALLY_FILLED'):
+        key, rec, failure = register_or_cancel('LIMIT', entry_order.get('orderId'), lim_p)
+        if failure:
+            return failure
+        result = {
             "success": True,
             "pending_limit_entry": True,
             "orderId": entry_order.get('orderId'),
@@ -1740,9 +2429,78 @@ def execute_complete_trade(
             "direction": str(direction).upper(),
             "limit_price": lim_p,
             "quantity": total_qty,
-            "status": "NEW",
-            "message": f"LIMIT order placed at {lim_p} (order ID: {entry_order.get('orderId')}). TP reduce-only orders deferred until fill to prevent -2022 rejection."
+            "status": entry_status,
+            "pending_entry_key": key,
+            "expires_at_ts": rec['expires_at_ts'],
+            "message": (f"LIMIT order placed at {lim_p} (order ID: {entry_order.get('orderId')}). SL/TP orders deferred until fill "
+                        "(prevents -2022) and placed on fill by `execute_futures_trade.py --protect-pending` / the position "
+                        f"guardian loop; unfilled after {PENDING_ENTRY_TIMEOUT_SECONDS // 60} min it is cancelled.")
         }
+        if entry_status == 'PARTIALLY_FILLED':
+            entry_id = entry_order.get('orderId')
+            head = f"LIMIT order PARTIALLY_FILLED at {lim_p} (order ID: {entry_id}). "
+            exec_qty = _to_float(entry_order.get('executedQty'))
+            if exec_qty > 0:
+                # Protect the filled part NOW from the entry response (no dependency on positionRisk visibility):
+                # closePosition with HMAC keys; quantity-based reduce-only via the MCP gateway (which needs a quantity).
+                try:
+                    sl_order = place_algo_stop_loss(symbol, exit_side, sl_p, target_env=target_env,
+                                                    quantity=exec_qty if uses_mcp_gateway(target_env) else None)
+                except Exception as e:
+                    sl_order = {"error": f"placement exception: {e}"}
+                placed_id = _order_id(sl_order) if isinstance(sl_order, dict) else None
+                sl_ok, sl_info = wait_for_stop_confirmation(symbol, exit_side, sl_p, algo_id=placed_id,
+                                                            tick_size=filters.get('tickSize'), target_env=target_env)
+                result["partial_fill_protection"] = {"executed_qty": exec_qty, "sl_order": sl_order, "verified": sl_ok,
+                                                     "new_stop": stop_summary(sl_info) if sl_ok else None}
+                result["partial_fill_protected"] = sl_ok
+                if not sl_ok:
+                    # Fail-safe auto-destruct: cancel the resting remainder, then close the filled part.
+                    entry_cancel_ok, entry_cancel_res = cancel_resting_entry(symbol, 'LIMIT', entry_id, target_env=target_env)
+                    abort_exit = emergency_abort_market_close(symbol, exit_side, exec_qty, target_env=target_env)
+                    log_emergency_abort(symbol, direction, exec_qty, sl_p, sl_order, abort_exit, target_env)
+                    if abort_exit.get("confirmed") and entry_cancel_ok:
+                        try:
+                            update_pending_entries(lambda entries: entries.pop(key, None))
+                        except Exception:
+                            pass  # an unfilled leftover record is dropped by --protect-pending after the grace period
+                    result.update(success=False, emergency_abort=True, abort_exit=abort_exit, entry_cancelled=entry_cancel_ok,
+                                  error=("CRITICAL FAIL-SAFE TRIGGERED: the Stop Loss of the partially filled LIMIT could "
+                                         f"not be confirmed ({sl_order}); remainder cancel ok={entry_cancel_ok}, MARKET close "
+                                         f"confirmed={bool(abort_exit.get('confirmed'))}."))
+                    return result
+                try:
+                    update_pending_entries(lambda entries: entries[key].update(
+                        sl_qty=exec_qty, sl_algo_id=stop_summary(sl_info).get('algo_id')) if key in entries else None)
+                except Exception as e:
+                    result["warnings"] = [f"sl_qty not saved ({e}); --protect-pending re-baselines the stop size."]
+                result["message"] = (head + f"The planned SL protects the filled {exec_qty}; TPs are placed once the entry "
+                                     "is fully filled (--protect-pending / guardian loop).")
+                return result
+            # Fallback (no executedQty in the response): protect from positionRisk, with progressive retries.
+            prot = None
+            for delay in (0.0,) + tuple(STOP_VERIFY_RETRY_DELAYS):
+                if delay:
+                    time.sleep(delay)
+                prot = protect_pending_entries(target_env=target_env, keys=[key])
+                if prot.get("errors") or prot.get("actions"):
+                    break
+            actions = prot.get("actions", []) if isinstance(prot, dict) else []
+            result["partial_fill_protection"] = prot
+            result["partial_fill_protected"] = any(a.get("type") == "pending_protect_sl" and a.get("success") for a in actions)
+            tps_placed = any(a.get("type") == "pending_tp_placed" and a.get("success") for a in actions)
+            if any(a.get("type") in ("pending_abort", "pending_sl_crossed_close") for a in actions):
+                result.update(success=False, emergency_abort=True,
+                              error=("CRITICAL FAIL-SAFE TRIGGERED: the Stop Loss of the partially filled LIMIT could not be "
+                                     "kept; the position was closed at MARKET (see partial_fill_protection)."))
+            else:
+                result["message"] = (head
+                                     + ("The planned SL protects the position; " if result["partial_fill_protected"] else
+                                        "WARNING: the partial position is not protected yet (executedQty missing and no "
+                                        "position visible; the guardian loop retries); ")
+                                     + ("the entry already filled completely and the TPs were placed."
+                                        if tps_placed else "TPs are placed once the entry is fully filled."))
+        return result
 
     actual_entry_price = float(entry_order.get('avgPrice', cur_price))
     if actual_entry_price == 0:
@@ -1778,39 +2536,10 @@ def execute_complete_trade(
                 "abort_exit": abort_exit
             }
 
-        # 10. Execute TP1 (LIMIT, 30% position, Reduce-Only)
-        tp1_order = None
-        if tp1_qty > 0:
-            tp1_params = {
-                'symbol': symbol,
-                'side': exit_side,
-                'type': 'LIMIT',
-                'price': tp1_p,
-                'quantity': tp1_qty,
-                'timeInForce': 'GTC',
-                'reduceOnly': 'true'
-            }
-            tp1_order = send_signed_request('POST', '/fapi/v1/order', tp1_params, target_env=target_env)
-
-        # 11. Execute TP2 (LIMIT, 70% position remaining, Reduce-Only)
-        tp2_order = None
-        if tp2_qty > 0:
-            tp2_params = {
-                'symbol': symbol,
-                'side': exit_side,
-                'type': 'LIMIT',
-                'price': tp2_p,
-                'quantity': tp2_qty,
-                'timeInForce': 'GTC',
-                'reduceOnly': 'true'
-            }
-            tp2_order = send_signed_request('POST', '/fapi/v1/order', tp2_params, target_env=target_env)
+        # 10-11. TP1 (LIMIT, 30% position) and TP2 (LIMIT, 70% remaining), both Reduce-Only
+        tp1_order, tp2_order = place_take_profit_orders(symbol, exit_side, tp1_p, tp2_p, tp1_qty, tp2_qty, target_env=target_env)
 
         # Log to local audit ledger with canonical provenance and atomic writing
-        log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'logs')
-        os.makedirs(log_dir, exist_ok=True)
-        audit_file = os.path.join(log_dir, 'trades_audit.jsonl')
-        
         record = {
             'timestamp': int(time.time()),
             'symbol': symbol,
@@ -1832,20 +2561,7 @@ def execute_complete_trade(
             'tp2_order_id': tp2_order.get('orderId') if isinstance(tp2_order, dict) else None,
             'target_env': target_env
         }
-
-        try:
-            from provenance_stamp import stamp_trade_record
-            from utils.atomic_writer import atomic_append_jsonl
-            record = stamp_trade_record(
-                record,
-                evaluator="isolated_market_evaluator",
-                strategy="microstructure_wick_reversion",
-                sizing_model=f"volatility_parity_margin_{margin_usdt}"
-            )
-            atomic_append_jsonl(audit_file, record)
-        except Exception:
-            with open(audit_file, 'a', encoding='utf-8') as f:
-                f.write(json.dumps(record) + "\n")
+        append_trade_audit_record(record, margin_usdt)
 
         return {
             "success": True,
@@ -2332,6 +3048,7 @@ def main():
     parser.add_argument("--close-position", "--close_position", action="store_true", dest="close_position", help="Close open position at market with reduceOnly")
     parser.add_argument("--audit-orphans", "--audit_orphans", action="store_true", dest="audit_orphans", help="Audit all open positions for missing Stop Loss")
     parser.add_argument("--auto-heal", "--auto_heal", action="store_true", dest="auto_heal", help="Audit and automatically heal orphan positions lacking Stop Loss")
+    parser.add_argument("--protect-pending", "--protect_pending", action="store_true", dest="protect_pending", help="Place the planned SL/TPs of filled resting entries (logs/pending_entries.json); cancel expired ones")
     parser.add_argument("--positions", action="store_true", help="Read-only list of open positions with attached SL/TP orders")
     parser.add_argument("--move-breakeven", "--move_breakeven", action="store_true", dest="move_breakeven", help="Move the Stop Loss of --symbol to True Net Break-Even (place-then-cancel)")
     parser.add_argument("--force", action="store_true", help="With --move-breakeven: override the YOLO-before-TP1 and anti-truncation rules")
@@ -2340,9 +3057,13 @@ def main():
     args = parser.parse_args()
 
     new_modes = [m for m in ("positions", "move_breakeven") if getattr(args, m)]
-    other_modes = [m for m in ("close_position", "audit_orphans", "auto_heal") if getattr(args, m)]
+    other_modes = [m for m in ("close_position", "audit_orphans", "auto_heal", "protect_pending") if getattr(args, m)]
     if new_modes and (len(new_modes) > 1 or other_modes or args.direction):
         print(json.dumps({"success": False, "error": "--positions and --move-breakeven are exclusive modes; they cannot be combined with other modes or --direction."}, indent=2))
+        sys.exit(1)
+        return
+    if args.protect_pending and (len(other_modes) > 1 or args.direction):
+        print(json.dumps({"success": False, "error": "--protect-pending is an exclusive mode; it cannot be combined with other modes or --direction."}, indent=2))
         sys.exit(1)
         return
 
@@ -2375,6 +3096,13 @@ def main():
             for w in res.get("warnings", []):
                 print(f"WARNING: {w}")
         sys.exit(0 if res.get("success") else (2 if res.get("refused") else 1))
+        return
+
+    # 0c. Post-fill protection of resting entries (risk-reducing: never opens or increases a position)
+    if args.protect_pending:
+        res = protect_pending_entries(target_env=target_env)
+        print(json.dumps(res, indent=2))
+        sys.exit(0 if res.get("ok") else 1)
         return
 
     # 1. Close Position

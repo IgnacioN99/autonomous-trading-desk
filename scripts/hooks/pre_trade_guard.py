@@ -26,8 +26,8 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    piped interpreters, curl/wget writes to Binance, unsanctioned scripts importing the engine) are denied.
    Batch deploy scripts and auto-deploy loops are treated as trade openings.
 4. STRUCTURED RISK-REDUCING ACTION PARSING:
-   Requires exact structured flags (--close-position, --auto-heal, --audit-orphans, --move-breakeven with
-   exactly one --symbol, reduceOnly=true), evaluated per shell sub-command. Never matches generic substrings
+   Requires exact structured flags (--close-position, --auto-heal, --audit-orphans, --protect-pending,
+   --move-breakeven with exactly one --symbol, reduceOnly=true), evaluated per shell sub-command. Never matches generic substrings
    like 'close'. `execute_futures_trade.py --positions` is read-only (ask). The position guardian loop never
    opens positions: bounded runs (--once / --dry-run) are allowed, long-running ones require confirmation.
 5. FAIL-CLOSED SESSION STATE & STALENESS CHECK:
@@ -236,7 +236,7 @@ RISK_FLAG_SCRIPTS_RE = re.compile(
     r"\b(?:execute_futures_trade|trading_doctor|night_cutoff_loop|record_evaluation|climax_watcher_loop|user_profile)(?:\.py)?\b"
 )
 RISK_REDUCING_FLAGS = {"--close-position", "--close_position", "--auto-heal", "--auto_heal",
-                       "--audit-orphans", "--audit_orphans", "--heal"}
+                       "--audit-orphans", "--audit_orphans", "--heal", "--protect-pending", "--protect_pending"}
 RISK_REDUCING_SCRIPTS_RE = re.compile(
     r"\b(?:night_cutoff_loop|audit_orphan_positions|close_position_market|close_position)\.py\b"
 )
@@ -464,7 +464,7 @@ def is_risk_reducing_action(cmd_or_name: str, args_dict: dict = None) -> bool:
     Verifies whether an action reduces or eliminates risk (NEVER blocked).
     Structured arguments ONLY:
     - MCP: reduceOnly=true, closePosition=true, or cancel / delete operations
-    - CLI: exact --close-position / --auto-heal / --audit-orphans / --heal / --help tokens on scripts whose CLI
+    - CLI: exact --close-position / --auto-heal / --audit-orphans / --protect-pending / --heal / --help tokens on scripts whose CLI
       implements them, `execute_futures_trade.py --move-breakeven` with exactly one --symbol, bounded position
       guardian runs (--once / --dry-run), or dedicated risk-reduction scripts. Batch deploy scripts are never
       risk-reducing.
@@ -953,7 +953,7 @@ def analyze_run_command(command_line: str, cwd: str, base_dir: str) -> Dict[str,
             "using trading primitives (execute_futures_trade, send_signed_request, /fapi/v1 write endpoints, MCP gateway) "
             f"is strictly forbidden. Orders must be routed exclusively through {CHOKE_POINT}; "
             "risk reduction must use the sanctioned CLI flags (--close-position, --move-breakeven, --auto-heal, "
-            "--audit-orphans) or scripts/loops/position_guardian_loop.py."
+            "--audit-orphans, --protect-pending) or scripts/loops/position_guardian_loop.py."
         )
         return result
 
@@ -1128,7 +1128,7 @@ def retired_radar_reason(tool: str) -> str:
         f"and tool '{tool or '?'}' is no longer available. {hint}"
         "Read-only analytics are CLI scripts with --json output (see .agents/skills/market-radar/SKILL.md); "
         f"orders and position management go exclusively through {CHOKE_POINT} "
-        "(--positions, --move-breakeven, --close-position, --audit-orphans, --auto-heal); trailing stops, dead-alpha "
+        "(--positions, --move-breakeven, --close-position, --audit-orphans, --auto-heal, --protect-pending); trailing stops, dead-alpha "
         "and orphan audits run in scripts/loops/position_guardian_loop.py. Remove the stale 'crypto_radar' entry "
         "from your MCP client configuration."
     )

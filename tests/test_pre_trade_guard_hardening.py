@@ -349,6 +349,25 @@ class TestPreTradeGuardHardening(unittest.TestCase):
     def _cmd(self, command_line: str) -> dict:
         return self._run_guard_payload({"toolCall": {"name": "run_command", "args": {"CommandLine": command_line}}})
 
+    def test_structured_cli_protect_pending_flag_allowed(self):
+        """--protect-pending (post-fill SL/TPs of resting entries) is risk-reducing: no dossier / session state needed."""
+        for cmd in ("python3 scripts/execute_futures_trade.py --protect-pending",
+                    "python3 scripts/execute_futures_trade.py --protect-pending --env prod",
+                    "python3 scripts/execute_futures_trade.py --protect_pending --env testnet"):
+            res = self._cmd(cmd)
+            self.assertEqual(res.get("decision"), "allow", cmd)
+            self.assertIn("Risk-reducing", res.get("reason", ""))
+
+    def test_cli_protect_pending_does_not_whitelist_chained_trade(self):
+        """A --protect-pending sub-command never whitelists a trade opening chained before or after it."""
+        for cmd in ("python3 scripts/execute_futures_trade.py --protect-pending && "
+                    "python3 scripts/execute_futures_trade.py --symbol SOLUSDT --direction LONG",
+                    "python3 scripts/execute_futures_trade.py --symbol SOLUSDT --direction LONG --order-type STOP_MARKET "
+                    "--trigger-price 150 ; python3 scripts/execute_futures_trade.py --protect-pending"):
+            res = self._cmd(cmd)
+            self.assertEqual(res.get("decision"), "deny", cmd)
+            self.assertIn("Clean-Room Evaluator Required", res.get("reason", ""))
+
     def test_cli_move_breakeven_with_symbol_allowed(self):
         """--move-breakeven with exactly one --symbol is risk-reducing (no dossier / session state needed)."""
         for cmd in ("python3 scripts/execute_futures_trade.py --move-breakeven --symbol BTCUSDT",

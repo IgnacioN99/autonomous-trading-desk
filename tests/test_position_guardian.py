@@ -186,6 +186,7 @@ class TestGuardianFailSafe(unittest.TestCase):
     def test_network_failure_is_logged_not_raised(self):
         log_dir = tempfile.mkdtemp()
         with patch("execute_futures_trade.send_signed_request", side_effect=OSError("network unreachable")), \
+             patch("execute_futures_trade._workspace_dir", return_value=log_dir), \
              patch.object(pgl, "DEFAULT_LOG_DIR", log_dir):
             code, _ = run_main(["--once", "--env", "testnet"])
         self.assertEqual(code, 1)
