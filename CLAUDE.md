@@ -23,10 +23,13 @@ agy mechanics to Claude Code.
   New or renamed subagents only appear as `subagent_type` values after restarting the Claude Code session.
 - Tool names: `invoke_subagent` = Agent tool (`subagent_type`), `send_message` = the subagent's final
   response, `view_file` = Read, `grep_search` = Grep, `list_dir` = Glob, `search_web` = WebSearch,
-  `read_url_content` = WebFetch, `run_command` = Bash, agy `conversationId` = Claude `agentId`
-  (subagent) or `session_id` (main session).
-- Hooks (`.claude/settings.json`): PreToolUse `pre_trade_guard.py` on Bash, MCP and file writes (deny =
-  exit 2); PostToolUse `post_trade_sync.py` and `post_pr_review_hook.py`; Stop
+  `read_url_content` = WebFetch, `run_command` = Bash (or PowerShell, Claude Code on Windows), file writes =
+  Write / Edit / MultiEdit / NotebookEdit, agy `conversationId` = Claude `agentId` (subagent) or `session_id`
+  (main session).
+- Hooks (`.claude/settings.json`): PreToolUse `pre_trade_guard.py` on Bash, PowerShell, MCP and file writes
+  (Write, Edit, MultiEdit, NotebookEdit; deny = exit 2); PowerShell commands get the same decisions as Bash plus
+  a stricter check on protected paths (only read-only cmdlets such as Get-Content may name them; encoded commands
+  are denied); PostToolUse `post_trade_sync.py` and `post_pr_review_hook.py` (Bash and PowerShell); Stop
   `pr_review_stop_hook.py --claude`. Hooks are fail-closed exactly as in agy: if they are not active,
   live order execution is prohibited.
 

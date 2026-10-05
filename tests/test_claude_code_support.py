@@ -225,11 +225,14 @@ class TestClaudeConfiguration(unittest.TestCase):
         for forbidden in ("/mnt/", "/home/", "C:\\", "Users", "wsl.exe"):
             self.assertNotIn(forbidden, raw)
         pre = self._commands(cfg, "PreToolUse")
-        self.assertTrue(any("pre_trade_guard.py" in c and re.fullmatch(m, "Bash") and re.fullmatch(m, "Write")
-                            and re.fullmatch(m, "mcp__binance__x") for m, c in pre))
+        guarded = ("Bash", "PowerShell", "NotebookEdit", "Write", "Edit", "MultiEdit", "mcp__binance__x")
+        self.assertTrue(any("pre_trade_guard.py" in c and all(re.fullmatch(m, t) for t in guarded) for m, c in pre))
         post = self._commands(cfg, "PostToolUse")
-        self.assertTrue(any("post_trade_sync.py" in c for _, c in post))
-        self.assertTrue(any("post_pr_review_hook.py" in c and re.fullmatch(m, "Bash") for m, c in post))
+        self.assertTrue(any("post_trade_sync.py" in c and all(re.fullmatch(m, t) for t in
+                                                                ("Bash", "PowerShell", "mcp__binance__x"))
+                            for m, c in post))
+        self.assertTrue(any("post_pr_review_hook.py" in c and re.fullmatch(m, "Bash") and re.fullmatch(m, "PowerShell")
+                            for m, c in post))
         stop = self._commands(cfg, "Stop")
         self.assertEqual(len(stop), 1)
         self.assertIn("pr_review_stop_hook.py --claude", stop[0][1])

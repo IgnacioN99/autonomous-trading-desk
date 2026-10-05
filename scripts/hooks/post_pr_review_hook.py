@@ -15,7 +15,7 @@ Failed commands change nothing. Events are logged to logs/pr_hook_events.jsonl.
 
 Contract:
   Input (stdin): agy {toolCall:{name:"run_command", args:{CommandLine}}, conversationId, error?} or
-                 Claude Code {tool_name:"Bash", tool_input:{command}, tool_response, session_id}
+                 Claude Code {tool_name:"Bash"|"PowerShell", tool_input:{command}, tool_response, session_id}
                  (Claude Code only fires PostToolUse on success; failed calls go to PostToolUseFailure).
   Output (stdout): {} (empty JSON object, valid for both runtimes), always with exit code 0.
 """
@@ -91,8 +91,8 @@ def extract_command(payload: dict) -> str:
     args = tool_call.get("args") if isinstance(tool_call.get("args"), dict) else {}
     command_line = args.get("CommandLine", "")
     if not command_line and isinstance(payload.get("tool_input"), dict):
-        # Claude Code PostToolUse payload: only the Bash tool runs shell commands
-        if payload.get("tool_name", "Bash") != "Bash":
+        # Claude Code PostToolUse payload: only the Bash and PowerShell tools run shell commands
+        if payload.get("tool_name", "Bash") not in ("Bash", "PowerShell"):
             return ""
         command_line = payload["tool_input"].get("command", "")
     return command_line if isinstance(command_line, str) else ""
