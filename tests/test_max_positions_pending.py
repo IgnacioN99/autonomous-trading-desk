@@ -223,6 +223,7 @@ class TestGate0ATestsNeverTouchRealLogs(unittest.TestCase):
     ISOLATED_TESTS = [
         "test_max_positions_pending.TestGate0ACountsPendingEntries",
         "test_max_positions_pending.TestGate0ABeforeAnyWrite",
+        "test_pending_entries.TestUnregisteredRestingEntriesGate",
         "test_execute_futures_hardening.TestLeverageCeilingGates",
         "test_execute_futures_hardening.TestDynamicEquityRiskGate",
         "test_execute_futures_hardening.TestAutoDestructAndFailSafe.test_execute_complete_trade_aborts_when_sl_unconfirmed",
