@@ -23,13 +23,54 @@ def fetch_json(url, timeout=6):
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode())
 
-def get_symbol_microstructure(symbol, period="15m", history_limit=30):
+WICK_SUM_EPSILON = 1e-6
+
+def _wick_pcts(o, h, l, c, candle_range):
+    body_top = max(o, c)
+    body_bottom = min(o, c)
+    return ((body_bottom - l) / candle_range) * 100, ((h - body_top) / candle_range) * 100
+
+def candle_wick_pcts(kline):
+    """(lower_wick_pct, upper_wick_pct) of ONE Binance kline [openTime, open, high, low, close, ...], each as a %
+    of that candle's high-low range. Both sides always come from the same candle (issue #20).
+    Zero range (high == low) -> (0.0, 0.0). Invariant: 0 <= each side and lower + upper <= 100; malformed data
+    that breaks it (open/close outside [low, high]) is not emitted as-is: the body is clamped into [low, high]."""
+    o, h, l, c = (float(kline[i]) for i in (1, 2, 3, 4))
+    candle_range = h - l
+    if candle_range <= 0:
+        return 0.0, 0.0
+    lower, upper = _wick_pcts(o, h, l, c, candle_range)
+    if lower + upper > 100.0 + WICK_SUM_EPSILON or lower < -WICK_SUM_EPSILON or upper < -WICK_SUM_EPSILON:
+        o, c = min(max(o, l), h), min(max(c, l), h)
+        lower, upper = _wick_pcts(o, h, l, c, candle_range)
+    return lower, upper
+
+def select_wick_kline(klines, wick_candle_open_time=None):
+    """Kline whose wicks are reported: the one opening at `wick_candle_open_time` (ms) when given, else the last
+    CLOSED candle (klines[-2]; klines[-1] is still forming). Returns (kline, mismatch): mismatch is True when an
+    open time was requested but no kline matches it (fallback to the last closed candle)."""
+    if wick_candle_open_time is not None:
+        for k in klines:
+            try:
+                if int(k[0]) == int(wick_candle_open_time):
+                    return k, False
+            except (TypeError, ValueError):
+                continue
+        return klines[-2], True
+    return klines[-2], False
+
+def get_symbol_microstructure(symbol, period="15m", history_limit=30, wick_candle_open_time=None):
     """
     Queries quantitative order flow metrics over a 30-period rolling window:
     1. Taker Buy/Sell Volume Ratio & Cumulative CVD (Aggressive buyer vs seller taker volume)
     2. Historical Open Interest with Z-Score (Fresh institutional capital vs forced liquidations)
     3. Funding Rate & market premium
     4. Price action and absorption wicks
+
+    Wicks (`lower_wick_pct`/`upper_wick_pct` and the % in `absorption_desc`) come from ONE candle: the kline
+    opening at `wick_candle_open_time` (ms) when given (callers pass the candle they scored, so a candle boundary
+    between their fetch and this one does not shift it), else the last closed candle. If the requested candle is
+    not in this fetch, the last closed candle is used and `wick_candle_mismatch` is True.
     """
     try:
         # 1. Taker Buy/Sell Volume Ratio (30-candle window)
@@ -89,12 +130,9 @@ def get_symbol_microstructure(symbol, period="15m", history_limit=30):
         c_close = float(klines[-1][4])
         p_change_pct = ((c_close - c_open) / c_open) * 100
 
-        # Range and Absorption Wicks
-        candle_range = c_high - c_low if (c_high - c_low) > 0 else 1e-8
-        body_top = max(c_open, c_close)
-        body_bottom = min(c_open, c_close)
-        lower_wick_pct = ((body_bottom - c_low) / candle_range) * 100
-        upper_wick_pct = ((c_high - body_top) / candle_range) * 100
+        # Absorption Wicks: both sides from one candle (the caller's candle, else the last closed one)
+        wick_kline, wick_candle_mismatch = select_wick_kline(klines, wick_candle_open_time)
+        lower_wick_pct, upper_wick_pct = candle_wick_pcts(wick_kline)
 
         # --- QUANTITATIVE REGIME CLASSIFICATION (OI Z-Score >= 1.25σ or Significant Delta) ---
         # Robust filter: Requires statistically anomalous OI change (|Z| >= 1.25 or |ΔOI| >= 0.40%)
@@ -170,6 +208,8 @@ def get_symbol_microstructure(symbol, period="15m", history_limit=30):
             "vwap_deviation_pct": round(vwap_deviation_pct, 2),
             "lower_wick_pct": round(lower_wick_pct, 1),
             "upper_wick_pct": round(upper_wick_pct, 1),
+            "wick_candle_open_time": int(wick_kline[0]),
+            "wick_candle_mismatch": wick_candle_mismatch,
             "regime": regime,
             "regime_desc": regime_desc,
             "absorption": absorption,
