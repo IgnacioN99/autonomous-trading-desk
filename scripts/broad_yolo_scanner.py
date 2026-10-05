@@ -7,6 +7,11 @@ Enforces Nassim Taleb Barbell Convexity:
 - Asymmetric Convex Sizing: isolated margin and leverage from config/user_profile.json
   (yolo_margin_fixed / yolo_equity_pct and leverage_yolo, capped at leverage_ceiling)
 - TP1 (+2.2R) and TP2 (+4.5R) to preserve right-tail convexity
+- Executor gates (issue #64): every long/short row carries `gate_ok` / `gate_failures` from yolo_gate_failures()
+  (level coherence, 0.35% TP1 friction floor, 35%-of-margin YOLO loss cap, TP1 >= 1.8R / TP2 >= 3:1), checked
+  on 6-significant-digit prices with an adverse rounding margin. Gates run on every qualified row before the
+  --top cut; gate-passing rows are listed first (score order within each group), failing rows are flagged; the
+  `recommendation` is the top gate-passing long (or null, slot EMPTY).
 
 Read-only: uses public Binance Futures market data and never places orders.
 
@@ -21,11 +26,13 @@ import json
 import time
 import argparse
 import contextlib
+import math
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from utils.gate_limits import MIN_TP1_DISTANCE, YOLO_MAX_LOSS_MARGIN_FRACTION
 
 BASE_FAPI = "https://fapi.binance.com"
 SUPPORTED_INTERVALS = ("5m", "15m", "1h")
@@ -46,6 +53,17 @@ MAX_RISK_PCT = 5.5
 TP1_R = 2.2
 TP2_R = 4.5
 TRIGGER_BUFFER = 0.0008  # next-candle confirmation trigger beyond the signal candle extreme
+
+# Executor gates applied to every row (yolo_gate_failures). The loss cap (GATE 2, YOLO) and the friction floor
+# (GATE 3) come from scripts/utils/gate_limits.py, the module execute_futures_trade.py enforces.
+# Desk R:R floors measured from the trigger entry: TP1 must reach +1.8R (fees + free trade) and TP2 >= 3:1.
+YOLO_MIN_R_TP1 = 1.8
+YOLO_MIN_RR_TP2 = 3.0
+YOLO_SIG_DIGITS = 6  # levels forwarded to the evaluator are rounded to 6 significant digits (token budget)
+# Adverse margin for the checks on rounded prices: SL moved away from the trigger and TP1/TP2 moved toward it by
+# 0.05% of their price. Covers the 6-significant-digit rounding (<= 0.005%) plus the executor's ROUND_DOWN snap to
+# tickSize, which on memecoin books with few price digits can move a level by a few hundredths of a percent.
+YOLO_ROUNDING_MARGIN = 0.0005
 
 MEME_KEYWORDS = [
     'PEPE', 'DOGE', 'SHIB', 'BONK', 'WIF', 'FLOKI', 'MEME', 'BOME', 'NEIRO',
@@ -248,6 +266,71 @@ def build_levels(r, direction, sizing):
         "atr_pct": r['atr_pct'],
     }
 
+def _sig(x, digits=YOLO_SIG_DIGITS):
+    """Plain float rounded to `digits` significant digits."""
+    return float(f"{float(x):.{digits}g}")
+
+def yolo_gate_failures(row):
+    """Names of the executor gates a LONG or SHORT build_levels() row fails when entered at its trigger
+    (empty list = passes). Pure function; the Barbell volume filter is not part of it.
+
+    Checks run on trigger/SL/TP1/TP2 rounded to YOLO_SIG_DIGITS significant digits (the values forwarded to the
+    evaluator):
+    - coherence: finite levels, LONG 0 < sl < price and sl < trigger < tp1 <= tp2 (SHORT mirrored:
+      price < sl and 0 < tp2 <= tp1 < trigger < sl), leverage >= 1 and margin > 0. Rounded values, no margin.
+    - friction (GATE 3), loss_cap (GATE 2 YOLO), rr_tp1 / rr_tp2 (desk R:R floors): worst case, with the SL moved
+      away from the trigger and TP1/TP2 moved toward it by YOLO_ROUNDING_MARGIN of their price.
+    """
+    try:
+        direction = str(row["direction"]).upper()
+        price = float(row["price"])
+        trigger, sl = _sig(row["trigger"]), _sig(row["sl"])
+        tp1, tp2 = _sig(row["tp1"]), _sig(row["tp2"])
+        leverage, margin = int(row["leverage"]), float(row["margin_usdt"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return ["coherence"]
+
+    finite = all(math.isfinite(v) for v in (price, trigger, sl, tp1, tp2, margin))
+    if direction == "LONG":
+        coherent = finite and 0.0 < sl < price and sl < trigger < tp1 <= tp2
+    elif direction == "SHORT":
+        coherent = finite and 0.0 < price < sl and 0.0 < tp2 <= tp1 < trigger < sl
+    else:
+        coherent = False
+    if not (coherent and leverage >= 1 and margin > 0.0):
+        return ["coherence"]
+
+    m = YOLO_ROUNDING_MARGIN
+    if direction == "LONG":
+        risk = trigger - sl * (1 - m)
+        reward_tp1 = tp1 * (1 - m) - trigger
+        reward_tp2 = tp2 * (1 - m) - trigger
+    else:
+        # SHORT rows are hedge-only (never the recommendation). The executor rounds the trigger DOWN to tickSize
+        # before its gates, which moves a SHORT entry adversely (closer to TP, farther from SL); the SL (and
+        # TP) margin covers that as long as one tick is <= YOLO_ROUNDING_MARGIN (0.05%) of the price.
+        risk = sl * (1 + m) - trigger
+        reward_tp1 = trigger - tp1 * (1 + m)
+        reward_tp2 = trigger - tp2 * (1 + m)
+
+    failures = []
+    if reward_tp1 / trigger < MIN_TP1_DISTANCE:
+        failures.append("friction")
+    if risk / trigger * leverage > YOLO_MAX_LOSS_MARGIN_FRACTION:
+        failures.append("loss_cap")
+    if reward_tp1 / risk < YOLO_MIN_R_TP1:
+        failures.append("rr_tp1")
+    if reward_tp2 / risk < YOLO_MIN_RR_TP2:
+        failures.append("rr_tp2")
+    return failures
+
+def _flag_gates(row):
+    """Adds gate_ok / gate_failures to a build_levels() row (flagged, never dropped)."""
+    failures = yolo_gate_failures(row)
+    row["gate_ok"] = not failures
+    row["gate_failures"] = failures
+    return row
+
 def scan_yolo(target_env, interval="15m", top=5):
     """Runs the full YOLO scan and returns the JSON-ready payload (raises on unrecoverable data errors)."""
     sizing = resolve_yolo_sizing(target_env)
@@ -265,11 +348,18 @@ def scan_yolo(target_env, interval="15m", top=5):
 
     qual_longs = sorted([r for r in results if r['pass_long']], key=lambda x: x['score_long'], reverse=True)
     qual_shorts = sorted([r for r in results if r['pass_short']], key=lambda x: x['score_short'], reverse=True)
-    longs = [build_levels(r, "LONG", sizing) for r in qual_longs[:top]]
-    shorts = [build_levels(r, "SHORT", sizing) for r in qual_shorts[:top]]
+    # Gates run on every qualified row before the top-N cut, so a gate-passing row ranked below N is not lost
+    # (wide-wick top scorers are the most likely to fail the loss cap at high leverage). Gate-passing rows come
+    # first; the sort is stable, so score order is kept within each group. Failing rows still fill the list when
+    # fewer than `top` rows pass.
+    longs = sorted((_flag_gates(build_levels(r, "LONG", sizing)) for r in qual_longs),
+                   key=lambda c: not c["gate_ok"])[:top]
+    shorts = sorted((_flag_gates(build_levels(r, "SHORT", sizing)) for r in qual_shorts),
+                    key=lambda c: not c["gate_ok"])[:top]
     surges = sorted(results, key=lambda x: x['vol_ratio'], reverse=True)[:8]
 
-    recommendation = longs[0] if longs else None
+    # Only a long the executor would accept at its trigger can fill the slot (issue #64).
+    recommendation = next((c for c in longs if c["gate_ok"]), None)
     if recommendation is None:
         slot_status = "EMPTY"
     elif not sizing["yolo_slot_enabled"]:
@@ -293,6 +383,11 @@ def scan_yolo(target_env, interval="15m", top=5):
             "long_max_rsi": LONG_MAX_RSI,
             "short_min_rsi": SHORT_MIN_RSI,
             "min_score": MIN_SCORE,
+            "min_tp1_distance": MIN_TP1_DISTANCE,
+            "max_loss_margin_fraction": YOLO_MAX_LOSS_MARGIN_FRACTION,
+            "min_r_tp1": YOLO_MIN_R_TP1,
+            "min_rr_tp2": YOLO_MIN_RR_TP2,
+            "rounding_margin": YOLO_ROUNDING_MARGIN,
         },
         "sizing": sizing,
         "slot_status": slot_status,
@@ -335,12 +430,16 @@ def print_text_report(p):
             print(f"  Microstructure: Vol Ratio = {c['vol_ratio']}x | {wick_label} = {c[wick_key]}% | RSI = {c['rsi']}")
             print(f"  Levels: SL = {c['sl']:.6f} (-{c['risk_pct']:.2f}% | max loss -{c['max_loss_usdt']:.2f} USDT) | "
                   f"TP1 (+{c['roe_tp1_pct']}% ROE) = {c['tp1']:.6f} | TP2 (+{c['roe_tp2_pct']}% ROE) = {c['tp2']:.6f}")
+            if not c.get("gate_ok", True):
+                print(f"  GATE FAIL: {', '.join(c.get('gate_failures') or [])} (the executor would reject it; not a slot candidate)")
 
     print("\n🚀 [TOP QUALIFIED YOLO LONG MOONSHOTS]:")
     if not p["longs"]:
         print("  🚫 No long candidates passed the hardened filters. The YOLO slot remains empty (capital preserved).")
     else:
         _print(p["longs"], "lower_wick", "Lower Wick")
+        if p["recommendation"] is None:
+            print("  🚫 No long candidate passes the executor gates. The YOLO slot remains empty (capital preserved).")
 
     print("\n🔻 [TOP QUALIFIED YOLO SHORT MOONSHOTS / HEDGES]:")
     if not p["shorts"]:

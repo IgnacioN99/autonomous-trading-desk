@@ -28,6 +28,7 @@ import sync_session_state as sss
 import fetch_newsletters as fn
 import broad_yolo_scanner as bys
 from utils.env_resolver import resolve_env
+from utils.gate_limits import MIN_TP1_DISTANCE, YOLO_MAX_LOSS_MARGIN_FRACTION
 
 # Barbell YOLO slot (issue #52): the memecoin scanner runs concurrently under a hard time budget so it can
 # never block or break the standard scan (prime_evaluator_brief.py gives the whole pipeline 60 s).
@@ -39,15 +40,16 @@ YOLO_FILTER_TEXT = (f"climax volume >= {bys.MIN_VOL_RATIO}x or buyer absorption 
                     f"(volume >= {bys.MIN_VOL_FLOOR}x)")
 YOLO_INACTIVE_STATUS = f"INACTIVE: Preserving capital. No memecoin exceeds {YOLO_FILTER_TEXT}."
 YOLO_DISABLED_STATUS = "DISABLED: yolo_slot_enabled is false in the user profile."
-# Executor gates mirrored here (not imported) so the evaluator never sees a YOLO entry that the executor would
-# reject when entered at the trigger: friction floor (execute_futures_trade.py GATE 3, TP1 >= 0.35% from the entry)
+# The evaluator never sees a YOLO entry that the executor would reject when entered at the trigger. The gate checks
+# live in broad_yolo_scanner.yolo_gate_failures (shared with the standalone scanner) and use the executor's own
+# limits from utils/gate_limits.py: friction floor (execute_futures_trade.py GATE 3, TP1 >= 0.35% from the entry)
 # and the Barbell YOLO loss cap (GATE 2, loss at SL <= 35% of the isolated margin: SL distance x leverage <= 0.35).
-YOLO_MIN_TP1_DISTANCE = 0.0035
-YOLO_MAX_LOSS_MARGIN_FRACTION = 0.35
+# The names below are aliases kept for callers and tests.
+YOLO_MIN_TP1_DISTANCE = MIN_TP1_DISTANCE
 # Desk R:R floors measured from the trigger entry: TP1 must reach +1.8R (fees + free trade) and TP2 >= 3:1.
-YOLO_MIN_R_TP1 = 1.8
-YOLO_MIN_RR_TP2 = 3.0
-YOLO_SIG_DIGITS = 6  # forwarded floats are rounded to 6 significant digits (token budget)
+YOLO_MIN_R_TP1 = bys.YOLO_MIN_R_TP1
+YOLO_MIN_RR_TP2 = bys.YOLO_MIN_RR_TP2
+YOLO_SIG_DIGITS = bys.YOLO_SIG_DIGITS  # forwarded floats are rounded to 6 significant digits (token budget)
 _last_yolo_future = None  # Future of the latest pipeline run's YOLO scan (CLI exit handling)
 
 # ==========================================
@@ -344,14 +346,12 @@ def _yolo_unavailable(reason: str, detail: Optional[str] = None) -> Tuple[str, Y
         print(f"YOLO slot UNAVAILABLE ({reason}): {detail}", file=sys.stderr)
     return f"UNAVAILABLE: {reason}. YOLO slot kept empty.", YoloSlot(status="UNAVAILABLE", interval=YOLO_SCAN_INTERVAL)
 
-def _sig(x: float, digits: int = YOLO_SIG_DIGITS) -> float:
-    """Plain float rounded to `digits` significant digits."""
-    return float(f"{float(x):.{digits}g}")
+_sig = bys._sig  # plain float rounded to 6 significant digits
 
 def _to_yolo_candidate(raw: dict) -> Optional[YoloCandidate]:
     """Plain-typed LONG candidate that passes the Barbell filters, the executor's YOLO gates and the desk R:R floors
-    when entered at its trigger (the entry the evaluator uses), else None. risk_pct and rr_tp2 are computed from
-    the trigger."""
+    when entered at its trigger (the entry the evaluator uses), else None. The gates (bys.yolo_gate_failures) are
+    checked on the rounded levels that are forwarded; risk_pct and rr_tp2 are computed from the rounded trigger."""
     try:
         if raw.get("direction") != "LONG":
             return None
@@ -366,26 +366,22 @@ def _to_yolo_candidate(raw: dict) -> Optional[YoloCandidate]:
     # never a dry-volume wick (vol_ratio < 1.0x is thin-book noise, FAKE_TIER_S on every K2 path).
     if vol_ratio < bys.MIN_VOL_FLOOR or not (vol_ratio >= bys.MIN_VOL_RATIO or lower_wick >= bys.MIN_WICK_PCT):
         return None
-    # LONG levels must be coherent around the current price and the trigger entry (also drops NaN levels).
-    if not (0.0 < sl < price and sl < trigger < tp1 <= tp2 and leverage >= 1 and margin > 0.0):
+    # Executor gates on the rounded levels with the adverse rounding margin: coherence around the current price and
+    # the trigger entry (also drops NaN levels), friction floor, 35%-of-margin loss cap and the R:R floors.
+    if bys.yolo_gate_failures(dict(raw, price=price, trigger=trigger, sl=sl, tp1=tp1, tp2=tp2,
+                                   leverage=leverage, margin_usdt=margin)):
         return None
+    trigger, sl, tp1, tp2 = _sig(trigger), _sig(sl), _sig(tp1), _sig(tp2)
     risk = trigger - sl
-    risk_frac = risk / trigger
-    if (tp1 - trigger) / trigger < YOLO_MIN_TP1_DISTANCE:
-        return None
-    if risk_frac * leverage > YOLO_MAX_LOSS_MARGIN_FRACTION:
-        return None
     rr_tp2 = (tp2 - trigger) / risk
-    if (tp1 - trigger) / risk < YOLO_MIN_R_TP1 or rr_tp2 < YOLO_MIN_RR_TP2:
-        return None
     return YoloCandidate(
         symbol=symbol,
         direction="LONG",
-        trigger=_sig(trigger),
-        sl=_sig(sl),
-        tp1=_sig(tp1),
-        tp2=_sig(tp2),
-        risk_pct=round(risk_frac * 100, 2),
+        trigger=trigger,
+        sl=sl,
+        tp1=tp1,
+        tp2=tp2,
+        risk_pct=round(risk / trigger * 100, 2),
         rr_tp2=round(rr_tp2, 2),
         leverage=leverage,
         margin_usdt=round(margin, 2),
