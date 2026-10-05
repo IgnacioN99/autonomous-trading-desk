@@ -68,6 +68,28 @@ def _load_module(name, rel_path):
     return mod
 
 
+def isolate_workspace(tc, profile=None, gate1_state=False):
+    """
+    Points the executor's logs/ (session_state.json, pending_entries.json, audit trails) at a temp workspace for the
+    duration of the test, so it never reads or writes the real logs/ (the desk machine trades live). profile: explicit
+    user profile instead of the operator's config/user_profile.json. gate1_state: also redirect the module __file__,
+    from which GATE 1 (delta, PROD) resolves logs/session_state.json. Returns the temp workspace path.
+    """
+    tmp = tempfile.TemporaryDirectory()
+    tc.addCleanup(tmp.cleanup)
+    ws = tmp.name
+    os.makedirs(os.path.join(ws, "logs"), exist_ok=True)
+    patches = [patch("execute_futures_trade._workspace_dir", return_value=ws)]
+    if gate1_state:
+        patches.append(patch.object(eft, "__file__", os.path.join(ws, "scripts", "execute_futures_trade.py")))
+    if profile is not None:
+        patches.append(patch("user_profile.load_user_profile", return_value=dict(profile)))
+    for p in patches:
+        p.start()
+        tc.addCleanup(p.stop)
+    return ws
+
+
 # =====================================================================================
 # 1. Dossier gate
 # =====================================================================================
@@ -369,6 +391,7 @@ class TestIsolatedMarginFailClosed(unittest.TestCase):
     def test_execute_aborts_without_any_order_when_margin_fails(self, mock_send, _f, _e):
         fake, calls = self._fake_send({"code": -4048, "msg": "Margin type cannot be changed if there exists position."})
         mock_send.side_effect = fake
+        isolate_workspace(self, profile=PROFILE)
         res = eft.execute_complete_trade(symbol="SOLUSDT", direction="LONG", leverage=3, margin_usdt=10.0,
                                          sl_price=97.0, target_env="testnet", bypass_eval_gate=True)
         self.assertFalse(res["success"])
@@ -474,6 +497,7 @@ class TestLiquidationGate(unittest.TestCase):
 
     @patch("quant_risk_engine.get_account_equity", return_value=10000.0)
     def test_mechanical_gates_include_liquidation_gate(self, _eq):
+        isolate_workspace(self)
         with patch("user_profile.load_user_profile", return_value=dict(PROFILE)):
             ok, msg = eft.check_mechanical_gates("LONG", 100.0, 94.0, 103.0, 1.0, 15, target_env="testnet", is_yolo=True)
         self.assertFalse(ok)
@@ -498,6 +522,7 @@ class TestLiquidationGateUsesEffectiveLeverage(unittest.TestCase):
             if endpoint == "/fapi/v1/order" and method == "POST":
                 return {"orderId": 7, "avgPrice": "100.0", "status": "FILLED"}
             return {}
+        isolate_workspace(self)
         with patch("execute_futures_trade.send_signed_request", side_effect=fake), \
              patch("execute_futures_trade.get_symbol_filters", return_value=FILTERS), \
              patch("execute_futures_trade.place_algo_stop_loss", return_value={"algoId": 9}), \
@@ -541,28 +566,20 @@ class TestLiquidationGateUsesEffectiveLeverage(unittest.TestCase):
 class TestEntryBasedRiskGates(unittest.TestCase):
     """Issue #22: PROD risk (GATE 2) and friction (GATE 3) gates are measured from the effective entry."""
 
-    STATE_FILE = os.path.join(BASE_DIR, "logs", "session_state.json")
-
     def setUp(self):
-        os.makedirs(os.path.dirname(self.STATE_FILE), exist_ok=True)
-        self._orig = _read_bytes(self.STATE_FILE) if os.path.exists(self.STATE_FILE) else None
-        with open(self.STATE_FILE, "w", encoding="utf-8") as f:
+        # session_state.json lives in a temp workspace (Gate 0A and the PROD delta gate), never in the real logs/
+        ws = isolate_workspace(self, profile=PROFILE, gate1_state=True)
+        with open(os.path.join(ws, "logs", "session_state.json"), "w", encoding="utf-8") as f:
             json.dump({"is_valid": True, "last_updated_ts": int(time.time()),
                        "portfolio_exposure": {"delta_bias": "NEUTRAL"}}, f)
         # equity 1000 x 0.5% x 1.25 buffer = $6.25 PROD loss cap
-        self._patches = [patch("quant_risk_engine.get_account_equity", return_value=1000.0),
-                         patch("user_profile.load_user_profile", return_value=dict(PROFILE))]
+        self._patches = [patch("quant_risk_engine.get_account_equity", return_value=1000.0)]
         for p in self._patches:
             p.start()
 
     def tearDown(self):
         for p in self._patches:
             p.stop()
-        if self._orig is not None:
-            with open(self.STATE_FILE, "wb") as f:
-                f.write(self._orig)
-        elif os.path.exists(self.STATE_FILE):
-            os.remove(self.STATE_FILE)
 
     def test_long_loss_measured_from_trigger_above_current(self):
         # At cur_price 100: |100-95|*1.2 = $6.00 <= $6.25; from trigger 101: $7.20 > $6.25
@@ -729,6 +746,7 @@ class TestLeverageCeilingSingleSource(unittest.TestCase):
 
     @patch("quant_risk_engine.get_account_equity", return_value=10000.0)
     def test_executor_gate_follows_profile_ceiling(self, _eq):
+        isolate_workspace(self)
         prof = dict(PROFILE, leverage_ceiling=20, leverage_yolo=20)
         with patch("user_profile.load_user_profile", return_value=prof):
             ok, msg = eft.check_mechanical_gates("LONG", 100.0, 98.0, 103.0, 1.0, 20, target_env="testnet", is_yolo=True)
@@ -739,6 +757,7 @@ class TestLeverageCeilingSingleSource(unittest.TestCase):
 
     @patch("quant_risk_engine.get_account_equity", return_value=10000.0)
     def test_yolo_leverage_capped_by_profile(self, _eq):
+        isolate_workspace(self)
         with patch("user_profile.load_user_profile", return_value=dict(PROFILE, leverage_yolo=5)):
             ok, msg = eft.check_mechanical_gates("LONG", 100.0, 98.0, 103.0, 1.0, 10, target_env="testnet", is_yolo=True)
         self.assertFalse(ok)
