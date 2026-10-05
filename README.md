@@ -284,13 +284,27 @@ The `crypto_radar` MCP server (`scripts/radar_mcp_server.py`) has been retired. 
 4. Schedule the position guardian (see above) to replace the old trailing / dead-alpha MCP tools.
 
 ### 6. Automated GitHub Issue Reporting & Observability
-If subagents, hooks, or loops encounter unexpected failures, unhandled exceptions, or infrastructure drift, the system directly invokes the native bash reporter (`report_issue.sh`):
+If subagents, hooks, or loops encounter unexpected failures, unhandled exceptions, or infrastructure drift, the system directly invokes the native bash reporter (`report_issue.sh`). Agents always pass the structured flags so the issue arrives as a complete engineering report:
 ```bash
-./scripts/report_issue.sh --title "Endpoint timeout in ticker stream" --error "ReadTimeout at /fapi/v1/ticker/24hr" --severity "HIGH" --category "infra"
+./scripts/report_issue.sh --title "broad_market_radar: ticker stream timeout" \
+  --error "ReadTimeout at /fapi/v1/ticker/24hr after 3 retries" \
+  --severity MEDIUM --category infra \
+  --repro "python3 scripts/broad_market_radar.py --json (exit 1)" \
+  --root-cause "No backoff on 5xx/timeouts in the ticker fetch" \
+  --affected-files "scripts/broad_market_radar.py:40-75" \
+  --context "Scan before the London open; BTC 15m data was fresh" \
+  --output-file logs/radar_last_run.txt \
+  --impact "Scan degraded: no candidates this cycle, no orders affected" \
+  --acceptance-criteria "Exponential backoff on timeouts; regression test in tests/"
 
-# If offline or GITHUB_TOKEN is pending, issues are safely queued in logs/issues_backlog.jsonl. Sync them with:
+# If offline or gh is not authenticated, issues are safely queued in logs/issues_backlog.jsonl. Sync them with:
 ./scripts/report_issue.sh --sync
 ```
+- **Body:** six sections (executive summary with severity/priority matrix, runtime & ledger telemetry, reproduction + raw output tail, code pointers & root cause, desk impact, remediation & acceptance checklist). Telemetry (`scripts/utils/issue_telemetry.py`) adds git commit/branch, environment, delta bias, open symbols and PnL *sign* only; free text is sanitized (tokens, keys, USD/USDT amounts). Without Python it degrades to bash-only telemetry.
+- **Labels:** `agent-failure`, `severity:<level>`, `priority:<Px>`, `cat:<category>`. `--severity` is case-insensitive and validated (exit 2 on invalid values); `--priority` defaults from severity (CRITICAL→P0, HIGH→P1, MEDIUM→P2, LOW→P3). If the repository rejects the labels they are created (`gh label create --force`) and the create is retried; as a last resort the issue is created unlabelled with a `[SEV/Px] ` title prefix, the labels are added with `gh issue edit`, and a warning prints the exact fix-up command if that fails.
+- **Executor failures:** the pre-trade hook classifies the whole command text, so an executor command inline in `--repro` / `--error` can get the report itself held behind the trade gate. When the failing command is `scripts/execute_futures_trade.py`, put the exact command and its output in a file and pass it with `--output-file` / `--context-file`; keep `--repro` to the script name and exit code.
+- **Delivery:** only an HTTP 422 (rejected labels) triggers the label fallback; any other gh/curl failure (5xx, timeout, 403, network) queues the report in the backlog so no duplicate issues are created. `--sync` adds the default `priority:*` label to legacy entries queued with only `severity:*`. Values of monetary keys (`*_usdt`, `*pnl*`, `*margin*`, `*balance*`, ...) are redacted from all text and attached files.
+- **Manual reports:** the GitHub issue forms (`.github/ISSUE_TEMPLATE/`: *Harness failure / bug*, *Enhancement*) require severity and priority; the `issue-triage` workflow labels any issue missing them `needs-triage`. `scripts/report_agent_issue.py` offers the same flags for Python callers.
 
 ### 7. PR Review with Native Subagents
 Pull Requests are audited inside the same agy session by four isolated, read-only reviewer subagents (`.agents/agents/<domain>_reviewer/agent.md`: `trading_risk`, `binance_microstructure`, `agentic_harness`, `prompt_engineering`). Each starts with a clean context, can only `view_file` / `grep_search` / `list_dir` (`commandExecutionPolicy: "off"`) and returns one `### Verdict: <reviewer>` section with `send_message`.
@@ -371,7 +385,8 @@ autonomous-trading-desk/
 │   ├── utils/
 │   │   ├── atomic_writer.py           # POSIX atomic ledger persistence
 │   │   ├── dossier_provenance.py      # Dossier extraction & provenance verification
-│   │   └── env_resolver.py            # Centralized environment resolver & security enforcer
+│   │   ├── env_resolver.py            # Centralized environment resolver & security enforcer
+│   │   └── issue_telemetry.py         # Issue reporter telemetry, labels & six-section body
 │   ├── broad_market_radar.py          # Concurrent 80+ pair screener (15m/5m/1h)
 │   ├── dynamic_exit_manager.py        # Chandelier ATR structural trailing stop
 │   ├── execute_futures_trade.py       # Fail-closed order deployment engine & hard gates

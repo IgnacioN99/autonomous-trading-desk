@@ -1,0 +1,88 @@
+name: Harness failure / bug
+description: A desk script, gate, hook, loop or agent workflow failed or behaved unexpectedly.
+title: "<script>: <short failure>"
+labels: ["agent-failure"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Agents should prefer `./scripts/report_issue.sh` (it adds runtime/ledger telemetry, sanitizes secrets and
+        amounts, and applies the `severity:*` / `priority:*` labels automatically). Use this form for manual reports.
+        Never paste API keys, tokens, balances or exact PnL.
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      description: Applied as a `severity:*` label during triage.
+      options:
+        - "CRITICAL - a position is unprotected or its stop cannot be verified"
+        - "HIGH - execution or a risk gate is blocked/incorrect"
+        - "MEDIUM - scan, analysis or tooling degraded"
+        - "LOW - cosmetic, docs or optional hardening"
+    validations:
+      required: true
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      description: "Applied as a `priority:*` label. Default from severity: CRITICAL->P0, HIGH->P1, MEDIUM->P2, LOW->P3."
+      options:
+        - "P0 - drop everything: fix now"
+        - "P1 - next up: fix in the current cycle"
+        - "P2 - planned: schedule soon"
+        - "P3 - backlog: when convenient"
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What failed, where, and what was expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction (command + exit code)
+      description: The exact command that failed and its exit code.
+      render: bash
+    validations:
+      required: true
+  - type: textarea
+    id: error_output
+    attributes:
+      label: Error output
+      description: Relevant tail of the raw output / traceback (sanitized).
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: affected_files
+    attributes:
+      label: Affected files
+      description: "Code pointers, e.g. `scripts/report_issue.sh:120-160`."
+    validations:
+      required: true
+  - type: textarea
+    id: root_cause
+    attributes:
+      label: Root cause
+      description: Suspected or confirmed root cause (optional).
+    validations:
+      required: false
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact on the desk
+      description: Operational impact (blocked step, unprotected exposure, degraded scan...).
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance_criteria
+    attributes:
+      label: Acceptance criteria
+      description: Verifiable conditions for closing the issue (one per line).
+      value: |
+        - [ ] Regression test added in tests/ covering this failure
+    validations:
+      required: true
