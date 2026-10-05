@@ -467,6 +467,447 @@ class TestFileWriteProtection(GuardHarness):
                          "force_ask")
 
 
+class TestGroundTruthProtection(GuardHarness):
+    """Issue #37: guardian_state.json / pending_entries.json gate PROD orders like session_state.json."""
+
+    WRITERS = {
+        "session_state.json": "scripts/sync_session_state.py",
+        "guardian_state.json": "scripts/loops/position_guardian_loop.py",
+        "pending_entries.json": "scripts/execute_futures_trade.py",
+    }
+    NEW_FILES = ("guardian_state.json", "pending_entries.json")
+
+    def assertGroundTruthDenied(self, res, name, label=""):
+        self.assertDenied(res, "Ground Truth Protection")
+        self.assertIn(f"logs/{name} may only be written by", res.get("reason", ""), label)
+        self.assertIn(self.WRITERS[name], res.get("reason", ""), label)
+
+    def assertNotGroundTruth(self, res, label=""):
+        self.assertNotIn("Ground Truth Protection", res.get("reason", "") + res.get("__stderr__", ""), label)
+
+    def shell_vectors(self, name):
+        p = f"logs/{name}"
+        return [
+            f"echo '{{\"mode\": \"loop\"}}' > {p}",
+            f"echo '{{}}' >> {p}",
+            f"printf x >| {p}",
+            f"echo '{{}}' | tee {p}",
+            f"rm {p}",
+            f"rm -f ./{p}",
+            f"mv /tmp/forged.json {p}",
+            f"cp /tmp/forged.json {p}",
+            f"sed -i 's/old/new/' {p}",
+            f"truncate -s 0 {p}",
+            f"dd if=/tmp/forged.json of={p}",
+            f"git restore {p}",
+            f"python3 -c \"import json; json.dump({{'mode': 'loop'}}, open('{p}', 'w'))\"",
+            f"python3 -c \"from pathlib import Path; Path('{p}').write_text('{{}}')\"",
+            f"python3 -c \"import pathlib; pathlib.Path('{p}').unlink()\"",
+            f"node -e \"require('fs').writeFileSync('{p}', '{{}}')\"",
+            f"python3 - <<'EOF'\nimport json\nwith open('{p}', 'w') as f:\n    json.dump({{'mode': 'loop'}}, f)\nEOF",
+            f"python3 - <<'EOF'\nfrom pathlib import Path\nstate = Path('{p}')\nstate.write_text('{{}}')\nEOF",
+            f"find logs -name {name} -delete",
+            f"find . -path './{p}' -exec rm {{}} \\;",
+        ]
+
+    def test_shell_write_vectors_denied_for_new_files(self):
+        for name in self.NEW_FILES:
+            for c in self.shell_vectors(name):
+                self.assertGroundTruthDenied(self.agy(self.cmd(c)), name, c)
+
+    def test_new_shell_vectors_denied_for_session_state(self):
+        for c in ("python3 - <<'EOF'\nimport json\njson.dump({'is_valid': True}, open('logs/session_state.json', 'w'))\nEOF",
+                  "python3 -c \"from pathlib import Path; Path('logs/session_state.json').write_text('{}')\"",
+                  "find logs -name session_state.json -delete",
+                  "find logs -name 'session_*' -exec rm -f {} +"):
+            self.assertGroundTruthDenied(self.agy(self.cmd(c)), "session_state.json", c)
+
+    def test_session_state_message_unchanged(self):
+        res = self.agy(self.cmd("echo '{}' > logs/session_state.json"))
+        self.assertEqual(res.get("reason"), "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Ground Truth Protection): "
+                                            "logs/session_state.json may only be written by "
+                                            "`python3 scripts/sync_session_state.py`.")
+
+    def test_claude_code_bash_write_denied(self):
+        res = self.run_guard({"tool_name": "Bash", "tool_input": {"command": "echo '{}' > logs/guardian_state.json"}})
+        self.assertEqual(res.get("__exit_code__"), 2)
+        self.assertIn("logs/guardian_state.json may only be written by", res["__stderr__"])
+
+    def test_logs_directory_and_matching_globs_denied(self):
+        for c in ("rm -rf logs", "rm -r ./logs/", f"rm -rf {self.root}/logs", "mv logs logs.old",
+                  "shred -u logs/*", "rm logs/*.json", "rm logs/*state*", "rm -f logs/{guardian_state,x}.json",
+                  "find logs -type f -delete", "find logs -name '*.json' -delete",
+                  "cp -r /tmp/forged/. logs/", "cp /tmp/forged/* logs/", "rsync -a /tmp/forged/ logs/",
+                  "echo '{}' | tee logs/guardian_stat?.json"):
+            res = self.agy(self.cmd(c))
+            self.assertDenied(res, "Ground Truth Protection")
+            self.assertIn("logs/guardian_state.json may only be written by", res.get("reason", ""), c)
+        both = self.agy(self.cmd("rm logs/*state*")).get("reason", "")
+        self.assertIn("logs/session_state.json may only be written by", both)
+        self.assertNotIn("pending_entries", both)
+        self.assertIn("logs/pending_entries.json", self.agy(self.cmd("rm -rf logs")).get("reason", ""))
+
+    def test_globs_and_files_that_cannot_match_are_not_ground_truth(self):
+        for c in ("rm logs/*.log", "rm logs/guardian_actions.jsonl", "echo x >> logs/guardian.log",
+                  "find logs -name '*.log' -delete", "mv report.txt logs/", "cp report.txt logs/",
+                  "rm -rf logs/pr_review", "rm -rf build"):
+            res = self.agy(self.cmd(c))
+            self.assertNotGroundTruth(res, c)
+            self.assertNotEqual(res.get("decision"), "deny", c)
+
+    def test_reads_keep_previous_decision(self):
+        for c in ("cat logs/guardian_state.json", "jq . logs/pending_entries.json", "tail -n 5 logs/guardian_state.json",
+                  "grep -c symbol logs/pending_entries.json", "cat logs/session_state.json",
+                  "python3 -c \"import json; print(json.load(open('logs/guardian_state.json')))\"",
+                  "cp logs/guardian_actions.jsonl /tmp/actions.jsonl"):
+            self.assertEqual(self.agy(self.cmd(c)).get("decision"), "ask", c)
+
+    def test_desk_writers_unchanged(self):
+        self.assertEqual(self.agy(self.cmd("python3 scripts/execute_futures_trade.py --protect-pending --env prod"))
+                         .get("decision"), "allow")
+        self.assertEqual(self.agy(self.cmd("python3 scripts/loops/position_guardian_loop.py --once")).get("decision"),
+                         "allow")
+        self.assertNotGroundTruth(self.agy(self.cmd("python3 scripts/loops/position_guardian_loop.py --interval 60")))
+        self.assertNotGroundTruth(self.agy(self.cmd("python3 scripts/sync_session_state.py")))
+
+    def test_file_tools_denied_for_every_path_form(self):
+        for name in self.NEW_FILES:
+            targets = [f"logs/{name}", f"./logs/{name}", f"logs/../logs/{name}", os.path.join(self.root, "logs", name),
+                       f"C:\\Users\\x\\repo\\logs\\{name}", f"C:/Users/x/repo/LOGS/{name.upper()}"]
+            for target in targets:
+                for tool in ("write_to_file", "replace_file_content", "multi_replace_file_content"):
+                    res = self.agy({"toolCall": {"name": tool, "args": {"TargetFile": target, "CodeContent": "{}"}}})
+                    self.assertGroundTruthDenied(res, name, f"{tool} {target}")
+                for tool in ("Write", "Edit", "MultiEdit"):
+                    res = self.run_guard({"tool_name": tool, "tool_input": {"file_path": target, "content": "{}"}})
+                    self.assertEqual(res.get("__exit_code__"), 2, f"{tool} {target}")
+                    self.assertIn(f"logs/{name} may only be written by", res["__stderr__"], f"{tool} {target}")
+                    self.assertIn(self.WRITERS[name], res["__stderr__"])
+
+    def test_windows_path_to_session_state_denied(self):
+        for target in ("C:\\Users\\x\\repo\\logs\\session_state.json", "file:///C:/Users/x/repo/logs/session_state.json"):
+            res = self.run_guard({"tool_name": "Write", "tool_input": {"file_path": target, "content": "{}"}})
+            self.assertEqual(res.get("__exit_code__"), 2, target)
+            self.assertIn("logs/session_state.json may only be written by", res["__stderr__"])
+            self.assertGroundTruthDenied(self.agy({"toolCall": {"name": "write_to_file", "args": {
+                "TargetFile": target, "CodeContent": "{}"}}}), "session_state.json", target)
+
+    def test_unrelated_log_files_keep_normal_policy(self):
+        for target in ("logs/guardian_actions.jsonl", "logs/guardian.log", "docs/guardian_state.md",
+                       "logs/old/guardian_state.json.bak"):
+            res = self.agy({"toolCall": {"name": "write_to_file", "args": {"TargetFile": target, "CodeContent": "x"}}})
+            self.assertEqual(res.get("decision"), "ask", target)
+
+    # ---------------------------------------------------------------- review round 1 findings
+    def assertAllGroundTruthDenied(self, commands):
+        for c in commands:
+            res = self.agy(self.cmd(c))
+            self.assertDenied(res, "Ground Truth Protection")
+            self.assertIn("logs/guardian_state.json may only be written by", res.get("reason", ""), c)
+            self.assertIn("logs/pending_entries.json may only be written by", res.get("reason", ""), c)
+
+    def assertNoneGroundTruth(self, commands):
+        for c in commands:
+            res = self.agy(self.cmd(c))
+            self.assertNotGroundTruth(res, c)
+            self.assertNotEqual(res.get("decision"), "deny", c)
+
+    def test_punctuation_run_redirects_denied(self):
+        self.assertEqual(pre_trade_guard._tokenize("(printf x)>logs/a; echo 1<>b;>c"),
+                         ["(", "printf", "x", ")", ">", "logs/a", ";", "echo", "1", "<>", "b", ";", ">", "c"])
+        for c, name in (("(printf x)>logs/guardian_state.json", "guardian_state.json"),
+                        ("echo x 1<>logs/pending_entries.json", "pending_entries.json"),
+                        ("echo x;>logs/guardian_state.json", "guardian_state.json"),
+                        ("(cat /tmp/forged.json)>>logs/guardian_state.json", "guardian_state.json"),
+                        ("cat /tmp/forged.json 1<>logs/pending_entries.json", "pending_entries.json"),
+                        ("{ cat /tmp/forged.json; }>logs/session_state.json", "session_state.json")):
+            self.assertGroundTruthDenied(self.agy(self.cmd(c)), name, c)
+        self.assertTrue(pre_trade_guard._is_redirect(")>") and pre_trade_guard._is_redirect("<>"))
+        self.assertFalse(pre_trade_guard._is_redirect("<") or pre_trade_guard._is_redirect(")"))
+
+    def test_logs_dir_globs_and_braces_denied(self):
+        self.assertAllGroundTruthDenied(["rm -rf {logs,build}", "rm -rf log*", "rm -rf lo[g]s", "mv log? /tmp/x",
+                                         "rm -rf *", "rm -rf ..", "rm -rf ../*", f"rm -rf {self.root}",
+                                         f"rm -rf {self.root}/lo*", "mv * /tmp/x", "shred -u lo?s/*"])
+        self.assertNoneGroundTruth(["rm -rf build/*", "rm -rf /nonexistent/x/*", "rm -rf {build,dist}",
+                                    "cp /tmp/x/* /nonexistent/dest/", "rm *.pyc", "mv dist/* /tmp/x"])
+
+    def test_unfiltered_or_negated_find_denied(self):
+        self.assertAllGroundTruthDenied([
+            "find . -name '*.json' ! -name package.json -delete", "find . -type f -mmin -5 -delete",
+            "find . -regex '.*state.*' -delete", "find . -not -name '*.log' -delete", "find .. -type f -delete",
+            "find / -newer /tmp/x -delete", "find ~ -type f -delete", "find -L . -type f -delete",
+            "find . \\( -type f \\) -delete", "find . -name '*.log' -o -name '*.tmp' -delete",
+            f"find {self.root} -mmin -5 -delete", "find logs -type f -exec sh -c 'rm \"$0\"' {} \\;",
+            "find . -type f -exec awk -i inplace 1 {} +", "find -type f -delete",
+        ])
+        self.assertNoneGroundTruth(["find . -name '*.log' -delete", "find build -type f -delete",
+                                    "find /nonexistent/build -type f -delete", "find . -type f -exec wc -l {} +",
+                                    "find . -type f -exec sed -n 1p {} \\;", "find . -fprint /tmp/list",
+                                    "find . -name guardian_state.json", "find logs -name '*.json'"])
+        self.assertGroundTruthDenied(self.agy(self.cmd("find . -fprint logs/guardian_state.json")),
+                                     "guardian_state.json")
+
+    def test_option_attached_target_directory_denied(self):
+        self.assertAllGroundTruthDenied([
+            "cp --target-directory=logs /tmp/f/*", "cp -tlogs /tmp/f/*", "mv --target-directory=logs /tmp/f/*",
+            "install --target-directory=logs /tmp/f/*", "cp -t logs -r /tmp/f/.", "cp -rtlogs /tmp/f/.",
+            "mv -t ./logs/ /tmp/f/*", "cp --target=logs /tmp/f/*", "cp -r /tmp/f/* .",
+        ])
+        self.assertNoneGroundTruth(["mv -t logs report.txt", "cp -t logs report.txt", "cp --target-directory=/tmp/x logs/*.log"])
+
+    def test_symlink_aliases_of_logs_dir_denied(self):
+        self.assertAllGroundTruthDenied(["ln -s logs st", "ln -s ./logs/ st", f"ln -s {self.root}/logs st",
+                                         "ln -sT lo* st", "ln -s -t /tmp/x logs", "cmd //c mklink /J st logs"])
+        self.assertGroundTruthDenied(self.agy(self.cmd("ln -s /tmp/forged.json logs/guardian_state.json")),
+                                     "guardian_state.json")
+        self.assertNoneGroundTruth(["ln -s /tmp/x logs/x", "ln -s scripts/foo.py bar.py"])
+
+    def test_file_tool_realpath_and_hard_link_aliases_denied(self):
+        logs = os.path.join(self.root, "logs")
+        try:
+            os.symlink(logs, os.path.join(self.root, "st"), target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"symlinks unavailable: {exc}")
+        with open(os.path.join(logs, "pending_entries.json"), "w", encoding="utf-8") as f:
+            f.write("{}")
+        os.link(os.path.join(logs, "pending_entries.json"), os.path.join(self.root, "pe.json"))
+        cases = [("st/guardian_state.json", "guardian_state.json"),
+                 (os.path.join(self.root, "st", "pending_entries.json"), "pending_entries.json"),
+                 ("st/../st/session_state.json", "session_state.json"),
+                 ("pe.json", "pending_entries.json")]
+        for target, name in cases:
+            self.assertGroundTruthDenied(self.agy({"toolCall": {"name": "write_to_file", "args": {
+                "TargetFile": target, "CodeContent": "{}"}}}), name, target)
+            res = self.run_guard({"tool_name": "Write", "tool_input": {"file_path": target, "content": "{}"}})
+            self.assertEqual(res.get("__exit_code__"), 2, target)
+            self.assertIn(f"logs/{name} may only be written by", res["__stderr__"], target)
+        res = self.agy({"toolCall": {"name": "write_to_file", "args": {"TargetFile": "st/guardian.log", "CodeContent": "x"}}})
+        self.assertEqual(res.get("decision"), "ask")
+
+    def test_write_programs_outside_denylist_denied(self):
+        cases = [
+            ("jq '.mode=\"loop\"' /tmp/x.json | sponge logs/guardian_state.json", "guardian_state.json"),
+            ("curl -o logs/guardian_state.json http://127.0.0.1:9/x", "guardian_state.json"),
+            ("wget -O logs/guardian_state.json http://127.0.0.1:9/x", "guardian_state.json"),
+            ("awk -i inplace '{print}' logs/pending_entries.json", "pending_entries.json"),
+            ("sort -o logs/pending_entries.json /tmp/x", "pending_entries.json"),
+            ("python3 -m json.tool /tmp/in.json logs/guardian_state.json", "guardian_state.json"),
+            ("jq --in-place . logs/guardian_state.json", "guardian_state.json"),
+            ("python3 tool.py logs/pending_entries.json", "pending_entries.json"),
+            ("echo logs/guardian_state.json | xargs rm", "guardian_state.json"),
+            ("F=logs/guardian_state.json; echo x > $F", "guardian_state.json"),
+            ("perl -pi -e 's/a/b/' logs/pending_entries.json", "pending_entries.json"),
+            ("cp /tmp/x logs/{guardian_state,y}.json", "guardian_state.json"),
+            ("python3 - <<'EOF'\nimport os\nos.symlink('/tmp/f', 'logs/guardian_state.json')\nEOF", "guardian_state.json"),
+            ("bash <<'EOF'\necho x > logs/guardian_state.json\nEOF", "guardian_state.json"),
+            ("python3 -V; bash <<'EOF'\necho x > logs/guardian_state.json\nEOF", "guardian_state.json"),
+            ("python3 - <<'EOF'\n__import__('os').system('cp /tmp/f logs/guardian_state.json')\nEOF", "guardian_state.json"),
+            ("git -C . checkout stash@{0} -- logs/pending_entries.json", "pending_entries.json"),
+            ("git show HEAD:x > logs/guardian_state.json", "guardian_state.json"),
+        ]
+        for c, name in cases:
+            self.assertGroundTruthDenied(self.agy(self.cmd(c)), name, c)
+        self.assertAllGroundTruthDenied(["git clean -fdX", "git clean -xfd", "git stash --all", "git stash push -a",
+                                         "git -C . clean -fdx", "git -c core.x=y stash -a",
+                                         "find /tmp/f -type f -exec cp {} logs/ \\;"])
+        self.assertNoneGroundTruth(["git clean -fd", "git stash", "git stash -u"])
+
+    def test_allowlisted_reads_and_dev_workflow_keep_ask(self):
+        for c in ("python3 -m json.tool logs/guardian_state.json", "python3 -m json.tool --indent 2 logs/guardian_state.json",
+                  "python3 - <<'EOF'\nimport json\nprint(json.load(open('logs/guardian_state.json')))\nEOF",
+                  "jq . < logs/guardian_state.json", "cat logs/guardian_state.json > /tmp/copy.json",
+                  "ls -la logs/*.json", "md5sum logs/guardian_state.json", "stat logs/pending_entries.json",
+                  "diff logs/guardian_state.json /tmp/x.json", "head -c 200 logs/pending_entries.json | wc -c",
+                  "rg -n pending_entries.json scripts/", "grep -rn guardian_state.json scripts tests",
+                  "git diff -- scripts/hooks/pre_trade_guard.py", "git log --oneline -- logs/guardian_state.json",
+                  "git commit -m \"fix(guard): protect logs/guardian_state.json and logs/pending_entries.json\"",
+                  "gh pr create --title x --body \"protects logs/pending_entries.json\"",
+                  "echo x >> logs/guardian.log", "find logs -name guardian_state.json"):
+            res = self.agy(self.cmd(c))
+            self.assertEqual(res.get("decision"), "ask", c)
+            self.assertNotGroundTruth(res, c)
+        self.assertEqual(self.agy(self.cmd("python3 scripts/loops/position_guardian_loop.py --once >> logs/guardian.log 2>&1"))
+                         .get("decision"), "allow")
+        self.assertEqual(self.agy(self.cmd("python3 scripts/execute_futures_trade.py --protect-pending --env prod "
+                                           "2>&1 | tee -a logs/guardian.log")).get("decision"), "ask")
+
+    def test_heredoc_message_with_write_marker_denied(self):
+        msg = "git commit -m \"$(cat <<'EOF'\nfix: block json.dump(state, f) into logs/guardian_state.json\nEOF\n)\""
+        self.assertGroundTruthDenied(self.agy(self.cmd(msg)), "guardian_state.json")
+        self.assertEqual(self.agy(self.cmd(msg.replace("json.dump(state, f)", "forged writes"))).get("decision"), "ask")
+        self.assertEqual(self.agy(self.cmd("git commit -F /tmp/msg.txt")).get("decision"), "ask")
+
+    def test_windows_aliases_denied(self):
+        cases = [("logs\\guardian_state.json.", "guardian_state.json"),
+                 ("C:\\Users\\x\\repo\\logs\\guardian_state.json. ", "guardian_state.json"),
+                 ("logs/guardian_state.json::$DATA", "guardian_state.json"),
+                 ("C:\\Users\\x\\repo\\logs\\pending_entries.json:stream:$DATA", "pending_entries.json"),
+                 ("C:\\Users\\x\\repo\\logs.\\pending_entries.json", "pending_entries.json"),
+                 ("logs/session_state.json...", "session_state.json")]
+        for target, name in cases:
+            self.assertGroundTruthDenied(self.agy({"toolCall": {"name": "write_to_file", "args": {
+                "TargetFile": target, "CodeContent": "{}"}}}), name, target)
+            res = self.run_guard({"tool_name": "Write", "tool_input": {"file_path": target, "content": "{}"}})
+            self.assertEqual(res.get("__exit_code__"), 2, target)
+            self.assertIn(f"logs/{name} may only be written by", res["__stderr__"], target)
+
+    # ---------------------------------------------------------------- review round 2 findings
+    def test_allowlisted_programs_with_write_or_exec_options_denied(self):
+        forged = '{"env":"prod","dry_run":false,"mode":"loop","interval_seconds":60,"last_cycle_ts":1}'
+        cases = [
+            (f"git log -1 --format='{forged}' --output=logs/guardian_state.json", "guardian_state.json"),
+            ("git show HEAD:x --output logs/guardian_state.json", "guardian_state.json"),
+            ("git diff --output=logs/pending_entries.json", "pending_entries.json"),
+            ("rg --pre rm . logs/pending_entries.json", "pending_entries.json"),
+            ("rg --pre=/tmp/x y logs/guardian_state.json", "guardian_state.json"),
+            ("git -c core.fsmonitor='rm -f logs/pending_entries.json; false' status", "pending_entries.json"),
+            ("git --config-env=core.pager=EVIL log -- logs/guardian_state.json", "guardian_state.json"),
+            ("git --exec-path=/tmp/x status -- logs/guardian_state.json", "guardian_state.json"),
+            ("git grep -O'rm -f' x -- logs/pending_entries.json", "pending_entries.json"),
+            ("git grep --open-files-in-pager=rm x -- logs/pending_entries.json", "pending_entries.json"),
+            ("git diff --ext-diff -- logs/guardian_state.json", "guardian_state.json"),
+            ("git fetch --upload-pack='rm logs/pending_entries.json' /tmp/r", "pending_entries.json"),
+            ("cat /tmp/forged.json | less -o logs/guardian_state.json", "guardian_state.json"),
+            ("cat /tmp/forged.json | less -Ologs/guardian_state.json", "guardian_state.json"),
+            ("less --log-file=logs/guardian_state.json /tmp/forged.json", "guardian_state.json"),
+            ("less '+!rm logs/pending_entries.json' /tmp/x", "pending_entries.json"),
+            ("LESSOPEN='|rm %s' less logs/pending_entries.json", "pending_entries.json"),
+            ("env LESSOPEN='|rm %s' less logs/pending_entries.json", "pending_entries.json"),
+            ("GIT_EXTERNAL_DIFF=/tmp/x git diff -- logs/guardian_state.json", "guardian_state.json"),
+            ("RIPGREP_CONFIG_PATH=/tmp/rc rg x logs/pending_entries.json", "pending_entries.json"),
+        ]
+        for c, name in cases:
+            self.assertGroundTruthDenied(self.agy(self.cmd(c)), name, c)
+        # git -c values are shell commands: judged even when they only name the logs/ directory
+        self.assertAllGroundTruthDenied(["git -c core.fsmonitor='rm -rf logs; false' status",
+                                         "git -c alias.x='!rm -rf logs' x"])
+        for c in ("git log --oneline -- logs/guardian_state.json", "git show HEAD -- logs/guardian_state.json",
+                  "rg -n pending_entries.json scripts/", "less logs/guardian_state.json", "less -R -S logs/guardian_state.json",
+                  "git grep -c guardian_state.json", "git -c core.pager=cat log -1", "git -C . diff --stat"):
+            res = self.agy(self.cmd(c))
+            self.assertEqual(res.get("decision"), "ask", c)
+            self.assertNotGroundTruth(res, c)
+
+    def test_git_abbreviated_and_clustered_exec_options_denied(self):
+        # git parse-options accepts unique-prefix abbreviations and short clusters (-nOrm = -n -O rm)
+        self.assertEqual(pre_trade_guard._git_long_options("--op=cp /tmp/f"), ["open-files-in-pager"])
+        self.assertEqual(pre_trade_guard._git_long_options("--upl"), ["upload-pack"])
+        self.assertEqual(pre_trade_guard._git_long_options("--rece=x"), ["receive-pack"])
+        self.assertIn("exec", pre_trade_guard._git_long_options("--exe=x"))
+        self.assertEqual(pre_trade_guard._git_long_options("--conf=x"), ["config-env"])
+        for harmless in ("--oneline", "--only-matching", "--or", "--count", "--contains", "--con", "--exclude-standard",
+                         "--exit-code", "--recurse-submodules=no", "--update-head-ok", "--no-index", "--", "-O"):
+            self.assertEqual(pre_trade_guard._git_long_options(harmless), [], harmless)
+        cases = [
+            ("git grep --no-index --op='cp /tmp/f' -e . -- logs/guardian_state.json", "guardian_state.json"),
+            ("git grep --no-index -nOrm -e . -- logs/guardian_state.json", "guardian_state.json"),
+            ("git grep --open='cp /tmp/f' x -- logs/pending_entries.json", "pending_entries.json"),
+            ("git log -1 --out=logs/guardian_state.json", "guardian_state.json"),
+            ("git diff --ext -- logs/guardian_state.json", "guardian_state.json"),
+            ("git show -o x -- logs/guardian_state.json", "guardian_state.json"),
+            ("git fetch --upl='rm logs/pending_entries.json' /tmp/r", "pending_entries.json"),
+        ]
+        for c, name in cases:
+            self.assertGroundTruthDenied(self.agy(self.cmd(c)), name, c)
+        self.assertAllGroundTruthDenied([
+            "git fetch --upl='rm -rf logs;:' .", "git push --rece='rm -rf logs;:' .", "git push --exe='rm -rf logs;:' .",
+            "git fetch --upload-pack='rm -rf logs;:' .", "git fetch --upload-pack 'rm -rf logs;:' /tmp/r",
+            "git push --receive-pack=/tmp/x .", "git ls-remote --upl /tmp/x .",
+            "git grep --no-index -nOrm -e . -- logs", "git grep --no-index -Ocat foo",
+        ])
+        for c in ("git grep foo", "git log --oneline", "git fetch origin", "git push origin branch",
+                  "git log --oneline -- logs/guardian_state.json", "git grep -c guardian_state.json",
+                  "git grep -n -o foo -- logs/guardian_state.json", "git fetch --recurse-submodules=no origin",
+                  "git diff -O/tmp/order -- scripts", "git grep -n foo -- scripts", "git log -p --stat ."):
+            res = self.agy(self.cmd(c))
+            self.assertEqual(res.get("decision"), "ask", c)
+            self.assertNotGroundTruth(res, c)
+
+    def test_command_running_option_values_and_operands_judged(self):
+        # Values of command-running options are nested commands and their operands may not reach logs/,
+        # whether or not a protected file is named
+        self.assertAllGroundTruthDenied([
+            "rg -uu --pre rm . logs", "rg --pre=rm foo logs", "rg --pre /tmp/x foo", "rg --pre rm -e foo -- .",
+            "rg --pre=\"bash -c 'rm -rf logs'\" foo scripts/", "rg --hostname-bin='rm -rf logs' foo scripts/",
+            "less '+!rm -rf logs' /tmp/x", "git grep -O'rm -rf logs' foo -- scripts",
+            "git -C . grep --op=/tmp/x foo -- logs",
+        ])
+        for c in ("rg foo logs/", "rg -n foo scripts/", "rg foo", "rg --pre-glob '*.gz' foo logs/",
+                  "rg --pre /tmp/x foo scripts/ tests/", "less +G logs/guardian.log", "less '+/pattern' /tmp/x",
+                  "git fetch --upload-pack=/tmp/x /tmp/r"):
+            res = self.agy(self.cmd(c))
+            self.assertEqual(res.get("decision"), "ask", c)
+            self.assertNotGroundTruth(res, c)
+
+    def test_nested_shells_inline_code_and_find_exec_on_logs_dir_denied(self):
+        self.assertAllGroundTruthDenied([
+            "bash -c 'rm -rf logs'", "sh -c 'rm -f logs/*.json'", "eval 'rm -rf logs'", "eval rm -rf logs",
+            "cmd //c rd /s /q logs", "python3 -c \"import shutil; shutil.rmtree('logs')\"",
+            "node -e \"require('fs').rmSync('logs',{recursive:true})\"",
+            "find . -maxdepth 0 -name . -exec rm -rf logs \\;",
+            "bash -lc 'mv logs /tmp/x'", "sudo sh -c \"ln -s logs st\"", "bash -c \"bash -c 'rm -rf logs'\"",
+            "cmd.exe /c del /s /q logs", "cmd //c move logs C:\\tmp", "powershell -Command \"Remove-Item -Recurse -Force logs\"",
+            "pwsh -c 'Move-Item -Path logs -Destination /tmp/x'",
+            "find . -type d -name 'lo*' -exec rm -rf {} +", "find . -maxdepth 1 -name logs -exec mv {} /tmp/x \\;",
+            "find /tmp -name x -exec sh -c 'rm -rf logs' \\;", f"find {self.root} -maxdepth 0 -exec rm -rf {{}} \\;",
+            "python3 -c \"import shutil; shutil.rmtree('.')\"",
+            "python3 -c \"import glob,os; [os.remove(p) for p in glob.glob('logs/*')]\"",
+            "python3 -c \"import os; os.rename('logs', '/tmp/x')\"", "node -e \"require('fs').renameSync('logs','/tmp/x')\"",
+            "python3 -c \"import os; os.symlink('logs', 'st')\"",
+            "python3 - <<'EOF'\nimport shutil\nshutil.rmtree('logs')\nEOF",
+        ])
+        self.assertNoneGroundTruth([
+            "bash -c 'echo hi'", "bash scripts/dev/x.sh logs", "sh -c 'rm -rf build'", "eval \"$(ssh-agent -s)\"",
+            "find . -name '*.pyc' -exec rm -f {} +", "find . -name __pycache__ -type d -exec rm -rf {} +",
+            "find build -type d -exec rm -rf {} +", "cmd //c rd /s /q build", "cmd //c dir logs",
+            "python3 -c \"print('a.b'.replace('.', '_'))\"", "python3 -c \"import os; print(os.listdir('logs'))\"",
+            "python3 -c \"import shutil; shutil.rmtree('build')\"", "bash -c 'cat logs/guardian.log'",
+        ])
+
+    def test_inline_write_markers_and_heredoc_program(self):
+        cases = [
+            ("node -e \"require('fs').rm('logs/pending_entries.json',()=>{})\"", "pending_entries.json"),
+            ("node -e \"const fs=require('fs');fs.writeSync(fs.openSync('logs/guardian_state.json','w'),'{}')\"",
+             "guardian_state.json"),
+            ("node -e \"const {rm}=require('node:fs/promises'); rm('logs/pending_entries.json')\"", "pending_entries.json"),
+            ("python3 -c \"import os; os.execvp('rm',['rm','logs/pending_entries.json'])\"", "pending_entries.json"),
+            ("python3 -c \"import os; os.spawnlp(os.P_WAIT,'rm','rm','logs/pending_entries.json')\"", "pending_entries.json"),
+            ("python3 -c \"import os; os.posix_spawnp('rm',['rm','logs/pending_entries.json'],{})\"", "pending_entries.json"),
+            ("python3 -c \"import pty; pty.spawn(['rm','logs/pending_entries.json'])\"", "pending_entries.json"),
+            ("python3 -c \"f=open('logs/guardian_state.json','bw')\"", "guardian_state.json"),
+            ("python3 -c \"f=open('logs/guardian_state.json', mode='ab')\"", "guardian_state.json"),
+            ("python3 -c \"f=open('logs/guardian_state.json','b+r')\"", "guardian_state.json"),
+            ("perl <<'EOF' # python\nunlink \"logs/pending_entries.json\";\nEOF", "pending_entries.json"),
+            ("ruby <<'EOF' # node\nFile.delete('logs/pending_entries.json')\nEOF", "pending_entries.json"),
+        ]
+        for c, name in cases:
+            self.assertGroundTruthDenied(self.agy(self.cmd(c)), name, c)
+        for c in ("python3 -c \"print(open('logs/guardian_state.json','rb').read())\"",
+                  "python3 -c \"print(open('logs/guardian_state.json', 'r').read())\"",
+                  "node -e \"console.log(require('fs').readFileSync('logs/guardian_state.json','utf8'))\"",
+                  "cat <<'EOF' | python3 -\nimport json\nprint(json.load(open('logs/guardian_state.json')))\nEOF"):
+            res = self.agy(self.cmd(c))
+            self.assertEqual(res.get("decision"), "ask", c)
+            self.assertNotGroundTruth(res, c)
+        lines = pre_trade_guard._strip_interpreter_heredocs("perl <<'EOF' # python\nunlink x;\nEOF").split("\n")
+        self.assertIn("unlink x;", lines)
+        self.assertNotIn("x = 1", pre_trade_guard._strip_interpreter_heredocs("python3 - <<'EOF'\nx = 1\nEOF").split("\n"))
+
+    def test_unquoted_command_substitution_paths_denied(self):
+        self.assertEqual(pre_trade_guard._lift_path_substitutions("rm -rf $(pwd)/logs"), "rm -rf ./logs")
+        self.assertEqual(pre_trade_guard._lift_path_substitutions("ln -s $(dirname x)/logs st"),
+                         "ln -s ./logs st\ndirname x")
+        self.assertAllGroundTruthDenied([
+            "rm -rf $(pwd)/logs", "ln -s $(pwd)/logs st", "rm -rf `pwd`/logs", "rm -rf $(pwd -P)/logs",
+            "rm -rf $(pwd)", "rm -rf \"$PWD\"", "rm -rf ${PWD}/logs", "rm -rf $(git rev-parse --show-toplevel)",
+            "rm -rf $(git rev-parse --show-toplevel)/logs", "rm -rf $(dirname /x/y)/logs", "mv $(pwd)/logs /tmp/x",
+            "echo \"$(rm -rf logs)/x\"", "rm -rf $HOME",
+        ])
+        self.assertNoneGroundTruth(["ls $(pwd)/logs", "echo $(pwd)", "cd $(git rev-parse --show-toplevel)",
+                                    "rm -rf $(pwd)/build", "cat $(pwd)/logs/guardian_state.json"])
+
+
 class TestRuntimeContracts(GuardHarness):
 
     def test_agy_mode_never_exits_non_zero(self):
