@@ -33,6 +33,8 @@ import pre_trade_guard
 import sync_session_state
 import execute_futures_trade as eft
 
+GATE_PROFILE = {"max_open_positions": 3, "leverage_standard": 3, "risk_pct_equity": 0.005, "max_margin_ratio": 0.30}
+
 
 class TestPreTradeGuardHardening(unittest.TestCase):
 
@@ -656,7 +658,10 @@ class TestPreTradeGuardHardening(unittest.TestCase):
                 return self.state_path
             return orig_join(*p)
 
-        with patch("os.path.join", side_effect=fake_join):
+        # pending_entries.json (Gate 0A) is read from the temp root and the profile is explicit: never the real logs/
+        with patch("os.path.join", side_effect=fake_join), \
+             patch("execute_futures_trade._workspace_dir", return_value=self.mock_root), \
+             patch("user_profile.load_user_profile", return_value=dict(GATE_PROFILE)):
             passed, reason = eft.check_mechanical_gates(
                 direction="LONG",
                 cur_price=65000.0,
@@ -679,7 +684,10 @@ class TestPreTradeGuardHardening(unittest.TestCase):
                 return self.state_path
             return orig_join(*p)
 
-        with patch("os.path.join", side_effect=fake_join):
+        # pending_entries.json (Gate 0A) is read from the temp root and the profile is explicit: never the real logs/
+        with patch("os.path.join", side_effect=fake_join), \
+             patch("execute_futures_trade._workspace_dir", return_value=self.mock_root), \
+             patch("user_profile.load_user_profile", return_value=dict(GATE_PROFILE)):
             passed, reason = eft.check_mechanical_gates(
                 direction="LONG",
                 cur_price=65000.0,

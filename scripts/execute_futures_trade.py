@@ -78,7 +78,7 @@ JSON schemas (stable; extra keys may be added, existing keys are never renamed):
       "sl_price", "tp1_price", "tp2_price", ..., "error"?: str, "hard_gate_rejection"?: bool}
       Resting entries (untriggered STOP_MARKET via the algo order API, resting LIMIT) return
       "conditional_entry" / "pending_limit_entry": true and "pending_entry_key"; they are recorded in
-      logs/pending_entries.json and require a live position guardian in PROD.
+      logs/pending_entries.json, require a live position guardian in PROD and count against max_open_positions.
 """
 
 import os
@@ -1315,24 +1315,12 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
     except Exception:
         prof = {}
 
-    # --- GATE 0A: Max Open Positions Gate ---
-    max_open_positions = int(prof.get("max_open_positions", 3))
+    # --- GATE 0A: Max Open Positions Gate (open positions + pending resting entries, Issue #38) ---
     log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'logs')
     state_file = os.path.join(log_dir, 'session_state.json')
-    total_active_positions = 0
-    if os.path.exists(state_file):
-        try:
-            with open(state_file, 'r', encoding='utf-8') as f:
-                state_data_pos = json.load(f)
-                total_active_positions = state_data_pos.get('portfolio_exposure', {}).get('total_active_positions')
-                if total_active_positions is None:
-                    total_active_positions = len(state_data_pos.get('active_positions', []))
-                total_active_positions = int(total_active_positions)
-        except Exception:
-            total_active_positions = 0
-
-    if total_active_positions >= max_open_positions:
-        return False, f"MECHANICAL HARD GATE REJECTION: Max open positions limit ({max_open_positions}) reached."
+    slots_ok, slots_err = check_max_open_positions(prof, target_env)
+    if not slots_ok:
+        return False, slots_err
 
     # --- GATE 0B: Leverage Ceiling Gate (Absolute Ceiling) ---
     # Single source of truth: user_profile.get_leverage_ceiling() (profile `leverage_ceiling`, default 15x)
@@ -1714,6 +1702,58 @@ def check_pending_entry_conflict(symbol, target_env):
         if isinstance(rec, dict) and rec.get('target_env') == target_env and str(rec.get('symbol', '')).upper() == symbol:
             return False, (f"ENTRY REJECTED: {symbol} has a pending resting entry ({key}) in logs/pending_entries.json; "
                            "wait until it fills (protected by --protect-pending / the guardian) or expires.")
+    return True, None
+
+
+def check_max_open_positions(prof, target_env):
+    """
+    Gate 0A (max_open_positions), evaluated before any write. Committed slots = open positions (logs/session_state.json)
+    + symbols with a pending resting entry for target_env in logs/pending_entries.json that have no open position yet
+    (a partially filled LIMIT has both a position and a record: counted once). A new entry is rejected when committed
+    slots >= profile max_open_positions. A missing registry counts zero pending entries; an unreadable one fails
+    closed in PROD (TESTNET counts zero). Returns (ok, message_or_None). Read-only.
+    """
+    target_env = resolve_env(target_env)
+    is_testnet = str(target_env).lower() == 'testnet'
+    max_open_positions = int((prof or {}).get("max_open_positions", 3))
+    prefix = f"MECHANICAL HARD GATE REJECTION: Max open positions limit ({max_open_positions})"
+
+    state_file = os.path.join(_workspace_dir(), 'logs', 'session_state.json')
+    open_count = 0
+    open_symbols = set()
+    if os.path.exists(state_file):
+        try:
+            with open(state_file, 'r', encoding='utf-8') as f:
+                state_data_pos = json.load(f)
+            open_count = state_data_pos.get('portfolio_exposure', {}).get('total_active_positions')
+            if open_count is None:
+                open_count = len(state_data_pos.get('active_positions', []))
+            open_count = int(open_count)
+        except Exception:
+            open_count = 0
+        else:
+            try:
+                open_symbols = {str(p.get('symbol')).upper() for p in state_data_pos.get('active_positions') or []
+                                if isinstance(p, dict) and p.get('symbol')}
+            except Exception:
+                open_symbols = set()
+
+    entries, err = load_pending_entries()
+    if err:
+        if not is_testnet:
+            return False, (f"{prefix}: FAIL-CLOSED — {err}; cannot count pending resting entries "
+                           "(logs/pending_entries.json). Order blocked.")
+        entries = {}
+    pending_symbols = set()
+    for rec in entries.values():
+        if isinstance(rec, dict) and rec.get('target_env') == target_env:
+            sym = str(rec.get('symbol', '')).upper()
+            if sym and sym not in open_symbols:
+                pending_symbols.add(sym)
+    pending_count = len(pending_symbols)
+
+    if open_count + pending_count >= max_open_positions:
+        return False, (f"{prefix} reached (open {open_count} + pending {pending_count} >= max {max_open_positions}).")
     return True, None
 
 
@@ -2256,6 +2296,11 @@ def execute_complete_trade(
         pend_ok, pend_err = check_pending_entry_conflict(symbol, target_env)
         if not pend_ok:
             return {"success": False, "hard_gate_rejection": True, "error": pend_err}
+    # 1c. Max open positions (Gate 0A, Issue #38): open positions + pending resting entries, checked before any write
+    # (check_mechanical_gates re-checks it after sizing).
+    slots_ok, slots_err = check_max_open_positions(prof, target_env)
+    if not slots_ok:
+        return {"success": False, "hard_gate_rejection": True, "error": slots_err}
     resting_kind = None
     if str(order_type).upper() == 'STOP_MARKET' and trigger_p is not None and not trigger_breached:
         resting_kind = 'STOP_MARKET'

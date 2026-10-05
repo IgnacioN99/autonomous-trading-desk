@@ -22,6 +22,29 @@ if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
 
 import execute_futures_trade as eft
+import user_profile as up
+
+
+def isolate_workspace(tc, profile=None, gate1_state=False):
+    """
+    Points the executor's logs/ (session_state.json, pending_entries.json, audit trails) at a temp workspace for the
+    duration of the test, so it never reads or writes the real logs/ (the desk machine trades live). profile: explicit
+    user profile instead of the operator's config/user_profile.json. gate1_state: also redirect the module __file__,
+    from which GATE 1 (delta, PROD) resolves logs/session_state.json. Returns the temp workspace path.
+    """
+    tmp = tempfile.TemporaryDirectory()
+    tc.addCleanup(tmp.cleanup)
+    ws = tmp.name
+    os.makedirs(os.path.join(ws, "logs"), exist_ok=True)
+    patches = [patch("execute_futures_trade._workspace_dir", return_value=ws)]
+    if gate1_state:
+        patches.append(patch.object(eft, "__file__", os.path.join(ws, "scripts", "execute_futures_trade.py")))
+    if profile is not None:
+        patches.append(patch("user_profile.load_user_profile", return_value=dict(profile)))
+    for p in patches:
+        p.start()
+        tc.addCleanup(p.stop)
+    return ws
 
 
 class TestVerifyAlgoStopLoss(unittest.TestCase):
@@ -80,6 +103,10 @@ class TestVerifyAlgoStopLoss(unittest.TestCase):
 
 class TestLeverageCeilingGates(unittest.TestCase):
     """[Finding 8] Hard Leverage Ceiling Verification."""
+
+    def setUp(self):
+        # Gate 0A reads session_state/pending_entries: temp workspace + cold-start profile (tests may override it)
+        isolate_workspace(self, profile=up.DEFAULT_PROFILE)
 
     @patch("quant_risk_engine.get_account_equity", return_value=10000.0)
     def test_leverage_exceeds_15x_absolute_ceiling_rejected(self, mock_eq):
@@ -176,57 +203,39 @@ class TestDynamicEquityRiskGate(unittest.TestCase):
             "portfolio_exposure": {"delta_bias": "NEUTRAL"}
         })
 
-        log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
-        os.makedirs(log_dir, exist_ok=True)
-        state_file = os.path.join(log_dir, "session_state.json")
-        orig_content = None
-        if os.path.exists(state_file):
-            try:
-                with open(state_file, "r", encoding="utf-8") as f:
-                    orig_content = f.read()
-            except Exception:
-                pass
+        # session_state.json lives in a temp workspace (Gate 0A and the PROD delta gate), never in the real logs/
+        ws = isolate_workspace(self, gate1_state=True)
+        state_file = os.path.join(ws, "logs", "session_state.json")
+        with open(state_file, "w", encoding="utf-8") as f:
+            f.write(valid_state)
 
-        try:
-            with open(state_file, "w", encoding="utf-8") as f:
-                f.write(valid_state)
+        # Loss of $10.00 exceeds $6.25 cap -> rejected
+        ok, reason = eft.check_mechanical_gates(
+            direction="LONG",
+            cur_price=100.0,
+            sl_price=90.0, # $10 per unit
+            tp1_price=105.0,
+            total_qty=1.0, # potential loss = $10.00
+            leverage=3,
+            target_env="prod",
+            is_yolo=False
+        )
+        self.assertFalse(ok)
+        self.assertIn("Monetary risk exceeds allowed cap", reason)
 
-            # Loss of $10.00 exceeds $6.25 cap -> rejected
-            ok, reason = eft.check_mechanical_gates(
-                direction="LONG",
-                cur_price=100.0,
-                sl_price=90.0, # $10 per unit
-                tp1_price=105.0,
-                total_qty=1.0, # potential loss = $10.00
-                leverage=3,
-                target_env="prod",
-                is_yolo=False
-            )
-            self.assertFalse(ok)
-            self.assertIn("Monetary risk exceeds allowed cap", reason)
-
-            # Loss of $5.00 is within $6.25 cap -> allowed
-            ok_valid, reason_valid = eft.check_mechanical_gates(
-                direction="LONG",
-                cur_price=100.0,
-                sl_price=95.0, # $5 per unit
-                tp1_price=105.0,
-                total_qty=1.0, # potential loss = $5.00
-                leverage=3,
-                target_env="prod",
-                is_yolo=False
-            )
-            self.assertTrue(ok_valid)
-            self.assertIsNone(reason_valid)
-        finally:
-            if orig_content is not None:
-                with open(state_file, "w", encoding="utf-8") as f:
-                    f.write(orig_content)
-            elif os.path.exists(state_file):
-                try:
-                    os.remove(state_file)
-                except Exception:
-                    pass
+        # Loss of $5.00 is within $6.25 cap -> allowed
+        ok_valid, reason_valid = eft.check_mechanical_gates(
+            direction="LONG",
+            cur_price=100.0,
+            sl_price=95.0, # $5 per unit
+            tp1_price=105.0,
+            total_qty=1.0, # potential loss = $5.00
+            leverage=3,
+            target_env="prod",
+            is_yolo=False
+        )
+        self.assertTrue(ok_valid)
+        self.assertIsNone(reason_valid)
 
 
 class TestAutoDestructAndFailSafe(unittest.TestCase):
@@ -291,6 +300,7 @@ class TestAutoDestructAndFailSafe(unittest.TestCase):
         mock_place_sl.return_value = {"error": "SL placement error"}
         mock_verify_sl.return_value = (False, None) # SL unconfirmed!
         mock_abort.return_value = {"success": True, "confirmed": True, "order": {"orderId": 50002}}
+        isolate_workspace(self, profile=up.DEFAULT_PROFILE)
 
         res = eft.execute_complete_trade(
             symbol="BTCUSDT",
@@ -333,7 +343,8 @@ class TestRestingLimitOrders(unittest.TestCase):
 
         mock_send.side_effect = fake_send
 
-        with tempfile.TemporaryDirectory() as ws, patch("execute_futures_trade._workspace_dir", return_value=ws):
+        with tempfile.TemporaryDirectory() as ws, patch("execute_futures_trade._workspace_dir", return_value=ws), \
+             patch("user_profile.load_user_profile", return_value=dict(up.DEFAULT_PROFILE)):
             res = eft.execute_complete_trade(
                 symbol="BTCUSDT",
                 direction="LONG",
@@ -470,6 +481,7 @@ class TestCLIEntryPoint(unittest.TestCase):
         }
         mock_send.return_value = {'price': '100.0'}
         mock_setup.return_value = ({'code': -4028, 'isError': True, 'error': 'Leverage exceeds account limit'}, {'code': 200, 'msg': 'success'}, 3)
+        isolate_workspace(self, profile=up.DEFAULT_PROFILE)
 
         res = eft.execute_complete_trade(
             symbol="BTCUSDT",

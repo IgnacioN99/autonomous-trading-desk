@@ -110,19 +110,14 @@ class TestMechanicalGatesProfileEnforcement(unittest.TestCase):
     """2. Mechanical Gates & Execution Engine Profile Enforcement."""
 
     def setUp(self):
-        self.state_file = os.path.join(BASE_DIR, "logs", "session_state.json")
-        self.orig_state = None
-        if os.path.exists(self.state_file):
-            try:
-                with open(self.state_file, "r", encoding="utf-8") as f:
-                    self.orig_state = f.read()
-            except Exception:
-                pass
-
-    def tearDown(self):
-        if self.orig_state is not None:
-            with open(self.state_file, "w", encoding="utf-8") as f:
-                f.write(self.orig_state)
+        # Temp workspace: the executor reads session_state.json / pending_entries.json there, never the real logs/
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.ws = tmp.name
+        ws_patch = patch("execute_futures_trade._workspace_dir", return_value=self.ws)
+        ws_patch.start()
+        self.addCleanup(ws_patch.stop)
+        self.state_file = os.path.join(self.ws, "logs", "session_state.json")
 
     def _write_session_state(self, active_count=0):
         state = {
