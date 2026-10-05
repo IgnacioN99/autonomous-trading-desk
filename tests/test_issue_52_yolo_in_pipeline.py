@@ -19,7 +19,7 @@ import textwrap
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 
@@ -219,6 +219,17 @@ class TestPipelineYoloSlot(_PipelineFakes):
             payload = self.run_pipeline()
         self.assertEqual([c.symbol for c in payload.yolo_slot.candidates], ["WIFUSDT"])
 
+    def test_dry_volume_wick_only_candidate_is_dropped(self):
+        """Round 4: the 1.0x volume floor also applies on the Barbell path (wick on dry volume = noise)."""
+        dry = _long("DRYUSDT", vol_ratio=0.6, lower_wick=62.0)
+        just_below = _long("EDGEUSDT", vol_ratio=0.99, lower_wick=90.0)
+        with patch("broad_yolo_scanner.scan_yolo", return_value=_scan_payload(longs=[dry, just_below])):
+            payload = self.run_pipeline()
+        self.assertEqual(payload.yolo_slot.status, "INACTIVE")
+        self.assertEqual(payload.yolo_slot.candidates, [])
+        self.assertEqual(bys.MIN_VOL_FLOOR, 1.0)
+        self.assertIn("(volume >= 1.0x)", payload.yolo_slot_status)
+
     def test_incoherent_or_short_entries_are_dropped(self):
         bad_levels = dict(_long("BADUSDT"), sl=1.0)          # SL above price for a LONG
         short_in_longs = dict(_long("SHRTUSDT"), direction="SHORT")
@@ -234,6 +245,54 @@ class TestPipelineYoloSlot(_PipelineFakes):
         scan.assert_not_called()
         self.assertEqual(payload.yolo_slot.status, "UNAVAILABLE")
         self.assertEqual(len(payload.top_candidates), 1)
+
+
+def _wick_klines(side, last_vol, n=40):
+    """Drift then a last candle with a ~98% lower (side='LONG') or upper (side='SHORT') wick and volume last_vol
+    (the previous bars trade 100). LONG drifts down (RSI < 50), SHORT drifts up (RSI > 50)."""
+    ks, price = [], 1.0
+    up, down = (0.997, 1.002) if side == "LONG" else (1.003, 0.998)
+    for i in range(n - 1):
+        o = price
+        c = price * (up if i % 2 == 0 else down)
+        ks.append([i, str(o), str(max(o, c) * 1.0005), str(min(o, c) * 0.9995), str(c), "100"])
+        price = c
+    o = price
+    if side == "LONG":
+        ks.append([n, str(o), str(o * 1.001), str(o * 0.95), str(o * 1.0005), str(last_vol)])
+    else:
+        ks.append([n, str(o), str(o * 1.05), str(o * 0.999), str(o * 0.9995), str(last_vol)])
+    return ks
+
+
+def _klines_response(klines):
+    resp = MagicMock()
+    resp.__enter__.return_value.read.return_value = json.dumps(klines).encode()
+    return resp
+
+
+class TestScannerVolumeFloor(unittest.TestCase):
+    """Round 4: the scanner never qualifies a wick printed on dry volume (< MIN_VOL_FLOOR), long or short."""
+
+    def _audit(self, side, last_vol):
+        with patch("urllib.request.urlopen", return_value=_klines_response(_wick_klines(side, last_vol))):
+            return bys.audit_symbol("WIFUSDT")
+
+    def test_wick_only_dry_volume_rejected_long_and_short(self):
+        for side, wick_key, pass_key in (("LONG", "lower_wick", "pass_long"), ("SHORT", "upper_wick", "pass_short")):
+            with self.subTest(side=side):
+                dry = self._audit(side, last_vol=60)        # vol_ratio 0.6x, wick ~98%
+                self.assertLess(dry["vol_ratio"], bys.MIN_VOL_FLOOR)
+                self.assertGreaterEqual(dry[wick_key], bys.MIN_WICK_PCT)
+                self.assertFalse(dry[pass_key], dry)
+                normal = self._audit(side, last_vol=120)    # same wick on 1.2x volume: Barbell wick path passes
+                self.assertGreaterEqual(normal["vol_ratio"], bys.MIN_VOL_FLOOR)
+                self.assertGreaterEqual(normal[wick_key], bys.MIN_WICK_PCT)
+                self.assertTrue(normal[pass_key], normal)
+
+    def test_floor_reported_in_filters(self):
+        self.assertEqual(bys.MIN_VOL_FLOOR, 1.0)
+        self.assertLess(bys.MIN_VOL_FLOOR, bys.MIN_VOL_RATIO)
 
 
 class TestYoloLevelsFromTrigger(unittest.TestCase):
@@ -526,7 +585,25 @@ class TestEvaluatorPromptReadsYoloCandidates(unittest.TestCase):
                   encoding="utf-8") as f:
             text = f.read()
         k2 = next(line for line in text.splitlines() if line.strip().startswith("- K2 Institutional volume"))
-        self.assertIn("EXCEPTION: candidates from `brief.yolo_slot.candidates` use the Barbell path only", k2)
+        invariant = ("A `vol_ratio < 1.0x` NEVER passes K2 at any tier or path, including the Barbell path: "
+                     "it is always FAKE_TIER_S.")
+        self.assertIn(invariant, k2)
+        self.assertIn("with `vol_ratio >= 1.0x` use the Barbell path (`vol_ratio >= 2.0x` OR `lower_wick >= 50%`, "
+                      "OIB not required) -> PASS (Barbell path) / FAIL.", k2)
+        rule6 = text.split("- RULE 6")[1].split("- RULE 7")[0]
+        self.assertIn(invariant, rule6)
+        self.assertIn("-> PASS (Barbell path) / FAIL.", rule6)
+        self.assertIn("`vol_ratio >= 1.0x` AND (climax volume", rule6)
+        self.assertNotIn("EXCEPTION: candidates from", text)
+        # One K2 label everywhere for YOLO lines
+        for line in text.splitlines():
+            if "(YOLO) K2" in line:
+                self.assertIn("K2 Institutional volume (Barbell path)", line)
+        # Leverage source: the candidate's leverage, never above leverage_yolo
+        self.assertEqual(text.count("never above `brief.risk_profile.leverage_yolo` (if they differ, use the lower)"), 2)
+        contract = text.split("<output_contract>")[1].split("</output_contract>")[0]
+        self.assertIn('"tier": "A", "entry": 0.0124', contract)
+        self.assertIn('"is_yolo": true, "requires_user_confirmation": true}', contract)
         c41 = next(line for line in text.splitlines() if line.strip().startswith("- C4.1 Confirmation policy"))
         self.assertIn("YOLO (`is_yolo: true`, always Tier A): always `true`", c41)
         self.assertIn('`"is_yolo": true`, `"tier": "A"`', text)
@@ -535,6 +612,11 @@ class TestEvaluatorPromptReadsYoloCandidates(unittest.TestCase):
         shot = text.split('<example id="eval_neg_04_yolo_long_heavy_abort">')[1].split("</example>")[0]
         self.assertIn("BLOCKED ([DELTA_GATE_REJECTION])", shot)
         self.assertIn('"approved_candidates": []', shot)
+        dry = text.split('<example id="eval_neg_05_yolo_dry_volume_wick_only">')[1].split("</example>")[0]
+        self.assertIn("vol_ratio 0.6x < 1.0x never passes at any tier or path", dry)
+        self.assertIn("-> FAKE_TIER_S", dry)
+        self.assertIn('"status": "REJECTED"', dry)
+        self.assertIn('"approved_candidates": []', dry)
         self.assertEqual(text.count("<example id="), text.count("</example>"))
 
 

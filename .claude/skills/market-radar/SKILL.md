@@ -81,14 +81,14 @@ sorted by confidence. `--top 0` (default) returns all of them.
 
 `python3 scripts/broad_yolo_scanner.py --json [--top N] [--interval 15m|5m|1h] [--env ENV]`
 
-Hardened Barbell filters: climax volume ≥ 2.0x OR absorption wick ≥ 50%, long RSI ≤ 65, short
+Hardened Barbell filters: climax volume ≥ 2.0x OR absorption wick ≥ 50% (never below 1.0x volume), long RSI ≤ 65, short
 RSI ≥ 45, score ≥ 50. Margin comes from the profile (`yolo_margin_fixed`, else `yolo_equity_pct`
 × equity of `env`, clamped to 10-15 USDT); leverage is `leverage_yolo` capped at `leverage_ceiling`.
 
 ```json
 {"status": "ok", "command": "yolo", "env": "prod", "interval": "15m", "universe_size": 96,
  "universe_from_live_ticker": true, "scanned": 94,
- "filters": {"min_vol_ratio": 2.0, "min_wick_pct": 50.0, "long_max_rsi": 65.0, "short_min_rsi": 45.0, "min_score": 50.0},
+ "filters": {"min_vol_ratio": 2.0, "min_wick_pct": 50.0, "min_vol_floor": 1.0, "long_max_rsi": 65.0, "short_min_rsi": 45.0, "min_score": 50.0},
  "sizing": {"margin_usdt": 12.0, "leverage": 15, "leverage_ceiling": 15, "margin_mode": "ISOLATED", "yolo_slot_enabled": true},
  "slot_status": "CANDIDATE",
  "recommendation": {"symbol": "WIFUSDT", "direction": "LONG", "score": 88.1, "price": 2.01, "trigger": 2.031,

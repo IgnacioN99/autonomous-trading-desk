@@ -35,7 +35,8 @@ YOLO_SCAN_TIMEOUT_S = 25
 YOLO_SCAN_INTERVAL = "15m"
 YOLO_SCAN_TOP = 3
 YOLO_MAX_CANDIDATES = 2  # token budget of the primed brief
-YOLO_FILTER_TEXT = f"climax volume >= {bys.MIN_VOL_RATIO}x or buyer absorption wick >= {bys.MIN_WICK_PCT:.0f}%"
+YOLO_FILTER_TEXT = (f"climax volume >= {bys.MIN_VOL_RATIO}x or buyer absorption wick >= {bys.MIN_WICK_PCT:.0f}% "
+                    f"(volume >= {bys.MIN_VOL_FLOOR}x)")
 YOLO_INACTIVE_STATUS = f"INACTIVE: Preserving capital. No memecoin exceeds {YOLO_FILTER_TEXT}."
 YOLO_DISABLED_STATUS = "DISABLED: yolo_slot_enabled is false in the user profile."
 # Executor gates mirrored here (not imported) so the evaluator never sees a YOLO entry that the executor would
@@ -361,8 +362,9 @@ def _to_yolo_candidate(raw: dict) -> Optional[YoloCandidate]:
         vol_ratio, lower_wick = float(raw["vol_ratio"]), float(raw["lower_wick"])
     except Exception:
         return None
-    # Defense in depth: never forward a memecoin that fails both hardened filters (AGENTS.md Barbell rule).
-    if not (vol_ratio >= bys.MIN_VOL_RATIO or lower_wick >= bys.MIN_WICK_PCT):
+    # Defense in depth: never forward a memecoin that fails the hardened filters (AGENTS.md Barbell rule), and
+    # never a dry-volume wick (vol_ratio < 1.0x is thin-book noise, FAKE_TIER_S on every K2 path).
+    if vol_ratio < bys.MIN_VOL_FLOOR or not (vol_ratio >= bys.MIN_VOL_RATIO or lower_wick >= bys.MIN_WICK_PCT):
         return None
     # LONG levels must be coherent around the current price and the trigger entry (also drops NaN levels).
     if not (0.0 < sl < price and sl < trigger < tp1 <= tp2 and leverage >= 1 and margin > 0.0):

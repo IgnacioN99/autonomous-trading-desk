@@ -3,7 +3,7 @@
 broad_yolo_scanner.py - High-Throughput Quantitative YOLO Moonshot Scanner.
 Audits 80+ memecoins and hyper-volatile perpetual contracts on Binance Futures.
 Enforces Nassim Taleb Barbell Convexity:
-- Climax Volume >= 2.0x MA OR Absorption Wick >= 50% (hardened filters, see AGENTS.md)
+- Climax Volume >= 2.0x MA OR Absorption Wick >= 50%, never with dry volume < 1.0x (hardened filters, see AGENTS.md)
 - Asymmetric Convex Sizing: isolated margin and leverage from config/user_profile.json
   (yolo_margin_fixed / yolo_equity_pct and leverage_yolo, capped at leverage_ceiling)
 - TP1 (+2.2R) and TP2 (+4.5R) to preserve right-tail convexity
@@ -33,6 +33,8 @@ SUPPORTED_INTERVALS = ("5m", "15m", "1h")
 # Hardened Barbell filters (AGENTS.md: climax volume >= 2.0x OR absorption wick >= 50%).
 MIN_VOL_RATIO = 2.0
 MIN_WICK_PCT = 50.0
+# Volume floor on every path: a wick printed on dry volume (< 1.0x) is thin-book noise, not absorption.
+MIN_VOL_FLOOR = 1.0
 LONG_MAX_RSI = 65.0
 SHORT_MIN_RSI = 45.0
 MIN_SCORE = 50.0
@@ -142,12 +144,12 @@ def audit_symbol(symbol, interval="15m"):
 
         # 1. LONG Candidate Evaluation (hardened: climax volume or buyer absorption wick, RSI not overheated)
         score_long = lower_wick * 0.45 + (vol_ratio * 18.0) + (max(0, 50 - rsi) * 0.9)
-        pass_long = ((vol_ratio >= MIN_VOL_RATIO or lower_wick >= MIN_WICK_PCT)
+        pass_long = (vol_ratio >= MIN_VOL_FLOOR and (vol_ratio >= MIN_VOL_RATIO or lower_wick >= MIN_WICK_PCT)
                      and rsi <= LONG_MAX_RSI and score_long >= MIN_SCORE)
 
         # 2. SHORT Candidate Evaluation (hedge side: climax volume or seller absorption wick)
         score_short = upper_wick * 0.45 + (vol_ratio * 18.0) + (max(0, rsi - 50) * 0.9)
-        pass_short = ((vol_ratio >= MIN_VOL_RATIO or upper_wick >= MIN_WICK_PCT)
+        pass_short = (vol_ratio >= MIN_VOL_FLOOR and (vol_ratio >= MIN_VOL_RATIO or upper_wick >= MIN_WICK_PCT)
                       and rsi >= SHORT_MIN_RSI and score_short >= MIN_SCORE)
 
         return {
@@ -287,6 +289,7 @@ def scan_yolo(target_env, interval="15m", top=5):
         "filters": {
             "min_vol_ratio": MIN_VOL_RATIO,
             "min_wick_pct": MIN_WICK_PCT,
+            "min_vol_floor": MIN_VOL_FLOOR,
             "long_max_rsi": LONG_MAX_RSI,
             "short_min_rsi": SHORT_MIN_RSI,
             "min_score": MIN_SCORE,
@@ -321,7 +324,7 @@ def print_text_report(p):
     s = p["sizing"]
     lev = s["leverage"]
     print(f"🔬 SCANNING EXPANDED YOLO UNIVERSE: {p['universe_size']} CONTRACTS (Binance Futures, {p['interval']}, env={p['env']})")
-    print(f"Hardened Filters: Climax Vol >= {MIN_VOL_RATIO}x OR Absorption Wick >= {MIN_WICK_PCT:.0f}% | "
+    print(f"Hardened Filters: Climax Vol >= {MIN_VOL_RATIO}x OR Absorption Wick >= {MIN_WICK_PCT:.0f}% (Vol >= {MIN_VOL_FLOOR}x) | "
           f"Sizing (profile): {s['margin_usdt']:.2f} USDT isolated at {lev}x (ceiling {s['leverage_ceiling']}x) | "
           f"YOLO slot {'ENABLED' if s['yolo_slot_enabled'] else 'DISABLED'}")
     print("=" * 80)
