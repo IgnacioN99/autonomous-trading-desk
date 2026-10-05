@@ -8,13 +8,20 @@ block) into its own transcript. Two runtimes are supported:
   * Google Antigravity (agy): the subagent is its own conversation,
         ~/.gemini/<product>/brain/<conversationId>/.system_generated/logs/transcript.jsonl
     record_evaluation.py --from-subagent <conversationId>
+    agy truncates long fields in transcript.jsonl (row key "truncated_fields"; content/thinking keep
+    head + "\\n<truncated N bytes>\\n" + tail, tool_call args keep a JSON-encoded prefix +
+    "\\n<truncated N bytes>"). read_agy_steps() takes those scanned rows from the sibling
+    transcript_full.jsonl (same line) only after cross-checking every untruncated field, the
+    head/tail/prefix and N (UTF-8 bytes removed) against transcript.jsonl, and fails closed otherwise.
+    Untruncated rows are read from transcript.jsonl exactly as before.
   * Claude Code: the subagent transcript lives next to its parent session,
         ~/.claude/projects/<project-slug>/<parentSessionId>/subagents/agent-<agentId>.jsonl
     with agent-<agentId>.meta.json ({"agentType": "isolated_market_evaluator", ...}).
     record_evaluation.py --from-claude-subagent <agentId>  (or --from-subagent, auto-detected)
     The meta agentType MUST be the evaluator: a general-purpose agent cannot sign a dossier.
 
-The recorder stores a provenance stamp (source, transcript path, step, sha256 of the block).
+The recorder stores a provenance stamp (source, transcript path, step, sha256 of the block; agy also
+full_transcript_used / resolved_steps).
 Every consumer (pre_trade_guard.py hook, execute_futures_trade.py) re-verifies the stamp against
 the transcript before allowing an order, so a dossier typed by the main agent is rejected.
 
@@ -40,6 +47,11 @@ VALID_DIRECTIONS = ("LONG", "SHORT")
 # Antigravity products keep conversation data under ~/.gemini/<product>/brain
 AGY_PRODUCT_DIRS = ("antigravity", "antigravity-cli", "antigravity-ide")
 TRANSCRIPT_REL = os.path.join(".system_generated", "logs", "transcript.jsonl")
+TRANSCRIPT_FULL_NAME = "transcript_full.jsonl"
+TRANSCRIPT_FULL_REL = os.path.join(".system_generated", "logs", TRANSCRIPT_FULL_NAME)
+TRUNCATED_MARKER_RE = re.compile(r"\n<truncated (\d+) bytes>")
+TRUNCATED_ARG_RE = re.compile(r"\A([\s\S]*)\n<truncated (\d+) bytes>\Z")
+AGY_ROW_KEYS = ("step_index", "source", "type", "status", "created_at")
 
 DOSSIER_RE = re.compile(r"<dossier_json>\s*([\s\S]*?)\s*</dossier_json>")
 CONVERSATION_ID_RE = re.compile(r"^[0-9a-fA-F][0-9a-fA-F-]{7,63}$")
@@ -148,6 +160,166 @@ def _model_texts(step: dict) -> list:
     return texts
 
 
+# =============================================================================
+# agy transcript truncation: resolve scanned rows from transcript_full.jsonl
+# =============================================================================
+def full_transcript_path(path: str) -> str:
+    """Sibling transcript_full.jsonl of an agy transcript.jsonl (same logs/ dir, rows paired by line)."""
+    return os.path.join(os.path.dirname(path), TRANSCRIPT_FULL_NAME)
+
+
+def _read_rows_by_line(path: str) -> list:
+    """Parsed JSON value per physical line (None for blank or unparsable lines), so the rows of
+    transcript.jsonl and transcript_full.jsonl can be paired by line number."""
+    rows = []
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            try:
+                rows.append(json.loads(line) if line else None)
+            except json.JSONDecodeError:
+                rows.append(None)
+    return rows
+
+
+def _needs_full_row(row: Any) -> bool:
+    """True for a truncated row whose model text is scanned (PLANNER_RESPONSE content or send_message args)."""
+    if not isinstance(row, dict) or not row.get("truncated_fields"):
+        return False
+    if row.get("source") != "MODEL" or row.get("type") != "PLANNER_RESPONSE":
+        return False
+    fields = row["truncated_fields"]
+    if not isinstance(fields, list):
+        return True  # malformed: resolve, so the cross-check fails closed
+    if "content" in fields:
+        return True
+    return "tool_calls" in fields and any(
+        isinstance(c, dict) and c.get("name") == "send_message" for c in row.get("tool_calls") or [])
+
+
+def _middle_cut_matches(short: Any, full: Any) -> bool:
+    """agy content/thinking truncation: head + '\\n<truncated N bytes>\\n' + tail, N = UTF-8 bytes removed."""
+    if not isinstance(short, str) or not isinstance(full, str):
+        return False
+    full_bytes = len(full.encode("utf-8"))
+    for m in TRUNCATED_MARKER_RE.finditer(short):
+        head, tail = short[:m.start()], short[m.end():]
+        if not tail.startswith("\n"):
+            continue
+        tail = tail[1:]
+        removed = full_bytes - len(head.encode("utf-8")) - len(tail.encode("utf-8"))
+        if removed == int(m.group(1)) and full.startswith(head) and full.endswith(tail):
+            return True
+    return False
+
+
+def _resolve_tool_calls(short_calls: Any, full_calls: Any, truncated: bool, bad) -> list:
+    """Cross-checks tool_calls and returns them in transcript.jsonl form (JSON-encoded arg values).
+    Truncated args keep a prefix of json.dumps(full_value, ensure_ascii=False) + '\\n<truncated N bytes>',
+    N = UTF-8 bytes removed from that encoded value; every other arg must decode to the full value."""
+    if not isinstance(short_calls, list) or not isinstance(full_calls, list) or len(short_calls) != len(full_calls):
+        raise bad("tool_calls count differs")
+    out = []
+    for i, (s, f) in enumerate(zip(short_calls, full_calls)):
+        if not isinstance(s, dict) or not isinstance(f, dict) or s.get("name") != f.get("name"):
+            raise bad(f"tool_calls[{i}] name differs")
+        if set(s) != set(f) or any(s[k] != f[k] for k in s if k != "args"):
+            raise bad(f"tool_calls[{i}] fields differ")
+        s_args, f_args = s.get("args"), f.get("args")
+        if s_args is None and f_args is None:
+            out.append(dict(s))
+            continue
+        if not isinstance(s_args, dict) or not isinstance(f_args, dict) or set(s_args) != set(f_args):
+            raise bad(f"tool_calls[{i}] args differ")
+        args = {}
+        for name, s_val in s_args.items():
+            encoded = json.dumps(f_args[name], ensure_ascii=False)
+            m = TRUNCATED_ARG_RE.match(s_val) if truncated and isinstance(s_val, str) else None
+            if m:
+                prefix = m.group(1)
+                removed = len(encoded.encode("utf-8")) - len(prefix.encode("utf-8"))
+                if removed != int(m.group(2)) or not encoded.startswith(prefix):
+                    raise bad(f"truncated tool_calls[{i}].args.{name} does not match the full value")
+                args[name] = encoded
+            elif _decode_arg(s_val) != _decode_arg(encoded):
+                raise bad(f"tool_calls[{i}].args.{name} differs")
+            else:
+                args[name] = s_val
+        call = dict(s)
+        call["args"] = args
+        out.append(call)
+    return out
+
+
+def _resolve_truncated_row(short: dict, full: Any) -> dict:
+    """Returns the short row with its truncated fields taken from the full row, after verifying that the
+    full row is the same step (identity keys, every untruncated field) and extends every truncated value."""
+    step = short.get("step_index")
+
+    def bad(reason: str) -> ProvenanceError:
+        return ProvenanceError(f"{TRANSCRIPT_FULL_NAME} mismatch at step {step}: {reason}")
+
+    if not isinstance(full, dict):
+        raise bad("row missing or unreadable")
+    if "truncated_fields" in full:
+        raise bad("full row is truncated too")
+    fields = short.get("truncated_fields")
+    if not isinstance(fields, list) or not all(isinstance(x, str) for x in fields):
+        raise bad("malformed truncated_fields")
+    for key in AGY_ROW_KEYS:
+        if short.get(key) != full.get(key):
+            raise bad(f"'{key}' differs")
+    for key in fields:
+        if key not in full:
+            raise bad(f"truncated field '{key}' missing from the full row")
+
+    resolved = {}
+    for key in (set(short) - {"truncated_fields"}) | set(full):
+        if key not in short or key not in full:
+            raise bad(f"field '{key}' differs")
+        if key == "tool_calls":
+            resolved[key] = _resolve_tool_calls(short[key], full[key], key in fields, bad)
+        elif key in fields:
+            if key not in ("content", "thinking"):
+                raise bad(f"unsupported truncated field '{key}'")
+            if not _middle_cut_matches(short[key], full[key]):
+                raise bad(f"truncated '{key}' does not match the full value")
+            resolved[key] = full[key]
+        elif short[key] != full[key]:
+            raise bad(f"field '{key}' differs")
+        else:
+            resolved[key] = short[key]
+    return resolved
+
+
+def read_agy_steps(path: str) -> Tuple[list, list]:
+    """Rows of an agy transcript.jsonl, with every truncated row whose model text is scanned replaced by its
+    verified counterpart from transcript_full.jsonl. Other rows are returned exactly as in transcript.jsonl.
+    Returns (steps, resolved_rows). Raises ProvenanceError if a needed row cannot be resolved."""
+    rows = _read_rows_by_line(path)
+    needed = {i for i, row in enumerate(rows) if _needs_full_row(row)}
+    full_rows = []
+    if needed:
+        full_path = full_transcript_path(path)
+        try:
+            full_rows = _read_rows_by_line(full_path)
+        except OSError as e:
+            first = rows[min(needed)].get("step_index")
+            raise ProvenanceError(
+                f"transcript.jsonl truncates the subagent output at step {first} and {TRANSCRIPT_FULL_NAME} "
+                f"is missing or unreadable ({full_path}): {e}"
+            )
+    steps, resolved = [], []
+    for i, row in enumerate(rows):
+        if row is None:
+            continue
+        if i in needed:
+            row = _resolve_truncated_row(row, full_rows[i] if i < len(full_rows) else None)
+            resolved.append(row)
+        steps.append(row)
+    return steps, resolved
+
+
 def _parse_created_at(value: Any) -> int:
     """ISO-8601 UTC timestamp ('2026-10-05T00:11:07Z' or with fractional seconds) -> epoch seconds."""
     if not value:
@@ -182,8 +354,9 @@ def sha256_text(text: str) -> str:
 
 
 def extract_dossier_from_transcript(path: str) -> Dict[str, Any]:
-    """Returns the last <dossier_json> block the subagent model emitted, with its provenance."""
-    steps = _read_steps(path)
+    """Returns the last <dossier_json> block the subagent model emitted, with its provenance.
+    Truncated scanned rows are resolved from transcript_full.jsonl (read_agy_steps)."""
+    steps, resolved = read_agy_steps(path)
     if not steps:
         raise ProvenanceError(f"Transcript is empty or unreadable: {path}")
 
@@ -224,6 +397,8 @@ def extract_dossier_from_transcript(path: str) -> Dict[str, Any]:
         "conversation_id": os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(path)))),
         "parent_conversation_id": parent_id,
         "transcript_path": os.path.abspath(path),
+        "full_transcript_used": any(row is step for row in resolved),
+        "resolved_steps": [row.get("step_index") for row in resolved],
     }
 
 
@@ -448,6 +623,10 @@ def build_record_from_extraction(extracted: Dict[str, Any], recorded_at_ts: Opti
     if source == CLAUDE_SOURCE:
         provenance["step_uuid"] = extracted.get("step_uuid")
         provenance["agent_type"] = extracted.get("agent_type")
+    else:
+        # Whether the dossier step was resolved from transcript_full.jsonl, and every resolved step
+        provenance["full_transcript_used"] = bool(extracted.get("full_transcript_used"))
+        provenance["resolved_steps"] = list(extracted.get("resolved_steps") or [])
     return {
         "schema_version": SCHEMA_VERSION,
         "timestamp_utc": datetime.datetime.fromtimestamp(evaluated_at, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
@@ -514,6 +693,10 @@ def rebuild_verified_record(record: dict) -> Tuple[bool, str, Optional[dict]]:
         return False, "Dossier hash does not match the latest <dossier_json> emitted by the evaluator subagent.", None
     if source == CLAUDE_SOURCE and extracted.get("step_uuid") != prov.get("step_uuid"):
         return False, "Dossier hash does not match the latest <dossier_json> emitted by the evaluator subagent.", None
+    # sha256 + step_index already pin the block; this also pins how it was read (transcript.jsonl vs the
+    # verified transcript_full.jsonl row). resolved_steps is informational: later rows may legitimately add to it.
+    if source == AGY_SOURCE and bool(extracted.get("full_transcript_used")) != bool(prov.get("full_transcript_used")):
+        return False, "Dossier was recorded from a different transcript source (transcript_full.jsonl resolution changed).", None
 
     rebuilt = build_record_from_extraction(extracted, record.get("recorded_at_ts"))
     if _verdict_fingerprint(rebuilt) != _verdict_fingerprint(record):

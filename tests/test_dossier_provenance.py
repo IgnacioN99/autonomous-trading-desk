@@ -64,6 +64,47 @@ FEW_SHOT_PROMPT = (
 )
 
 
+def agy_full_row(step: dict) -> dict:
+    """transcript.jsonl row -> its transcript_full.jsonl twin (tool-call args as plain values)."""
+    row = dict(step)
+    if isinstance(row.get("tool_calls"), list):
+        row["tool_calls"] = [dict(c, args={k: json.loads(v) for k, v in (c.get("args") or {}).items()})
+                             for c in row["tool_calls"]]
+    return row
+
+
+def agy_middle_cut(text: str, head: int = 60, tail: int = 20) -> str:
+    """agy content/thinking truncation: head + '\\n<truncated N bytes>\\n' + tail (N = UTF-8 bytes removed)."""
+    h, t = text[:head], text[len(text) - tail:]
+    removed = len(text.encode("utf-8")) - len(h.encode("utf-8")) - len(t.encode("utf-8"))
+    return f"{h}\n<truncated {removed} bytes>\n{t}"
+
+
+def agy_prefix_cut(value, keep: int = 60) -> str:
+    """agy tool-call arg truncation: prefix of the JSON-encoded value + '\\n<truncated N bytes>'."""
+    encoded = json.dumps(value, ensure_ascii=False)
+    prefix = encoded[:keep]
+    return f"{prefix}\n<truncated {len(encoded.encode('utf-8')) - len(prefix.encode('utf-8'))} bytes>"
+
+
+def agy_truncate_row(step: dict, fields: list, keep: int = 60) -> dict:
+    """Truncates a transcript.jsonl row exactly like agy does (only values longer than `keep`)."""
+    row = dict(step)
+    for field in fields:
+        if field in ("content", "thinking"):
+            row[field] = agy_middle_cut(row[field], head=keep)
+        elif field == "tool_calls":
+            row["tool_calls"] = [dict(c, args={
+                k: agy_prefix_cut(json.loads(v), keep) if len(v) > keep else v
+                for k, v in (c.get("args") or {}).items()}) for c in row["tool_calls"]]
+    row["truncated_fields"] = list(fields)
+    return row
+
+
+# Long send_message text with non-ASCII in the truncated region (agy counts UTF-8 bytes)
+LONG_HEADER = "# QUANTITATIVE EVALUATION MASTER DOSSIER\n" + "Análisis: régimen σ = +0.66 — ok.\n" * 20
+
+
 class TranscriptFixture(unittest.TestCase):
     """Creates a fake brain dir (AGY_BRAIN_DIRS) and a fake workspace for every test."""
 
@@ -83,15 +124,38 @@ class TranscriptFixture(unittest.TestCase):
         self._tmp.cleanup()
 
     # -- transcript builders -------------------------------------------------
-    def write_transcript(self, conv_id: str, steps: list) -> str:
+    def write_transcript(self, conv_id: str, steps: list, truncate: dict = None, full: bool = None) -> str:
+        """Writes transcript.jsonl. truncate = {line: [fields]} writes those rows truncated like agy.
+        full (default: True when truncating) also writes the untruncated transcript_full.jsonl."""
         d = os.path.join(self.brain, conv_id, ".system_generated", "logs")
         os.makedirs(d, exist_ok=True)
         path = os.path.join(d, "transcript.jsonl")
+        truncate = truncate or {}
+        for i, step in enumerate(steps):
+            step.setdefault("step_index", i)
         with open(path, "w", encoding="utf-8") as f:
             for i, step in enumerate(steps):
-                step.setdefault("step_index", i)
-                f.write(json.dumps(step) + "\n")
+                row = agy_truncate_row(step, truncate[i]) if i in truncate else step
+                f.write(json.dumps(row) + "\n")
+        if full if full is not None else bool(truncate):
+            self.dump_rows(dp.full_transcript_path(path), [agy_full_row(s) for s in steps])
         return path
+
+    @staticmethod
+    def load_rows(path: str) -> list:
+        with open(path, encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    @staticmethod
+    def dump_rows(path: str, rows: list) -> None:
+        with open(path, "w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    def edit_row(self, path: str, line: int, edit) -> None:
+        rows = self.load_rows(path)
+        edit(rows[line])
+        self.dump_rows(path, rows)
 
     def system_step(self, ts: int) -> dict:
         return {"source": "SYSTEM", "type": "SYSTEM_MESSAGE", "created_at": iso(ts),
@@ -446,6 +510,207 @@ class TestRecordEvaluationCli(TranscriptFixture):
     def test_invalid_env_refused(self):
         code, _, _ = self.run_main(["--env", "staging", "--from-subagent", "eeeeeeee"])
         self.assertEqual(code, 2)
+
+
+class TestTruncatedAgyTranscripts(TranscriptFixture):
+    """agy truncates long fields in transcript.jsonl; the full row lives in transcript_full.jsonl (issue #31)."""
+
+    def truncated_send_message(self, conv: str, payload: dict = APPROVED_SHORT, full: bool = None, ts: int = None) -> str:
+        ts = self.now - 30 if ts is None else ts
+        step = self.send_message_step(ts, dossier_text(payload, header=LONG_HEADER))
+        step["thinking"] = "Checking the brief freshness and the delta gate. " * 10
+        steps = [self.system_step(ts - 5)] + self.view_file_steps(ts - 3) + [step]
+        return self.write_transcript(conv, steps, truncate={3: ["thinking", "tool_calls"]}, full=full)
+
+    def record(self, conv: str) -> dict:
+        with patch.object(rec, "_register_shadow"), redirect_stdout(io.StringIO()):
+            return rec.record_from_subagent(conv, target_env="prod", base_dir=self.workspace)
+
+    def assertMismatch(self, path: str, fragment: str = "transcript_full.jsonl mismatch"):
+        with self.assertRaises(dp.ProvenanceError) as cm:
+            dp.extract_dossier_from_transcript(path)
+        self.assertIn(fragment, str(cm.exception))
+
+    def test_short_row_really_is_truncated(self):
+        path = self.truncated_send_message("ffffffff-0000-0000-0000-000000000001")
+        row = self.load_rows(path)[3]
+        self.assertEqual(row["truncated_fields"], ["thinking", "tool_calls"])
+        self.assertNotIn("</dossier_json>", row["tool_calls"][0]["args"]["Message"])
+        self.assertRegex(row["tool_calls"][0]["args"]["Message"], r"\n<truncated \d+ bytes>\Z")
+
+    def test_truncated_send_message_resolved_from_full_transcript(self):
+        conv = "ffffffff-0000-0000-0000-000000000002"
+        path = self.truncated_send_message(conv)
+        self.assertEqual(dp.find_subagent_transcript(conv), path)  # stored path stays transcript.jsonl
+        ex = dp.extract_dossier_from_transcript(path)
+        expected_raw = dp.DOSSIER_RE.search(dossier_text(APPROVED_SHORT, header=LONG_HEADER)).group(1).strip()
+        self.assertEqual(ex["raw"], expected_raw)
+        self.assertEqual(ex["sha256"], dp.sha256_text(expected_raw))
+        self.assertEqual(ex["step_index"], 3)
+        self.assertEqual(ex["parent_conversation_id"], PARENT_ID)
+        self.assertEqual(ex["conversation_id"], conv)
+        self.assertTrue(ex["full_transcript_used"])
+        self.assertEqual(ex["resolved_steps"], [3])
+        self.assertEqual(ex["transcript_path"], os.path.abspath(path))
+
+        # Same hash as an untruncated transcript carrying the same message
+        plain = self.write_transcript("ffffffff-0000-0000-0000-000000000003", [
+            self.system_step(self.now), self.send_message_step(self.now, dossier_text(APPROVED_SHORT, header=LONG_HEADER))])
+        self.assertEqual(dp.extract_dossier_from_transcript(plain)["sha256"], ex["sha256"])
+
+        record = self.record(conv)
+        self.assertTrue(record["provenance"]["full_transcript_used"])
+        self.assertEqual(record["provenance"]["resolved_steps"], [3])
+        self.assertEqual(record["provenance"]["transcript_path"], os.path.abspath(path))
+        ok, reason, cand = self.validate("FILUSDT", "SHORT")
+        self.assertTrue(ok, reason)
+        self.assertEqual(cand["direction"], "SHORT")
+
+    def test_missing_full_transcript_fails_closed(self):
+        conv = "ffffffff-0000-0000-0000-000000000004"
+        path = self.truncated_send_message(conv, full=False)
+        with self.assertRaises(dp.ProvenanceError) as cm:
+            dp.extract_dossier_from_transcript(path)
+        self.assertIn("transcript_full.jsonl", str(cm.exception))
+        with self.assertRaises(dp.ProvenanceError):
+            self.record(conv)
+        self.assertFalse(os.path.exists(dp.default_dossier_path(self.workspace)))
+
+    def test_full_transcript_deleted_after_recording_rejected(self):
+        conv = "ffffffff-0000-0000-0000-000000000005"
+        path = self.truncated_send_message(conv)
+        self.record(conv)
+        os.remove(dp.full_transcript_path(path))
+        ok, reason, _ = self.validate("FILUSDT", "SHORT")
+        self.assertFalse(ok)
+        self.assertIn("transcript_full.jsonl", reason)
+
+    def test_full_row_prefix_mismatch_rejected(self):
+        path = self.truncated_send_message("ffffffff-0000-0000-0000-000000000006")
+        full = dp.full_transcript_path(path)
+
+        def forge(row):
+            msg = row["tool_calls"][0]["args"]["Message"]
+            row["tool_calls"][0]["args"]["Message"] = msg.replace("QUANTITATIVE", "QUALITATIVEX", 1)  # same length
+        self.edit_row(full, 3, forge)
+        self.assertMismatch(path, "does not match the full value")
+
+    def test_full_row_byte_count_mismatch_rejected(self):
+        path = self.truncated_send_message("ffffffff-0000-0000-0000-000000000007")
+        self.edit_row(dp.full_transcript_path(path), 3,
+                      lambda row: row["tool_calls"][0]["args"].update(
+                          Message=row["tool_calls"][0]["args"]["Message"] + "extra"))
+        self.assertMismatch(path, "does not match the full value")
+
+    def test_full_row_identity_and_untruncated_fields_must_match(self):
+        edits = {
+            "created_at": lambda row: row.update(created_at=iso(self.now - 999)),
+            "step_index": lambda row: row.update(step_index=7),
+            "tool name": lambda row: row["tool_calls"][0].update(name="notify_user"),
+            "recipient": lambda row: row["tool_calls"][0]["args"].update(Recipient="99999999-0000-0000-0000-000000000000"),
+            "tool count": lambda row: row["tool_calls"].append({"name": "view_file", "args": {"AbsolutePath": "x"}}),
+            "extra field": lambda row: row.update(content="injected"),
+            "thinking": lambda row: row.update(thinking="Different reasoning entirely. " * 20),
+            "full truncated": lambda row: row.update(truncated_fields=["tool_calls"]),
+        }
+        for i, (label, edit) in enumerate(edits.items()):
+            with self.subTest(label):
+                path = self.truncated_send_message(f"ffffffff-1000-0000-0000-00000000000{i}")
+                self.edit_row(dp.full_transcript_path(path), 3, edit)
+                self.assertMismatch(path)
+
+    def test_full_transcript_edited_after_recording_rejected_by_hash(self):
+        conv = "ffffffff-0000-0000-0000-000000000008"
+        path = self.truncated_send_message(conv)
+        self.record(conv)
+        full = dp.full_transcript_path(path)
+
+        def tamper(row):  # same byte length, inside the truncated region: every cross-check still passes
+            msg = row["tool_calls"][0]["args"]["Message"]
+            self.assertIn("1.0663", msg)
+            row["tool_calls"][0]["args"]["Message"] = msg.replace("1.0663", "1.0669")
+        self.edit_row(full, 3, tamper)
+        ok, reason, _ = self.validate("FILUSDT", "SHORT")
+        self.assertFalse(ok)
+        self.assertIn("hash", reason.lower())
+
+    def test_short_transcript_edited_after_recording_rejected(self):
+        conv = "ffffffff-0000-0000-0000-000000000009"
+        path = self.truncated_send_message(conv)
+        self.record(conv)
+
+        def tamper(row):
+            msg = row["tool_calls"][0]["args"]["Message"]
+            row["tool_calls"][0]["args"]["Message"] = msg.replace("QUANTITATIVE", "QUALITATIVEX", 1)
+        self.edit_row(path, 3, tamper)
+        ok, reason, _ = self.validate("FILUSDT", "SHORT")
+        self.assertFalse(ok)
+        self.assertIn("transcript_full.jsonl mismatch", reason)
+
+        # Dropping the truncation marker instead leaves no block to extract
+        conv2 = "ffffffff-0000-0000-0000-00000000000a"
+        path2 = self.truncated_send_message(conv2)
+        self.record(conv2)
+        self.edit_row(path2, 3, lambda row: row.pop("truncated_fields"))
+        ok, _, _ = self.validate("FILUSDT", "SHORT")
+        self.assertFalse(ok)
+
+    def test_resolution_flag_tampered_in_record_rejected(self):
+        conv = "ffffffff-0000-0000-0000-00000000000b"
+        self.truncated_send_message(conv)
+        self.record(conv)
+        dossier = dp.default_dossier_path(self.workspace)
+        record = dp.load_dossier(dossier)
+        record["provenance"]["full_transcript_used"] = False
+        with open(dossier, "w", encoding="utf-8") as f:
+            json.dump(record, f)
+        ok, reason, _ = self.validate("FILUSDT", "SHORT")
+        self.assertFalse(ok)
+        self.assertIn("transcript_full.jsonl", reason)
+
+    def test_truncated_planner_content_middle_cut_resolved(self):
+        conv = "ffffffff-0000-0000-0000-00000000000c"
+        text = dossier_text(APPROVED_SHORT, header=LONG_HEADER)
+        steps = [self.system_step(self.now), self.content_step(self.now, text)]
+        path = self.write_transcript(conv, steps, truncate={1: ["content"]})
+        short = self.load_rows(path)[1]["content"]
+        self.assertNotIn("<dossier_json>", short)
+        self.assertIn("\n<truncated ", short)
+        ex = dp.extract_dossier_from_transcript(path)
+        self.assertEqual(ex["dossier"]["approved_symbols"], ["FILUSDT"])
+        self.assertTrue(ex["full_transcript_used"])
+        # A full content whose tail differs from the kept tail is rejected
+        self.edit_row(dp.full_transcript_path(path), 1, lambda row: row.update(content=row["content"][:-1] + "X"))
+        self.assertMismatch(path, "truncated 'content' does not match")
+
+    def test_untruncated_rows_ignore_full_transcript(self):
+        conv = "ffffffff-0000-0000-0000-00000000000d"
+        path = self.standard_transcript(conv, APPROVED_SHORT)
+        before = dp.extract_dossier_from_transcript(path)
+        rejected = {"status": "REJECTED", "approved_candidates": []}
+        steps = [self.system_step(self.now)] + self.view_file_steps(self.now) + \
+            [self.send_message_step(self.now, dossier_text(rejected))]
+        for i, s in enumerate(steps):
+            s["step_index"] = i
+        self.dump_rows(dp.full_transcript_path(path), [agy_full_row(s) for s in steps])
+        after = dp.extract_dossier_from_transcript(path)
+        self.assertEqual(after["dossier"]["status"], "APPROVED")
+        self.assertEqual(after["sha256"], before["sha256"])
+        self.assertFalse(after["full_transcript_used"])
+        self.assertEqual(after["resolved_steps"], [])
+
+    def test_unscanned_truncated_rows_do_not_need_full_transcript(self):
+        conv = "ffffffff-0000-0000-0000-00000000000e"
+        ts = self.now - 30
+        view_call, view_result = self.view_file_steps(ts - 3)
+        view_call["thinking"] = "Reading the brief first. " * 10
+        view_result["content"] = FEW_SHOT_PROMPT * 3
+        steps = [self.system_step(ts - 5), view_call, view_result, self.send_message_step(ts, dossier_text(APPROVED_SHORT))]
+        path = self.write_transcript(conv, steps, truncate={1: ["thinking"], 2: ["content"]}, full=False)
+        ex = dp.extract_dossier_from_transcript(path)
+        self.assertEqual(ex["dossier"]["status"], "APPROVED")
+        self.assertFalse(ex["full_transcript_used"])
+        self.assertEqual(ex["resolved_steps"], [])
 
 
 # =============================================================================

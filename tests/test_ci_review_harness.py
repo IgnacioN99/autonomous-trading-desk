@@ -337,6 +337,50 @@ class TestReviewAssembler(unittest.TestCase):
             self.assertEqual(code, EXIT_CHANGES_REQUIRED)
             self.assertEqual(gate["approved"], ["agentic_harness"])
 
+    def test_truncated_agy_verdict_recovered_from_full_transcript(self):
+        """agy truncates long send_message args in transcript.jsonl; the verdict comes from transcript_full.jsonl."""
+        conv = "11111111-aaaa-bbbb-cccc-000000000003"
+        message = ("Reviewed the diff file by file — ningún hallazgo crítico.\n" * 40 +
+                   "### Verdict: agentic_harness\n- **Status:** [APPROVED]\n- **Findings:** ok")
+        encoded = json.dumps(message, ensure_ascii=False)
+        prefix = encoded[:80]
+        removed = len(encoded.encode("utf-8")) - len(prefix.encode("utf-8"))
+        system = {"step_index": 0, "source": "SYSTEM", "type": "USER_INPUT", "status": "DONE",
+                  "created_at": "2026-10-05T00:00:00Z", "content": "sender=aaaaaaaa-0000-0000-0000-000000000000"}
+        short = {"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE",
+                 "created_at": "2026-10-05T00:00:05Z", "content": "",
+                 "tool_calls": [{"name": "send_message", "args": {"Message": f"{prefix}\n<truncated {removed} bytes>"}}],
+                 "truncated_fields": ["tool_calls"]}
+        full = dict(short, tool_calls=[{"name": "send_message", "args": {"Message": message}}])
+        del full["truncated_fields"]
+        manifest = ["agentic_harness"]
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = Path(tmp) / "brain"
+            logs = brain / conv / ".system_generated" / "logs"
+            logs.mkdir(parents=True)
+            (logs / "transcript.jsonl").write_text(
+                "\n".join(json.dumps(r) for r in (system, short)) + "\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"AGY_BRAIN_DIRS": str(brain)}):
+                # Without the full transcript the truncated verdict cannot be read: fail closed
+                sections, _, errors = assemble_review.collect_sections(manifest, {"agentic_harness": conv}, {})
+                self.assertEqual(sections, {})
+                self.assertIn("transcript_full.jsonl", errors[0])
+
+                (logs / "transcript_full.jsonl").write_text(
+                    "\n".join(json.dumps(r, ensure_ascii=False) for r in (system, full)) + "\n", encoding="utf-8")
+                sections, provenance, errors = assemble_review.collect_sections(manifest, {"agentic_harness": conv}, {})
+                self.assertEqual(errors, [])
+                self.assertIn("[APPROVED]", sections["agentic_harness"])
+                self.assertEqual(provenance["agentic_harness"], f"subagent {conv}")
+
+                # A full row that does not extend the kept prefix is rejected
+                forged = dict(full, tool_calls=[{"name": "send_message", "args": {"Message": "X" + message[1:]}}])
+                (logs / "transcript_full.jsonl").write_text(
+                    "\n".join(json.dumps(r, ensure_ascii=False) for r in (system, forged)) + "\n", encoding="utf-8")
+                sections, _, errors = assemble_review.collect_sections(manifest, {"agentic_harness": conv}, {})
+                self.assertEqual(sections, {})
+                self.assertIn("mismatch", errors[0])
+
     def test_assemble_marks_missing_reviewers_incomplete(self):
         manifest = {"required_reviewers": ["prompt_engineering"], "changed_files": ["docs/a.md"]}
         report, result = assemble_review.build_report(manifest, {}, {}, pr="")

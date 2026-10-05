@@ -8,6 +8,8 @@ Each reviewer subagent (.agents/agents/<reviewer>_reviewer/agent.md, generated f
 This script reads that section straight from each subagent transcript, so the parent agent never retypes
 or edits a verdict, and computes the consolidated verdict mechanically:
   * agy:         ~/.gemini/<product>/brain/<conversationId>/.system_generated/logs/transcript.jsonl
+                 (rows agy truncated there are read from the verified sibling transcript_full.jsonl,
+                 same reader as the dossier recorder: dossier_provenance.read_agy_steps)
   * Claude Code: ~/.claude/projects/<slug>/<sessionId>/subagents/agent-<agentId>.jsonl, whose meta.json
                  agentType must be "<reviewer>_reviewer" (a general-purpose agent cannot sign a verdict).
 
@@ -43,9 +45,11 @@ OVERALL_INCOMPLETE = "[INCOMPLETE REVIEW]"
 
 
 def extract_section_from_transcript(path: str, reviewer: str) -> str | None:
-    """Last '### Verdict: <reviewer>' section the subagent model emitted (send_message or response)."""
+    """Last '### Verdict: <reviewer>' section the subagent model emitted (send_message or response).
+    Raises ProvenanceError when a truncated row cannot be resolved from transcript_full.jsonl."""
     found = None
-    for step in transcripts._read_steps(path):
+    steps, _ = transcripts.read_agy_steps(path)
+    for step in steps:
         for text in transcripts._model_texts(step):
             section = gate.extract_section(text, reviewer)
             if section:
@@ -110,10 +114,10 @@ def collect_sections(required: list[str], subagents: dict, section_files: dict,
         elif rev in subagents:
             try:
                 path = transcripts.find_subagent_transcript(subagents[rev])
+                section = extract_section_from_transcript(path, rev)
             except transcripts.ProvenanceError as e:
                 errors.append(f"{rev}: {e}")
                 continue
-            section = extract_section_from_transcript(path, rev)
             if section:
                 sections[rev] = section
                 provenance[rev] = f"subagent {subagents[rev]}"
