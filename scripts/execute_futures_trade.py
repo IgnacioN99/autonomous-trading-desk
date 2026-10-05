@@ -78,7 +78,9 @@ JSON schemas (stable; extra keys may be added, existing keys are never renamed):
       "sl_price", "tp1_price", "tp2_price", ..., "error"?: str, "hard_gate_rejection"?: bool}
       Resting entries (untriggered STOP_MARKET via the algo order API, resting LIMIT) return
       "conditional_entry" / "pending_limit_entry": true and "pending_entry_key"; they are recorded in
-      logs/pending_entries.json and require a live position guardian in PROD.
+      logs/pending_entries.json, require a live position guardian in PROD and count against max_open_positions.
+      In PROD every new entry is rejected while an opening order rests on the exchange without a registry record
+      (find_unregistered_resting_entries; the position guardian reports them as unknown_resting_entry).
 """
 
 import os
@@ -1315,24 +1317,12 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
     except Exception:
         prof = {}
 
-    # --- GATE 0A: Max Open Positions Gate ---
-    max_open_positions = int(prof.get("max_open_positions", 3))
+    # --- GATE 0A: Max Open Positions Gate (open positions + pending resting entries, Issue #38) ---
     log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'logs')
     state_file = os.path.join(log_dir, 'session_state.json')
-    total_active_positions = 0
-    if os.path.exists(state_file):
-        try:
-            with open(state_file, 'r', encoding='utf-8') as f:
-                state_data_pos = json.load(f)
-                total_active_positions = state_data_pos.get('portfolio_exposure', {}).get('total_active_positions')
-                if total_active_positions is None:
-                    total_active_positions = len(state_data_pos.get('active_positions', []))
-                total_active_positions = int(total_active_positions)
-        except Exception:
-            total_active_positions = 0
-
-    if total_active_positions >= max_open_positions:
-        return False, f"MECHANICAL HARD GATE REJECTION: Max open positions limit ({max_open_positions}) reached."
+    slots_ok, slots_err = check_max_open_positions(prof, target_env)
+    if not slots_ok:
+        return False, slots_err
 
     # --- GATE 0B: Leverage Ceiling Gate (Absolute Ceiling) ---
     # Single source of truth: user_profile.get_leverage_ceiling() (profile `leverage_ceiling`, default 15x)
@@ -1592,7 +1582,9 @@ def pending_entry_key(target_env, symbol, entry_id):
 
 def load_pending_entries():
     """Returns (entries, error). A missing registry is empty; an unreadable or malformed one is an error
-    (callers fail closed: no new resting entry is accepted and no record is ever dropped)."""
+    (callers fail closed: no new resting entry is accepted and no record is ever dropped). An empty registry is
+    only trusted together with the exchange: find_unregistered_resting_entries (PROD executor gate and guardian
+    cycle) reports opening orders resting on the exchange without a record."""
     path = pending_entries_path()
     if not os.path.exists(path):
         return {}, None
@@ -1714,6 +1706,126 @@ def check_pending_entry_conflict(symbol, target_env):
         if isinstance(rec, dict) and rec.get('target_env') == target_env and str(rec.get('symbol', '')).upper() == symbol:
             return False, (f"ENTRY REJECTED: {symbol} has a pending resting entry ({key}) in logs/pending_entries.json; "
                            "wait until it fills (protected by --protect-pending / the guardian) or expires.")
+    return True, None
+
+
+def find_unregistered_resting_entries(target_env):
+    """
+    Read-only cross-check of the exchange against logs/pending_entries.json (Issue #46): a missing registry reads
+    as empty, so an opening order resting on the exchange without a record would never get its SL on fill.
+    Two all-symbol GETs (both endpoints, KEYS and MCP gateway, accept an omitted symbol):
+      - /fapi/v1/openAlgoOrders: an algo order that is neither closePosition nor reduceOnly is an ENTRY (desk
+        conditional STOP_MARKET entries); it is unknown unless a STOP_MARKET record of target_env has its algoId;
+      - /fapi/v1/openOrders: a regular order that is neither reduceOnly nor closePosition is an ENTRY (desk
+        resting LIMIT entries); it is unknown unless a LIMIT record of target_env has its orderId.
+    Stop Losses and TPs (closePosition / reduceOnly) never count. Through the MCP gateway the algo listing keeps
+    only conditional types with a trigger and folds reduceOnly into closePosition (same classification).
+    Returns (unknown, error): unknown = [{"symbol", "source": "algo" | "order", "kind": "STOP_MARKET" | "LIMIT"
+    (the cancel_resting_entry kind), "id", "type", "side", "price", "quantity"}]; error is set (and callers fail
+    closed) when the registry is unreadable or either query fails. The registry is read AFTER the queries, so an
+    entry the executor places and registers meanwhile is not reported.
+    """
+    listed = []
+    for source, endpoint, kind in (('algo', '/fapi/v1/openAlgoOrders', 'STOP_MARKET'),
+                                   ('order', '/fapi/v1/openOrders', 'LIMIT')):
+        try:
+            res = send_signed_request('GET', endpoint, target_env=target_env)
+        except Exception as e:
+            res = {"error": str(e)}
+        if not isinstance(res, list):
+            return [], f"{endpoint} query failed: {res}"
+        listed.extend((source, kind, o) for o in res if isinstance(o, dict)
+                      and not _truthy(o.get('closePosition')) and not _truthy(o.get('reduceOnly')))
+    entries, err = load_pending_entries()
+    if err:
+        return [], err
+    known = {pending_entry_key(target_env, rec.get('symbol'), rec.get('entry_id')):
+             ('STOP_MARKET' if str(rec.get('kind', '')).upper() == 'STOP_MARKET' else 'LIMIT')
+             for rec in entries.values() if isinstance(rec, dict) and rec.get('target_env') == target_env}
+    unknown = []
+    for source, kind, o in listed:
+        oid = _order_id(o)
+        sym = str(o.get('symbol') or '').upper()
+        if known.get(pending_entry_key(target_env, sym, oid)) == kind:
+            continue
+        unknown.append({"symbol": sym, "source": source, "kind": kind, "id": oid, "type": _order_type(o),
+                        "side": o.get('side'), "price": _trigger_price(o) or _to_float(o.get('price')),
+                        "quantity": o.get('quantity') or o.get('origQty')})
+    return unknown, None
+
+
+def describe_unregistered_entries(unknown):
+    return ", ".join(f"{u['symbol']} {u['kind']} {u['source']} {u['id']} ({u['type']} {u['side']} @ {u['price']})"
+                     for u in unknown)
+
+
+def check_unregistered_resting_entries(target_env):
+    """
+    PROD gate for EVERY new entry, before any write (Issue #46): no opening order may rest on the exchange
+    without a record in logs/pending_entries.json for target_env (deleted / lost registry, manual order). Fails
+    closed on a query error. Returns (ok, message_or_None). Read-only (find_unregistered_resting_entries).
+    """
+    unknown, err = find_unregistered_resting_entries(target_env)
+    if err:
+        return False, (f"ENTRY REJECTED: FAIL-CLOSED — cannot cross-check resting entries on the exchange against "
+                       f"logs/pending_entries.json ({err}).")
+    if unknown:
+        return False, (f"ENTRY REJECTED: FAIL-CLOSED — {len(unknown)} resting entry order(s) on the exchange are not in "
+                       f"logs/pending_entries.json and would get no Stop Loss on fill: {describe_unregistered_entries(unknown)}. "
+                       "Cancel them (or restore their registry records) before any new entry.")
+    return True, None
+
+
+def check_max_open_positions(prof, target_env):
+    """
+    Gate 0A (max_open_positions), evaluated before any write. Committed slots = open positions (logs/session_state.json)
+    + symbols with a pending resting entry for target_env in logs/pending_entries.json that have no open position yet
+    (a partially filled LIMIT has both a position and a record: counted once). A new entry is rejected when committed
+    slots >= profile max_open_positions. A missing registry counts zero pending entries (in PROD the executor then
+    rejects any entry resting on the exchange without a record, check_unregistered_resting_entries); an unreadable
+    one fails closed in PROD (TESTNET counts zero). Returns (ok, message_or_None). Read-only, file-only.
+    """
+    target_env = resolve_env(target_env)
+    is_testnet = str(target_env).lower() == 'testnet'
+    max_open_positions = int((prof or {}).get("max_open_positions", 3))
+    prefix = f"MECHANICAL HARD GATE REJECTION: Max open positions limit ({max_open_positions})"
+
+    state_file = os.path.join(_workspace_dir(), 'logs', 'session_state.json')
+    open_count = 0
+    open_symbols = set()
+    if os.path.exists(state_file):
+        try:
+            with open(state_file, 'r', encoding='utf-8') as f:
+                state_data_pos = json.load(f)
+            open_count = state_data_pos.get('portfolio_exposure', {}).get('total_active_positions')
+            if open_count is None:
+                open_count = len(state_data_pos.get('active_positions', []))
+            open_count = int(open_count)
+        except Exception:
+            open_count = 0
+        else:
+            try:
+                open_symbols = {str(p.get('symbol')).upper() for p in state_data_pos.get('active_positions') or []
+                                if isinstance(p, dict) and p.get('symbol')}
+            except Exception:
+                open_symbols = set()
+
+    entries, err = load_pending_entries()
+    if err:
+        if not is_testnet:
+            return False, (f"{prefix}: FAIL-CLOSED — {err}; cannot count pending resting entries "
+                           "(logs/pending_entries.json). Order blocked.")
+        entries = {}
+    pending_symbols = set()
+    for rec in entries.values():
+        if isinstance(rec, dict) and rec.get('target_env') == target_env:
+            sym = str(rec.get('symbol', '')).upper()
+            if sym and sym not in open_symbols:
+                pending_symbols.add(sym)
+    pending_count = len(pending_symbols)
+
+    if open_count + pending_count >= max_open_positions:
+        return False, (f"{prefix} reached (open {open_count} + pending {pending_count} >= max {max_open_positions}).")
     return True, None
 
 
@@ -2256,6 +2368,17 @@ def execute_complete_trade(
         pend_ok, pend_err = check_pending_entry_conflict(symbol, target_env)
         if not pend_ok:
             return {"success": False, "hard_gate_rejection": True, "error": pend_err}
+    # 1c. Max open positions (Gate 0A, Issue #38): open positions + pending resting entries, checked before any write
+    # (check_mechanical_gates re-checks it after sizing).
+    slots_ok, slots_err = check_max_open_positions(prof, target_env)
+    if not slots_ok:
+        return {"success": False, "hard_gate_rejection": True, "error": slots_err}
+    # 1d. Unregistered resting entries (Issue #46, PROD): a missing registry reads as empty, so every opening order
+    # resting on the exchange must have its logs/pending_entries.json record (two all-symbol GETs, fail closed).
+    if is_prod:
+        unreg_ok, unreg_err = check_unregistered_resting_entries(target_env)
+        if not unreg_ok:
+            return {"success": False, "hard_gate_rejection": True, "error": unreg_err}
     resting_kind = None
     if str(order_type).upper() == 'STOP_MARKET' and trigger_p is not None and not trigger_breached:
         resting_kind = 'STOP_MARKET'

@@ -17,7 +17,11 @@ Per cycle:
   3. Structural trailing (dynamic_exit_manager.update_position_to_structural_stop): place-then-cancel,
      never loosens. YOLO positions are skipped until TP1 has filled (right-tail preservation).
   4. Dead-alpha check: reported only; positions are closed (reduce-only) only with --close-dead-alpha.
-  5. State is written atomically to logs/guardian_state.json and every action is appended to
+  5. Unknown resting entries (execute_futures_trade.find_unregistered_resting_entries, all symbols): an opening
+     order resting on the exchange without a logs/pending_entries.json record (e.g. deleted registry) would get
+     no SL on fill; each one is reported (unknown_resting_entry action + pending_unknown_entry error, so
+     cycle_ok is false) and never cancelled. A query failure is a pending_unknown_entry error too.
+  6. State is written atomically to logs/guardian_state.json and every action is appended to
      logs/guardian_actions.jsonl.
 
 Safety:
@@ -60,7 +64,7 @@ Action record (also one JSON line in logs/guardian_actions.jsonl):
   {"timestamp": int, "env": str, "symbol": str, "dry_run": bool, "success": bool,
    "type": "orphan_heal" | "orphan_close" | "trail_stop" | "dead_alpha_close" | "pending_protect_sl" |
            "pending_tp_placed" | "pending_abort" | "pending_timeout_cancel" | "pending_dropped" |
-           "pending_sl_crossed_close", "detail": {...}}
+           "pending_sl_crossed_close" | "unknown_resting_entry" (report only, success false), "detail": {...}}
 
 Scheduling (generic examples; run from the repository root):
   cron, every 5 minutes, one cycle per run:
@@ -276,6 +280,23 @@ class GuardianCycle:
         if not res.get("ok") and not res.get("errors"):
             self.error(None, "pending_entries", "protect_pending_entries reported failure")
 
+    def _check_unknown_entries(self):
+        """Report-only (Issue #46): opening orders resting on the exchange without a logs/pending_entries.json record
+        (deleted registry, manual order) would get no SL on fill. Each one is an unknown_resting_entry action plus a
+        pending_unknown_entry error (cycle_ok false); they are never cancelled here (could be operator orders)."""
+        try:
+            unknown, err = eft.find_unregistered_resting_entries(self.env)
+        except Exception as e:
+            unknown, err = [], f"{type(e).__name__}: {e}"
+        if err:
+            self.error(None, "pending_unknown_entry", f"Cannot cross-check resting entries against the registry: {err}")
+            return
+        for u in unknown:
+            msg = (f"{u['kind']} entry {u['id']} rests on the exchange without a logs/pending_entries.json record: "
+                   "no Stop Loss on fill. Cancel it or restore its record.")
+            self.action(u["symbol"], "unknown_resting_entry", False, dict(u, message=msg))
+            self.error(u["symbol"], "pending_unknown_entry", msg)
+
     # -- cycle -------------------------------------------------------------
     def run(self):
         self._protect_pending()
@@ -285,6 +306,7 @@ class GuardianCycle:
             pos_res = {"error": str(e)}
         if not isinstance(pos_res, list):
             self.error(None, "positions_sync", f"Position query failed: {pos_res}")
+            self._check_unknown_entries()
             return self.finish()
 
         for p in pos_res:
@@ -301,6 +323,7 @@ class GuardianCycle:
             except Exception as e:
                 view["error"] = f"{type(e).__name__}: {e}"
                 self.error(view["symbol"], "exception", f"{view['error']}\n{traceback.format_exc(limit=3)}")
+        self._check_unknown_entries()
         return self.finish()
 
     def finish(self):

@@ -11,6 +11,8 @@ test_pending_entries.py - Offline tests for Issue #33 (post-fill protection of r
 4. protect_pending_entries: planned SL on fill (place / replace / resize), TPs from the actual size, audit
    record, auto-destruct when the SL cannot be verified, timeout cancel, drop rules, fail-closed queries, dry run.
 5. Position guardian runs it first (no orphan emergency stop on a fresh fill); CLI --protect-pending.
+6. Issue #46: a missing / incomplete registry is cross-checked against the exchange: PROD rejects every new entry
+   while an opening order rests without a record (or the check fails); the guardian reports such entries.
 
 No network: every exchange call is faked and every file goes to a temp directory.
 """
@@ -117,10 +119,18 @@ class ExecutorHarness(unittest.TestCase):
         self.calls = []
         self.positions = []
         self.positions_error = False
+        self.open_algos = []      # GET /fapi/v1/openAlgoOrders (resting entries on the exchange, Issue #46)
+        self.open_orders = []     # GET /fapi/v1/openOrders
+        self.open_errors = {}     # endpoint -> error response
 
     def fake(self, method, endpoint, params=None, target_env=None, retry_count=0):
         params = dict(params or {})
         self.calls.append((method, endpoint, params))
+        if method == "GET" and endpoint in ("/fapi/v1/openAlgoOrders", "/fapi/v1/openOrders"):
+            if endpoint in self.open_errors:
+                return self.open_errors[endpoint]
+            listed = self.open_algos if endpoint == "/fapi/v1/openAlgoOrders" else self.open_orders
+            return [dict(o) for o in listed if not params.get("symbol") or o["symbol"] == params["symbol"]]
         if endpoint == "/fapi/v1/marginType":
             return {"code": 200, "msg": "success"}
         if endpoint == "/fapi/v1/leverage":
@@ -498,6 +508,208 @@ class TestRestingEntryProdGates(ExecutorHarness):
         res = self.execute(env="prod", order_type="MARKET")  # no guardian state, no registry
         self.assertTrue(res["success"], res.get("error"))
         self.assertFalse([c for c in self.calls if c[1] == "/fapi/v2/positionRisk"])
+
+
+def entry_limit(order_id=77, symbol="ETHUSDT", side="BUY", price=98.0, reduce_only=False):
+    """A resting regular order as listed by GET /fapi/v1/openOrders (reduce_only=True: a desk TP)."""
+    return {"orderId": order_id, "symbol": symbol, "side": side, "type": "LIMIT", "price": str(price),
+            "origQty": "1.5", "reduceOnly": reduce_only, "closePosition": False, "status": "NEW"}
+
+
+ENTRY_KINDS = (dict(order_type="STOP_MARKET", trigger_price=102.347),   # resting conditional
+               dict(order_type="STOP_MARKET", trigger_price=99.5),      # breached trigger -> MARKET fallthrough
+               dict(order_type="LIMIT", limit_price=98.767),
+               dict(order_type="MARKET"))
+
+
+class TestUnregisteredRestingEntriesGate(ExecutorHarness):
+    """Issue #46: in PROD a missing / incomplete logs/pending_entries.json no longer reads as 'no resting entries':
+    every opening order resting on the exchange must have its registry record, else every new entry is rejected
+    before any write."""
+
+    def setUp(self):
+        super().setUp()
+        write_guardian_state(self.ws)  # resting entries would otherwise be rejected by the guardian gate first
+
+    def assertUnregisteredRejected(self, fragments, **kw):
+        for entry in ENTRY_KINDS:
+            self.calls = []
+            res = self.execute(env="prod", **dict(entry, **kw))
+            self.assertFalse(res["success"], entry)
+            self.assertTrue(res.get("hard_gate_rejection"), entry)
+            self.assertIn("not in logs/pending_entries.json", res["error"], entry)
+            self.assertIn("Cancel them (or restore their registry records)", res["error"], entry)
+            for fragment in fragments:
+                self.assertIn(fragment, res["error"], entry)
+            self.assertEqual(self.writes(), [], f"no margin/leverage/order write on rejection: {entry}")
+            all_symbol_gets = [c[1] for c in self.calls if c[0] == "GET" and c[2] == {}]
+            self.assertEqual(all_symbol_gets, ["/fapi/v1/openAlgoOrders", "/fapi/v1/openOrders"], "bounded: two GETs")
+
+    def test_deleted_registry_with_resting_conditional_entry_rejects_every_entry(self):
+        self.open_algos = [entry_algo(algo_id=7001, symbol="BTCUSDT")]
+        self.assertUnregisteredRejected(["1 resting entry order(s)", "BTCUSDT STOP_MARKET algo 7001 (STOP_MARKET BUY @ 101.0)"])
+        self.assertIsNone(read_registry(self.ws))
+
+    def test_deleted_registry_with_resting_limit_entry_rejects_every_entry(self):
+        self.open_orders = [entry_limit()]
+        self.assertUnregisteredRejected(["ETHUSDT LIMIT order 77 (LIMIT BUY @ 98.0)"])
+        self.assertIsNone(read_registry(self.ws))
+
+    def test_empty_registry_and_unregistered_entry_of_traded_symbol_rejected(self):
+        write_registry(self.ws)  # registry present but empty
+        self.open_algos = [entry_algo(algo_id=31, symbol="SOLUSDT")]
+        self.open_orders = [entry_limit(order_id=32, symbol="SOLUSDT")]
+        self.assertUnregisteredRejected(["2 resting entry order(s)", "SOLUSDT STOP_MARKET algo 31", "SOLUSDT LIMIT order 32"])
+        self.assertEqual(read_registry(self.ws), {})
+
+    def test_registry_matching_exchange_entries_accepted(self):
+        self.open_algos = [entry_algo(algo_id=7001, symbol="BTCUSDT")]
+        self.open_orders = [entry_limit(order_id=77, symbol="ETHUSDT")]
+        for entry in ENTRY_KINDS:
+            # fresh registry each time: a resting SOLUSDT entry placed by the previous run would block the symbol
+            write_registry(self.ws, make_record(kind="STOP_MARKET", entry_id="7001", symbol="BTCUSDT", env="prod"),
+                           make_record(kind="LIMIT", entry_id="77", symbol="ETHUSDT", env="prod"))
+            res = self.execute(env="prod", **entry)
+            self.assertTrue(res["success"], (entry, res.get("error")))
+
+    def test_stop_losses_and_take_profits_are_never_entries(self):
+        self.open_algos = [stop(501, 95.0, symbol="BTCUSDT"),                                   # closePosition SL
+                           dict(stop(502, 96.0, symbol="ETHUSDT", close_position=False), reduceOnly=True, quantity="2"),
+                           dict(stop(503, 120.0, symbol="ETHUSDT", close_position=False), orderType="TAKE_PROFIT_MARKET",
+                                reduceOnly="true"),
+                           dict(stop(504, 94.0, symbol="XRPUSDT"), closePosition="true")]
+        self.open_orders = [entry_limit(order_id=601, side="SELL", price=110.0, reduce_only=True),   # desk TP
+                            dict(entry_limit(order_id=602, side="SELL", price=120.0), reduceOnly="true")]
+        for entry in ENTRY_KINDS:
+            registry = os.path.join(self.ws, "logs", "pending_entries.json")
+            if os.path.exists(registry):  # missing registry (a resting entry placed by the previous run blocks SOLUSDT)
+                os.remove(registry)
+            res = self.execute(env="prod", **entry)
+            self.assertTrue(res["success"], (entry, res.get("error")))
+
+    def test_record_of_other_env_or_kind_does_not_cover_an_entry(self):
+        self.open_algos = [entry_algo(algo_id=7001, symbol="BTCUSDT")]
+        for record in (make_record(kind="STOP_MARKET", entry_id="7001", symbol="BTCUSDT", env="testnet"),
+                       make_record(kind="LIMIT", entry_id="7001", symbol="BTCUSDT", env="prod"),
+                       make_record(kind="STOP_MARKET", entry_id="7001", symbol="ETHUSDT", env="prod")):
+            write_registry(self.ws, record)
+            self.calls = []
+            res = self.execute(env="prod", order_type="MARKET")
+            self.assertFalse(res["success"], record)
+            self.assertIn("BTCUSDT STOP_MARKET algo 7001", res["error"], record)
+            self.assertEqual(self.writes(), [], record)
+
+    def test_open_orders_query_failure_rejected(self):
+        for endpoint in ("/fapi/v1/openAlgoOrders", "/fapi/v1/openOrders"):
+            self.open_errors = {endpoint: {"code": -1001, "msg": "Internal error"}}
+            self.calls = []
+            res = self.execute(env="prod", order_type="MARKET")
+            self.assertFalse(res["success"], endpoint)
+            self.assertTrue(res.get("hard_gate_rejection"), endpoint)
+            self.assertIn("ENTRY REJECTED: FAIL-CLOSED — cannot cross-check resting entries", res["error"])
+            self.assertIn(f"{endpoint} query failed", res["error"])
+            self.assertEqual(self.writes(), [], endpoint)
+
+    def test_open_orders_query_exception_rejected(self):
+        def send(method, endpoint, params=None, target_env=None, retry_count=0):
+            if method == "GET" and endpoint == "/fapi/v1/openOrders":
+                self.calls.append((method, endpoint, dict(params or {})))
+                raise OSError("network unreachable")
+            return self.fake(method, endpoint, params, target_env)
+        res = self.execute(env="prod", order_type="MARKET", send=send)
+        self.assertFalse(res["success"])
+        self.assertIn("network unreachable", res["error"])
+        self.assertEqual(self.writes(), [])
+
+    def test_testnet_unchanged(self):
+        self.open_algos = [entry_algo(algo_id=7001, symbol="BTCUSDT")]
+        self.open_orders = [entry_limit()]
+        self.open_errors = {}
+        for entry in ENTRY_KINDS:
+            self.calls = []
+            res = self.execute(env="testnet", **entry)
+            self.assertTrue(res["success"], (entry, res.get("error")))
+            self.assertEqual([c for c in self.calls if c[0] == "GET" and c[2] == {}], [], "no all-symbol cross-check")
+
+
+class TestFindUnregisteredRestingEntries(unittest.TestCase):
+
+    def find(self, send, *records, env="prod"):
+        ws = tempfile.mkdtemp()
+        if records:
+            write_registry(ws, *records)
+        with patch("execute_futures_trade.send_signed_request", side_effect=send), \
+             patch("execute_futures_trade._workspace_dir", return_value=ws):
+            return eft.find_unregistered_resting_entries(env)
+
+    def test_reports_unknown_entries_with_cancel_kind(self):
+        fake = FakeExchange([], algos=[entry_algo(algo_id=7001), stop(501, 95.0)],
+                            open_orders=[entry_limit(order_id=77), entry_limit(order_id=78, reduce_only=True)])
+        unknown, err = self.find(fake, make_record(kind="LIMIT", entry_id="99", symbol="ETHUSDT", env="prod"))
+        self.assertIsNone(err)
+        self.assertEqual(unknown, [
+            {"symbol": "BTCUSDT", "source": "algo", "kind": "STOP_MARKET", "id": 7001, "type": "STOP_MARKET",
+             "side": "BUY", "price": 101.0, "quantity": "12"},
+            {"symbol": "ETHUSDT", "source": "order", "kind": "LIMIT", "id": 77, "type": "LIMIT",
+             "side": "BUY", "price": 98.0, "quantity": "1.5"},
+        ])
+        self.assertEqual(fake.calls, [("GET", "/fapi/v1/openAlgoOrders", {}), ("GET", "/fapi/v1/openOrders", {})])
+
+    def test_missing_registry_and_no_entries_is_ok(self):
+        fake = FakeExchange([], algos=[stop(501, 95.0)])
+        self.assertEqual(self.find(fake), ([], None))
+
+    def test_unreadable_registry_is_an_error(self):
+        ws = tempfile.mkdtemp()
+        os.makedirs(os.path.join(ws, "logs"))
+        with open(os.path.join(ws, "logs", "pending_entries.json"), "w") as f:
+            f.write("{broken")
+        with patch("execute_futures_trade.send_signed_request", side_effect=FakeExchange([])), \
+             patch("execute_futures_trade._workspace_dir", return_value=ws):
+            unknown, err = eft.find_unregistered_resting_entries("prod")
+        self.assertEqual(unknown, [])
+        self.assertIn("unreadable", err)
+
+    @patch("execute_futures_trade.call_binance_mcp")
+    def test_mcp_gateway_listing_all_symbols(self, mock_mcp):
+        def mcp(tool, args=None, session_id=None):
+            if tool == "futures_usds.currentAllAlgoOpenOrders":
+                return [
+                    {"algoId": 4242, "symbol": "BTCUSDT", "side": "BUY", "orderType": "STOP_MARKET", "triggerPrice": "101",
+                     "quantity": "1", "closePosition": "false", "reduceOnly": "false", "algoStatus": "NEW"},
+                    {"algoId": 5, "symbol": "BTCUSDT", "side": "SELL", "orderType": "STOP_MARKET", "triggerPrice": "95",
+                     "quantity": "1", "closePosition": "false", "reduceOnly": "true"},             # MCP qty-based SL
+                    {"algoId": 6, "symbol": "ETHUSDT", "side": "SELL", "orderType": "STOP_MARKET", "triggerPrice": "90",
+                     "closePosition": "true"},
+                ]
+            if tool == "futures_usds.currentAllOpenOrders":
+                return [{"orderId": 11, "symbol": "BTCUSDT", "side": "SELL", "type": "LIMIT", "price": "110",
+                         "origQty": "0.3", "reduceOnly": "true", "closePosition": False},          # TP
+                        {"orderId": 12, "symbol": "SOLUSDT", "side": "BUY", "type": "LIMIT", "price": "98",
+                         "origQty": "2", "reduceOnly": False, "closePosition": False}]             # LIMIT entry
+            return {"error": f"unexpected {tool}", "isError": True}
+        mock_mcp.side_effect = mcp
+
+        def route(method, endpoint, params=None, target_env=None, retry_count=0):
+            return eft.send_mcp_gateway_request(method, endpoint, params=params)  # MCP_OAUTH_ACTIVE path
+
+        unknown, err = self.find(route)
+        self.assertIsNone(err)
+        self.assertEqual([(u["symbol"], u["kind"], u["id"]) for u in unknown],
+                         [("BTCUSDT", "STOP_MARKET", 4242), ("SOLUSDT", "LIMIT", 12)])
+        self.assertEqual([c[0] for c in mock_mcp.call_args_list],
+                         [("futures_usds.currentAllAlgoOpenOrders", {}), ("futures_usds.currentAllOpenOrders", {})])
+        unknown, err = self.find(route, make_record(kind="STOP_MARKET", entry_id="4242", symbol="BTCUSDT", env="prod"),
+                                 make_record(kind="LIMIT", entry_id="12", symbol="SOLUSDT", env="prod"))
+        self.assertEqual((unknown, err), ([], None))
+
+    @patch("execute_futures_trade.call_binance_mcp")
+    def test_mcp_gateway_error_fails_closed(self, mock_mcp):
+        mock_mcp.return_value = {"error": "gateway down", "isError": True}
+        unknown, err = self.find(lambda m, e, params=None, target_env=None, retry_count=0:
+                                 eft.send_mcp_gateway_request(m, e, params=params))
+        self.assertEqual(unknown, [])
+        self.assertIn("/fapi/v1/openAlgoOrders query failed", err)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -994,6 +1206,70 @@ class TestGuardianProtectsPendingEntries(unittest.TestCase):
         code, state = self.run_guardian(fake, tempfile.mkdtemp())
         self.assertEqual(code, 0)
         self.assertEqual(state["actions"], [])
+        self.assertEqual(fake.writes(), [])
+
+
+class TestGuardianReportsUnknownRestingEntries(unittest.TestCase):
+    """Issue #46: each guardian cycle cross-checks the exchange against logs/pending_entries.json; an opening order
+    resting without a record is reported (error + action, cycle not ok) and never cancelled."""
+
+    run_guardian = TestGuardianProtectsPendingEntries.run_guardian
+
+    def unknown_fake(self):
+        return FakeExchange([long_position()], algos=[stop(501, 95.0), entry_algo(algo_id=7001, symbol="XRPUSDT")],
+                            open_orders=[entry_limit(order_id=77),
+                                         entry_limit(order_id=78, symbol="BTCUSDT", side="SELL", price=110.0,
+                                                     reduce_only=True)])
+
+    def assertReported(self, state, fake, dry_run):
+        self.assertFalse(state["cycle_ok"])
+        unknown = [a for a in state["actions"] if a["type"] == "unknown_resting_entry"]
+        self.assertEqual([(a["symbol"], a["detail"]["kind"], a["detail"]["id"]) for a in unknown],
+                         [("XRPUSDT", "STOP_MARKET", 7001), ("ETHUSDT", "LIMIT", 77)])
+        self.assertTrue(all(not a["success"] and a["dry_run"] is dry_run for a in unknown))
+        self.assertIn("without a logs/pending_entries.json record", unknown[0]["detail"]["message"])
+        self.assertEqual([(e["symbol"], e["stage"]) for e in state["errors"]],
+                         [("XRPUSDT", "pending_unknown_entry"), ("ETHUSDT", "pending_unknown_entry")])
+        self.assertEqual(fake.writes(), [], "unknown entries are never cancelled by the guardian")
+        self.assertTrue(state["positions"][0]["protected"])
+
+    def test_unknown_entries_reported_not_cancelled(self):
+        for env in ("testnet", "prod"):
+            fake = self.unknown_fake()
+            ws = tempfile.mkdtemp()
+            code, state = self.run_guardian(fake, ws, argv=("--once", "--env", env))
+            self.assertEqual(code, 1, env)
+            self.assertReported(state, fake, dry_run=False)
+            self.assertIsNone(read_registry(ws), "the registry is never written by the check")
+
+    def test_dry_run_reports_without_writes(self):
+        fake = self.unknown_fake()
+        code, state = self.run_guardian(fake, tempfile.mkdtemp(), argv=("--once", "--env", "prod", "--dry-run"))
+        self.assertEqual(code, 1)
+        self.assertReported(state, fake, dry_run=True)
+
+    def test_registered_entries_are_not_reported(self):
+        fake = self.unknown_fake()
+        ws = tempfile.mkdtemp()
+        write_registry(ws, make_record(kind="STOP_MARKET", entry_id="7001", symbol="XRPUSDT", env="prod"),
+                       make_record(kind="LIMIT", entry_id="77", symbol="ETHUSDT", env="prod"))
+        code, state = self.run_guardian(fake, ws, argv=("--once", "--env", "prod"))
+        self.assertEqual(code, 0, state["errors"])
+        self.assertTrue(state["cycle_ok"])
+        self.assertEqual([a for a in state["actions"] if a["type"] == "unknown_resting_entry"], [])
+
+    def test_cross_check_query_error_marks_cycle_not_ok(self):
+        fake = FakeExchange([long_position()], algos=[stop(501, 95.0)])
+
+        def broken(method, endpoint, params=None, target_env=None, retry_count=0):
+            if endpoint == "/fapi/v1/openOrders" and not (params or {}).get("symbol"):
+                return {"code": -1001, "msg": "Internal error"}
+            return fake(method, endpoint, params, target_env)
+        code, state = self.run_guardian(broken, tempfile.mkdtemp(), argv=("--once", "--env", "prod"))
+        self.assertEqual(code, 1)
+        self.assertFalse(state["cycle_ok"])
+        self.assertEqual([e["stage"] for e in state["errors"]], ["pending_unknown_entry"])
+        self.assertIn("/fapi/v1/openOrders query failed", state["errors"][0]["error"])
         self.assertEqual(fake.writes(), [])
 
 
