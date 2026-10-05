@@ -619,14 +619,18 @@ class TestExecutorSizesAtEffectiveEntry(unittest.TestCase):
             if endpoint == "/fapi/v1/ticker/price":
                 return {"price": "100.0"}
             if endpoint == "/fapi/v1/order" and method == "POST":
-                status = "NEW" if params.get("type") in ("LIMIT", "STOP_MARKET") else "FILLED"
+                status = "NEW" if params.get("type") == "LIMIT" else "FILLED"
                 return {"orderId": 7, "avgPrice": "100.0", "status": status}
+            if endpoint == "/fapi/v1/" + "algoOrder" and method == "POST":
+                return {"algoId": 8}
             return {}
         args = dict(symbol="SOLUSDT", direction="LONG", leverage=3, margin_usdt=10.0,
                     sl_price=97.0, tp1_price=110.0, tp2_price=120.0, target_env="testnet", bypass_eval_gate=True)
         args.update(kwargs)
         gates = MagicMock(wraps=eft.check_mechanical_gates)
+        ws = tempfile.mkdtemp()  # pending_entries.json of resting entries never touches the real logs/
         with patch("execute_futures_trade.send_signed_request", side_effect=fake), \
+             patch("execute_futures_trade._workspace_dir", return_value=ws), \
              patch("execute_futures_trade.check_mechanical_gates", gates), \
              patch("execute_futures_trade.get_symbol_filters", return_value=FILTERS), \
              patch("execute_futures_trade.place_algo_stop_loss", return_value={"algoId": 9}), \
@@ -637,7 +641,7 @@ class TestExecutorSizesAtEffectiveEntry(unittest.TestCase):
              patch("utils.atomic_writer.atomic_append_jsonl"), \
              patch("provenance_stamp.stamp_trade_record", side_effect=lambda rec, **kw: rec):
             res = eft.execute_complete_trade(**args)
-        orders = [c[2] for c in calls if c[1] == "/fapi/v1/order" and c[0] == "POST"]
+        orders = [c[2] for c in calls if c[1] in ("/fapi/v1/order", "/fapi/v1/" + "algoOrder") and c[0] == "POST"]
         return res, orders, gates
 
     def _gate_kwargs(self, gates):
@@ -651,6 +655,8 @@ class TestExecutorSizesAtEffectiveEntry(unittest.TestCase):
         expected = eft.round_step(10.0 * 3 / 102.34, FILTERS["stepSize"], FILTERS["precision_qty"])
         self.assertEqual(expected, 0.293)
         self.assertEqual(orders[0]["type"], "STOP_MARKET")
+        self.assertEqual(orders[0]["algoType"], "CONDITIONAL")
+        self.assertEqual(orders[0]["triggerPrice"], 102.34)
         self.assertEqual(orders[0]["quantity"], expected)
         self.assertLess(orders[0]["quantity"], eft.round_step(30.0 / 100.0, FILTERS["stepSize"], FILTERS["precision_qty"]))
         kw = self._gate_kwargs(gates)

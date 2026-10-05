@@ -64,6 +64,8 @@ Follow these steps in order. Skipping one is a hard failure: the PreToolUse hook
    - `python3 scripts/execute_futures_trade.py --positions --json` (read-only snapshot)
    - `python3 scripts/execute_futures_trade.py --move-breakeven --symbol <SYMBOL>` (only after TP1 or a confirmed +2.0×ATR_15m expansion)
    - `python3 scripts/execute_futures_trade.py --close-position --symbol <SYMBOL>`, `--audit-orphans`, `--auto-heal`
+   - `python3 scripts/execute_futures_trade.py --protect-pending` (places the planned SL/TPs of filled resting entries from `logs/pending_entries.json`, cancels expired ones; the guardian runs it every cycle)
+   - Resting entries (untriggered `STOP_MARKET`, `LIMIT`) get their SL only on fill: in PROD they require a running guardian loop (`python3 scripts/loops/position_guardian_loop.py --interval 60`; `--interval` <= 120 s, not `--once` or `--dry-run`) and no open position on the symbol. While a symbol has a pending entry, every new entry on it is rejected.
 9. **Trailing stops, dead alpha and orphan audits** run in `scripts/loops/position_guardian_loop.py` (never opens positions): `--once` for a single cycle (allowed by the hook), `--dry-run` to only report, `--interval <seconds>` to run in the background (requires confirmation). Schedule it outside the chat session, e.g. cron: `*/5 * * * * cd <repo> && python3 scripts/loops/position_guardian_loop.py --once --env prod >> logs/guardian.log 2>&1`.
 
 ## Phase 4: Notion Journal Sync

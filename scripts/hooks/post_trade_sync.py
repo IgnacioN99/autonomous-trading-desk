@@ -12,7 +12,7 @@ Recognized tool calls (Antigravity and Claude Code payloads):
   * run_command / Bash executing the sanctioned trading scripts (inspection commands such as grep/cat
     that merely mention them are ignored):
       - scripts/execute_futures_trade.py: trade openings, --close-position, --move-breakeven,
-        --audit-orphans, --auto-heal (read-only --positions and --help are ignored);
+        --audit-orphans, --auto-heal, --protect-pending (read-only --positions and --help are ignored);
       - scripts/loops/position_guardian_loop.py (except --dry-run), night_cutoff_loop.py,
         dynamic_exit_manager.py and batch deploy scripts.
   * call_mcp_tool, mcp_tool, mcp_<server>_<tool>, mcp__<server>__<tool>:
@@ -51,7 +51,7 @@ POSITION_SCRIPTS_RE = re.compile(r"\b(?:night_cutoff_loop|dynamic_exit_manager)(
 HELP_FLAGS = {"--help", "-h"}
 EXECUTOR_NON_OPENING_FLAGS = {
     "--close-position", "--close_position", "--audit-orphans", "--audit_orphans", "--auto-heal", "--auto_heal",
-    "--move-breakeven", "--move_breakeven",
+    "--move-breakeven", "--move_breakeven", "--protect-pending", "--protect_pending",
 }
 EXECUTOR_READ_ONLY_FLAGS = {"--positions"}
 GUARDIAN_NO_WRITE_FLAGS = {"--dry-run", "--dry_run"}

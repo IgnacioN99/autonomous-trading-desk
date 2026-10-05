@@ -12,6 +12,7 @@ test_execute_futures_hardening.py - Comprehensive Unit Tests for Issue #9 Harden
 import os
 import sys
 import json
+import tempfile
 import unittest
 from unittest.mock import patch, MagicMock, mock_open
 
@@ -332,19 +333,20 @@ class TestRestingLimitOrders(unittest.TestCase):
 
         mock_send.side_effect = fake_send
 
-        res = eft.execute_complete_trade(
-            symbol="BTCUSDT",
-            direction="LONG",
-            leverage=3,
-            margin_usdt=100.0,
-            sl_price=95.0,
-            tp1_price=105.0,
-            tp2_price=110.0,
-            target_env="testnet",
-            order_type="LIMIT",
-            limit_price=98.0,
-            bypass_eval_gate=True  # TESTNET-only explicit bypass: this test targets resting LIMIT handling
-        )
+        with tempfile.TemporaryDirectory() as ws, patch("execute_futures_trade._workspace_dir", return_value=ws):
+            res = eft.execute_complete_trade(
+                symbol="BTCUSDT",
+                direction="LONG",
+                leverage=3,
+                margin_usdt=100.0,
+                sl_price=95.0,
+                tp1_price=105.0,
+                tp2_price=110.0,
+                target_env="testnet",
+                order_type="LIMIT",
+                limit_price=98.0,
+                bypass_eval_gate=True  # TESTNET-only explicit bypass: this test targets resting LIMIT handling
+            )
 
         self.assertTrue(res["success"])
         self.assertTrue(res["pending_limit_entry"])

@@ -94,7 +94,7 @@ Whenever the user explicitly requests crypto trading operations, Binance Futures
      * **Tier S** candidates (conviction $\ge 80\%$, `requires_user_confirmation: false`) are executed and shielded immediately without chat confirmation **only if** the profile enables `autonomous_execution_tier_s`; otherwise ask the user.
      * Tier A+ / Tier A candidates (`requires_user_confirmation: true`) always need the user's explicit confirmation in chat.
    - **Technical Execution Engine (`scripts/execute_futures_trade.py`, the single choke point; no MCP wrapper):**
-     * Position management via the same CLI: `--positions --json` (read-only), `--move-breakeven --symbol <SYMBOL>`, `--close-position --symbol <SYMBOL>`, `--audit-orphans`, `--auto-heal`.
+     * Position management: `--positions --json` (read-only), `--move-breakeven --symbol <S>`, `--close-position --symbol <S>`, `--audit-orphans`, `--auto-heal`, `--protect-pending`.
      * Margin: Mandatory Isolated
      * Leverage: profile `leverage_standard` (standard) / `leverage_yolo` (YOLO), ceiling `leverage_ceiling`, default 15x (5x on MCP sub-accounts)
      * Size: risk-based from `risk_pct_equity`, margin capped at `max_margin_ratio` of equity; YOLO margin from the profile

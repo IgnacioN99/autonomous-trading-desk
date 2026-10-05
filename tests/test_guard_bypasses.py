@@ -285,6 +285,12 @@ class TestRunCommandBypasses(GuardHarness):
              "python3 scripts/trading_doctor.py --auto-heal")
         self.assertDenied(self.agy(self.cmd(c)), "Clean-Room Evaluator Required")
 
+    def test_chained_protect_pending_does_not_whitelist_trade(self):
+        c = ("python3 scripts/execute_futures_trade.py --symbol SOLUSDT --direction LONG && "
+             "python3 scripts/execute_futures_trade.py --protect-pending")
+        self.assertDenied(self.agy(self.cmd(c)), "Clean-Room Evaluator Required")
+        self.assertEqual(self.agy(self.cmd("python3 scripts/execute_futures_trade.py --protect-pending --env prod")).get("decision"), "allow")
+
     def test_batch_deploy_scripts_and_auto_deploy_denied(self):
         self.assertDenied(self.agy(self.cmd("python3 scripts/deploy_fresh_basket.py --help")))
         self.assertDenied(self.agy(self.cmd("python3 scripts/deploy_fomc_batch.py --env prod")), "Batch deploy")
@@ -512,6 +518,8 @@ class TestPostTradeSync(GuardHarness):
                 patch("post_trade_sync.find_workspace_root", return_value=self.root):
             for c in ("python3 scripts/execute_futures_trade.py --move-breakeven --symbol BTCUSDT --env testnet",
                       "python3 scripts/execute_futures_trade.py --close-position --symbol BTCUSDT --env testnet",
+                      "python3 scripts/execute_futures_trade.py --protect-pending --env testnet",
+                      "python3 scripts/execute_futures_trade.py --protect_pending --env testnet",
                       "python3 scripts/loops/position_guardian_loop.py --once --env testnet"):
                 res = post_trade_sync.handle_post_trade_sync(self.cmd(c))
                 self.assertTrue(res["order_placed"], c)

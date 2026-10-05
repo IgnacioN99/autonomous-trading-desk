@@ -6,6 +6,10 @@ Replaces the retired crypto_radar MCP tools update_trailing_stop_structural,
 audit_and_trail_all_positions, check_dead_alpha and audit_orphan_positions.
 
 Per cycle:
+  0. Pending entries (execute_futures_trade.protect_pending_entries, same as --protect-pending): a filled
+     resting entry from logs/pending_entries.json gets its planned SL (verified, else reduce-only close) and,
+     once the entry order is gone, its TPs sized from the actual position; expired unfilled entries are
+     cancelled. Runs first, so a fresh fill gets the planned stop instead of the orphan emergency stop.
   1. Sync open positions (GET /fapi/v2/positionRisk).
   2. Orphan audit: a position without a verified protective stop is auto-healed with a verified
      emergency stop (execute_futures_trade.heal_orphan_position); if the stop cannot be verified,
@@ -18,7 +22,8 @@ Per cycle:
 
 Safety:
   - It NEVER opens or increases a position. The only writes it can send are protective stop
-    placements/cancellations and reduce-only market closes.
+    placements/cancellations, reduce-only market closes, reduce-only TP limits for filled pending
+    entries and cancellations of resting entries.
   - --dry-run computes every decision but sends no write request at all.
   - An exception on one position never stops the others; a network failure is logged and the
     next cycle retries.
@@ -26,6 +31,7 @@ Safety:
 Usage:
   python3 scripts/loops/position_guardian_loop.py --once [--env prod|testnet] [--dry-run] [--json]
   python3 scripts/loops/position_guardian_loop.py [--interval 300] [--env prod|testnet] [--close-dead-alpha]
+  (PROD resting STOP_MARKET / LIMIT entries require a running loop with --interval <= 120, e.g. --interval 60)
 
 Exit code (--once): 0 when the cycle completed without errors and every position ends protected, else 1.
 
@@ -33,6 +39,9 @@ State file (logs/guardian_state.json):
   {
     "schema_version": 1,
     "timestamp": int, "timestamp_utc": str, "env": "prod" | "testnet", "dry_run": bool,
+    "mode": "loop" | "once",           # "loop" when running with --interval (no --once)
+    "interval_seconds": int | null,    # loop interval; PROD resting entries need a loop with <= 120s
+                                       # (execute_futures_trade.check_guardian_alive)
     "cycle_ok": bool,                  # no errors and every position protected at the end of the cycle
     "positions": [{
       "symbol": str, "side": "LONG" | "SHORT", "size": float, "entry_price": float, "mark_price": float,
@@ -49,7 +58,9 @@ State file (logs/guardian_state.json):
 
 Action record (also one JSON line in logs/guardian_actions.jsonl):
   {"timestamp": int, "env": str, "symbol": str, "dry_run": bool, "success": bool,
-   "type": "orphan_heal" | "orphan_close" | "trail_stop" | "dead_alpha_close", "detail": {...}}
+   "type": "orphan_heal" | "orphan_close" | "trail_stop" | "dead_alpha_close" | "pending_protect_sl" |
+           "pending_tp_placed" | "pending_abort" | "pending_timeout_cancel" | "pending_dropped" |
+           "pending_sl_crossed_close", "detail": {...}}
 
 Scheduling (generic examples; run from the repository root):
   cron, every 5 minutes, one cycle per run:
@@ -117,7 +128,7 @@ def _position_view(p):
 
 
 class GuardianCycle:
-    def __init__(self, target_env, dry_run=False, close_dead_alpha=False, log_dir=None):
+    def __init__(self, target_env, dry_run=False, close_dead_alpha=False, log_dir=None, mode="once", interval_seconds=None):
         self.env = target_env
         self.dry_run = bool(dry_run)
         self.close_dead_alpha = bool(close_dead_alpha)
@@ -129,6 +140,8 @@ class GuardianCycle:
             "timestamp_utc": datetime.datetime.fromtimestamp(now, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
             "env": target_env,
             "dry_run": self.dry_run,
+            "mode": mode,
+            "interval_seconds": interval_seconds,
             "cycle_ok": False,
             "positions": [],
             "actions": [],
@@ -247,8 +260,25 @@ class GuardianCycle:
         res = eft.close_position_market(sym, target_env=self.env)
         self.action(sym, "dead_alpha_close", bool(res.get("success")), {"dead_alpha": view["dead_alpha"], "result": res})
 
+    def _protect_pending(self):
+        """Post-fill protection of resting entries (planned SL/TPs) BEFORE the orphan audit, so a freshly filled
+        entry gets its planned stop instead of the emergency orphan stop. No-op without logs/pending_entries.json."""
+        try:
+            res = eft.protect_pending_entries(target_env=self.env, dry_run=self.dry_run)
+        except Exception as e:
+            self.error(None, "pending_entries", f"{type(e).__name__}: {e}")
+            return
+        for a in res.get("actions", []):
+            self.action(a.get("symbol"), a.get("type"), a.get("success"),
+                        dict(a.get("detail") or {}, pending_entry_key=a.get("key")))
+        for e in res.get("errors", []):
+            self.error(e.get("symbol"), f"pending_{e.get('stage')}", e.get("error"))
+        if not res.get("ok") and not res.get("errors"):
+            self.error(None, "pending_entries", "protect_pending_entries reported failure")
+
     # -- cycle -------------------------------------------------------------
     def run(self):
+        self._protect_pending()
         try:
             pos_res = eft.send_signed_request("GET", "/fapi/v2/positionRisk", target_env=self.env)
         except Exception as e:
@@ -291,9 +321,10 @@ class GuardianCycle:
                 print(f"guardian: failed to append action: {e}", file=sys.stderr)
 
 
-def run_cycle(target_env=None, dry_run=False, close_dead_alpha=False, log_dir=None):
+def run_cycle(target_env=None, dry_run=False, close_dead_alpha=False, log_dir=None, mode="once", interval_seconds=None):
     target_env = resolve_env(target_env)
-    return GuardianCycle(target_env, dry_run=dry_run, close_dead_alpha=close_dead_alpha, log_dir=log_dir).run()
+    return GuardianCycle(target_env, dry_run=dry_run, close_dead_alpha=close_dead_alpha, log_dir=log_dir,
+                         mode=mode, interval_seconds=interval_seconds).run()
 
 
 def format_state(state):
@@ -328,9 +359,13 @@ def main(argv=None):
         print(json.dumps({"success": False, "error": f"Invalid environment: {e}"}))
         return 1
 
+    interval = max(int(args.interval), 10)
+    mode = "once" if args.once else "loop"
+
     def one_cycle():
         try:
-            state = run_cycle(target_env, dry_run=args.dry_run, close_dead_alpha=args.close_dead_alpha)
+            state = run_cycle(target_env, dry_run=args.dry_run, close_dead_alpha=args.close_dead_alpha,
+                              mode=mode, interval_seconds=None if args.once else interval)
         except Exception as e:  # never let a cycle crash the loop
             print(f"guardian: cycle failed: {e}", file=sys.stderr)
             return False
@@ -340,7 +375,6 @@ def main(argv=None):
     if args.once:
         return 0 if one_cycle() else 1
 
-    interval = max(int(args.interval), 10)
     while True:
         one_cycle()
         try:

@@ -35,12 +35,13 @@ class FakeExchange:
     """Stateful in-memory stand-in for send_signed_request. Records every call."""
 
     def __init__(self, positions, algos=None, open_orders=None, index_new_stops=True, reject_new_stops=False,
-                 fail_cancel=False):
+                 fail_cancel=False, reject_response=None):
         self.positions = [dict(p) for p in positions]
         self.algos = [dict(a) for a in (algos or [])]
         self.open_orders = [dict(o) for o in (open_orders or [])]
         self.index_new_stops = index_new_stops
         self.reject_new_stops = reject_new_stops
+        self.reject_response = reject_response or {"code": -2021, "msg": "Order would immediately trigger."}
         self.fail_cancel = fail_cancel
         self.calls = []
         self.next_id = 9000
@@ -57,7 +58,7 @@ class FakeExchange:
             return [dict(o) for o in self.open_orders if not sym or o["symbol"] == sym]
         if endpoint == ALGO_ENDPOINT and method == "POST":
             if self.reject_new_stops:
-                return {"code": -2021, "msg": "Order would immediately trigger."}
+                return dict(self.reject_response)
             self.next_id += 1
             order = {
                 "algoId": self.next_id, "symbol": sym, "side": params.get("side"), "orderType": params.get("type"),
@@ -74,6 +75,9 @@ class FakeExchange:
             return {"algoId": params.get("algoId"), "code": "200", "msg": "success"}
         if endpoint == "/fapi/v1/order" and method == "POST":
             return {"orderId": 1, "status": "FILLED"}
+        if endpoint == "/fapi/v1/order" and method == "DELETE":
+            self.open_orders = [o for o in self.open_orders if str(o.get("orderId")) != str(params.get("orderId"))]
+            return {"orderId": params.get("orderId"), "status": "CANCELED"}
         if endpoint == "/fapi/v1/allOpenOrders":
             return []
         return {}
