@@ -99,6 +99,17 @@ def write_guardian_state(ws, env="prod", dry_run=False, age=5, mode="loop", inte
                    "cycle_ok": True, "positions": [], "actions": [], "errors": []}, f)
 
 
+def write_session_state(ws, positions=(), bias="DELTA_BALANCED"):
+    """A fresh, valid logs/session_state.json consistent with the fake exchange's positionRisk rows (issue #101: PROD
+    Gate 0A rejects a missing cache and takes the stricter of the cache and the live view)."""
+    active = [{"symbol": p["symbol"], "qty": float(p.get("positionAmt", 0))} for p in positions
+              if float(p.get("positionAmt", 0) or 0) != 0]
+    os.makedirs(os.path.join(ws, "logs"), exist_ok=True)
+    with open(os.path.join(ws, "logs", "session_state.json"), "w", encoding="utf-8") as f:
+        json.dump({"is_valid": True, "last_updated_ts": int(time.time()), "active_positions": active,
+                   "portfolio_exposure": {"total_active_positions": len(active), "delta_bias": bias}}, f)
+
+
 def entry_algo(algo_id=7001, symbol="BTCUSDT", side="BUY", trigger=101.0):
     """A resting conditional ENTRY (not protective: neither closePosition nor reduceOnly)."""
     return {"algoId": algo_id, "symbol": symbol, "side": side, "orderType": "STOP_MARKET",
@@ -140,7 +151,10 @@ class ExecutorHarness(unittest.TestCase):
         if endpoint == "/fapi/v1/ticker/price":
             return {"price": "100.0"}
         if endpoint == "/fapi/v2/positionRisk":
-            return {"error": "timeout"} if self.positions_error else [dict(p) for p in self.positions]
+            # positions_error: True fails every query; "symbol" only the per-symbol ones (the all-symbol live
+            # snapshot of the PROD gates, issue #101, still succeeds)
+            failing = self.positions_error is True or (self.positions_error == "symbol" and params.get("symbol"))
+            return {"error": "timeout"} if failing else [dict(p) for p in self.positions]
         if endpoint == ALGO_ENDPOINT and method == "POST":
             return {"algoId": 8}
         if endpoint == ALGO_ENDPOINT and method == "DELETE":
@@ -161,6 +175,8 @@ class ExecutorHarness(unittest.TestCase):
         if env == "testnet":
             args["bypass_eval_gate"] = True
         args.update(kwargs)
+        if not os.path.exists(os.path.join(self.ws, "logs", "session_state.json")):
+            write_session_state(self.ws, self.positions)  # PROD Gate 0A requires the cache (issue #101), as live
         with patch("execute_futures_trade.send_signed_request", side_effect=send or self.fake), \
              patch("execute_futures_trade._workspace_dir", return_value=self.ws), \
              patch("execute_futures_trade.load_env", return_value={"LIVE_TRADING_ARMED": "true"}), \
@@ -461,8 +477,16 @@ class TestRestingEntryProdGates(ExecutorHarness):
 
     def test_position_query_failure_rejected(self):
         write_guardian_state(self.ws)
-        self.positions_error = True
+        self.positions_error = "symbol"
         self.assertGateRejected(self._prod_stop(), "cannot verify open positions")
+        # Issue #101: a failing all-symbol positionRisk (live snapshot) rejects every entry before any write
+        self.positions_error = True
+        self.calls = []
+        res = self._prod_stop()
+        self.assertFalse(res["success"])
+        self.assertTrue(res.get("hard_gate_rejection"))
+        self.assertIn("cannot read the live exchange state for the PROD gates", res["error"])
+        self.assertEqual(self.writes(), [])
 
     def test_existing_pending_entry_rejects_every_entry_type(self):
         write_guardian_state(self.ws)
@@ -507,7 +531,8 @@ class TestRestingEntryProdGates(ExecutorHarness):
     def test_market_entry_not_affected(self):
         res = self.execute(env="prod", order_type="MARKET")  # no guardian state, no registry
         self.assertTrue(res["success"], res.get("error"))
-        self.assertFalse([c for c in self.calls if c[1] == "/fapi/v2/positionRisk"])
+        # only the all-symbol live snapshot of the PROD gates (issue #101), never the per-symbol resting-entry check
+        self.assertEqual([c[2] for c in self.calls if c[1] == "/fapi/v2/positionRisk"], [{}])
 
 
 def entry_limit(order_id=77, symbol="ETHUSDT", side="BUY", price=98.0, reduce_only=False):
@@ -543,7 +568,8 @@ class TestUnregisteredRestingEntriesGate(ExecutorHarness):
                 self.assertIn(fragment, res["error"], entry)
             self.assertEqual(self.writes(), [], f"no margin/leverage/order write on rejection: {entry}")
             all_symbol_gets = [c[1] for c in self.calls if c[0] == "GET" and c[2] == {}]
-            self.assertEqual(all_symbol_gets, ["/fapi/v1/openAlgoOrders", "/fapi/v1/openOrders"], "bounded: two GETs")
+            self.assertEqual(all_symbol_gets, ["/fapi/v2/positionRisk", "/fapi/v1/openAlgoOrders", "/fapi/v1/openOrders"],
+                             "bounded: the three GETs of the live snapshot (issue #101), fetched once")
 
     def test_deleted_registry_with_resting_conditional_entry_rejects_every_entry(self):
         self.open_algos = [entry_algo(algo_id=7001, symbol="BTCUSDT")]
@@ -606,7 +632,8 @@ class TestUnregisteredRestingEntriesGate(ExecutorHarness):
             res = self.execute(env="prod", order_type="MARKET")
             self.assertFalse(res["success"], endpoint)
             self.assertTrue(res.get("hard_gate_rejection"), endpoint)
-            self.assertIn("ENTRY REJECTED: FAIL-CLOSED — cannot cross-check resting entries", res["error"])
+            # the shared live snapshot (issue #101) fails first, before any write
+            self.assertIn("FAIL-CLOSED — cannot read the live exchange state for the PROD gates", res["error"])
             self.assertIn(f"{endpoint} query failed", res["error"])
             self.assertEqual(self.writes(), [], endpoint)
 
@@ -804,7 +831,8 @@ class TestProtectPendingEntries(unittest.TestCase):
         heal = dict(stop(601, 98.4, close_position=False), reduceOnly=True, quantity="4")
         fake = FakeExchange([long_position(amt="4", entry="101.0")], algos=[heal], open_orders=[limit])
         ws = tempfile.mkdtemp()
-        write_registry(ws, make_record(kind="LIMIT", entry_id="8001", sl=95.0))  # no sl_qty: coverage unknown
+        # no sl_qty: coverage unknown (total_qty matches the resting LIMIT's origQty, issue #101 cross-check)
+        write_registry(ws, make_record(kind="LIMIT", entry_id="8001", sl=95.0, total_qty=10.0))
         with offline(fake, workspace=ws):
             res1 = eft.protect_pending_entries(target_env="testnet")
             self.assertTrue(res1["ok"], res1["errors"])
@@ -1252,7 +1280,8 @@ class TestGuardianReportsUnknownRestingEntries(unittest.TestCase):
         fake = self.unknown_fake()
         ws = tempfile.mkdtemp()
         write_registry(ws, make_record(kind="STOP_MARKET", entry_id="7001", symbol="XRPUSDT", env="prod"),
-                       make_record(kind="LIMIT", entry_id="77", symbol="ETHUSDT", env="prod"))
+                       make_record(kind="LIMIT", entry_id="77", symbol="ETHUSDT", env="prod", total_qty=1.5,
+                                   trigger_or_limit_price=98.0))   # matches the resting order (issue #101)
         code, state = self.run_guardian(fake, ws, argv=("--once", "--env", "prod"))
         self.assertEqual(code, 0, state["errors"])
         self.assertTrue(state["cycle_ok"])

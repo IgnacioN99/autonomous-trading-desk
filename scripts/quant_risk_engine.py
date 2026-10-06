@@ -44,12 +44,15 @@ def fetch_json(url, timeout=6):
         return json.loads(resp.read().decode())
 
 def get_account_equity(target_env="testnet") -> float:
-    """Fetches total wallet balance/equity from session_state.json or Binance ledger with strict environment matching."""
+    """Total USDT wallet balance used for risk sizing and the PROD monetary risk gate.
+    PROD (any env other than testnet) always reads the live ledger (GET /fapi/v2/balance) and never the
+    logs/session_state.json cache, so an edited operating_balance cannot widen the risk cap (issue #101); it raises
+    (callers fail closed) when the live read fails. TESTNET may use the cache when its target_env matches."""
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     state_file = os.path.join(base_dir, "logs", "session_state.json")
     target_env_clean = str(target_env).strip().lower()
 
-    if os.path.exists(state_file):
+    if target_env_clean == "testnet" and os.path.exists(state_file):
         try:
             with open(state_file, "r", encoding="utf-8") as f:
                 data = json.load(f)

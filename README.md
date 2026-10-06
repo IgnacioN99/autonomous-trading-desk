@@ -31,7 +31,7 @@ graph TD
     end
 
     subgraph L1 ["Layer 1: Ground Truth Ledger"]
-        SYNC["scripts/sync_session_state.py<br/>• Direct Binance Ledger Sync (~600ms)<br/>• Single Source of Truth: session_state.json"]
+        SYNC["scripts/sync_session_state.py<br/>• Direct Binance Ledger Sync (~600ms)<br/>• Cache: session_state.json (PROD gates re-read the exchange)"]
     end
 
     subgraph L2 ["Layer 2: Mechanical Hard Gates (PreToolUse Hook)"]

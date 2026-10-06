@@ -36,6 +36,28 @@ import execute_futures_trade as eft
 GATE_PREFIX = "MECHANICAL HARD GATE REJECTION: Max open positions limit"
 
 
+def _no_network(*args, **kwargs):
+    raise AssertionError("Network access attempted during offline test")
+
+
+def setUpModule():
+    global _net_patch
+    _net_patch = patch("urllib.request.urlopen", side_effect=_no_network)
+    _net_patch.start()
+
+
+def tearDownModule():
+    _net_patch.stop()
+
+
+def flat_exchange(method, endpoint, params=None, target_env=None, retry_count=0):
+    """Live PROD gate snapshot (issue #101): no position, no resting order; any other call is a test bug."""
+    if method == "GET" and not params and endpoint in ("/fapi/v2/positionRisk", "/fapi/v1/openAlgoOrders",
+                                                       "/fapi/v1/openOrders"):
+        return []
+    raise AssertionError(f"unexpected exchange call {method} {endpoint} {params}")
+
+
 def write_session_state(ws, symbols, last_updated_ts=None):
     os.makedirs(os.path.join(ws, "logs"), exist_ok=True)
     if last_updated_ts is None:
@@ -79,7 +101,8 @@ class TestIssue47MaxOpenPositions(unittest.TestCase):
 
     def _check(self, max_open=2, env="prod"):
         prof = {"max_open_positions": max_open}
-        with patch("execute_futures_trade._workspace_dir", return_value=self.ws):
+        with patch("execute_futures_trade._workspace_dir", return_value=self.ws), \
+             patch("execute_futures_trade.send_signed_request", side_effect=flat_exchange):
             return eft.check_max_open_positions(prof, env, base_dir=self.ws)
 
     def _check_gates(self, max_open=2, env="prod"):
@@ -91,6 +114,7 @@ class TestIssue47MaxOpenPositions(unittest.TestCase):
             "risk_pct_equity": 0.005
         }
         with patch("execute_futures_trade._workspace_dir", return_value=self.ws), \
+             patch("execute_futures_trade.send_signed_request", side_effect=flat_exchange), \
              patch("quant_risk_engine.get_account_equity", return_value=10000.0), \
              patch("user_profile.load_user_profile", return_value=prof):
             return eft.check_mechanical_gates(

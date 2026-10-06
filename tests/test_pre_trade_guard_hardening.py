@@ -661,9 +661,18 @@ class TestPreTradeGuardHardening(unittest.TestCase):
                 return self.state_path
             return orig_join(*p)
 
+        def flat_exchange(method, endpoint, params=None, target_env=None, retry_count=0):
+            # issue #101 live PROD snapshot: flat exchange; any other exchange call is a test bug (never real)
+            if method == "GET" and not params and endpoint in ("/fapi/v2/positionRisk", "/fapi/v1/openAlgoOrders",
+                                                               "/fapi/v1/openOrders"):
+                return []
+            raise AssertionError(f"unexpected exchange call {method} {endpoint}")
+
         # pending_entries.json (Gate 0A) is read from the temp root and the profile is explicit: never the real logs/
         with patch("os.path.join", side_effect=fake_join), \
              patch("execute_futures_trade._workspace_dir", return_value=self.mock_root), \
+             patch("execute_futures_trade.send_signed_request", side_effect=flat_exchange), \
+             patch("urllib.request.urlopen", side_effect=AssertionError("network access in offline test")), \
              patch("user_profile.load_user_profile", return_value=dict(GATE_PROFILE)):
             passed, reason = eft.check_mechanical_gates(
                 direction="LONG",
@@ -687,9 +696,18 @@ class TestPreTradeGuardHardening(unittest.TestCase):
                 return self.state_path
             return orig_join(*p)
 
+        def flat_exchange(method, endpoint, params=None, target_env=None, retry_count=0):
+            # issue #101 live PROD snapshot: flat exchange; any other exchange call is a test bug (never real)
+            if method == "GET" and not params and endpoint in ("/fapi/v2/positionRisk", "/fapi/v1/openAlgoOrders",
+                                                               "/fapi/v1/openOrders"):
+                return []
+            raise AssertionError(f"unexpected exchange call {method} {endpoint}")
+
         # pending_entries.json (Gate 0A) is read from the temp root and the profile is explicit: never the real logs/
         with patch("os.path.join", side_effect=fake_join), \
              patch("execute_futures_trade._workspace_dir", return_value=self.mock_root), \
+             patch("execute_futures_trade.send_signed_request", side_effect=flat_exchange), \
+             patch("urllib.request.urlopen", side_effect=AssertionError("network access in offline test")), \
              patch("user_profile.load_user_profile", return_value=dict(GATE_PROFILE)):
             passed, reason = eft.check_mechanical_gates(
                 direction="LONG",

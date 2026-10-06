@@ -17,8 +17,8 @@ Whenever the user explicitly requests crypto trading operations, Binance Futures
    - **Layer 0: Pre-Flight Diagnostic, Onboarding Profiler & Health Sensor (`scripts/trading_doctor.py` & `scripts/user_profile.py`):**
      * Prior to any scanning or trading action, execute the Doctor and verify that the User Profile (`config/user_profile.json`) is calibrated. If uninitialized, prompt the user through an interactive onboarding interview to define risk tolerance (`risk_pct_equity`, default 0.5% of equity per trade), max margin ceiling (30%), leverage, overnight handling mode, and YOLO moonshot preference.
      * The Doctor validates API latency (<800ms), clock drift (<1000ms), credentials (`MCP` or `KEYS` auth mode), USDT balance, pre-trade guard liveness, and performs a **Forensic Orphan Position Audit**. If any open position lacks an active Stop Loss on Binance, it operates in **Fail CLOSED mode (exit code 1)** or triggers automatic `--heal`.
-   - **Layer 1: Deterministic Ground Truth Synchronization (`scripts/sync_session_state.py`):**
-     * Synchronizes in ~600ms directly against the real Binance ledger and writes `logs/session_state.json` (Single Source of Truth: daily PnL, floating PnL, algo orders, and portfolio Delta balance).
+   - **Layer 1: Ledger Cache Synchronization (`scripts/sync_session_state.py`):**
+     * Syncs in ~600ms against the real Binance ledger into `logs/session_state.json`, a cache (daily PnL, floating PnL, algo orders, portfolio Delta). PROD gates re-read the exchange; the stricter view wins.
    - **Layer 2: Hard Code Gates (Mechanical Software Gates in `scripts/execute_futures_trade.py`):**
      * *Deterministic Execution Interception:* Risk control is never delegated to natural language LLM instructions; it is programmatically enforced at runtime. The execution engine physically intercepts every order:
        1. **Delta-Neutral Gate:** If the portfolio marks `LONG_HEAVY`, physically rejects any `LONG` order (`hard_gate_rejection: True`). If it marks `SHORT_HEAVY`, rejects any `SHORT`.

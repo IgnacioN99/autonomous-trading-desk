@@ -50,6 +50,13 @@ def write_corrupt_registry(ws):
         f.write("{not json")
 
 
+def empty_exchange(method, endpoint, params=None, target_env=None, retry_count=0):
+    """Live PROD gate snapshot (issue #101): no position and no resting order on the exchange."""
+    if method == "GET" and endpoint in ("/fapi/v2/positionRisk", "/fapi/v1/openAlgoOrders", "/fapi/v1/openOrders"):
+        return []
+    raise AssertionError(f"unexpected exchange call {method} {endpoint}")
+
+
 class GateHarness(unittest.TestCase):
     """check_mechanical_gates / check_max_open_positions against a temp workspace."""
 
@@ -61,6 +68,7 @@ class GateHarness(unittest.TestCase):
         prof = {"max_open_positions": max_open, "yolo_slot_enabled": True, "leverage_standard": 3,
                 "leverage_yolo": 15, "risk_pct_equity": 0.005}
         with patch("execute_futures_trade._workspace_dir", return_value=self.ws), \
+             patch("execute_futures_trade.send_signed_request", side_effect=empty_exchange), \
              patch("quant_risk_engine.get_account_equity", return_value=10000.0), \
              patch("user_profile.load_user_profile", return_value=prof):
             return eft.check_mechanical_gates(direction="LONG", cur_price=100.0, sl_price=98.0, tp1_price=105.0,
@@ -122,6 +130,7 @@ class TestGate0ACountsPendingEntries(GateHarness):
         self.assertIn("(open 2 + pending 1 >= max 3)", reason)
 
     def test_unreadable_registry_fails_closed_in_prod(self):
+        write_session_state(self.ws, [])
         write_corrupt_registry(self.ws)
         ok, reason = self.gates(max_open=3, env="prod")
         self.assertFalse(ok)
@@ -133,7 +142,9 @@ class TestGate0ACountsPendingEntries(GateHarness):
         os.makedirs(os.path.join(self.ws, "logs"), exist_ok=True)
         with open(os.path.join(self.ws, "logs", "pending_entries.json"), "w", encoding="utf-8") as f:
             json.dump({"entries": []}, f)
-        with patch("execute_futures_trade._workspace_dir", return_value=self.ws):
+        write_session_state(self.ws, [])
+        with patch("execute_futures_trade._workspace_dir", return_value=self.ws), \
+             patch("execute_futures_trade.send_signed_request", side_effect=empty_exchange):
             ok, reason = eft.check_max_open_positions({"max_open_positions": 3}, "prod")
         self.assertFalse(ok)
         self.assertIn("FAIL-CLOSED", reason)
