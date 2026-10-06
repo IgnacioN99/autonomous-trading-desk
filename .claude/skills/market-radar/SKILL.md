@@ -74,6 +74,9 @@ sorted by confidence. `--top 0` (default) returns all of them.
 ```
 
 - `tier_code`: `S` (≥ 80), `A+` (65-79), `A` (55-64). Tier S requires volume ≥ 1.4x or wick ≥ 60%.
+- `lower_wick` / `upper_wick` come from ONE closed candle (sum ≤ 100) opening at `wick_candle_open_time` (ms);
+  `vol_ratio` is that same candle's volume vs the 20 before it. `micro.wick_candle_mismatch` (candle not in the
+  micro fetch) or `micro.taker_candle_matched: false` (no taker row for it) → no absorption bonus, reason says so.
 - Prices are floats (unrounded); `micro` is `null` when order-flow data was unavailable.
 - `roe_est_pct` = `risk_pct × rr × leverage_standard` (informational).
 
