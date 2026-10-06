@@ -1592,20 +1592,20 @@ PENDING_MISSING_GRACE_SECONDS = 60      # "entry gone, no position" must persist
 PENDING_ENTRIES_SCHEMA_VERSION = 1
 
 
-def pending_entries_path():
-    return os.path.join(_workspace_dir(), 'logs', 'pending_entries.json')
+def pending_entries_path(base_dir=None):
+    return os.path.join(base_dir or _workspace_dir(), 'logs', 'pending_entries.json')
 
 
 def pending_entry_key(target_env, symbol, entry_id):
     return f"{target_env}:{str(symbol).upper()}:{entry_id}"
 
 
-def load_pending_entries():
+def load_pending_entries(base_dir=None):
     """Returns (entries, error). A missing registry is empty; an unreadable or malformed one is an error
     (callers fail closed: no new resting entry is accepted and no record is ever dropped). An empty registry is
     only trusted together with the exchange: find_unregistered_resting_entries (PROD executor gate and guardian
     cycle) reports opening orders resting on the exchange without a record."""
-    path = pending_entries_path()
+    path = pending_entries_path(base_dir)
     if not os.path.exists(path):
         return {}, None
     try:
@@ -1618,15 +1618,15 @@ def load_pending_entries():
     return data['entries'], None
 
 
-def update_pending_entries(mutate):
+def update_pending_entries(mutate, base_dir=None):
     """Read-modify-write of logs/pending_entries.json: re-reads the registry, applies mutate(entries) and writes
     it atomically. Raises on an unreadable registry or a failed write."""
-    entries, err = load_pending_entries()
+    entries, err = load_pending_entries(base_dir)
     if err:
         raise IOError(err)
     mutate(entries)
     from utils.atomic_writer import atomic_write_json
-    atomic_write_json(pending_entries_path(), {"schema_version": PENDING_ENTRIES_SCHEMA_VERSION, "entries": entries})
+    atomic_write_json(pending_entries_path(base_dir), {"schema_version": PENDING_ENTRIES_SCHEMA_VERSION, "entries": entries})
     return entries
 
 
@@ -1796,23 +1796,27 @@ def check_unregistered_resting_entries(target_env):
     return True, None
 
 
-def check_max_open_positions(prof, target_env):
+def check_max_open_positions(prof, target_env, base_dir=None):
     """
     Gate 0A (max_open_positions), evaluated before any write. Committed slots = open positions (logs/session_state.json)
     + symbols with a pending resting entry for target_env in logs/pending_entries.json that have no open position yet
-    (a partially filled LIMIT has both a position and a record: counted once). A new entry is rejected when committed
-    slots >= profile max_open_positions. A missing registry counts zero pending entries (in PROD the executor then
-    rejects any entry resting on the exchange without a record, check_unregistered_resting_entries); an unreadable
-    one fails closed in PROD (TESTNET counts zero). Returns (ok, message_or_None). Read-only, file-only.
+    (a partially filled LIMIT has both a position and a record: counted once)
+    + symbols with a recent fill for target_env in logs/trades_audit.jsonl since last session_state sync (Issue #47).
+    A new entry is rejected when committed slots >= profile max_open_positions. A missing registry counts zero pending
+    entries (in PROD the executor then rejects any entry resting on the exchange without a record,
+    check_unregistered_resting_entries); an unreadable one fails closed in PROD (TESTNET counts zero).
+    Returns (ok, message_or_None). Read-only, file-only.
     """
     target_env = resolve_env(target_env)
     is_testnet = str(target_env).lower() == 'testnet'
     max_open_positions = int((prof or {}).get("max_open_positions", 3))
     prefix = f"MECHANICAL HARD GATE REJECTION: Max open positions limit ({max_open_positions})"
 
-    state_file = os.path.join(_workspace_dir(), 'logs', 'session_state.json')
+    base = base_dir or _workspace_dir()
+    state_file = os.path.join(base, 'logs', 'session_state.json')
     open_count = 0
     open_symbols = set()
+    last_sync_ts = 0
     if os.path.exists(state_file):
         try:
             with open(state_file, 'r', encoding='utf-8') as f:
@@ -1821,8 +1825,13 @@ def check_max_open_positions(prof, target_env):
             if open_count is None:
                 open_count = len(state_data_pos.get('active_positions', []))
             open_count = int(open_count)
+            try:
+                last_sync_ts = int(state_data_pos.get('last_updated_ts', 0))
+            except (TypeError, ValueError):
+                last_sync_ts = 0
         except Exception:
             open_count = 0
+            last_sync_ts = 0
         else:
             try:
                 open_symbols = {str(p.get('symbol')).upper() for p in state_data_pos.get('active_positions') or []
@@ -1830,7 +1839,7 @@ def check_max_open_positions(prof, target_env):
             except Exception:
                 open_symbols = set()
 
-    entries, err = load_pending_entries()
+    entries, err = load_pending_entries(base_dir=base)
     if err:
         if not is_testnet:
             return False, (f"{prefix}: FAIL-CLOSED — {err}; cannot count pending resting entries "
@@ -1844,7 +1853,75 @@ def check_max_open_positions(prof, target_env):
                 pending_symbols.add(sym)
     pending_count = len(pending_symbols)
 
-    if open_count + pending_count >= max_open_positions:
+    audit_file = os.path.join(base, 'logs', 'trades_audit.jsonl')
+    cutoff_ts = last_sync_ts if last_sync_ts > 0 else (time.time() - 300)
+    recent_fill_symbols = set()
+    if os.path.exists(audit_file):
+        audit_records = []
+        try:
+            with open(audit_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        r = json.loads(line)
+                        if isinstance(r, dict):
+                            audit_records.append(r)
+                    except (ValueError, TypeError):
+                        continue
+        except OSError:
+            audit_records = []
+
+        latest_entry_ts = {}
+        latest_entry_seq = {}
+        latest_abort_ts = {}
+        latest_abort_seq = {}
+
+        for seq, rec in enumerate(audit_records):
+            rec_env = rec.get('target_env')
+            if rec_env != target_env and str(rec_env).lower() != str(target_env).lower():
+                continue
+            try:
+                rec_ts = float(rec.get('timestamp', 0))
+            except (TypeError, ValueError):
+                rec_ts = 0.0
+            if rec_ts < cutoff_ts:
+                continue
+            sym = str(rec.get('symbol', '')).strip().upper()
+            if not sym:
+                continue
+
+            event = rec.get('event')
+            if event == 'CRITICAL_FAILSAFE_ABORT':
+                if (rec_ts > latest_abort_ts.get(sym, -1.0) or
+                    (rec_ts == latest_abort_ts.get(sym, -1.0) and seq > latest_abort_seq.get(sym, -1))):
+                    latest_abort_ts[sym] = rec_ts
+                    latest_abort_seq[sym] = seq
+            elif (not event) or ('total_qty' in rec):
+                if (rec_ts > latest_entry_ts.get(sym, -1.0) or
+                    (rec_ts == latest_entry_ts.get(sym, -1.0) and seq > latest_entry_seq.get(sym, -1))):
+                    latest_entry_ts[sym] = rec_ts
+                    latest_entry_seq[sym] = seq
+
+        for sym, e_ts in latest_entry_ts.items():
+            if sym in open_symbols or sym in pending_symbols:
+                continue
+            a_ts = latest_abort_ts.get(sym)
+            if a_ts is not None:
+                e_seq = latest_entry_seq.get(sym, 0)
+                a_seq = latest_abort_seq.get(sym, 0)
+                if a_ts > e_ts or (a_ts == e_ts and a_seq > e_seq):
+                    continue
+            recent_fill_symbols.add(sym)
+
+    recent_count = len(recent_fill_symbols)
+    committed_count = open_count + pending_count + recent_count
+
+    if committed_count >= max_open_positions:
+        if recent_count > 0:
+            return False, (f"{prefix} reached (open {open_count} + pending {pending_count} + "
+                           f"recent fills {recent_count} >= max {max_open_positions}).")
         return False, (f"{prefix} reached (open {open_count} + pending {pending_count} >= max {max_open_positions}).")
     return True, None
 
