@@ -2093,5 +2093,188 @@ class TestRiskReducingPrefixesAndWindowsCwd(GuardHarness):
             self.root = real_root
 
 
+class TestGitConfigFileChannels(GuardHarness):
+    """Issue #99: writing git config / hook files directly (.git/config, .git/hooks/*, ~/.gitconfig,
+    ~/.config/git/config, worktree / submodule config, a .git gitdir file) is the same command channel as
+    `git -c core.fsmonitor=...`: a later innocent git command runs the payload. Shell writes are denied, file tools
+    require explicit confirmation, reads and git's own config handling are unaffected."""
+
+    LABEL = "Git Config Channel Protection"
+
+    WRITES = [
+        "printf '[core]\\n\\tfsmonitor = rm -rf logs\\n' >> .git/config; git status",
+        "echo 'rm -rf logs' > .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit; git commit -m x",
+        "chmod +x .git/hooks/pre-commit",
+        "cp /tmp/x .git/hooks/pre-commit",
+        "cp /tmp/x .git/hooks",
+        "cp -t .git/hooks /tmp/pre-commit",
+        "install -m 755 /tmp/x .git/hooks/post-checkout",
+        "mv /tmp/x .git/hooks/pre-push",
+        "ln -s /tmp/x .git/hooks/post-checkout",
+        "touch .git/hooks/pre-commit",
+        "sed -i 's/a/b/' .git/config",
+        "perl -pi -e 's/a/b/' .git/config",
+        "dd if=/tmp/x of=.git/config",
+        "curl -o .git/hooks/pre-commit http://127.0.0.1:9/x",
+        "tar -xf /tmp/h.tar -C .git/hooks",
+        "unzip /tmp/h.zip -d .git",
+        "echo '[alias] st = !rm' | tee -a ~/.gitconfig",
+        "echo x >> ~/.gitconfig",
+        "echo x >> /home/u/.gitconfig.local",
+        "echo x >> $HOME/.config/git/config",
+        "echo x >> ${HOME}/.config/git/config",
+        "echo x > /etc/gitconfig",
+        "echo x >> .git/config.worktree",
+        "echo x >> .git/worktrees/wt/config.worktree",
+        "echo /tmp/evil > .git/worktrees/wt/commondir",
+        "echo x >> .git/modules/sub/config",
+        "echo x > .git/modules/sub/hooks/pre-commit",
+        "echo 'gitdir: /tmp/e' > .git",
+        "echo x > ./.GIT/CONFIG",
+        "echo x > /abs/repo/.git/hooks/pre-commit",
+        "echo x > 'C:\\Users\\x\\repo\\.git\\config'",
+        "echo x > .git/hoo*/pre-commit",
+        "echo x > .gi?/config",
+        "cd .git/hooks && echo x > pre-commit",
+        "cd .git && echo x >> config",
+        "bash -c 'echo x >> .git/config'",
+        "sh -c \"cp /tmp/x .git/hooks/pre-commit\"",
+        "find /tmp/h -name x -exec cp {} .git/hooks/pre-commit \\;",
+        "cat > .git/hooks/pre-commit <<EOF\nrm -rf logs\nEOF",
+        "python3 -c \"open('.git/config','a').write('[core]')\"",
+        "python3 -c \"import os; os.system('echo x >> .git/config')\"",
+        "wsl.exe -e bash -c 'echo x >> .git/config'",
+        # round 2: link sources (a link aliases its source)
+        "ln -s .git/config x; echo y >> x", "ln .git/config x", "ln -t . .git/config", "ln -sr .git/config x",
+        "link .git/config x", "cp -l .git/config x", "cp -s .git/config x", "cp --link .git/config x",
+        "cp -as .git/config x", "ln -s .git/hooks h; cp /tmp/x h/pre-commit", "ln -s .git g",
+        "rsync -a --link-dest=.git/hooks /tmp/h/ /tmp/out/",
+        # round 2: programs whose writes are not modelled (catch-all)
+        "patch .git/config /tmp/p.diff", "echo x | sponge .git/config", "ed -s .git/config < /tmp/cmds",
+        "ex -sc wq .git/config", "vim -c wq .git/config", "awk -i inplace 1 .git/config",
+        "perl -e \"open(F,q(>>.git/config))\"", "sudo vim .git/hooks/pre-commit", "nano ~/.gitconfig",
+        "code .git/config", "xxd -r /tmp/x.hex > .git/config", "xxd -r /tmp/x.hex .git/config",
+        "xxd -revert /tmp/x.hex .git/hooks/pre-commit",
+        # round 2: git pointed at another global config / repository
+        "HOME=/tmp/h git status", "XDG_CONFIG_HOME=/tmp/x git log -1", "env HOME=/tmp/h git status",
+        "git --git-dir=/tmp/r/.git status", "git --git-dir /tmp/r/.git log",
+    ]
+    POWERSHELL_WRITES = [
+        "Set-Content -Path .git\\hooks\\pre-commit -Value 'rm -rf logs'",
+        "Add-Content .git/config '[core]'",
+        "'x' | Out-File -FilePath $HOME\\.gitconfig -Append",
+        "Copy-Item C:\\tmp\\x .git\\hooks\\pre-commit",
+        "New-Item -ItemType File .git/hooks/post-checkout",
+        "echo x > .git/config",
+        "wsl.exe -- bash -c 'echo x >> .git/config'",
+    ]
+    UNAFFECTED = [
+        "git status", "git commit -F msg.txt", "git config --get user.name", "cat .git/config",
+        "git config -f .git/config --get core.hooksPath", "git config -f .git/config --list",
+        "grep fsmonitor .git/config", "ls .git/hooks", "cp .git/config /tmp/config.bak", "cat ~/.gitconfig",
+        "echo x >> .gitignore", "echo x >> .gitattributes", "echo x > .github/workflows/x.yml",
+        "echo x >> .gitmodules", "git config -f .git/config user.name x", "git config user.name x",
+        "rm .git/hooks/pre-commit.sample", "echo x > notes/git-config.md", "head -1 .git/HEAD",
+        "mv .git/hooks/pre-commit /tmp/pre-commit.bak",
+        "echo x >> .git/info/exclude", "echo x > .git/info/sparse-checkout",
+        "git worktree add ../x -b y origin/main", "git worktree remove ../x --force", "git fetch -q origin",
+        "git pull --ff-only origin main", "git merge --no-edit origin/main", "git branch -D y",
+        "gh pr create --body-file f.md", "pre-commit install", "git commit -F .git/COMMIT_EDITMSG",
+        "cp .git/config /tmp/x", "ln -s /tmp/a /tmp/b", "cp -a src/ /tmp/dst/", "HOME=/tmp/h ls",
+        "git -C /tmp/r status", "vim notes.md", "wsl.exe -e cat .git/config",
+        "du -sh .git", "tree .git/hooks", "od -c .git/config", "hexdump -C .git/config", "nl .git/config",
+        "xxd .git/config", "xxd -g1 .git/hooks/pre-commit.sample",
+    ]
+
+    def bash(self, command_line):
+        return self.run_guard({"tool_name": "Bash", "tool_input": {"command": command_line}})
+
+    def ps(self, command_line):
+        return pre_trade_guard.evaluate_powershell_command(command_line, self.root, self.root, None)
+
+    def test_shell_writes_denied_with_the_git_channel_reason(self):
+        failures = []
+        for c in self.WRITES:
+            res, claude = self.agy(self.cmd(c)), self.bash(c)
+            if (res.get("decision") != "deny" or self.LABEL not in res.get("reason", "")
+                    or "Ground Truth Protection" in res.get("reason", "") or claude.get("__exit_code__") != 2
+                    or self.LABEL not in claude["__stderr__"]):
+                failures.append((c, res.get("decision"), res.get("reason", "")[:90]))
+        self.assertEqual(failures, [])
+
+    def test_powershell_writes_denied(self):
+        for c in self.WRITES[:4] + self.POWERSHELL_WRITES:
+            decision, reason = self.ps(c)
+            self.assertEqual(decision, "deny", c)
+            self.assertIn(self.LABEL, reason, c)
+
+    def test_reads_and_git_config_handling_unaffected(self):
+        for c in self.UNAFFECTED:
+            res = self.agy(self.cmd(c))
+            self.assertNotEqual(res.get("decision"), "deny", f"{c}: {res}")
+            self.assertNotIn(self.LABEL, res.get("reason", "") + res.get("__stderr__", ""), c)
+        for c in ("Get-Content .git/config", "Select-String fsmonitor .git/config", "git status",
+                  "git config -f .git/config --get core.hooksPath", "Add-Content .gitignore x"):
+            decision, reason = self.ps(c)
+            self.assertNotEqual(decision, "deny", f"{c}: {reason}")
+        # A persistent `git config` write stays judged by the key rules only (issue #88)
+        self.assertDenied(self.agy(self.cmd("git config -f .git/config core.hooksPath /tmp/h")))
+        self.assertNotIn(self.LABEL, self.agy(self.cmd("git config -f .git/config core.hooksPath /tmp/h"))["reason"])
+
+    def test_bash_wsl_linux_command_judged(self):
+        # Found while fixing #99: from the Bash tool, `wsl.exe -e <cmd>` / `wsl.exe -- <cmd>` run <cmd> in Linux;
+        # its tokens are judged like PowerShell's wsl calls (quoting kept), not only the re-parsed joined text
+        for c in ("wsl.exe -e rm -rf logs", "wsl.exe -e bash -c 'rm -rf logs'", "wsl.exe -- bash -c 'rm -rf logs'",
+                  "wsl.exe -d Ubuntu -e tee logs/guardian_state.json"):
+            self.assertDenied(self.agy(self.cmd(c)), "Ground Truth Protection")
+            self.assertEqual(self.bash(c).get("__exit_code__"), 2, c)
+        for c in ("wsl.exe -e tee .git/config", "wsl.exe -- bash -c 'echo x >> .git/config'",
+                  "wsl.exe -e ls > .git/config"):
+            self.assertDenied(self.agy(self.cmd(c)), self.LABEL)
+        # The outer tokens keep every Bash rule (env channels, run-time values, unknown cwd) after the unwrap
+        for c in ("PAGER=most wsl.exe -e git log -1", "GIT_CONFIG_PARAMETERS=x wsl.exe -e git status",
+                  "cd \"$X\"; wsl.exe -e tee state.json", "LD_PRELOAD=/tmp/x.so wsl.exe -e ls",
+                  "wsl.exe -e ls > $Y", "wsl.exe --cd /tmp -e tee state.json"):
+            self.assertDenied(self.agy(self.cmd(c)))
+        for c in ("wsl.exe -e ls logs", "wsl.exe -- git status", "wsl.exe -e cat .git/config"):
+            self.assertNotEqual(self.agy(self.cmd(c)).get("decision"), "deny", c)
+
+    def test_both_channels_named_together(self):
+        res = self.agy(self.cmd("echo x | tee .git/config logs/guardian_state.json"))
+        self.assertDenied(res, "Ground Truth Protection")
+        self.assertIn(self.LABEL, res["reason"])
+
+    def test_file_tools_force_ask(self):
+        for target in (".git/config", ".git/hooks/pre-commit", "~/.gitconfig", ".git/config.worktree",
+                       os.path.join(self.root, ".git", "hooks", "post-checkout"), "C:\\repo\\.git\\config",
+                       ".git/worktrees/wt/config", "/home/u/.config/git/config", ".git"):
+            for name in ("write_to_file", "replace_file_content", "multi_replace_file_content"):
+                res = self.agy({"toolCall": {"name": name, "args": {"TargetFile": target, "CodeContent": "x"}}})
+                self.assertEqual(res.get("decision"), "force_ask", f"{name} {target}")
+                self.assertIn("git config / hook file", res.get("reason", ""), target)
+            for tool, key in (("Write", "file_path"), ("Edit", "file_path"), ("MultiEdit", "file_path"),
+                              ("NotebookEdit", "notebook_path")):
+                claude = self.run_guard({"tool_name": tool, "tool_input": {key: target, "content": "x"}})
+                self.assertEqual(claude.get("hookSpecificOutput", {}).get("permissionDecision"), "ask",
+                                 f"{tool} {target}: {claude}")
+        for target in (".gitignore", ".gitattributes", ".github/workflows/x.yml", ".gitmodules", "docs/git.md",
+                       ".git/info/exclude"):
+            res = self.agy({"toolCall": {"name": "write_to_file", "args": {"TargetFile": target, "CodeContent": "x"}}})
+            self.assertEqual(res.get("decision"), "ask", target)
+
+    def test_path_matcher(self):
+        match = pre_trade_guard._git_exec_config_path
+        for p in (".git/config", ".git/config.worktree", ".git/hooks", ".git/hooks/", ".git/hooks/pre-commit",
+                  ".git/worktrees/x/config.worktree", ".git/modules/x/config",
+                  ".git/modules/a/modules/b/hooks/y", ".git", "foo/.git", "~/.gitconfig", "/x/.gitconfig",
+                  "/x/.config/git/config", "/etc/gitconfig", "C:\\r\\.git\\config", ".git/hooks/../config",
+                  "~/.config/git/c*", "{.git/config,x}"):
+            self.assertTrue(match(p), p)
+        for p in (".gitignore", ".gitattributes", ".gitmodules", ".github/workflows/x.yml", ".git/index",
+                  ".git/info/exclude", ".git/info", ".git/info/attributes",
+                  ".git/HEAD", "msg.txt", "+x", "config", "git/config", "*", "logs/x.json", ".github"):
+            self.assertFalse(match(p), p)
+
+
 if __name__ == "__main__":
     unittest.main()

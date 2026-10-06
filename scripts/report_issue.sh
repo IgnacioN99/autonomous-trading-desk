@@ -53,12 +53,21 @@ derive_repo() {
     echo ""
 }
 
-# 1. Load variables from .env if present and not exported
+# 1. Load variables from .env if present and not exported. Only the reporter's own keys are loaded (GitHub
+#    credentials / repository, ISSUE_REPORTER_* and BINANCE_API_ENV for telemetry): exporting arbitrary keys would
+#    hand command channels (GIT_CONFIG_* -> core.fsmonitor, BASH_ENV, PAGER ...) to the git / gh / python3
+#    commands this script runs. GH_* (incl. GH_TOKEN) is no longer loaded from .env (GH_PAGER / GH_EDITOR /
+#    GH_BROWSER run commands): use GITHUB_TOKEN or `gh auth login`.
 if [ -f "${BASE_DIR}/.env" ]; then
     while IFS='=' read -r key val || [ -n "$key" ]; do
         [[ "$key" =~ ^#.*$ ]] && continue
         [ -z "$key" ] && continue
         key="$(echo "$key" | tr -d '[:space:]')"
+        case "$key" in
+            GITHUB_*|ISSUE_REPORTER_*|BINANCE_API_ENV) ;;
+            *) continue ;;
+        esac
+        [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
         val="$(echo "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^["'"'"']//' -e 's/["'"'"']$//')"
         if [ -n "$key" ] && [ -z "${!key}" ]; then
             export "$key"="$val"
