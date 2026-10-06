@@ -209,6 +209,17 @@ class TestDynamicEquityRiskGate(unittest.TestCase):
         with open(state_file, "w", encoding="utf-8") as f:
             f.write(valid_state)
 
+        # Live PROD gate snapshot (issue #101): a flat exchange consistent with the state above, never a real read
+        def flat_exchange(method, endpoint, params=None, target_env=None, retry_count=0):
+            if method == "GET" and not params and endpoint in ("/fapi/v2/positionRisk", "/fapi/v1/openAlgoOrders",
+                                                               "/fapi/v1/openOrders"):
+                return []
+            raise AssertionError(f"unexpected exchange call {method} {endpoint}")
+        for p in (patch("execute_futures_trade.send_signed_request", side_effect=flat_exchange),
+                  patch("urllib.request.urlopen", side_effect=AssertionError("network access in offline test"))):
+            p.start()
+            self.addCleanup(p.stop)
+
         # Loss of $10.00 exceeds $6.25 cap -> rejected
         ok, reason = eft.check_mechanical_gates(
             direction="LONG",

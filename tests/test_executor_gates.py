@@ -618,7 +618,13 @@ class TestEntryBasedRiskGates(unittest.TestCase):
             json.dump({"is_valid": True, "last_updated_ts": int(time.time()),
                        "portfolio_exposure": {"delta_bias": "NEUTRAL"}}, f)
         # equity 1000 x 0.5% x 1.25 buffer = $6.25 PROD loss cap
-        self._patches = [patch("quant_risk_engine.get_account_equity", return_value=1000.0)]
+        # live PROD gate snapshot (issue #101): flat exchange, consistent with the session_state above
+        def flat_exchange(method, endpoint, params=None, target_env=None, retry_count=0):
+            if method == "GET" and endpoint in ("/fapi/v2/positionRisk", "/fapi/v1/openAlgoOrders", "/fapi/v1/openOrders"):
+                return []
+            raise AssertionError(f"unexpected exchange call {method} {endpoint}")
+        self._patches = [patch("quant_risk_engine.get_account_equity", return_value=1000.0),
+                         patch("execute_futures_trade.send_signed_request", side_effect=flat_exchange)]
         for p in self._patches:
             p.start()
 

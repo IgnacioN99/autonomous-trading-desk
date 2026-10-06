@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 sync_session_state.py - Deterministic Session and Portfolio State Synchronizer.
-Acts as the Single Source of Truth for clean-room AI agent instances,
-eliminating context bloat, information loss, and hallucinations.
+Writes a ledger cache for clean-room AI agent instances, eliminating context bloat, information loss,
+and hallucinations. It is a cache, not an authority: the executor's PROD gates re-read the exchange and
+apply the stricter of the cache and the live view (issue #101).
 
 Zero LLM Tokens / Latency ~600ms.
 Generates 'logs/session_state.json' and outputs a typed executive summary for cold-start priming.
@@ -18,6 +19,7 @@ from typing import Dict, List, Any
 # Ensure local path resolution
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import execute_futures_trade as eft
+from utils.portfolio_exposure import compute_exposure, LONG_HEAVY, SHORT_HEAVY
 
 LOGS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
 STATE_FILE = os.path.join(LOGS_DIR, "session_state.json")
@@ -120,27 +122,24 @@ def sync_session_state(target_env: str = None) -> dict:
         return error_state
 
     active_positions = []
-    long_notional = 0.0
-    short_notional = 0.0
+    # Portfolio delta classification shared with the executor's PROD gates (utils/portfolio_exposure.py, issue #101)
+    exposure = compute_exposure(pos_res if isinstance(pos_res, list) else [])
+    long_notional = exposure["long_notional"]
+    short_notional = exposure["short_notional"]
 
     if isinstance(pos_res, list):
-        for p in pos_res:
-            amt = float(p.get("positionAmt", 0))
-            if amt != 0:
+        for live_pos in exposure["active_positions"]:
+                p = live_pos["row"]
+                amt = live_pos["qty"]
                 sym = p["symbol"]
-                direction = "LONG" if amt > 0 else "SHORT"
+                direction = live_pos["side"]
                 entry_p = float(p.get("entryPrice", 0))
                 mark_p = float(p.get("markPrice", 0))
                 unrealized_pnl = float(p.get("unRealizedProfit", 0))
                 leverage = int(p.get("leverage", 3))
-                notional = abs(amt * mark_p)
+                notional = live_pos["notional"]
                 margin = notional / leverage if leverage > 0 else 0.0
                 roe_pct = (unrealized_pnl / margin * 100) if margin > 0 else 0.0
-
-                if direction == "LONG":
-                    long_notional += notional
-                else:
-                    short_notional += notional
 
                 meta_trade = audit_meta.get(sym, {})
                 active_positions.append({
@@ -229,18 +228,15 @@ def sync_session_state(target_env: str = None) -> dict:
     win_rate_today = (wins_count / closed_trades_count * 100) if closed_trades_count > 0 else 0.0
 
     # 6. Portfolio Delta Exposure Calculation
-    total_active_notional = long_notional + short_notional
-    net_notional_delta = long_notional - short_notional
-    delta_ratio = (net_notional_delta / total_active_notional) if total_active_notional > 0 else 0.0
+    # (utils/portfolio_exposure.compute_exposure: delta_ratio = (long - short) / (long + short), +/-0.35 thresholds)
+    net_notional_delta = exposure["net_notional"]
+    portfolio_delta_bias = exposure["delta_bias"]
 
-    if delta_ratio > 0.35:
-        portfolio_delta_bias = "LONG_HEAVY"
+    if portfolio_delta_bias == LONG_HEAVY:
         delta_advice = "🚨 BULLISH IMBALANCE: Additional Longs prohibited. Short hedge or risk neutralization required prior to new exposure."
-    elif delta_ratio < -0.35:
-        portfolio_delta_bias = "SHORT_HEAVY"
+    elif portfolio_delta_bias == SHORT_HEAVY:
         delta_advice = "🚨 BEARISH IMBALANCE: Additional Shorts prohibited. Long support leg or risk neutralization required."
     else:
-        portfolio_delta_bias = "DELTA_BALANCED"
         delta_advice = "⚖️ DELTA-NEUTRAL EQUILIBRIUM: Balanced portfolio with bounded directional exposure (Δ ≈ 0)."
 
     # 7. Shadow Desk Telemetry & Counterfactual Metrics
