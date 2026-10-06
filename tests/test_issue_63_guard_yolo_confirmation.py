@@ -316,7 +316,12 @@ class TestShellWrappedConfirmation(t49.PowerShellHarness):
     def test_confirmed_inside_bash_c_string_allowed(self):
         direct, via_wsl = self.forms(f"cd /mnt/c/repo && {self.TRADE} --confirmed")
         self.assertBothShells(direct, "allow")
-        self.assertEqual(self.decision(self.bash(via_wsl)), "allow")
+        # Issue #97: from the Bash tool the joined wsl arguments are judged again as the Linux default shell re-parses
+        # them (conservative model: plain join, quotes dropped): `bash -lc cd /mnt/c/repo && <TRADE> --confirmed`.
+        # The trade is still confirmed (never a confirmation denial), but the line now has another non-benign
+        # sub-command (`bash -lc cd ...`), so it is no longer auto-allowed: normal permission prompt.
+        self.assertEqual(self.decision(self.bash(via_wsl)), "passthrough")
+        self.assertNotIn(YOLO_GATE, self.bash(via_wsl)["__stderr__"])
         # PowerShell judges wsl.exe itself as an unlisted command: normal permission prompt (same as before #63),
         # never a confirmation denial.
         self.assertEqual(self.decision(self.ps(via_wsl)), "passthrough")

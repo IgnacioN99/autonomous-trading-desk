@@ -241,7 +241,7 @@ Every new trade goes through the evaluator subagent; the dossier is never writte
 In TESTNET, the legacy manual recorder (`--env testnet --symbols ... --directions ...`) remains available for experiments; it is refused in PROD.
 
 ### 4. Position Management & Guardian Loop
-Open positions are managed through the same executor CLI (risk-reducing actions are always allowed by the hook):
+Open positions are managed through the same executor CLI (the hook auto-allows these risk-reducing commands when each one runs as a single flat call, exactly as below; chains, `cd` prefixes, redirects and shell metacharacters get a permission prompt):
 ```bash
 python3 scripts/execute_futures_trade.py --positions --json                 # read-only snapshot
 python3 scripts/execute_futures_trade.py --move-breakeven --symbol BTCUSDT  # ratchet SL to True Net Break-Even

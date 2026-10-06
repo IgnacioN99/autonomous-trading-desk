@@ -53,13 +53,13 @@ Follow these steps in order. Skipping one is a hard failure: the PreToolUse hook
    - Order 1: Entry + SL (Algo Order with `closePosition: true`), SL verified on the ledger or the position is closed `reduceOnly`
    - Order 2: TP1 (30% size at +1.8R) Limit with `Reduce-Only: Checked`
    - Order 3: TP2 (70% size at +4.0R) Limit with `Reduce-Only: Checked`
-8. **Manage open positions** with the same CLI (risk-reducing actions are never blocked):
+8. **Manage open positions** with the same CLI (risk-reducing actions are never blocked). The hook auto-allows them only as one flat command per call, by their exact path and flags, e.g. `python3 scripts/execute_futures_trade.py --close-position --symbol <SYMBOL>` for an emergency close (one symbol per call); multi-line batches, `&&` / `;` chains, `cd` prefixes, redirects and shell metacharacters get a permission prompt instead:
    - `python3 scripts/execute_futures_trade.py --positions --json` (read-only snapshot)
    - `python3 scripts/execute_futures_trade.py --move-breakeven --symbol <SYMBOL>` (only after TP1 or a confirmed +2.0×ATR_15m expansion)
    - `python3 scripts/execute_futures_trade.py --close-position --symbol <SYMBOL>`, `--audit-orphans`, `--auto-heal`
    - `python3 scripts/execute_futures_trade.py --protect-pending` (places the planned SL/TPs of filled resting entries from `logs/pending_entries.json`, cancels expired ones; the guardian runs it every cycle)
    - Resting entries (untriggered `STOP_MARKET`, `LIMIT`) get their SL only on fill: in PROD they require a running guardian loop (`python3 scripts/loops/position_guardian_loop.py --interval 60`; `--interval` <= 120 s, not `--once` or `--dry-run`) and no open position on the symbol. While a symbol has a pending entry, every new entry on it is rejected.
-9. **Trailing stops, dead alpha and orphan audits** run in `scripts/loops/position_guardian_loop.py` (never opens positions): `--once` for a single cycle (allowed by the hook), `--dry-run` to only report, `--interval <seconds>` to run in the background (requires confirmation). Schedule it outside the chat session, e.g. cron: `*/5 * * * * cd <repo> && python3 scripts/loops/position_guardian_loop.py --once --env prod >> logs/guardian.log 2>&1`.
+9. **Trailing stops, dead alpha and orphan audits** run in `scripts/loops/position_guardian_loop.py` (never opens positions): `--once` for a single cycle (allowed by the hook), `--once --dry-run` to only report, `--interval <seconds>` to run in the background (requires confirmation). Schedule it outside the chat session, e.g. cron: `*/5 * * * * cd <repo> && python3 scripts/loops/position_guardian_loop.py --once --env prod >> logs/guardian.log 2>&1`.
 
 ## Phase 4: Notion Journal Sync
 Sync the chosen position to Notion:
