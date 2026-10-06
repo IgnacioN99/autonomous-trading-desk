@@ -153,10 +153,12 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    old-style xf, unzip, 7z x, Expand-Archive; tar -t and -xO are reads, tar -czf only creates) whose destination
    (-C, -d, -o, -DestinationPath, else the cwd) is logs/ or an ancestor, tar output files (--index-file, -g)
    naming a protected file, symlinks/hard links (ln, mklink) aliasing logs/, git clean -x/-X and git stash --all.
-   `_is_logs_dir` resolves relative and POSIX absolute paths against the workspace root and tracked cwd, so a
-   directory merely *named* logs elsewhere (/tmp/other/logs, build/logs) is not a ground-truth deny; a path in
-   Windows / UNC / drive-mount form (C:/.../logs, //server/.../logs, /mnt/c/.../logs, /c/.../logs) whose last
-   component is logs, and an unresolvable one ($X/logs, ~/logs), always counts. PowerShell statements are judged
+   `_is_logs_dir` counts ANY path whose last component is logs (relative, POSIX absolute, Windows / UNC /
+   drive-mount form, $X/logs, ~/logs, and so also /tmp/other/logs, build/logs): symlinks, /proc/<pid>/cwd and
+   junctions alias the workspace logs/ in ways the hook cannot resolve; globs (log*, *) are resolved against the
+   workspace root and tracked cwd. A cd / pushd / env -C / sudo -D into a directory named logs counts as inside
+   logs/, and a path through /proc/<pid>/{cwd,root,fd} or /dev/fd (a write operand, cd target or find root) is
+   unresolvable: an unknown cwd / ancestor of logs/. PowerShell statements are judged
    per sub-command with these rules minus the Bash-only ones (cd / variable / xargs / stdin-shell tracking, run-time
    values, scripts by path; see 9). Reads by allowlisted programs keep the normal permission policy (ask).
    Not covered (residual, defense in depth; the executor-side fail-closed checks are the primary control): Python /
@@ -1823,27 +1825,37 @@ def _windows_form(word: str) -> bool:
 
 
 def _is_logs_dir(word: str, cwd: str = "", base_dir: str = "") -> bool:
-    """True when a word (braces expanded) names *the workspace's* `logs` directory: last component `logs`
-    (logs, ./logs/, /abs/repo/logs) or a glob that can expand to it (log*, lo[g]s, *). Relative paths and POSIX
-    absolute paths are resolved against the tracked cwd and the workspace root, so a directory merely *named* logs
-    elsewhere (/tmp/other/logs, build/logs) does NOT count. A path in Windows / drive-mount form (C:\\...\\logs,
-    \\\\server\\...\\logs, /mnt/c/.../logs) whose last component is logs always counts: the hook (WSL) and the agent
-    (Windows) may spell the repo differently and junctions / 8.3 names defeat exact resolution. When the path
-    cannot be resolved (no base_dir, a leading ~), it fails safe (True)."""
+    """True when a word (braces expanded) names a `logs` directory: ANY path whose last component is `logs`
+    (logs, ./logs/, ./x/../logs, /abs/repo/logs, /tmp/other/logs, build/logs, C:\\...\\logs, /mnt/c/.../logs,
+    /proc/self/cwd/logs): symlinks (/tmp/r -> repo), /proc/<pid>/cwd, junctions and 8.3 names alias the workspace
+    logs/ in ways the hook cannot resolve, so every directory named logs counts. A glob that can expand to logs
+    (log*, lo[g]s, *) is resolved against the tracked cwd and the workspace root; when it cannot be resolved (no
+    base_dir, a leading ~, a run-time value) it fails safe (True)."""
     logs = _canon_path(base_dir).rstrip("/") + "/logs" if base_dir else ""
     for expanded in _expand_braces(word or ""):
         sp = _shell_path(expanded)
         head, _, last = sp.rpartition("/")
         last = last.lower()
-        is_glob = bool(SHELL_GLOB_RE.search(last) and fnmatch.fnmatchcase("logs", last))
-        if last != "logs" and not is_glob:
+        if last == "logs":
+            return True
+        if not (SHELL_GLOB_RE.search(last) and fnmatch.fnmatchcase("logs", last)):
             continue
-        if not base_dir or sp.startswith("~") or _unresolved(sp) or (last == "logs" and _windows_form(expanded)):
-            return True  # cannot resolve the path ($X/logs, ~/logs) or Windows / drive-mount form: fail safe
-        resolved = _canon_path(sp, cwd or base_dir)
-        if fnmatch.fnmatchcase(logs, resolved) if is_glob else resolved == logs:
+        if not base_dir or sp.startswith("~") or _unresolved(sp):
+            return True  # cannot resolve the glob ($X/lo*, ~/lo*): fail safe
+        if fnmatch.fnmatchcase(logs, _canon_path(sp, cwd or base_dir)):
             return True
     return False
+
+
+# /proc/<pid>/cwd, /proc/<pid>/root, /proc/<pid>/fd (also via task/<tid>) and /dev/fd resolve against the process
+# that runs the command, not the hook: a path through them is unresolvable (an unknown cwd / ancestor of logs/).
+PROC_ALIAS_RE = re.compile(r"^(?:/proc/[^/]+/(?:task/[^/]+/)?(?:cwd|root|fd)|/dev/fd)(?:/|$)")
+
+
+def _proc_alias(word: str) -> bool:
+    """A path through /proc/<pid>/{cwd,root,fd} or /dev/fd (raw with repeated slashes / ./ squeezed, or normalised)."""
+    raw = re.sub(r"/(?:\./)+", "/", re.sub(r"/+", "/", (word or "").replace("\\", "/")))
+    return any(PROC_ALIAS_RE.match(p) for p in (raw, _shell_path(word or "")))
 
 
 def _word_value(word: str) -> str:
@@ -1864,7 +1876,8 @@ def _canon_path(path: str, cwd: str = "") -> str:
 
 
 def _reaches_logs_dir(word: str, cwd: str, base_dir: str) -> bool:
-    """True when a word (braces/globs expanded) is the logs dir or one of its ancestors (., .., /, ~, the repo...)."""
+    """True when a word (braces/globs expanded) is the logs dir or one of its ancestors (., .., /, ~, the repo...),
+    or a path through /proc/<pid>/cwd|root|fd or /dev/fd (unresolvable: counts as an ancestor)."""
     logs = _canon_path(base_dir).rstrip("/") + "/logs" if base_dir else "/logs"
     ancestors = [logs]
     while ancestors[-1] != "/":
@@ -1872,7 +1885,7 @@ def _reaches_logs_dir(word: str, cwd: str, base_dir: str) -> bool:
     for expanded in _expand_braces(word or ""):
         if not expanded:
             continue
-        if _is_logs_dir(expanded, cwd, base_dir):
+        if _is_logs_dir(expanded, cwd, base_dir) or _proc_alias(expanded):
             return True
         sp = _shell_path(expanded)
         if sp in (".", "..", "/", "~") or sp.endswith("/.."):
@@ -3145,6 +3158,7 @@ def _ground_truth_writes(tokens: List[str], text: str, cwd: str = "", base_dir: 
             cwd_unknown = True
         else:
             cwd = _join_cwd(cwd, d)
+            cwd_unknown = cwd_unknown or _proc_alias(d)
     read_programs = GROUND_TRUTH_READ_PROGRAMS | (PS_READ_CMDLETS if shell == "powershell" else set())
     mentioned = _ground_truth_named(text)
     for a in tokens:
@@ -3178,6 +3192,10 @@ def _ground_truth_writes(tokens: List[str], text: str, cwd: str = "", base_dir: 
         hits.extend(all_files)
     # Run-time values ($VAR, $(...), `...`) in a write position
     if bash_rules and _unresolved_write(prog, prog_token, args, redirects, cwd, base_dir):
+        hits.extend(all_files)
+    # A write / destructive operand through /proc/<pid>/cwd|root|fd or /dev/fd: it resolves against the command's
+    # process, not the hook's (rm -f /proc/self/cwd/logs/x, mv /proc/self/cwd/logs /tmp/x)
+    if _is_destructive_write(prog, args) and any(_proc_alias(w) for w in _write_targets(prog, args)):
         hits.extend(all_files)
     # Nested command lines (bash -c, eval, cmd /c, powershell -Command / -EncodedCommand, git -c values, rg --pre,
     # env -S, flock -c, watch, tar --to-command, os.system('...') ...): the full, strict line analysis one level
@@ -3437,16 +3455,18 @@ def _join_cwd(base: str, rel: str) -> str:
 
 
 def _cwd_in_logs(cur_cwd: str, base_dir: str) -> bool:
-    """True when a working directory is the workspace's logs/ or below it (or, spelled in Windows / drive-mount form,
-    has a `logs` component: see _is_logs_dir)."""
+    """True when a working directory is the workspace's logs/ or below it, or (fail safe, see _is_logs_dir) a
+    directory named logs or below one anywhere (cd /proc/self/cwd/logs, cd /tmp/r/logs, env -C build/logs): a
+    `logs` component of the path relative to the workspace root, or of the whole path when it lies outside it."""
     if not base_dir or not cur_cwd:
         return False
     raw = cur_cwd.replace("\\", "/")
     if _windows_form(raw) and "logs" in [c.lower() for c in raw.split("/")]:
         return True
-    logs = _canon_path(base_dir).rstrip("/") + "/logs"
+    root = _canon_path(base_dir).rstrip("/")
     c = _canon_path(cur_cwd, base_dir)
-    return c == logs or c.startswith(logs + "/")
+    rel = c[len(root):] if c == root or c.startswith(root + "/") else c
+    return "logs" in rel.split("/")
 
 
 def _apply_cd(tokens: List[str], cwds: List[str], unknown: bool) -> Tuple[List[str], bool]:
@@ -3462,7 +3482,7 @@ def _apply_cd(tokens: List[str], cwds: List[str], unknown: bool) -> Tuple[List[s
     merged = cwds + [c for c in new if c not in cwds]
     if len(merged) > 16:
         return cwds, True
-    return merged, unknown
+    return merged, unknown or _proc_alias(target)  # cd /proc/self/cwd: resolves in the command's process
 
 
 def _written_basenames(subs: List[List[str]], depth: int = 0) -> set:

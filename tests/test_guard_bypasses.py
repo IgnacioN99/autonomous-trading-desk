@@ -1030,13 +1030,56 @@ class TestGroundTruthProtection(GuardHarness):
             self.assertNotGroundTruth(res, c)
             self.assertNotEqual(res.get("decision"), "deny", c)
 
-    def test_directory_merely_named_logs_elsewhere_not_denied(self):
-        # Vector G: _is_logs_dir only matches the workspace logs/, not any directory named logs.
-        for c in ("rm -rf /tmp/other/logs", "rm -rf build/logs", "rm -rf ../sibling/logs",
-                  "mv /tmp/a/logs /tmp/b/logs", "rm -rf node_modules/pkg/logs"):
+    def test_any_directory_named_logs_denied(self):
+        # Issue #53 round 7 (back to main's rule): any path whose last component is logs counts as logs/, since a
+        # symlink (/tmp/r -> repo) or /proc/self/cwd can alias the workspace in ways the hook cannot resolve.
+        self.assertAllGroundTruthDenied([
+            "rm -rf /tmp/other/logs", "rm -rf build/logs", "rm -rf ../sibling/logs",
+            "mv /tmp/a/logs /tmp/b/logs", "rm -rf node_modules/pkg/logs", "rm -rf /tmp/r/logs",
+            "rm -rf ./x/../logs", "rm -rf LOGS/", "rm -rf /tmp/r/logs/.",
+        ])
+
+    def test_proc_cwd_and_symlink_aliases_of_logs_denied(self):
+        # Issue #53 round 7: every row of the reviewer's regression table (main: deny, branch: ask) denies again
+        self.assertAllGroundTruthDenied([
+            "rm -rf /proc/self/cwd/logs", "mv /proc/self/cwd/logs /tmp/x",
+            "ln -s \"$PWD\" /tmp/r && rm -rf /tmp/r/logs", "rm -rf /tmp/r/logs",
+            "rm -rf /tmp/other/logs", "rm -rf build/logs",
+            "cd /proc/self/cwd/logs && rm -f *.json",
+            "find /proc/self/cwd/logs -name '*.json' | xargs rm",
+            # /proc/<pid>/{cwd,root,fd} and /dev/fd resolve in the command's process: unknown cwd / ancestor
+            "rm -rf /proc/self/cwd", "rm -rf /proc/123/root/x", "rm -rf //proc/self/./cwd",
+            "rm -rf /proc/self/task/1/cwd", "rm -rf /dev/fd/3", "mv /proc/self/cwd/x /tmp/y",
+            "rm -f /proc/self/cwd/a.json", "cd /proc/self/cwd && rm -f logs/*.json",
+            "cd /proc/self/cwd && rm -f x.json", "pushd /proc/1/cwd; rm -f x.json",
+            "env -C /proc/self/cwd rm -f x.json", "cd /tmp/r/logs && rm -f *.json",
+            "cd /tmp/r/logs && cd sub && rm -f ../*.json", "env -C build/logs rm -f *.json",
+            "find /proc/self/cwd -type f -delete", "tar -xf a.tar -C /proc/self/cwd",
+            "cp -r /tmp/x/. /proc/self/cwd",
+        ])
+        for c in ("ls /proc/self/cwd/logs", "cat /proc/self/cwd/logs/a.txt", "cd /proc/self/cwd && ls",
+                  "find /proc/self/cwd/logs -name '*.json'", "cd /tmp/r && rm x.json"):
             res = self.agy(self.cmd(c))
             self.assertNotGroundTruth(res, c)
             self.assertNotEqual(res.get("decision"), "deny", c)
+
+    def test_symlink_alias_of_workspace_logs_denied(self):
+        # Issue #53 round 7: a real symlink to the workspace root; the hook judges the literal path, never resolves it
+        link_dir = tempfile.mkdtemp()
+        link = os.path.join(link_dir, "r")
+        try:
+            os.symlink(self.root, link, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            shutil.rmtree(link_dir, ignore_errors=True)
+            self.skipTest("symlinks not available")
+        try:
+            posix_link = link.replace("\\", "/")
+            self.assertAllGroundTruthDenied([f"rm -rf {posix_link}/logs", f"mv {posix_link}/logs /tmp/x",
+                                             f"cd {posix_link}/logs && rm -f *.json"])
+        finally:
+            if os.path.islink(link):
+                os.unlink(link)
+            shutil.rmtree(link_dir, ignore_errors=True)
 
     def test_shell_script_file_content_is_judged(self):
         script = os.path.join(self.root, "evil.sh")
@@ -1080,7 +1123,7 @@ class TestGroundTruthProtection(GuardHarness):
 
     def test_windows_and_drive_mount_logs_paths_denied_whatever_the_root(self):
         # Item 0: a Windows / UNC / WSL-drive path whose last component is logs stays denied (the hook may not be
-        # able to map it onto the workspace root); relative and other POSIX paths are resolved exactly.
+        # able to map it onto the workspace root); since round 7 so does any other path whose last component is logs.
         self.assertAllGroundTruthDenied([
             "rm -rf /mnt/c/Users/x/repo/logs", "rm -rf C:/Users/x/repo/logs", "rm -rf //server/share/repo/logs",
             "cmd //c rd /s /q C:/Users/x/repo/logs", "rm -rf 'C:\\Users\\x\\repo\\logs'",
@@ -1091,7 +1134,8 @@ class TestGroundTruthProtection(GuardHarness):
             res = self.ps(command)
             self.assertEqual(res["__exit_code__"], 2, command)
             self.assertIn("may only be written by", res["__stderr__"], command)
-        self.assertNoneGroundTruth(["rm -rf /tmp/other/logs", "rm -rf build/logs", "rm -rf C:/tmp/build/*"])
+        self.assertNoneGroundTruth(["rm -rf C:/tmp/build/*"])
+        self.assertAllGroundTruthDenied(["rm -rf /tmp/other/logs", "rm -rf build/logs"])  # round 7: main's rule
 
     def test_cd_tracking_only_adds_denials(self):
         # Item 1 (blocker): a cd may fail, run in a subshell or be skipped; every possible cwd is judged
