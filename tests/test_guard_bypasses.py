@@ -10,6 +10,9 @@ import os
 import io
 import sys
 import json
+import base64
+import hashlib
+import shutil
 import time
 import datetime
 import tempfile
@@ -907,6 +910,563 @@ class TestGroundTruthProtection(GuardHarness):
         self.assertNoneGroundTruth(["ls $(pwd)/logs", "echo $(pwd)", "cd $(git rev-parse --show-toplevel)",
                                     "rm -rf $(pwd)/build", "cat $(pwd)/logs/guardian_state.json"])
 
+    # ---------------------------------------------------------------- review round 5 findings (issue #53)
+    def test_option_values_not_counted_as_search_paths(self):
+        # Vector A: values of value-taking rg / git grep options must not be mistaken for operands, so the
+        # default-'.' rule still fires and the command runs on logs/.
+        self.assertAllGroundTruthDenied([
+            "rg -uu --pre rm -m 1 foo", "rg --pre rm -g '*.json' foo", "rg --pre rm -t json foo",
+            "rg --pre rm -A 2 foo", "rg --pre rm --max-depth 2 foo", "rg --pre rm --threads 2 foo",
+            "rg --pre rm -m1 foo", "rg --pre rm --max-count=1 foo", "rg --pre rm -tjson foo",
+            "git grep --no-index -Orm -m 1 '{'", "git grep --no-index -Orm --max-count 1 '{'",
+        ])
+        # Vector G over-denial fix: -eOrder = -e Order (a pattern), not -O.
+        for c in ("git grep -eOrder -- scripts", "git grep -e Order -- scripts", "rg -A 2 foo scripts/",
+                  "rg -m 1 foo scripts/", "git grep -f patterns.txt -- scripts"):
+            res = self.agy(self.cmd(c))
+            self.assertEqual(res.get("decision"), "ask", c)
+            self.assertNotGroundTruth(res, c)
+
+    def test_short_aliases_of_command_running_git_options_denied(self):
+        self.assertAllGroundTruthDenied([
+            "git clone -u 'rm -rf logs;:' file://. /tmp/y", "git ls-remote -u 'rm -rf logs;:' .",
+            "git fetch -u 'rm -rf logs;:' .", "git pull -u 'rm -rf logs;:' .",
+            "git rebase -x 'rm -rf logs' HEAD", "git difftool --extcmd 'rm -rf logs'",
+            "git difftool -x 'rm -rf logs'",
+        ])
+        for c in ("git clone file://. /tmp/y", "git fetch origin", "git rebase main", "git difftool HEAD~1"):
+            self.assertNotGroundTruth(self.agy(self.cmd(c)), c)
+
+    def test_env_var_command_channels_denied(self):
+        self.assertAllGroundTruthDenied([
+            "GIT_PAGER='rm -rf logs' git grep -O x", "PAGER='rm -rf logs' git log",
+            "GIT_EXTERNAL_DIFF='rm -rf logs' git diff", "GIT_SSH_COMMAND='rm -rf logs' git fetch origin",
+            "LESSOPEN='|rm -rf logs' less /tmp/x", "env GIT_SEQUENCE_EDITOR='rm -rf logs' git rebase -i HEAD",
+            # config / startup-file / library injection: denied outright on any command
+            "RIPGREP_CONFIG_PATH=/tmp/rc rg x scripts/", "LD_PRELOAD=/tmp/x.so ls", "BASH_ENV=/tmp/x bash -lc id",
+            "GIT_CONFIG_GLOBAL=/tmp/cfg git status", "GIT_CONFIG_COUNT=1 git status",
+            "export GIT_CONFIG_KEY_0=core.pager", "GIT_EXEC_PATH=/tmp/x git status",
+        ])
+        for c in ("PAGER=less git log", "GIT_PAGER=cat git diff", "EDITOR=true git commit --amend",
+                  "LANG=C git status", "TZ=UTC date"):
+            res = self.agy(self.cmd(c))
+            self.assertEqual(res.get("decision"), "ask", c)
+            self.assertNotGroundTruth(res, c)
+
+    def test_persistent_git_config_of_command_valued_key_denied(self):
+        self.assertAllGroundTruthDenied([
+            "git config core.pager 'rm -rf logs'", "git config --global alias.x '!rm -rf logs'",
+            "git config --add core.fsmonitor /tmp/x", "git config --replace-all core.sshCommand /tmp/x",
+            "git config diff.external /tmp/x", "git config filter.lfs.clean /tmp/x",
+            "git config remote.origin.uploadpack /tmp/x", "git config credential.helper /tmp/x",
+            "git config include.path /tmp/x", "git --config-env=core.pager=EVIL log",
+        ])
+        for c in ("git config --get core.pager", "git config -l", "git config user.name me",
+                  "git config --list", "git -c core.pager=cat log -1"):
+            res = self.agy(self.cmd(c))
+            self.assertEqual(res.get("decision"), "ask", c)
+            self.assertNotGroundTruth(res, c)
+
+    def test_other_command_running_git_subcommands_denied(self):
+        self.assertAllGroundTruthDenied([
+            "git bisect run rm -rf logs", "git submodule foreach 'rm -rf logs'",
+            "git submodule foreach --recursive rm -rf logs",
+            "git -C logs grep --no-index -Orm x -- '*.json'",
+        ])
+        for c in ("git bisect run make test", "git submodule foreach 'git status'", "git -C . diff --stat",
+                  "git -C subdir log --oneline"):
+            res = self.agy(self.cmd(c))
+            self.assertEqual(res.get("decision"), "ask", c)
+            self.assertNotGroundTruth(res, c)
+
+    def test_perl_ruby_inline_markers_and_empty_literal_gap_denied(self):
+        cases = [
+            ("perl -e 'rename \"logs/pending_entries.json\", \"x\"'", "pending_entries.json"),
+            ("perl -e 'remove_tree(\"logs\")'", "guardian_state.json"),
+            ("perl -e 'unlink \"logs/guardian_state.json\"'", "guardian_state.json"),
+            ("ruby -e 'FileUtils.rm_rf(\"logs\")'", "guardian_state.json"),
+            ("ruby -e 'FileUtils.mv(\"logs/pending_entries.json\", \"/tmp/x\")'", "pending_entries.json"),
+            ("ruby -e 'File.delete(\"logs/guardian_state.json\")'", "guardian_state.json"),
+            ("ruby -e 'File.rename(\"logs/pending_entries.json\", \"x\")'", "pending_entries.json"),
+            ("ruby -e 'Dir.rmdir(\"logs\")'", "guardian_state.json"),
+            # empty-literal scanner gap: print('') / print("") no longer swallows the following 'logs' literal
+            ("python3 -c \"print('');shutil.rmtree('logs')\"", "guardian_state.json"),
+            ("python3 -c 'print(\"\");shutil.rmtree(\"logs\")'", "guardian_state.json"),
+        ]
+        for c, name in cases:
+            self.assertGroundTruthDenied(self.agy(self.cmd(c)), name, c)
+        for c in ("perl -e 'print \"hello\"'", "ruby -e 'puts 1+1'",
+                  "python3 -c \"print('');print('ok')\""):
+            res = self.agy(self.cmd(c))
+            self.assertEqual(res.get("decision"), "ask", c)
+            self.assertNotGroundTruth(res, c)
+
+    def test_cd_and_variable_tracking_denied(self):
+        self.assertAllGroundTruthDenied([
+            "cd logs && rm *.json", "cd logs; mv x.json y.json", "cd ./logs/ && rm -f guardian_state.json",
+            "cd \"$X\"; rm x.json", "cd -; rm something.json",
+            "D=logs; rm -rf $D", "export D=logs; rm -rf ${D}", "D=logs && rm -rf \"$D\"",
+            "rm -rf $UNKNOWN", "rm -rf $TMPDIR/x",
+        ])
+        for c in ("cd build && rm *.o", "cd logs && cat guardian_state.json", "cd scripts && ls",
+                  "D=build; rm -rf $D", "cd /tmp && rm x.json"):
+            res = self.agy(self.cmd(c))
+            self.assertNotGroundTruth(res, c)
+            self.assertNotEqual(res.get("decision"), "deny", c)
+
+    def test_xargs_archive_recursive_copy_and_powershell_encoded_denied(self):
+        self.assertAllGroundTruthDenied([
+            "find logs -name '*.json' | xargs rm", "ls | xargs rm -f", "cat list | xargs rm",
+            "find . -type f | xargs rm",
+            "tar -xf a.tar -C logs", "tar xf a.tar -C .", "unzip -d . a.zip", "unzip a.zip",
+            "7z x -o./logs a.7z", "cp -a /tmp/x/* .", "rsync -a /tmp/x/ ./", "rsync --files-from=list / .",
+            "robocopy /tmp/src logs /E", "powershell -EncodedCommand cm0gLXJmIGxvZ3M=",
+            "powershell -enc bm90YmFzZTY0!!!",
+        ])
+        for c in ("find /tmp/x -type f | xargs rm", "tar -xzf deps.tar.gz -C /tmp/out",
+                  "unzip -l a.zip", "cp report.txt logs/", "rsync -a /tmp/x/ /tmp/y/",
+                  "find /tmp/build -type f | xargs grep foo"):
+            res = self.agy(self.cmd(c))
+            self.assertNotGroundTruth(res, c)
+            self.assertNotEqual(res.get("decision"), "deny", c)
+
+    def test_any_directory_named_logs_denied(self):
+        # Issue #53 round 7 (back to main's rule): any path whose last component is logs counts as logs/, since a
+        # symlink (/tmp/r -> repo) or /proc/self/cwd can alias the workspace in ways the hook cannot resolve.
+        self.assertAllGroundTruthDenied([
+            "rm -rf /tmp/other/logs", "rm -rf build/logs", "rm -rf ../sibling/logs",
+            "mv /tmp/a/logs /tmp/b/logs", "rm -rf node_modules/pkg/logs", "rm -rf /tmp/r/logs",
+            "rm -rf ./x/../logs", "rm -rf LOGS/", "rm -rf /tmp/r/logs/.",
+        ])
+
+    def test_proc_cwd_and_symlink_aliases_of_logs_denied(self):
+        # Issue #53 round 7: every row of the reviewer's regression table (main: deny, branch: ask) denies again
+        self.assertAllGroundTruthDenied([
+            "rm -rf /proc/self/cwd/logs", "mv /proc/self/cwd/logs /tmp/x",
+            "ln -s \"$PWD\" /tmp/r && rm -rf /tmp/r/logs", "rm -rf /tmp/r/logs",
+            "rm -rf /tmp/other/logs", "rm -rf build/logs",
+            "cd /proc/self/cwd/logs && rm -f *.json",
+            "find /proc/self/cwd/logs -name '*.json' | xargs rm",
+            # /proc/<pid>/{cwd,root,fd} and /dev/fd resolve in the command's process: unknown cwd / ancestor
+            "rm -rf /proc/self/cwd", "rm -rf /proc/123/root/x", "rm -rf //proc/self/./cwd",
+            "rm -rf /proc/self/task/1/cwd", "rm -rf /dev/fd/3", "mv /proc/self/cwd/x /tmp/y",
+            "rm -f /proc/self/cwd/a.json", "cd /proc/self/cwd && rm -f logs/*.json",
+            "cd /proc/self/cwd && rm -f x.json", "pushd /proc/1/cwd; rm -f x.json",
+            "env -C /proc/self/cwd rm -f x.json", "cd /tmp/r/logs && rm -f *.json",
+            "cd /tmp/r/logs && cd sub && rm -f ../*.json", "env -C build/logs rm -f *.json",
+            "find /proc/self/cwd -type f -delete", "tar -xf a.tar -C /proc/self/cwd",
+            "cp -r /tmp/x/. /proc/self/cwd",
+        ])
+        for c in ("ls /proc/self/cwd/logs", "cat /proc/self/cwd/logs/a.txt", "cd /proc/self/cwd && ls",
+                  "find /proc/self/cwd/logs -name '*.json'", "cd /tmp/r && rm x.json"):
+            res = self.agy(self.cmd(c))
+            self.assertNotGroundTruth(res, c)
+            self.assertNotEqual(res.get("decision"), "deny", c)
+
+    def test_symlink_alias_of_workspace_logs_denied(self):
+        # Issue #53 round 7: a real symlink to the workspace root; the hook judges the literal path, never resolves it
+        link_dir = tempfile.mkdtemp()
+        link = os.path.join(link_dir, "r")
+        try:
+            os.symlink(self.root, link, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            shutil.rmtree(link_dir, ignore_errors=True)
+            self.skipTest("symlinks not available")
+        try:
+            posix_link = link.replace("\\", "/")
+            self.assertAllGroundTruthDenied([f"rm -rf {posix_link}/logs", f"mv {posix_link}/logs /tmp/x",
+                                             f"cd {posix_link}/logs && rm -f *.json"])
+        finally:
+            if os.path.islink(link):
+                os.unlink(link)
+            shutil.rmtree(link_dir, ignore_errors=True)
+
+    def test_shell_script_file_content_is_judged(self):
+        script = os.path.join(self.root, "evil.sh")
+        with open(script, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\nrm -rf logs\n")
+        safe = os.path.join(self.root, "ok.sh")
+        with open(safe, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\nls -la\n")
+        for c in (f"bash {script}", f"sh {script}", f". {script}", f"source {script}", f"bash < {script}"):
+            self.assertDenied(self.agy(self.cmd(c)), "Ground Truth Protection")
+        for c in (f"bash {safe}", f"sh {safe}"):
+            self.assertNotGroundTruth(self.agy(self.cmd(c)), c)
+
+    # ---------------------------------------------------------------- review round 6 findings (issue #53 round 2)
+    def write_fixture_scripts(self):
+        """Script files in the workspace root (relative operands resolve there) and a script under scripts/."""
+        files = {
+            "evil.sh": "#!/bin/sh\nrm -rf logs\n",
+            "evil": "rm -rf logs\n",                                  # no shebang: the shell runs it
+            "evil_env": "#!/usr/bin/env -S bash -e\nrm -rf logs\n",
+            "pyscript": "#!/usr/bin/env python3\nimport shutil\nshutil.rmtree('logs')\n",
+            "ok.sh": "#!/bin/sh\n# don't panic: a quote in a comment\nls -la\n",
+            "cdlogs.sh": "cd logs\nrm -f *.json\n",
+            "self.sh": "source self.sh\n",
+            "scripts/desk_bad.sh": "#!/bin/bash\nrm -rf logs\n",
+            "tools/evil": "#!/bin/dash\nrm -rf logs\n",
+            "a.txt": "x",
+        }
+        os.makedirs(os.path.join(self.root, "scripts"), exist_ok=True)
+        os.makedirs(os.path.join(self.root, "tools"), exist_ok=True)
+        for name, content in files.items():
+            with open(os.path.join(self.root, *name.split("/")), "w", encoding="utf-8") as f:
+                f.write(content)
+        with open(os.path.join(self.root, "big.sh"), "w", encoding="utf-8") as f:
+            f.write("#" * (pre_trade_guard.SCRIPT_READ_LIMIT + 1))
+        with open(os.path.join(self.root, "latin1.sh"), "wb") as f:
+            f.write(b"echo caf\xe9\n")
+
+    def ps(self, command):
+        return self.run_guard({"tool_name": "PowerShell", "tool_input": {"command": command}})
+
+    def test_windows_and_drive_mount_logs_paths_denied_whatever_the_root(self):
+        # Item 0: a Windows / UNC / WSL-drive path whose last component is logs stays denied (the hook may not be
+        # able to map it onto the workspace root); since round 7 so does any other path whose last component is logs.
+        self.assertAllGroundTruthDenied([
+            "rm -rf /mnt/c/Users/x/repo/logs", "rm -rf C:/Users/x/repo/logs", "rm -rf //server/share/repo/logs",
+            "cmd //c rd /s /q C:/Users/x/repo/logs", "rm -rf 'C:\\Users\\x\\repo\\logs'",
+            "cd C:/Users/x/repo/logs && rm *.json",
+        ])
+        for command in ("Remove-Item C:\\Users\\x\\repo\\logs -Recurse", "Remove-Item \\\\server\\share\\logs -Recurse",
+                        "Remove-Item /mnt/c/Users/x/repo/logs -Recurse"):
+            res = self.ps(command)
+            self.assertEqual(res["__exit_code__"], 2, command)
+            self.assertIn("may only be written by", res["__stderr__"], command)
+        self.assertNoneGroundTruth(["rm -rf C:/tmp/build/*"])
+        self.assertAllGroundTruthDenied(["rm -rf /tmp/other/logs", "rm -rf build/logs"])  # round 7: main's rule
+
+    def test_cd_tracking_only_adds_denials(self):
+        # Item 1 (blocker): a cd may fail, run in a subshell or be skipped; every possible cwd is judged
+        self.assertAllGroundTruthDenied([
+            "cd /nonexistent; rm -rf logs", "(cd /tmp); rm -rf logs", "false && cd /tmp; rm -rf logs",
+            "cd ~/x/logs && rm -f *.json", "env -C logs rm -f *.json", "env --chdir=logs rm -f *.json",
+            "sudo -D logs rm -f *.json", "sudo --chdir=logs rm -f *.json", "cd; rm -rf x/logs.json",
+            "pushd /tmp; popd; rm x.json", "cd logs; echo x > guardian_state.tmp", "cd /tmp && rm -rf logs",
+        ])
+        self.assertNoneGroundTruth(["cd /tmp && rm x.json", "cd build && rm *.o", "cd logs && cat guardian_state.json",
+                                    "(cd build && make)", "cd scripts && ls"])
+
+    def test_script_written_on_the_same_line_denied(self):
+        # Item 2: the content the hook would read is not what runs
+        self.write_fixture_scripts()
+        self.assertAllGroundTruthDenied([
+            "echo ls > /tmp/a.sh && bash /tmp/a.sh", "printf ls | tee /tmp/a.sh; sh /tmp/a.sh",
+            "cat > /tmp/a.sh <<'EOF'\nls\nEOF\nbash /tmp/a.sh", "cp /tmp/x /tmp/a.sh; sh /tmp/a.sh",
+            "python3 -c \"open('/tmp/b.sh','w').write('rm -rf logs')\" && bash /tmp/b.sh",
+            "bash -c 'echo ls > /tmp/c.sh'; bash /tmp/c.sh", "tar -xf /tmp/a.tar -C /tmp/x && bash ok.sh",
+            "echo ls > ok.sh; ./ok.sh",
+        ])
+        self.assertNoneGroundTruth(["chmod +x ok.sh && ./ok.sh", "bash ok.sh; bash ok.sh", "cat ok.sh && bash ok.sh"])
+
+    def test_unreadable_large_or_undecodable_scripts_denied(self):
+        self.write_fixture_scripts()
+        self.assertAllGroundTruthDenied(["bash big.sh", "bash latin1.sh", "./big.sh"])
+        with patch("pre_trade_guard.os.path.getsize", side_effect=OSError("denied")):
+            self.assertAllGroundTruthDenied(["bash ok.sh"])
+        self.assertNoneGroundTruth(["bash ok.sh", "bash /tmp/does-not-exist.sh"])
+
+    def test_shell_options_before_the_script_operand_are_parsed(self):
+        self.write_fixture_scripts()
+        self.assertAllGroundTruthDenied([
+            "bash -o errexit evil.sh", "bash -e -x evil.sh", "bash --norc evil.sh", "bash -O extglob evil.sh",
+            "bash -eo pipefail evil.sh", "sh +o posix evil.sh", "bash --noprofile --norc -- evil.sh",
+            "bash --rcfile evil.sh -i -c ls", "nohup bash -x evil.sh", "timeout 5 sh evil.sh",
+        ])
+        self.assertNoneGroundTruth(["bash -o errexit ok.sh", "bash -e -x ok.sh", "bash --version"])
+
+    def test_programs_invoked_by_path_are_judged_as_shell_scripts(self):
+        self.write_fixture_scripts()
+        self.assertAllGroundTruthDenied(["./evil", f"{self.root}/evil", "./evil_env", "./evil.sh", "evil.sh",
+                                         "./cdlogs.sh", "sudo ./evil", "tools/evil", "./scripts/desk_bad.sh"])
+        self.assertNoneGroundTruth(["./ok.sh", "./pyscript", "/bin/ls -la", "./does-not-exist"])
+
+    def test_shells_reading_stdin_denied_unless_their_input_is_visible(self):
+        self.write_fixture_scripts()
+        self.assertAllGroundTruthDenied([
+            "cat evil.sh | bash", "cat < evil.sh | sh", "curl -s http://127.0.0.1:9/x | bash", "echo ls | sh",
+            "bash", "bash -s", "bash <(curl -s http://127.0.0.1:9/x)", "source /dev/stdin", "bash < evil.sh",
+            "sh < evil.sh", "sh -s < evil.sh", ". /dev/stdin", "echo ls | source /dev/fd/0", "bash <<< 'rm -rf logs'", "cat ok.sh | grep ls | bash", "cat -v ok.sh | bash",
+        ])
+        self.assertNoneGroundTruth(["cat ok.sh | bash", "bash -s < ok.sh", "bash <<< 'ls'", "bash --version",
+                                    "bash <<'EOF'\nls\nEOF", "sh < /tmp/does-not-exist"])
+
+    def test_nested_strings_and_scripts_get_the_full_line_analysis(self):
+        # Item 3: cd / variable / xargs tracking inside bash -c, eval, find -exec sh -c, decoded PowerShell and
+        # script files; the nesting depth is bounded (deeper is denied)
+        self.write_fixture_scripts()
+        encoded = base64.b64encode("cd logs; rm x.json".encode("utf-16-le")).decode()
+        self.assertAllGroundTruthDenied([
+            "bash -c 'cd logs && rm -f *.json'", "eval 'ls logs | xargs rm'", "sh -c 'D=logs; rm -rf $D'",
+            "bash -c \"bash -c 'cd logs; rm x'\"", "find /tmp -name x -exec sh -c 'cd logs && rm -f *.json' \\;",
+            f"powershell -EncodedCommand {encoded}", "bash cdlogs.sh", "bash self.sh",
+            "eval " * 9 + "ls",
+        ])
+        self.assertNoneGroundTruth(["bash -c 'cd build && rm -f *.o'", "eval 'ls build | wc -l'", "eval " * 3 + "ls"])
+
+    def test_xargs_requires_a_confined_producer(self):
+        # Item 4
+        self.assertAllGroundTruthDenied([
+            "xargs rm < /tmp/list", "xargs -a /tmp/list rm", "xargs --arg-file=/tmp/list rm",
+            "find . -name '*.json' | xargs -I {} rm {}", "find /tmp/x -type f | xargs -I {} rm {}",
+            "find /tmp/x | xargs sh -c 'rm \"$@\"' _", "find /tmp/x | xargs perl -e 'unlink @ARGV'",
+            "ls | nice xargs rm", "ls | timeout 5 xargs rm", "ls | command xargs rm", "ls | exec xargs rm",
+            "ls | stdbuf -oL xargs rm", "ls | env FOO=1 xargs rm", "find /tmp/x -type f | xargs nice rm",
+            "find /tmp/x -type f | xargs env rm", "find /tmp/x -type f | xargs -d '\\n' rm",
+            "find /tmp/x -type f | xargs -i rm {}", "find /tmp/x -type f | xargs --replace=X rm X",
+            "find -L /tmp/x -type f | xargs rm", "find /tmp/x -printf '%f\\n' | xargs rm",
+            "find /tmp/x | grep foo | xargs rm", "find /tmp/x -type f | xargs cp /tmp/y",
+            "find /tmp/x -type f | xargs truncate -s0", "find /tmp -type f | xargs rm", "ls /tmp/x | xargs rm -rf",
+            "cd \"$X\"; find build -type f | xargs rm", "find \"$D\" -type f | xargs rm",
+        ])
+        self.assertNoneGroundTruth([
+            "find /tmp/x -type f | xargs rm", "find /tmp/x -type f -print0 | xargs -0 rm -f",
+            "find /tmp/x -type f | xargs -n 1 -P 4 rm", "find /tmp/x -type f | xargs -L 1 rm",
+            "find /tmp/x -type f | xargs -s 100 rm", "find /tmp/x -type f | xargs -E END rm",
+            "find /tmp/x -type f | xargs --max-args=1 rm", "find /tmp/x -type f | timeout 5 xargs rm",
+            "find /tmp/x -type f | nice xargs rm", "find /tmp/x -type f | xargs cp -t /tmp/y",
+            "find . -type f | xargs wc -l", "find /tmp/x | xargs -I {} echo {}", "find build -type f | xargs rm",
+            "xargs",
+        ])
+
+    def test_env_and_config_command_channels_use_allowlists(self):
+        # Item 5: pager / editor values are allowlisted, every other channel is denied whatever its value
+        self.assertAllGroundTruthDenied([
+            "GIT_EXTERNAL_DIFF=rm git diff --no-index logs /tmp/e", "git -c diff.external=rm diff --no-index logs /tmp/e",
+            "PAGER='less +!rm' git log -1", "PAGER='less -ologs/x' git log -1", "PAGER=most git log -1",
+            "PAGER=$X git log -1", "PAGER=$(echo cat) git log -1", "PAGER=`echo cat` git log -1",
+            "EDITOR=vim git commit", "export PAGER='rm -rf logs'; git log", "PAGER+=x git log",
+            "nice env GIT_EXTERNAL_DIFF=rm git diff", "nice env LD_PRELOAD=/tmp/x.so ls",
+            "time GIT_EXTERNAL_DIFF='rm -rf logs;:' git diff", "GIT_EXTERNAL_DIFF+='rm -rf logs;:' git diff",
+            "command env GIT_SSH_COMMAND=x git fetch", "exec env PAGER=most git log", "sudo GIT_PAGER=most git log",
+            "env -S 'GIT_EXTERNAL_DIFF=rm git diff'", "env -S 'rm -rf logs'", "env --split-string='rm -rf logs'",
+            "git --config-env=core.fsmonitor=X status", "git --config-env core.pager=X log",
+            "git -c core.editor=vim commit", "git -c alias.st=status st", "git -c core.pager='less +!rm' log",
+            "ENV=/tmp/x sh -c ls", "BASH_ENV=/tmp/x bash -c ls", "ENV=/tmp/x env bash", "export BASH_ENV=/tmp/x",
+            "BASH_ENV=/tmp/x ./run.sh", "read PAGER < /tmp/x; git log", "printf -v PAGER rm; git log",
+            "for PAGER in rm; do git log; done", "declare -n ref=PAGER; ref=rm; git log", "LESS='+!rm' git log",
+            "LESS='-ologs/x' git log", "GIT_DIR=/tmp/r/.git git status", "GIT_WORK_TREE=logs git checkout .",
+            "GIT_INDEX_FILE=/tmp/i git add .", "MANPAGER='sh -c x' man ls", "VISUAL=nano crontab -e",
+        ])
+        self.assertNoneGroundTruth([
+            "git -c core.pager=cat log -1", "PAGER=less git log -1", "PAGER='less -R' git log -1",
+            "GIT_PAGER= git log -1", "EDITOR=true git commit --amend", "GIT_EDITOR=: git rebase -i HEAD~2",
+            "export PAGER=less; git log", "ENV=test python3 -m pytest", "LESS=FRX git log", "LESS=-R git log",
+            "git -c pager.log=false log", "env -u PAGER git log", "git --config-env=user.name=X status",
+            "GIT_PAGER=/usr/bin/less git log", "unset BASH_ENV; ls",
+        ])
+
+    def test_git_config_options_and_read_actions_parsed(self):
+        # Item 6: a git config call is a read only with an explicit read action; keys are case-insensitive
+        self.assertAllGroundTruthDenied([
+            "git config -f .git/config core.hooksPath /tmp/h", "git config --file=.git/config core.hooksPath /tmp/h",
+            "git config --type path core.hooksPath /tmp/h", "git config -t path core.hooksPath /tmp/h",
+            "git config -z core.pager x", "git config --name-only core.pager x", "git config --show-origin alias.x y",
+            "git config --default x core.sshCommand /tmp/x", "git config --comment hi core.fsmonitor /tmp/x",
+            "git config set core.pager rm", "git config set --comment=x alias.x '!rm'",
+            "git config --unset core.hooksPath", "git config unset alias.x", "git config core.pager",
+            "git config --rename-section foo alias", "git config rename-section foo alias", "git config --edit",
+            "git config -e", "git config edit", "git config CORE.HOOKSPATH /tmp/h", "git config Alias.X '!rm'",
+            "git config --rep core.sshCommand x", "git config --global credential.https://x.helper /tmp/h",
+            "git config core.worktree logs", "git config submodule.x.update '!rm -rf logs'",
+            "git clone -c core.fsmonitor=x file:///tmp/r /tmp/y", "git clone --config core.hooksPath=/tmp/h /tmp/r y",
+            "git clone --template=/tmp/t /tmp/r /tmp/y", "git init --template /tmp/t",
+            "git -C logs checkout -- .", "git --work-tree=logs checkout HEAD -- .", "git -C \"$D\" clean -fdx",
+        ])
+        self.assertNoneGroundTruth([
+            "git config core.pager less", "git config core.pager 'less -R'", "git config get core.pager",
+            "git config list", "git config --get core.pager", "git config --get-regexp alias", "git config -l",
+            "git config --list --show-origin", "git config -f .git/config --get core.hooksPath",
+            "git config user.name me", "git config --global user.email a@b", "git config pager.log false",
+            "git config --add pager.log false", "git -C \"$D\" status", "git -C logs status",
+        ])
+
+    def test_option_value_tables_follow_the_reference_help(self):
+        # Item 7: rg (15.1) value-taking options and git unique-prefix long options
+        self.assertEqual(pre_trade_guard._resolve_long("thr", pre_trade_guard.GIT_GREP_LONG_OPTIONS), "threads")
+        self.assertEqual(pre_trade_guard._resolve_long("max-d", pre_trade_guard.GIT_GREP_LONG_OPTIONS), "max-depth")
+        self.assertIsNone(pre_trade_guard._resolve_long("max", pre_trade_guard.GIT_GREP_LONG_OPTIONS))
+        self.assertAllGroundTruthDenied([
+            "git grep --no-index -Orm --thr 2 x", "git grep --no-index -Orm --max-d 2 x",
+            "git grep --no-index -Orm --max-c 1 x", "git grep --no-index --open-f=rm x",
+            "rg -uu --pre rm -e a -e b", "rg -uu --pre rm -d 9 foo", "rg -uu --pre rm --max-filesize 1M foo",
+            "rg -uu --pre rm --hyperlink-format x foo", "rg -uu --pre rm --pre-glob '*.gz' foo",
+            "rg -uu --pre rm -E utf-8 foo", "rg -uu --pre rm --engine auto foo", "rg -uu --pre rm -r x foo",
+        ])
+        self.assertNoneGroundTruth(["git grep -n --thr 2 foo -- scripts", "rg -d 9 foo scripts/",
+                                    "rg --max-filesize 1M foo scripts/", "git grep --max-d 1 -e x -- scripts"])
+
+    def test_powershell_encoded_command_in_any_prefix_spelling(self):
+        # Item 8: -e / -ec / -en ... -encodedcommand, with -, -- or / (and -enc:payload); undecodable -> deny
+        evil = base64.b64encode("Remove-Item -Recurse logs".encode("utf-16-le")).decode()
+        benign = base64.b64encode("Get-ChildItem".encode("utf-16-le")).decode()
+        self.assertAllGroundTruthDenied([
+            f"powershell -enco {evil}", f"powershell -encodedc {evil}", f"powershell /enc {evil}",
+            f"powershell --enc {evil}", f"pwsh -e {evil}", f"pwsh -ec {evil}", f"powershell -enc:{evil}",
+            f"powershell.exe -NoProfile -EncodedCommand {evil}", "powershell -enco notbase64!!!", "pwsh -enc",
+            "powershell -comm \"Remove-Item -Recurse logs\"",
+        ])
+        self.assertNoneGroundTruth([f"powershell -enco {benign}", "powershell -EncodedArguments x -Command Get-Date",
+                                    "pwsh -ExecutionPolicy Bypass -File C:/tmp/build.ps1"])
+
+    def test_run_time_values_in_write_positions_denied(self):
+        # Item 9: unresolved $VAR / ${VAR} / $(...) / `...` anywhere in a write operand, redirect, output option,
+        # destructive find root or archive destination
+        self.assertAllGroundTruthDenied([
+            "D=$(printf logs); rm -rf ./$D", "F=$(printf x); echo {} > \"$F\"", "find \"$D\" -delete",
+            "dd if=/dev/zero of=$F", "rm -rf \"$UNKNOWN\"/x", "rm -f /tmp/$NAME", "cp /tmp/x \"$DEST\"",
+            "mv \"$SRC\" /tmp/x", "curl -o \"$F\" http://127.0.0.1:9/x", "sort -o $F /tmp/in",
+            "tar -xf a.tar -C \"$D\"", "unzip -d $D a.zip", "sed -i s/a/b/ \"$F\"", "echo x >> ${F}.json",
+            "find ${D} -name '*.json' -exec rm {} +", "touch `printf logs`/x", "$RM -rf logs",
+            "$(which rm) -rf logs", "for f in logs/*; do rm \"$f\"; done", "D=build; for D in logs; do rm -rf $D; done",
+            "D=build; D=$(printf logs); rm -rf $D", "D=lo; D+=gs; rm -rf $D", "while read f; do rm \"$f\"; done < /tmp/l",
+            "ln -s /tmp/x \"$L\"", "tee -a \"$F\" < /tmp/x", "wget -O $F http://127.0.0.1:9/x",
+        ])
+        self.assertNoneGroundTruth([
+            "dd if=$F of=/tmp/out", "cp \"$SRC\" /tmp/x", "sed -i \"s/a/$B/\" /tmp/f", "cat $F", "\"$PY\" -m pytest",
+            "eval \"$(ssh-agent -s)\"", "echo hi > /dev/null 2>&1", "for f in logs/*; do cat \"$f\"; done",
+            "echo \"$(date)\" > /tmp/stamp", "D=build; rm -rf $D", "export D=build; rm -rf ${D}/x",
+        ])
+
+    def test_over_denial_fixes(self):
+        # Items 10 / 11: ENV only for shells, tar modes parsed, single-file copies
+        self.write_fixture_scripts()
+        self.assertNoneGroundTruth([
+            "ENV=test python3 -m pytest", "tar -czf /tmp/o.tgz index.txt", "tar czf /tmp/o.tgz index.txt",
+            "tar -tf a.tar", "tar tvf a.tar", "tar -xOf a.tar member", "tar -xf a.tar -C /tmp/out",
+            "tar --extract --file=a.tar --directory=/tmp/out", "copy a.txt .", "copy a.txt logs",
+            "robocopy /tmp/src .", "xcopy /tmp/src .", "unzip -l a.zip",
+        ])
+        self.assertAllGroundTruthDenied([
+            "tar -xzf deps.tgz", "tar xzf deps.tgz", "tar --ext -f a.tar", "tar --get -f a.tar",
+            "tar -xf a.tar --dir logs", "tar -xvzf a.tgz -C .", "tar --to-command='rm -rf logs' -xf a.tar -C /tmp/o",
+            "tar -I 'rm -rf logs' -xf a.tar -C /tmp/o", "tar -cf /tmp/o.tar --checkpoint-action=exec='rm -rf logs' x",
+            "copy /tmp/nonexistent.txt logs", "copy /tmp/* logs", "robocopy /tmp/src . /E", "robocopy /tmp/src . /MIR",
+            "robocopy /tmp/src logs", "xcopy /tmp/src . /S",
+        ])
+        self.assertGroundTruthDenied(self.agy(self.cmd("tar -cf /tmp/o.tar -g logs/guardian_state.json x")),
+                                     "guardian_state.json")
+
+    def test_shell_keywords_wrappers_and_inline_shell_calls_denied(self):
+        # Hardening found while closing the findings: keyword-prefixed commands, more wrappers, a quoted newline
+        # argument, and shell commands run from inline code
+        self.assertAllGroundTruthDenied([
+            "if true; then rm -rf logs; fi", "true && { rm -rf logs; }", "! rm -rf logs",
+            "while true; do rm -rf logs; done", "rm -rf '\n' logs", "setsid rm -rf logs", "sudo -u root rm -rf logs",
+            "timeout -s KILL 5 rm -rf logs", "ionice -c 3 rm -rf logs", "nice -n 10 rm -rf logs",
+            "watch -n 1 rm -rf logs", "watch 'rm -rf logs'", "flock /tmp/l -c 'rm -rf logs'",
+            "flock /tmp/l rm -rf logs", "su -c 'rm -rf logs'", "env - rm -rf logs",
+            "python3 -c \"import os; os.system('rm -rf logs')\"",
+            "python3 -c \"import subprocess; subprocess.run(['rm', '-rf', 'logs'])\"",
+            "perl -e 'system(\"rm -rf logs\")'", "ruby -e 'system(\"rm\", \"-rf\", \"logs\")'",
+            "ruby -e '%x(rm -rf logs)'", "awk 'BEGIN{system(\"rm -rf logs\")}'",
+            "node -e \"require('child_process').execSync('rm -rf logs')\"",
+            "python3 - <<'EOF'\nimport os\nos.system('rm -rf logs')\nEOF",
+        ])
+        self.assertGroundTruthDenied(self.agy(self.cmd("time -o logs/guardian_state.json ls")), "guardian_state.json")
+        self.assertNoneGroundTruth(["python3 -c \"import subprocess; subprocess.run(['ls', '-la'])\"",
+                                    "if true; then ls logs; fi", "timeout 5 make test", "sudo -u root ls"])
+
+    # ---------------------------------------------------------------- review round 7 findings (issue #53 round 3)
+    REPORT_ISSUE = os.path.join(BASE_DIR, "scripts", "report_issue.sh")
+
+    def test_report_issue_sh_pin_matches_the_real_file(self):
+        with open(self.REPORT_ISSUE, "rb") as f:
+            digest = hashlib.sha256(f.read()).hexdigest()
+        self.assertEqual(pre_trade_guard.DESK_SHELL_SCRIPTS["scripts/report_issue.sh"], digest,
+                         "scripts/report_issue.sh changed: update DESK_SHELL_SCRIPTS['scripts/report_issue.sh'] in "
+                         f"scripts/hooks/pre_trade_guard.py to {digest} after reviewing the change")
+        self.assertEqual(list(pre_trade_guard.DESK_SHELL_SCRIPTS), ["scripts/report_issue.sh"])
+        self.assertIn("scripts/report_issue.sh", pre_trade_guard.HARNESS_FILES)
+        res = self.agy({"toolCall": {"name": "write_to_file", "args": {"TargetFile": "scripts/report_issue.sh",
+                                                                         "CodeContent": "x"}}})
+        self.assertEqual(res.get("decision"), "force_ask")
+        self.assertEqual(self.agy(self.cmd("cp /tmp/x.sh scripts/report_issue.sh")).get("decision"), "force_ask")
+
+    def test_only_the_pinned_report_issue_sh_is_judged_with_relaxed_rules(self):
+        # Round-2 finding 1: any other file under scripts/ (and an edited report_issue.sh) is judged strictly
+        os.makedirs(os.path.join(self.root, "scripts"), exist_ok=True)
+        desk = os.path.join(self.root, "scripts", "desk.sh")
+        for body in ('cd "$(dirname "$0")/../logs" && rm -f *.json', 'D=$(printf logs); rm -rf "$D"',
+                     "ls logs/*.json | xargs rm", 'tmp=$(mktemp); rm -f "$tmp"'):
+            with open(desk, "w", encoding="utf-8") as f:
+                f.write("#!/bin/bash\n" + body + "\n")
+            for c in ("bash scripts/desk.sh", "./scripts/desk.sh"):
+                self.assertDenied(self.agy(self.cmd(c)), "Ground Truth Protection")
+        report = os.path.join(self.root, "scripts", "report_issue.sh")
+        shutil.copyfile(self.REPORT_ISSUE, report)
+        self.assertNoneGroundTruth([
+            './scripts/report_issue.sh --title "x: y" --error "boom" --category tool_error --severity HIGH',
+            "bash scripts/report_issue.sh --help",
+        ])
+        shutil.copyfile(self.REPORT_ISSUE, desk)  # same bytes, other path: not pinned
+        self.assertAllGroundTruthDenied(["bash scripts/desk.sh"])
+        with open(report, "a", encoding="utf-8") as f:
+            f.write("\n# edited\n")  # pin mismatch: strict
+        self.assertAllGroundTruthDenied(["./scripts/report_issue.sh --title x --error y"])
+
+    def test_scripts_run_from_a_pinned_script_are_strict(self):
+        os.makedirs(os.path.join(self.root, "scripts"), exist_ok=True)
+        inner = os.path.join(self.root, "inner.sh")
+        with open(inner, "w", encoding="utf-8") as f:
+            f.write('rm -f "$UNKNOWN"\n')
+        outer = os.path.join(self.root, "scripts", "outer.sh")
+        for body, denied in (('rm -f "$tmp"\n', False), ('rm -f "$tmp"\nsource inner.sh\n', True),
+                             ('bash "$SCRIPT"\n', True),
+                             ('bash -c \'rm -f "$x"\'\n', True), ("ls logs/*.json | xargs rm\n", True)):
+            data = ("#!/bin/bash\n" + body).encode()
+            with open(outer, "wb") as f:
+                f.write(data)
+            with patch.dict(pre_trade_guard.DESK_SHELL_SCRIPTS,
+                            {"scripts/outer.sh": hashlib.sha256(data).hexdigest()}):
+                res = self.agy(self.cmd("bash scripts/outer.sh"))
+            self.assertEqual(res.get("decision") == "deny", denied, body)
+
+    def test_audit_budget_is_fail_closed_and_bounded(self):
+        # Round-2 finding 2: cwd candidates x nested strings no longer multiply; past the budget -> deny
+        fan = ('cd a;cd b;cd c;cd d;bash -c "cd a;cd b;cd c;cd d;bash -c \'cd a;cd b;cd c;cd d;eval \\"cd a;cd b;'
+               'cd c;cd d;eval :\\"\'"; rm -rf logs')
+        started = time.monotonic()
+        self.assertDenied(self.agy(self.cmd(fan)), "Ground Truth Protection")
+        self.assertLess(time.monotonic() - started, 2.0)
+        started = time.monotonic()
+        self.assertEqual(self.agy(self.cmd(fan.replace("; rm -rf logs", ""))).get("decision"), "ask")
+        self.assertLess(time.monotonic() - started, 2.0)
+        too_many = "; ".join(["true"] * (pre_trade_guard.AUDIT_MAX_SUBCOMMANDS + 10))
+        self.assertDenied(self.agy(self.cmd(too_many)), "too complex to audit")
+        with patch("pre_trade_guard.AUDIT_DEADLINE_SECONDS", 0.0):
+            self.assertDenied(self.agy(self.cmd("ls -la; git status")), "too complex to audit")
+        for c in ("ls -la", "git status && git diff --stat", "python3 -m pytest -q 2>&1 | tail -20"):
+            self.assertEqual(self.agy(self.cmd(c)).get("decision"), "ask", c)
+        self.assertEqual(pre_trade_guard._AUDIT["active"], 0)
+
+    def test_git_ext_transport_and_protocol_keys_denied(self):
+        # Round-2 finding 3
+        self.assertAllGroundTruthDenied([
+            "git -c protocol.ext.allow=always clone 'ext::sh -c rm% -rf% logs' /tmp/y",
+            "GIT_ALLOW_PROTOCOL=ext git ls-remote 'ext::sh -c rm% -rf% logs'",
+            "git config --global protocol.allow always", "git clone ext::sh /tmp/y", "git fetch EXT::sh",
+            "git -c Protocol.Allow=always fetch origin", "git --config-env=protocol.ext.allow=V fetch origin",
+            "GIT_PROTOCOL_FROM_USER=1 git fetch origin", "git config protocol.ext.allow user",
+        ])
+        self.assertNoneGroundTruth(["git -c protocol.ext.allow=never fetch origin",
+                                    "git config --global protocol.file.allow never", "git fetch origin"])
+
+    def test_programs_by_path_read_only_the_head_unless_shell_scripts(self):
+        # Round-2 finding 6: a large binary / non-shell program invoked by path is classified from 4 KiB
+        big = os.path.join(self.root, "bigbin")
+        with open(big, "wb") as f:
+            f.write(b"\x7fELF\0" + b"\0" * (pre_trade_guard.SCRIPT_READ_LIMIT * 2))
+        bigpy = os.path.join(self.root, "bigpy")
+        with open(bigpy, "w", encoding="utf-8") as f:
+            f.write("#!/usr/bin/env python3\n" + "#" * (pre_trade_guard.SCRIPT_READ_LIMIT * 2))
+        bigsh = os.path.join(self.root, "bigsh")
+        with open(bigsh, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\n" + "#" * (pre_trade_guard.SCRIPT_READ_LIMIT * 2))
+        self.assertNoneGroundTruth(["./bigbin", "./bigpy"])
+        self.assertAllGroundTruthDenied(["./bigsh"])
+
 
 class TestRuntimeContracts(GuardHarness):
 
@@ -1044,6 +1604,212 @@ class TestPostTradeSync(GuardHarness):
             self.assertEqual(sys.stdout.getvalue().strip(), "{}")
         finally:
             sys.stdin, sys.stdout = stdin, stdout
+
+
+class TestQuotedNewlineSplitting(GuardHarness):
+    """Issue #53 round 4: only line breaks INSIDE a quoted string are arguments; a closing quote + newline + the next
+    line's opening quote is still a command separator (two commands must never merge into one)."""
+
+    CLOSE = "python3 scripts/execute_futures_trade.py --close-position --symbol BTCUSDT"
+
+    def decision(self, command_line):
+        return self.agy(self.cmd(command_line)).get("decision")
+
+    def assertAllGroundTruthDenied(self, commands):
+        for c in commands:
+            res = self.agy(self.cmd(c))
+            self.assertDenied(res, "Ground Truth Protection")
+            self.assertIn("logs/guardian_state.json may only be written by", res.get("reason", ""), c)
+
+    def assertNoneGroundTruth(self, commands):
+        for c in commands:
+            res = self.agy(self.cmd(c))
+            self.assertNotIn("Ground Truth Protection", res.get("reason", ""), c)
+            self.assertNotEqual(res.get("decision"), "deny", c)
+
+    def test_closing_and_opening_quotes_across_lines_stay_separate_commands(self):
+        for c in ("echo \"a\"\n\"rm\" -rf logs", "echo 'a'\n'rm' -rf logs",
+                  self.CLOSE + " \"x\"\n\"rm\" -rf logs", self.CLOSE + " 'x'\n'rm' -rf logs",
+                  self.CLOSE + " \"x\"\n\n\"rm\" -rf logs"):
+            self.assertAllGroundTruthDenied([c])
+        res = self.run_guard({"tool_name": "Bash", "tool_input": {"command": self.CLOSE + " \"x\"\n\"rm\" -rf logs"}})
+        self.assertEqual(res.get("__exit_code__"), 2)
+        self.assertEqual(pre_trade_guard.split_subcommands("echo \"a\"\n\"rm\" -rf logs"),
+                         [["echo", "a"], ["rm", "-rf", "logs"]])
+
+    def test_trade_opening_hidden_behind_risk_reducing_line_not_allowed(self):
+        c = self.CLOSE + " \"x\"\n\"python3\" scripts/execute_futures_trade.py --symbol SOLUSDT --direction LONG"
+        self.assertNotEqual(self.decision(c), "allow")
+        self.assertNotEqual(self.decision(self.CLOSE + "\npython3 scripts/execute_futures_trade.py --symbol SOLUSDT "
+                                          "--direction LONG"), "allow")
+
+    def test_line_breaks_inside_quotes_are_arguments(self):
+        self.assertNoneGroundTruth(["printf '%s' '\n'", "git commit -m \"a\n\nb\"",
+                                    "cat <<'EOF' > /tmp/n.txt\nit's fine\nEOF"])
+        self.assertEqual(pre_trade_guard.split_subcommands("printf '%s' '\n'"), [["printf", "%s", "\n"]])
+        self.assertEqual(pre_trade_guard.split_subcommands("git commit -m \"a\n\nb\""),
+                         [["git", "commit", "-m", "a\n\nb"]])
+
+    def test_scan_tracks_escapes_and_comments_and_fails_safe_when_unbalanced(self):
+        protect = pre_trade_guard._protect_quoted_newlines
+        self.assertEqual(protect("echo 'a\nb'\nls"), "echo 'a__newline__b'\nls")
+        self.assertEqual(protect("echo \"a\\\"\nb\"\nls"), "echo \"a\\\"__newline__b\"\nls")  # \" stays inside
+        self.assertEqual(protect("echo 'a\\'\nls"), "echo 'a\\'\nls")  # backslash is literal inside '...'
+        self.assertEqual(protect("echo \\'\nls\necho \\'"), "echo \\'\nls\necho \\'")  # escaped quotes outside
+        self.assertEqual(protect("ls # it's\n'rm' -rf logs\necho 'x'"), "ls # it's\n'rm' -rf logs\necho 'x'")
+        self.assertEqual(protect("echo it's\nrm -rf logs"), "echo it's\nrm -rf logs")  # unbalanced: unchanged
+        self.assertEqual(protect("echo a#'\nb'"), "echo a#'__newline__b'")  # '#' inside a word is not a comment
+        self.assertAllGroundTruthDenied(["ls # it's\n'rm' -rf logs\necho 'x'", "echo it's\nrm -rf logs"])
+
+    def test_risk_reducing_alone_still_allowed(self):
+        self.assertEqual(self.decision(self.CLOSE), "allow")
+        # Round 5: a multi-line command is never auto-allowed, even when every line is risk-reducing
+        self.assertEqual(self.decision(self.CLOSE + "\n" + self.CLOSE.replace("BTCUSDT", "ETHUSDT")), "ask")
+
+
+class TestNestedNewlinesAndAutoAllowFailSafe(GuardHarness):
+    """Issue #53 round 5: nested command strings keep their real line breaks; an auto-allow needs a flat single-line
+    command; risk-reducing scripts count only when they are the script actually executed."""
+
+    CLOSE = "python3 scripts/execute_futures_trade.py --close-position --symbol BTCUSDT"
+    CUTOFF = "python3 scripts/loops/night_cutoff_loop.py --once"
+
+    def decision(self, command_line):
+        return self.agy(self.cmd(command_line)).get("decision")
+
+    def test_nested_command_strings_are_judged_line_by_line(self):
+        for c in ("bash -c 'true\nrm -rf logs'", "eval \"true\nrm -rf logs\"", "sh -c 'true\nrm -rf logs'",
+                  "bash -c '" + self.CUTOFF + "\nrm -rf logs'"):
+            self.assertDenied(self.agy(self.cmd(c)), "Ground Truth Protection")
+        res = self.run_guard({"tool_name": "Bash", "tool_input": {"command": "bash -c '" + self.CUTOFF + "\nrm -rf logs'"}})
+        self.assertEqual(res.get("__exit_code__"), 2)
+        self.assertEqual(pre_trade_guard.split_subcommands("bash -c 'true\nrm -rf logs'"),
+                         [["bash", "-c", "true\nrm -rf logs"]])
+
+    def test_hidden_lines_never_auto_allowed(self):
+        for c in (self.CLOSE + " # it's\nrm -rf logs\necho \\'",
+                  self.CLOSE + " $'\\''\nrm -rf logs\necho \\'",
+                  "python3 scripts/loops/night_cutoff_loop.py \"<<EOF\"\nrm -rf logs close_position.py",
+                  "rm -rf logs close_position.py"):
+            self.assertNotEqual(self.decision(c), "allow", c)
+            res = self.run_guard({"tool_name": "Bash", "tool_input": {"command": c}})
+            self.assertNotEqual(res.get("hookSpecificOutput", {}).get("permissionDecision"), "allow", c)
+
+    def test_flat_single_line_required_for_allow(self):
+        # Each of these is risk-reducing for the analysis but carries text it cannot vouch for: ask, never deny
+        for c in (self.CLOSE + " # note", self.CLOSE + "\n" + self.CUTOFF, self.CLOSE + " --note $'x'",
+                  self.CLOSE + " --note \"$(date)\"", self.CLOSE + " --note `date`",
+                  self.CUTOFF + " <<< x", self.CLOSE + " --note 'a\nb'", "\n" + self.CLOSE):
+            self.assertEqual(self.decision(c), "ask", c)
+        blocker = pre_trade_guard._auto_allow_blocker
+        self.assertIn("here-string", blocker(self.CLOSE + " <<< x"))  # (denied anyway: inline code + executor)
+        self.assertIsNone(blocker(self.CLOSE))
+        self.assertIsNone(blocker(self.CLOSE + "\n"))  # trailing whitespace only
+        self.assertIsNone(blocker(self.CLOSE + " --note 'a # b' --tag x#y"))  # quoted / mid-word '#'
+        self.assertIsNotNone(blocker(self.CLOSE + " --note __newline__"))
+        self.assertIsNotNone(blocker(self.CLOSE + "\r" + self.CUTOFF))
+        # Trade openings: gates pass, but a multi-line command is downgraded to ask too
+        self.write_provenance_dossier("BTCUSDT", "LONG")
+        opening = "python3 scripts/execute_futures_trade.py --symbol BTCUSDT --direction LONG --leverage 3 --env prod"
+        self.assertEqual(self.agy(self.cmd(opening, conversationId=PARENT_CONV_ID)).get("decision"), "allow")
+        self.assertEqual(self.agy(self.cmd(opening + " # it's\nrm -rf logs\necho \\'",
+                                           conversationId=PARENT_CONV_ID)).get("decision"), "ask")
+        # PowerShell: a multi-line command is not auto-allowed either
+        ps = pre_trade_guard.evaluate_powershell_command
+        self.assertEqual(ps("python scripts\\execute_futures_trade.py --close-position --symbol BTCUSDT",
+                            self.root, self.root, None)[0], "allow")
+        self.assertEqual(ps("python scripts\\execute_futures_trade.py --close-position --symbol BTCUSDT\r\n"
+                            "python scripts\\execute_futures_trade.py --close-position --symbol ETHUSDT",
+                            self.root, self.root, None)[0], "ask")
+
+    def test_risk_reducing_script_must_be_the_executed_one(self):
+        script = pre_trade_guard._executed_script
+        self.assertEqual(script(["python3", "scripts/loops/night_cutoff_loop.py", "--once"]),
+                         "scripts/loops/night_cutoff_loop.py")
+        self.assertEqual(script(["python3", "-u", "-X", "dev", "-Wignore", "scripts/close_position.py"]),
+                         "scripts/close_position.py")
+        self.assertEqual(script(["env", "X=1", "./close_position.py"]), "./close_position.py")
+        self.assertEqual(script(["python3", "-c", "x", "close_position.py"]), "")
+        self.assertEqual(script(["python3", "-m", "close_position.py"]), "")
+        self.assertEqual(script(["rm", "-rf", "logs", "close_position.py"]), "rm")
+        rr = pre_trade_guard._subcommand_is_risk_reducing
+        for tokens in (["rm", "-rf", "logs", "close_position.py"], ["echo", "night_cutoff_loop.py"],
+                       ["python3", "evil_close_position.py"], ["python3", "-c", "x", "close_position.py"]):
+            self.assertFalse(rr(tokens, " ".join(tokens)), tokens)
+        for tokens in (["python3", "scripts/loops/night_cutoff_loop.py", "--once"],
+                       ["python3", "scripts/close_position_market.py"], ["./scripts/audit_orphan_positions.py"]):
+            self.assertTrue(rr(tokens, " ".join(tokens)), tokens)
+        self.assertNotEqual(self.decision("echo night_cutoff_loop.py"), "allow")
+        self.assertEqual(self.decision(self.CUTOFF), "allow")
+
+    def test_sanctioned_and_quoted_newline_commands_unchanged(self):
+        self.assertEqual(self.decision(self.CLOSE), "allow")
+        for c in ("git commit -m \"a\n\nb\"", "printf '%s' '\n'", "cat <<'EOF' > /tmp/n.txt\nit's fine\nEOF"):
+            res = self.agy(self.cmd(c))
+            self.assertNotEqual(res.get("decision"), "deny", c)
+            self.assertNotIn("Ground Truth Protection", res.get("reason", ""), c)
+
+
+class TestLoneQuotedNewlineAndWslAutoAllow(GuardHarness):
+    """Issue #53 round 6: a lone quoted line break is an argument holding a real newline (never the sentinel), so
+    eval / sh -c see the same lines as bash; the executed-script match sees through wsl.exe; a PowerShell backtick
+    escape is never auto-allowed."""
+
+    CLOSE = "python3 scripts/execute_futures_trade.py --close-position --symbol BTCUSDT"
+    CUTOFF = "python3 scripts/loops/night_cutoff_loop.py --once"
+    WSL = "wsl.exe -d Ubuntu -- "
+
+    def claude(self, tool, command):
+        return self.run_guard({"tool_name": tool, "tool_input": {"command": command}})
+
+    def test_eval_of_lone_quoted_newline_is_denied(self):
+        for c in ("eval '\n' rm -rf logs", "eval \"\n\" rm -rf logs",
+                  "eval '\n' git -c core.fsmonitor='curl x|sh' status", "eval '\n' rm -rf \"$D\""):
+            self.assertDenied(self.agy(self.cmd(c)))
+            self.assertEqual(self.claude("Bash", c).get("__exit_code__"), 2, c)
+        self.assertDenied(self.agy(self.cmd("eval '\n' rm -rf logs")), "Ground Truth Protection")
+        split = pre_trade_guard.split_subcommands
+        self.assertEqual(split("eval '\n' rm -rf logs"), [["eval", "\n", "rm", "-rf", "logs"]])
+        self.assertEqual(split("eval \"\n\" rm -rf logs"), [["eval", "\n", "rm", "-rf", "logs"]])
+        self.assertEqual(split("bash -c '\n'"), [["bash", "-c", "\n"]])
+        for c in ("eval '\n' rm -rf logs", "printf '%s' '\n'", "bash -c '\nrm -rf logs'"):
+            for tokens in split(c):
+                self.assertFalse(any(pre_trade_guard.QUOTED_NEWLINE_SENTINEL in t for t in tokens), c)
+        # A quoted line break is still an argument, not a separator; a bare one is still a separator
+        self.assertEqual(split("printf '%s' '\n' x"), [["printf", "%s", "\n", "x"]])
+        self.assertEqual(split("echo a\necho b"), [["echo", "a"], ["echo", "b"]])
+
+    def test_wsl_wrapped_sanctioned_commands_allowed(self):
+        script = pre_trade_guard._executed_script
+        self.assertEqual(script(["wsl.exe", "-d", "Ubuntu", "--", "python3", "scripts/loops/night_cutoff_loop.py",
+                                 "--once"]), "scripts/loops/night_cutoff_loop.py")
+        self.assertEqual(script(["wsl", "--cd", "/repo", "-u", "me", "-e", "python3", "scripts/close_position.py"]),
+                         "scripts/close_position.py")
+        self.assertEqual(script(["wsl.exe", "--exec", "./scripts/audit_orphan_positions.py"]),
+                         "./scripts/audit_orphan_positions.py")
+        self.assertEqual(script(["wsl.exe", "-d", "Ubuntu", "--", "rm", "close_position.py"]), "rm")
+        self.assertEqual(script(["wsl.exe", "--import", "x", "close_position.py"]), "wsl.exe")
+        self.assertEqual(script(["wsl.exe"]), "wsl.exe")
+        rr = pre_trade_guard._subcommand_is_risk_reducing
+        tokens = ["wsl.exe", "-d", "Ubuntu", "--", "rm", "-rf", "/tmp/x", "night_cutoff_loop.py"]
+        self.assertFalse(rr(tokens, " ".join(tokens)))
+        cutoff = self.WSL + self.CUTOFF
+        self.assertEqual(self.agy(self.cmd(cutoff)).get("decision"), "allow")
+        self.assertEqual(self.claude("Bash", cutoff).get("hookSpecificOutput", {}).get("permissionDecision"), "allow")
+        ps = pre_trade_guard.evaluate_powershell_command
+        self.assertEqual(ps(cutoff, self.root, self.root, None)[0], "allow")
+        self.assertEqual(ps(self.WSL + self.CLOSE, self.root, self.root, None)[0], "allow")
+        # Round-5 fail-safe still applies through wsl.exe
+        self.assertEqual(self.agy(self.cmd(cutoff + " # it's")).get("decision"), "ask")
+        self.assertEqual(ps(cutoff + "\r\n" + cutoff, self.root, self.root, None)[0], "ask")
+
+    def test_powershell_backtick_never_auto_allowed(self):
+        ps = pre_trade_guard.evaluate_powershell_command
+        self.assertEqual(ps(self.CLOSE, self.root, self.root, None)[0], "allow")
+        for c in (self.CLOSE.replace("BTCUSDT", "BTC`USDT"), self.CLOSE + " `", self.WSL + self.CUTOFF + " `"):
+            decision, reason = ps(c, self.root, self.root, None)
+            self.assertNotEqual(decision, "allow", c)
+            self.assertNotEqual(decision, "deny", c)
 
 
 if __name__ == "__main__":

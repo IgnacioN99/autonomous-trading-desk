@@ -48,35 +48,128 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    (resting-entry registry / post-fill protection) <- scripts/execute_futures_trade.py (registration and
    --protect-pending). File tools targeting them are denied: relative, absolute and Windows paths, NTFS aliases
    (trailing dot/space, ::$DATA streams) and targets whose os.path.realpath / samefile is a protected file
-   (symlinked directory, hard link). In shell commands, a sub-command naming a protected file (literally or via
-   a logs/ glob/brace word) is denied unless its program is read-only (GROUND_TRUTH_READ_PROGRAMS, jq without
-   --in-place, python3 -m json.tool without an output file, git read sub-commands such as diff/log/commit,
-   gh pr|issue, find judged below, python -c / node -e / python|node heredocs judged by write markers) and has no
-   write/exec option (git --output / --open-files-in-pager / --ext-diff / --upload-pack / --receive-pack /
-   --exec and their unique-prefix abbreviations (--op=, --upl=), short clusters with O (-nOrm), git -c /
-   --config-env / --exec-path, rg --pre / --hostname-bin, less -o / -O / --log-file / +cmd) and no leading VAR=
-   assignment (LESSOPEN, GIT_*). Any redirect to a protected file is denied (including ')>', ';>', '<>').
-   Nested command strings are judged like top-level ones: sh/bash -c, eval, cmd /c, powershell -Command,
-   git -c values, values of command-running options (git -O<cmd> / --upload-pack / --receive-pack / --exec,
-   rg --pre, less +!cmd), whether or not a protected file is named, and find -exec commands ({} = a root the
-   filters can match or logs/ under it). A command-running option that runs on files (rg --pre, git grep -O) or
-   on a local repository (git fetch --upload-pack, push --receive-pack / --exec) is denied when an operand (or the
-   default '.') is logs/ or one of its ancestors (rg --pre rm . logs, git fetch --upl=CMD .). $(pwd), `pwd`,
-   $PWD and $(git rev-parse --show-toplevel) count as '.', and $(cmd)/path as ./path (cmd judged separately).
-   Also denied: inline interpreters with write calls naming them, or with destructive calls next to a 'logs'
-   literal / logs/ glob (rmtree, rmSync, unlink, rename...) or recursive deletes/moves next to an ancestor
-   literal ('.', '..', the repo). Both are checked on the whole command line, so a `git commit -m "$(cat <<EOF
-   ...)"` or `gh ... --body "$(...)"` text naming a protected file next to a write marker such as `.write(` is
-   denied: use -F <file> / --body-file. Heredoc bodies are only exempt from the line-by-line check when fed to
-   python/node. Also: destructive find whose filters can match them or that is unfiltered/negated over a root that
-   is or contains logs/ (., .., /, ~, the repo), recursive rm / rd / del / Remove-Item / mv / move of logs/ or an
-   ancestor (globs and braces expanded: log*, {logs,build}), copies into logs/ (incl. -t/--target-directory),
-   symlinks/hard links (ln, mklink) aliasing logs/, git clean -x/-X and git stash --all.
-   Reads by allowlisted programs keep the normal permission policy (ask). Not covered: variable indirection,
-   xargs, archives, bare globs without a logs/ component (cd logs && rm *.json), cp -r src/. . / rsync src/ .
-   into the repo root, rsync --files-from, powershell -EncodedCommand inside a Bash command (the PowerShell tool
-   denies it, see 9), and a missing pending_entries.json still reads as empty in the executor (tracked as a
-   follow-up).
+   (symlinked directory, hard link).
+   Shell commands. The program of a sub-command is found past VAR=value / VAR+=value assignments, shell keywords
+   (if / then / do / { / !) and wrappers with their options (env -u / -C / -S, sudo -u / -D, timeout -s SIG N,
+   nice -n, stdbuf -oL, time -o, ionice, setsid, taskset, chroot, flock, doas, xargs -I {} -n 1 ...). A
+   sub-command naming a protected file (literally or via a logs/ glob/brace word) is denied unless its program is
+   read-only (GROUND_TRUTH_READ_PROGRAMS, jq without --in-place, python3 -m json.tool without an output file, git
+   read sub-commands such as diff/log/commit, gh pr|issue, for-loop word lists, find judged below, python -c /
+   node -e / python|node heredocs judged by write markers), has no write/exec option (git --output /
+   --open-files-in-pager / --ext-diff / --upload-pack / --receive-pack / --exec / --extcmd and their unique-prefix
+   abbreviations, short aliases per sub-command (clone/ls-remote -u, rebase -x, difftool -x; fetch/pull -u is
+   --update-head-ok, its next word is judged as a command and still parsed as an operand), short clusters with O
+   (-nOrm; value-taking shorts consume the rest, so -eOrder = -e Order), git -c / --config-env / --exec-path, rg
+   --pre / --hostname-bin, less -o / -O / --log-file / +cmd) and no VAR= assignment. Value-taking options are
+   skipped when collecting operands, from the rg 15.1 and git 2.43 help (rg -e/-d/-m/-t/--max-filesize/
+   --hyperlink-format ..., git grep -A/-B/-C/-e/-f/-m and --threads/--max-depth/--max-count/--context including
+   unique prefixes such as --thr 2). Any redirect (or time -o file) to a protected file is denied (also ')>',
+   ';>', '<>').
+   Line analysis (_ground_truth_line_hits): literal variables (D=logs, export D=logs, D+=x) are substituted in
+   order and forgotten when reassigned at run time (D=$(...), read D, for D in, printf -v D); `cd` / `pushd` only
+   ever ADD possible working directories (cd may fail, run in a subshell or after `false &&`), every sub-command is
+   judged against each of them and the outer cwd; `cd` with no operand, `cd -`, `cd ~/x`, `cd "$X"`, `cd $(...)`
+   and `popd` make it unknown, and then a write with a relative operand or redirect is denied (cd ~/x/logs && rm
+   *.json); env -C dir / sudo -D dir change it for one sub-command; inside logs/ any relative write is denied.
+   Run-time values ($VAR, ${VAR}, $(...), `...`, $1) left after substitution are denied in a write position: any
+   operand of a write / destructive program (rm, mv, tee, touch, the destination of cp / ln / install / rsync,
+   dd of=, the files of sed -i / perl -i, Windows delete / move / copy), a redirect target, an output option
+   (--output=, --log-file=, curl -o, sort -o, wget -O, tar -C / -f / -g, unzip -d), the root of a destructive find,
+   an archive destination, git -C / --work-tree of a writing git sub-command, and a program known only at run time
+   ($RM, $(which rm)) next to logs/, a protected file or another run-time value. $(pwd), `pwd`, $PWD and $(git
+   rev-parse --show-toplevel) count as '.', $(cmd)/path is a run-time path ($X/logs counts as logs/), every other
+   $(cmd) / `cmd` is lifted and judged as its own line, and a quoted line break is an argument, not a separator.
+   Nested command lines get the same full, strict line analysis one level deeper, started once from every
+   possible cwd of the enclosing line (beyond NESTED_DEPTH_LIMIT levels the command is denied): sh/bash -c, eval, cmd /c, powershell / pwsh -Command and -EncodedCommand in any prefix
+   spelling (-e, -ec, -en, -enc, -enco ... -encodedcommand, with -, -- or /, or -enc:payload; base64 UTF-16LE,
+   missing or undecodable -> deny), env -S, flock / su / runuser / script -c, watch, git -c values, git bisect run /
+   submodule foreach, the values of command-running options (git -O<cmd> / --upload-pack / --receive-pack /
+   --exec / --extcmd, rg --pre / --hostname-bin, less +!cmd, tar --to-command / -I / -F / --rsh-command /
+   --checkpoint-action=exec=), the shell calls of inline code (os.system / subprocess.* / popen / exec* /
+   child_process.exec* / perl system / qx / ruby %x / awk system(): their string literals), find -exec commands
+   ({} = a root the filters can match or logs/ under it), whether or not a protected file is named. A
+   command-running option that runs on files (rg --pre, git grep -O) or on a local repository (git fetch
+   --upload-pack, push --receive-pack / --exec) is denied when an operand (or the default '.', or the git -C base
+   dir) is logs/ or one of its ancestors (rg --pre rm . logs, git -C logs grep -O x -- '*.json').
+   Shell script files: a shell's script operand (options parsed: bash -o errexit f, sh -e -x f, bash --norc f,
+   --rcfile f), source f / . f, and a program invoked by path (./evil, /tmp/evil, scripts/x, f.sh) that is a text
+   file with a sh / bash / zsh / dash / ksh shebang (also /usr/bin/env [-S] bash) or none, have their content judged
+   by the same strict line analysis (whole-line comments dropped; a program invoked by path is classified from its
+   first SCRIPT_HEAD_BYTES (4 KiB) and read further only when it is a shell script) - denied when larger than
+   SCRIPT_READ_LIMIT (256 KiB),
+   unreadable or not UTF-8, when the same command line (or an enclosing one) writes the script (redirect, tee, cp,
+   heredoc, inline code naming it, git checkout; an archive extraction or recursive copy may write any name), or
+   when its path is a run-time value / relative to an unknown cwd; a missing file judges as nothing. A shell reading
+   commands from stdin (... | bash, bash -s, sh -s, source /dev/stdin, bash <(curl ...)) is denied unless its input
+   is visible: a heredoc (its body is judged line by line), a here-string (judged), `< file` or a single `cat file` /
+   `cat < file` producer (the file is judged). Only DESK_SHELL_SCRIPTS (scripts/report_issue.sh, resolved against
+   the workspace root and pinned by the sha256 of the bytes the hook read) is judged without the run-time-value and
+   unknown-cwd rules; every other rule (literal operands, xargs, stdin shells, nested lines) still applies, scripts
+   it runs or sources and every other file under scripts/ (or an edited copy) are strict, and the file is a harness
+   file (edits require confirmation).
+   Work budget: one hook evaluation shares a fail-closed budget across nested lines, scripts and cwd candidates
+   (AUDIT_MAX_SUBCOMMANDS = 5000 sub-command analyses, AUDIT_DEADLINE_SECONDS = 3.0 s monotonic); past it the
+   command is denied as too complex to audit. Nested lines and scripts are memoised per (text, cwds, flags) within
+   the evaluation.
+   xargs (also behind nice / timeout / env / command / exec / stdbuf ...; options parsed per GNU findutils: -I {},
+   -i, -n, -P, -L, -s, -E, -d, -0, -a) running anything but a read-only program is denied unless every producer of
+   its pipe is a find over literal roots that are neither logs/, below it nor an ancestor of it (also by realpath;
+   relative roots need a known cwd), without -L / -follow and printing only the paths, and the command is rm /
+   rmdir / unlink or cp / mv / ln / install -t DIR: no producer (xargs rm < list), -a FILE, -d DELIM, -I / -i, a
+   shell, an interpreter, env or a wrapper -> denied.
+   Env vars: injection and command channels are denied outright on any command (RIPGREP_CONFIG_PATH,
+   GIT_CONFIG_PARAMETERS / COUNT / GLOBAL / SYSTEM / KEY_* / VALUE_*, GIT_EXEC_PATH, GIT_TEMPLATE_DIR, GIT_DIR,
+   GIT_WORK_TREE, GIT_COMMON_DIR, GIT_INDEX_FILE, PROMPT_COMMAND, LD_PRELOAD, LD_AUDIT, LD_LIBRARY_PATH,
+   GIT_EXTERNAL_DIFF, GIT_SSH, GIT_SSH_COMMAND, GIT_ASKPASS, SSH_ASKPASS, GIT_PROXY_COMMAND, LESSOPEN, LESSCLOSE,
+   GIT_ALLOW_PROTOCOL, GIT_PROTOCOL_FROM_USER);
+   ENV / BASH_ENV when the program is a shell, env, a script run by path or nothing (standalone, export); pager vars
+   (GIT_PAGER, PAGER, MANPAGER) accept only an empty value or cat / less / more with read-only flags (no +cmd,
+   -o / -O / -k, --log-file), LESS only such flags, editor vars (EDITOR, VISUAL, GIT_EDITOR, GIT_SEQUENCE_EDITOR)
+   only true / : / cat; non-literal values are denied. This applies to VAR=v cmd, VAR+=v, assignments after
+   wrappers (nice env X=v, time X=v, sudo X=v, env -S 'X=v cmd'), export / declare / local / readonly, and read /
+   printf -v / mapfile / for / declare -n of these names.
+   Git config: GIT_CONFIG_DANGEROUS_RE keys (core.pager / editor / sshCommand / fsmonitor / hooksPath / worktree,
+   pager.*, alias.*, diff.external, diff.*.textconv, filter.*, remote.*.uploadpack, credential[.*].helper,
+   include[If].path, submodule.*.update, hook.*.command ...; case-insensitive) are denied in `git -c key=value`,
+   `git clone -c`, `--config-env` (hidden value: any dangerous key) and persistent `git config` (options with
+   values parsed: -f / --file, --blob, -t / --type, --default, --comment, --value; scopes, -z, --name-only; the
+   get / set / unset / list / rename-section / remove-section / edit syntax), except pager keys with an allowlisted
+   pager or a boolean, editor keys with true / : / cat, and protocol.allow / protocol.<name>.allow with never.
+   `git config` is a read only with an explicit read action (--get*, -l / --list, get, list); edit /
+   rename-section are denied; clone / init --template are denied; a writing git sub-command with -C / --work-tree
+   inside logs/ is denied; any git argument starting with ext:: (a transport that runs a shell command) is denied.
+   Also denied: inline interpreters (Python / Node / Perl / Ruby) with write calls naming them, or with destructive
+   calls next to a 'logs' literal / logs/ glob (rmtree, remove_tree, rmSync, unlink, rename, FileUtils.rm_rf,
+   File.delete, Dir.rmdir ...) or recursive deletes/moves next to an ancestor literal ('.', '..', the repo). Both
+   are checked on the whole command line, so a `git commit -m "$(cat <<EOF ...)"` or `gh ... --body "$(...)"` text
+   naming a protected file next to a write marker such as `.write(` is denied: use -F <file> / --body-file. Heredoc
+   bodies are only exempt from the line-by-line check when fed to python/node. Also: destructive find whose filters
+   can match them or that is unfiltered/negated over a root that is or contains logs/ (., .., /, ~, the repo),
+   recursive rm / rd / del / Remove-Item / mv / move of logs/ or an ancestor (globs and braces expanded: log*,
+   {logs,build}), recursive / glob / --files-from copies into logs/ or an ancestor (incl. -t/--target-directory,
+   cp -r src/. ., rsync -a src/ ./), Windows copies into logs/ (robocopy, xcopy, any recursive or wildcard copy, a
+   source that is not an existing regular file; `copy a.txt logs` stays allowed) or recursive ones (robocopy /S /E
+   /MIR /PURGE, xcopy /S /E, Copy-Item -Recurse) into an ancestor, archive extraction (tar -x / --extract / --get /
+   old-style xf, unzip, 7z x, Expand-Archive; tar -t and -xO are reads, tar -czf only creates) whose destination
+   (-C, -d, -o, -DestinationPath, else the cwd) is logs/ or an ancestor, tar output files (--index-file, -g)
+   naming a protected file, symlinks/hard links (ln, mklink) aliasing logs/, git clean -x/-X and git stash --all.
+   `_is_logs_dir` counts ANY path whose last component is logs (relative, POSIX absolute, Windows / UNC /
+   drive-mount form, $X/logs, ~/logs, and so also /tmp/other/logs, build/logs): symlinks, /proc/<pid>/cwd and
+   junctions alias the workspace logs/ in ways the hook cannot resolve; globs (log*, *) are resolved against the
+   workspace root and tracked cwd. A cd / pushd / env -C / sudo -D into a directory named logs counts as inside
+   logs/, and a path through /proc/<pid>/{cwd,root,fd} or /dev/fd (a write operand, cd target or find root) is
+   unresolvable: an unknown cwd / ancestor of logs/. PowerShell statements are judged
+   per sub-command with these rules minus the Bash-only ones (cd / variable / xargs / stdin-shell tracking, run-time
+   values, scripts by path; see 9). Reads by allowlisted programs keep the normal permission policy (ask).
+   Not covered (residual, defense in depth; the executor-side fail-closed checks are the primary control): Python /
+   Node / other non-shell script files (run by their interpreter or by path with their shebang), interpreters
+   reading code from a file we do not open (PYTHONPATH / sitecustomize, NODE_OPTIONS --require, PERL5OPT), command
+   text only known at run time (eval "$(...)", a $(cmd) program with no operands), writes by programs whose
+   semantics we do not model (make, docker, parallel, ssh to localhost ...), git commands run in another
+   repository whose config the agent wrote (git -C /tmp/r status), direct writes to git config / hook files
+   (.git/config, .git/hooks/*, ~/.gitconfig, ~/.config/git/config) that a later git command executes, run-time
+   values and unknown cwd inside the pinned scripts/report_issue.sh, and a missing pending_entries.json still reads
+   as empty in the executor (tracked as follow-ups).
 9. CLAUDE CODE POWERSHELL TOOL (Windows) AND NOTEBOOKEDIT:
    NotebookEdit is a file tool (notebook_path). PowerShell commands are scanned for analysis only (Unicode quotes
    and dashes mapped to ASCII; quote-aware: '...' literal, backtick escapes in "..." and bare text; comments
@@ -100,7 +193,8 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
 11. HEARTBEAT:
    Every invocation refreshes logs/hook_heartbeat.json (best effort, never alters the decision).
 
-Target latency: < 15ms (plus dossier provenance re-verification on trade openings).
+Target latency: < 15ms (plus dossier provenance re-verification on trade openings, and reading / judging the shell
+script files a command runs).
 """
 
 import os
@@ -110,6 +204,9 @@ import time
 import re
 import shlex
 import fnmatch
+import hashlib
+import contextlib
+import functools
 import posixpath
 import datetime
 from typing import Dict, Any, Tuple, Optional, List
@@ -266,6 +363,9 @@ BINANCE_BATCH_ORDER_OPS = {"placemultipleorders"}
 SHELL_SEPARATORS = {"&&", "||", ";", "|", "&", "\n", ";;", "|&", "(", ")"}
 REDIRECT_TOKENS = {">", ">>", ">|", "&>", "&>>", ">&", "<>"}
 SHELL_PUNCTUATION = "();<>|&\n"
+# Stands for a line break inside a '...' / "..." string (an argument, not a command separator)
+QUOTED_NEWLINE_SENTINEL = "__newline__"
+WORD_BOUNDARY_CHARS = " \t\r\n;&|()<>"
 # bash operators, longest first: shlex returns punctuation runs (')>', ';>', '<>') as one token
 SHELL_OPERATORS = ("&>>", "<<<", "&&", "||", ";;", "|&", ">>", ">|", ">&", "&>", "<>", "<<", "<&",
                    "(", ")", ";", "|", "&", "\n", ">", "<")
@@ -276,7 +376,79 @@ INSPECTION_PROGRAMS = {
 }
 BENIGN_PROGRAMS = {"cd", "pushd", "popd", "pwd", "true", "date", "sleep"}
 COMMAND_WRAPPERS = {"env", "nohup", "time", "exec", "nice", "stdbuf", "sudo", "command", "builtin"}
-SHELL_INTERPRETERS = {"sh", "bash", "zsh", "dash", "ksh", "fish"}
+# Wrappers walked by _command_start to find the program they run: (short options taking a value, long options
+# {name: takes a value}, positional operands before the command). Long options also match as unique prefixes.
+WRAPPER_SPECS: Dict[str, Tuple[str, Dict[str, bool], int]] = {
+    "env": ("uCS", {"ignore-environment": False, "null": False, "unset": True, "chdir": True, "split-string": True,
+                    "block-signal": False, "default-signal": False, "ignore-signal": False,
+                    "list-signal-handling": False, "debug": False, "help": False, "version": False}, 0),
+    "nohup": ("", {}, 0), "command": ("", {}, 0), "builtin": ("", {}, 0), "unbuffer": ("", {}, 0),
+    "exec": ("a", {}, 0),
+    "time": ("fo", {"format": True, "output": True, "append": False, "verbose": False, "portability": False,
+                    "quiet": False, "help": False, "version": False}, 0),
+    "nice": ("n", {"adjustment": True, "help": False, "version": False}, 0),
+    "stdbuf": ("ioe", {"input": True, "output": True, "error": True, "help": False, "version": False}, 0),
+    "sudo": ("ugprtCDRTU", {"user": True, "group": True, "host": True, "prompt": True, "role": True, "type": True,
+                            "close-from": True, "chdir": True, "chroot": True, "command-timeout": True,
+                            "other-user": True, "preserve-env": False, "login": False, "shell": False,
+                            "non-interactive": False, "background": False, "edit": False, "set-home": False,
+                            "stdin": False, "askpass": False, "preserve-groups": False, "reset-timestamp": False,
+                            "remove-timestamp": False, "list": False, "validate": False, "bell": False,
+                            "help": False, "version": False}, 0),
+    "doas": ("uC", {}, 0),
+    "timeout": ("sk", {"signal": True, "kill-after": True, "preserve-status": False, "foreground": False,
+                       "verbose": False, "help": False, "version": False}, 1),
+    "setsid": ("", {"ctty": False, "fork": False, "wait": False}, 0),
+    "ionice": ("cnpPu", {"class": True, "classdata": True, "pid": True, "pgid": True, "uid": True, "ignore": False},
+               0),
+    "taskset": ("", {"all-tasks": False, "pid": False, "cpu-list": False}, 1),
+    "chroot": ("", {"userspec": True, "groups": True, "skip-chdir": False}, 1),
+    "flock": ("wEc", {"timeout": True, "conflict-exit-code": True, "command": True, "shared": False,
+                      "exclusive": False, "unlock": False, "nonblock": False, "close": False, "no-fork": False,
+                      "verbose": False}, 1),
+}
+# xargs (GNU findutils 4.9 --help): short options taking a value, optional glued values, long options
+# (True = takes a value, "opt" = optional value glued with '=')
+XARGS_VALUE_SHORT = "adEILnPs"
+XARGS_OPTIONAL_SHORT = "eil"
+XARGS_LONG_OPTIONS: Dict[str, Any] = {
+    "null": False, "arg-file": True, "delimiter": True, "eof": "opt", "replace": "opt", "max-lines": True,
+    "max-args": True, "open-tty": False, "max-procs": True, "interactive": False, "process-slot-var": True,
+    "no-run-if-empty": False, "max-chars": True, "show-limits": False, "verbose": False, "exit": False,
+    "help": False, "version": False,
+}
+# xargs commands that only read; any other command (writers, shells, interpreters, env, wrappers) needs a confined
+# producer, and even then only these may run: deleters (rm does not follow symlinks) and copiers with -t DIR
+XARGS_READ_PROGRAMS = {"echo", "printf", "basename", "dirname", "realpath", "readlink", "sha1sum", "sha512sum", "du"}
+XARGS_DELETE_PROGRAMS = {"rm", "rmdir", "unlink"}
+XARGS_TARGET_PROGRAMS = {"cp", "mv", "ln", "install"}
+# find actions that print something other than the matched path (or act on it): not a confined listing
+FIND_NON_LISTING_ACTIONS = {"-printf", "-fprintf", "-fprint", "-fprint0", "-fls", "-ls", "-exec", "-execdir", "-ok",
+                            "-okdir", "-delete", "-L", "-H", "-follow"}
+# Shell keywords that may precede a command (if/then/do ...; `{ rm x; }`; `! cmd`)
+SHELL_PREFIX_KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "}"}
+SHELL_INTERPRETERS = {"sh", "bash", "zsh", "dash", "ksh", "fish", "mksh", "ash"}
+# Script operands that make a shell read its commands from stdin
+STDIN_SCRIPT_PATHS = {"-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"}
+# Shell script files larger than this (or unreadable / not UTF-8) cannot be judged: denied
+SCRIPT_READ_LIMIT = 256 * 1024
+# Bytes read first from a program invoked by path to tell a shell script (text, sh/bash/... or no shebang) apart
+SCRIPT_HEAD_BYTES = 4096
+# Desk shell scripts judged with relaxed rules (run-time values and unknown cwd only), pinned by the sha256 of their
+# bytes: an edited copy (or any other file under scripts/) is judged strictly. Update the pin with the script.
+DESK_SHELL_SCRIPTS = {
+    "scripts/report_issue.sh": "d5312e54cec20033c5c04fc57a849d489f99cbd74b1d8f1c81a55ad3cb5c5fb9",
+}
+# Fail-closed work budget of one hook evaluation (all nested lines, scripts and cwd candidates together)
+AUDIT_MAX_SUBCOMMANDS = 5000
+AUDIT_DEADLINE_SECONDS = 3.0
+# Writers that never put new content into the files they name (chmod +x f.sh && ./f.sh runs what we read)
+CONTENT_PRESERVING_WRITERS = {"chmod", "chown", "touch", "truncate", "rm", "rmdir", "unlink", "shred"}
+# Builtins that assign shell variables (export X=v, declare -x X, read X, printf -v X, for X in ...)
+DECLARE_BUILTINS = {"export", "declare", "typeset", "local", "readonly"}
+ASSIGNING_BUILTINS = DECLARE_BUILTINS | {"read", "printf", "mapfile", "readarray", "getopts", "for", "select", "unset"}
+# Interpreters whose inline code / program text may run shell commands (os.system('...'), awk system("..."))
+SHELL_CALL_INTERPRETERS_RE = re.compile(r"^(?:python[0-9.]*|node|nodejs|perl|ruby|php|awk|gawk|mawk|nawk)$")
 WRITE_PROGRAMS = {"cp", "mv", "rm", "tee", "truncate", "ln", "chmod", "chown", "install", "dd", "rsync",
                   "unlink", "shred", "touch"}
 
@@ -298,9 +470,16 @@ RISK_FLAG_SCRIPTS_RE = re.compile(
 )
 RISK_REDUCING_FLAGS = {"--close-position", "--close_position", "--auto-heal", "--auto_heal",
                        "--audit-orphans", "--audit_orphans", "--heal", "--protect-pending", "--protect_pending"}
+# Matched against the base name of the script a sub-command executes (_executed_script), never a word anywhere
 RISK_REDUCING_SCRIPTS_RE = re.compile(
     r"\b(?:night_cutoff_loop|audit_orphan_positions|close_position_market|close_position)\.py\b"
 )
+PYTHON_PROGRAM_RE = re.compile(r"^python[0-9.]*(?:\.exe)?$")
+PYTHON_LONG_VALUE_OPTIONS = {"--check-hash-based-pycs"}
+# Text an auto-allow cannot vouch for: the analysis may not see every command it runs (a comment or an
+# apostrophe hiding the next lines, heredoc bodies, ANSI-C strings, command substitutions)
+AUTO_ALLOW_BLOCKERS = (("<<", "a heredoc / here-string"), ("$'", "an ANSI-C $'...' string"),
+                       ("`", "a backtick command substitution"), ("$(", "a $(...) command substitution"))
 
 # Trading primitives that must never appear in inline code (python -c, heredocs, piped interpreters)
 INLINE_TRADING_PRIMITIVES_RE = re.compile(
@@ -366,6 +545,8 @@ GROUND_TRUTH_TARGET_RE = re.compile(
     r"(?:^|/)logs/(" + "|".join(re.escape(n) for n in GROUND_TRUTH_BASENAMES) + r")$", re.IGNORECASE
 )
 SHELL_GLOB_RE = re.compile(r"[*?\[{]")
+# Windows drive (C:\x, C:/x), UNC (\\server\share) and drive-mount (/mnt/c/x, Git Bash /c/x) path forms
+WINDOWS_FORM_PATH_RE = re.compile(r"^(?:[A-Za-z]:(?:/|$)|//[^/]|/mnt/[A-Za-z](?:/|$)|/[A-Za-z]/)")
 # A shell sub-command that names a protected file (literally or through a logs/ glob / brace word) is denied unless
 # its program is one of these read-only tools (plus the special cases in _ground_truth_read_only).
 GROUND_TRUTH_READ_PROGRAMS = {"cat", "head", "tail", "less", "more", "grep", "egrep", "rg", "jq", "wc", "stat",
@@ -374,12 +555,39 @@ GROUND_TRUTH_READ_PROGRAMS = {"cat", "head", "tail", "less", "more", "grep", "eg
 LOGS_DIR_DESTRUCTIVE_PROGRAMS = {"rm", "shred", "unlink", "truncate"}
 # Programs that can overwrite files inside logs/ with sources whose names are not visible (cp -r src/. logs)
 LOGS_DIR_COPY_PROGRAMS = {"cp", "rsync", "install"}
+# Windows / PowerShell recursive copy programs whose destination (2nd positional) can be logs/ or an ancestor
+WINDOWS_COPY_PROGRAMS = {"robocopy", "xcopy", "copy", "copy-item", "cpi"}
+# robocopy / xcopy / copy switches (/E, /MIR, /XD:x); a second '/' makes it a path (/tmp/src)
+WINDOWS_COPY_SWITCH_RE = re.compile(r"^/[A-Za-z0-9?]+(?::[^/\\]*)?$")
+WINDOWS_RECURSIVE_SWITCHES = {"/s", "/e", "/mir", "/purge", "/mov", "/move"}
+# Copy-Item parameters that take a value (other than -Path / -LiteralPath / -Destination)
+PS_COPY_VALUE_PARAMS = ("filter", "include", "exclude", "credential", "fromsession", "tosession")
+# Archive extractors; the destination directory is -C / -d / -o<dir> / -DestinationPath, else the cwd
+ARCHIVE_EXTRACT_PROGRAMS = {"tar", "bsdtar", "unzip", "7z", "7za", "7zr", "expand-archive"}
+# GNU tar (1.35 --help): short options taking a value and long options taking a value (also as the next word; tar
+# accepts unique prefixes, so any prefix counts); options whose value is a shell command or a file tar writes.
+TAR_VALUE_SHORT = set("fCbgFHIKLNTVX")
+TAR_VALUE_LONG = ("file", "directory", "blocking-factor", "listed-incremental", "info-script", "new-volume-script",
+                  "format", "use-compress-program", "starting-file", "tape-length", "newer", "after-date",
+                  "files-from", "label", "exclude-from", "exclude", "add-file", "transform", "xform", "owner", "group",
+                  "mode", "mtime", "to-command", "rmt-command", "rsh-command", "volno-file", "index-file",
+                  "record-size", "level", "newer-mtime", "suffix", "strip-components", "hole-detection", "sort",
+                  "owner-map", "group-map", "quoting-style", "quote-chars", "no-quote-chars", "pax-option",
+                  "sparse-version", "warning", "exclude-tag", "exclude-tag-all", "exclude-tag-under",
+                  "exclude-ignore", "exclude-ignore-recursive", "xattrs-exclude", "xattrs-include")
+TAR_EXEC_LONG = ("to-command", "use-compress-program", "info-script", "new-volume-script", "rmt-command",
+                 "rsh-command")
+TAR_EXEC_SHORT = set("IF")
+TAR_OUTPUT_LONG = ("index-file", "listed-incremental", "volno-file")
 # Programs accepting -t DIR / --target-directory=DIR (GNU coreutils)
 TARGET_DIR_PROGRAMS = {"cp", "mv", "install", "ln"}
 # git sub-commands that never modify working-tree files (anything else naming a protected file is denied)
 GIT_READ_SUBCOMMANDS = {"status", "diff", "log", "show", "grep", "blame", "commit", "add", "ls-files", "ls-tree",
                         "check-ignore", "rev-parse", "branch", "shortlog", "describe", "cat-file", "fetch", "push"}
-GIT_GLOBAL_VALUE_OPTIONS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
+# git sub-commands that rewrite work-tree files named in their arguments (a script named there counts as written)
+GIT_WRITE_SUBCOMMANDS = {"checkout", "restore", "apply", "mv", "rm", "reset", "stash", "merge", "pull", "am",
+                         "cherry-pick", "revert", "rebase", "switch", "worktree", "clone", "archive", "init"}
+GIT_GLOBAL_VALUE_OPTIONS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"}
 # Options that turn an allowlisted read into a write or a command run (git log --output=F, git grep -O<cmd>,
 # git -c core.fsmonitor=<cmd>, rg --pre CMD, less -o F); leading VAR= assignments (LESSOPEN, GIT_*) too.
 GIT_RUN_GLOBAL_OPTIONS = ("--config-env", "--exec-path")
@@ -387,14 +595,111 @@ GIT_RUN_GLOBAL_OPTIONS = ("--config-env", "--exec-path")
 # accepts any unique prefix (--op= for --open-files-in-pager, --upl=, --rece=, --exe=), so every prefix counts
 # (config-env from 4 letters: --co/--con abbreviate --contains/--color...). Longer spellings count too (--output-*).
 GIT_RUN_LONG_OPTIONS = {"output": 1, "open-files-in-pager": 1, "ext-diff": 1, "upload-pack": 1, "receive-pack": 1,
-                        "exec": 1, "exec-path": 1, "config-env": 4}
-# ...of which these run a shell command (their value, or the pager on matched files); the last three need a value
-GIT_EXEC_LONG_OPTIONS = ("open-files-in-pager", "upload-pack", "receive-pack", "exec")
-GIT_EXEC_VALUE_OPTIONS = ("upload-pack", "receive-pack", "exec")
+                        "exec": 1, "exec-path": 1, "config-env": 4, "extcmd": 1}
+# ...of which these run a shell command (their value, or the pager on matched files); the last need a value
+GIT_EXEC_LONG_OPTIONS = ("open-files-in-pager", "upload-pack", "receive-pack", "exec", "extcmd")
+GIT_EXEC_VALUE_OPTIONS = ("upload-pack", "receive-pack", "exec", "extcmd")
+# Short aliases of command-running git options, per sub-command (git 2.43 usage): their value is a nested command
+# and, for local-repo/file operations, follows the same operand rule as the long form.
+#   clone / ls-remote -u = --upload-pack ; rebase -x = --exec ; difftool -x = --extcmd
+GIT_SUBCOMMAND_SHORT_EXEC = {"clone": {"u"}, "ls-remote": {"u"}, "rebase": {"x"}, "difftool": {"x"}}
+# fetch / pull -u is --update-head-ok (no value) in git 2.43; older docs list it as --upload-pack: the next word is
+# judged as a command too, but still parsed as an operand (fail-safe for both readings).
+GIT_SUBCOMMAND_SHORT_EXEC_MAYBE = {"fetch": {"u"}, "pull": {"u"}}
 # Short clusters with O (git grep -O<cmd>, -nOrm; diff -O<orderfile>) or, for diff/log/show, o void the exemption
 GIT_LOWER_O_SUBCOMMANDS = {"diff", "log", "show"}
+# git grep short options that take a value (git 2.43 `git grep -h`: -A -B -C -e -f -m), so -eOrder = -e Order (NOT
+# -O) and -m1 / -A2 are glued values: once one appears in a short cluster, the rest of the cluster is its value.
+# -O is handled separately (optional attached pager value).
+GIT_GREP_VALUE_SHORT = set("ABCefm")
+GIT_GREP_PATTERN_OPTS_SHORT = set("ef")           # a pattern given via -e/-f: all positionals are then paths
+# git grep long options (True = takes a value, also as the next word; "opt" = optional value glued with '='). git
+# accepts any unique prefix (--thr 2 = --threads 2, --max-d 2 = --max-depth 2) and --no-<option>.
+GIT_GREP_LONG_OPTIONS: Dict[str, Any] = {
+    "cached": False, "no-index": False, "index": False, "untracked": False, "exclude-standard": False,
+    "recurse-submodules": False, "invert-match": False, "ignore-case": False, "word-regexp": False, "text": False,
+    "textconv": False, "recursive": False, "max-depth": True, "extended-regexp": False, "basic-regexp": False,
+    "fixed-strings": False, "perl-regexp": False, "line-number": False, "column": False, "full-name": False,
+    "files-with-matches": False, "name-only": False, "files-without-match": False, "null": False,
+    "only-matching": False, "count": False, "color": "opt", "break": False, "heading": False, "context": True,
+    "before-context": True, "after-context": True, "threads": True, "show-function": False,
+    "function-context": False, "and": False, "or": False, "not": False, "quiet": False, "all-match": False,
+    "open-files-in-pager": "opt", "ext-grep": False, "max-count": True,
+}
 RG_EXEC_OPTIONS = ("--pre", "--hostname-bin")
-ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# rg options that take a value (ripgrep 15 --help), skipped when collecting the operands --pre / --hostname-bin act
+# on. rg does not accept abbreviated long options.
+RG_VALUE_SHORT = set("efEmjgdtTABCMr")
+RG_VALUE_LONG = {"regexp", "file", "pre", "pre-glob", "dfa-size-limit", "encoding", "engine", "max-count",
+                 "regex-size-limit", "threads", "glob", "iglob", "ignore-file", "cursor-ignore", "max-depth",
+                 "max-filesize", "type", "type-not", "type-add", "type-clear", "after-context", "before-context",
+                 "color", "colors", "context", "context-separator", "field-context-separator",
+                 "field-match-separator", "hostname-bin", "hyperlink-format", "max-columns", "path-separator",
+                 "replace", "sort", "sortr", "generate"}
+ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=")
+ENV_ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)(\+?)=(.*)$", re.DOTALL)
+# Value of a variable assigned at run time (read X, for X in ..., declare -n): never a literal
+UNKNOWN_VALUE = "$__unknown__"
+# Env vars denied outright on ANY command, whatever their value: config / startup-file / library injection, git
+# repository redirection, and command channels that run their value (git diff, ssh, askpass, less preprocessors).
+ENV_DENY_OUTRIGHT = {"RIPGREP_CONFIG_PATH", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_CONFIG_GLOBAL",
+                     "GIT_CONFIG_SYSTEM", "GIT_EXEC_PATH", "GIT_TEMPLATE_DIR", "GIT_DIR", "GIT_WORK_TREE",
+                     "GIT_COMMON_DIR", "GIT_INDEX_FILE", "PROMPT_COMMAND", "LD_PRELOAD", "LD_AUDIT",
+                     "LD_LIBRARY_PATH", "GIT_EXTERNAL_DIFF", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_ASKPASS",
+                     "SSH_ASKPASS", "GIT_PROXY_COMMAND", "LESSOPEN", "LESSCLOSE", "GIT_ALLOW_PROTOCOL",
+                     "GIT_PROTOCOL_FROM_USER"}
+ENV_DENY_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
+# Startup files sourced by a shell: denied when the program is a shell / env / a script, or when exported
+ENV_STARTUP_VARS = {"ENV", "BASH_ENV"}
+# Pager / editor command channels: only an allowlisted literal value is accepted (cat / less / more with read-only
+# flags, or empty; true / : / cat for editors). LESS (less options) follows the same less-flag rule.
+ENV_PAGER_VARS = {"GIT_PAGER", "PAGER", "MANPAGER"}
+ENV_EDITOR_VARS = {"EDITOR", "VISUAL", "GIT_EDITOR", "GIT_SEQUENCE_EDITOR"}
+ENV_PROTECTED_VARS = ENV_DENY_OUTRIGHT | ENV_STARTUP_VARS | ENV_PAGER_VARS | ENV_EDITOR_VARS | {"LESS"}
+PAGER_PROGRAMS = {"cat", "less", "more"}
+EDITOR_VALUES = {"true", ":", "cat"}
+SYSTEM_BIN_DIRS = ("/bin/", "/usr/bin/")
+GIT_BOOLEAN_VALUES = {"true", "false", "yes", "no", "on", "off", "1", "0"}
+# Git config keys that hold a command or a path to an executable / config / hooks / work tree. Pager and editor
+# keys take the allowlisted values above; every other one is denied whatever its value: `git config` persisting
+# it, `git -c key=value`, `git clone -c`, `git --config-env=<key>=<envvar>` (hidden value: denied for all of them).
+GIT_CONFIG_DANGEROUS_RE = re.compile(
+    r"^(?:core\.(?:pager|editor|sshcommand|askpass|fsmonitor|hookspath|gitproxy|worktree|alternaterefscommand)|"
+    r"pager\..+|sequence\.editor|interactive\.difffilter|diff\.external|diff\..+\.(?:textconv|command)|"
+    r"difftool\..+\.(?:cmd|path)|merge\..+\.driver|mergetool\..+\.(?:cmd|path)|"
+    r"filter\..+\.(?:clean|smudge|process)|remote\..+\.(?:uploadpack|receivepack|proxy)|alias\..+|"
+    r"gpg\.program|gpg\..+\.program|gpg\.ssh\.defaultkeycommand|credential\.helper|credential\..+\.helper|"
+    r"uploadpack\.packobjectshook|include\.path|includeif\..+\.path|init\.templatedir|submodule\..+\.update|"
+    r"trailer\..+\.(?:command|cmd)|hook\..+\.command|browser\..+\.(?:cmd|path)|man\..+\.(?:cmd|path)|"
+    r"sendemail\..*(?:smtpserver|cmd)|protocol\.(?:.+\.)?allow)$", re.IGNORECASE)
+# protocol.allow / protocol.<name>.allow (ext:: runs a shell command as transport): only `never` is accepted
+GIT_CONFIG_PROTOCOL_KEY_RE = re.compile(r"^protocol\.(?:.+\.)?allow$", re.IGNORECASE)
+GIT_CONFIG_PAGER_KEY_RE = re.compile(r"^(?:core\.pager|pager\..+)$", re.IGNORECASE)
+GIT_CONFIG_EDITOR_KEY_RE = re.compile(r"^(?:core\.editor|sequence\.editor)$", re.IGNORECASE)
+# `git config` options (git 2.43 usage + the get/set/unset/list/... sub-command syntax): True = takes a value
+GIT_CONFIG_LONG_OPTIONS: Dict[str, bool] = {
+    "global": False, "system": False, "local": False, "worktree": False, "file": True, "blob": True, "get": False,
+    "get-all": False, "get-regexp": False, "get-urlmatch": False, "replace-all": False, "add": False,
+    "unset": False, "unset-all": False, "rename-section": False, "remove-section": False, "list": False,
+    "fixed-value": False, "edit": False, "get-color": False, "get-colorbool": False, "type": True, "bool": False,
+    "int": False, "bool-or-int": False, "bool-or-str": False, "path": False, "expiry-date": False, "null": False,
+    "name-only": False, "includes": False, "show-origin": False, "show-scope": False, "default": True,
+    "comment": True, "value": True, "all": False, "regexp": False, "url": True, "append": False,
+}
+GIT_CONFIG_VALUE_SHORT = set("ft")
+# A `git config` call is a read only with an explicit read action
+GIT_CONFIG_READ_ACTIONS = {"get", "get-all", "get-regexp", "get-urlmatch", "list", "get-color", "get-colorbool"}
+GIT_CONFIG_SUBCOMMANDS = {"get", "set", "unset", "list", "rename-section", "remove-section", "edit"}
+# Output-file values of any program (dd of=F, --output=F, --log-file=F) and per-program output options
+OUTPUT_VALUE_RE = re.compile(
+    r"^(?:of=|--(?:output[\w-]*|log-file|target-directory|directory|files-from|index-file|listed-incremental)=)",
+    re.IGNORECASE)
+OUTPUT_OPTIONS = {
+    "curl": {"-o", "--output"}, "wget": {"-O", "--output-document", "-o", "--output-file", "-a", "--append-output"},
+    "sort": {"-o", "--output"}, "less": {"-o", "-O", "--log-file", "--LOG-FILE"}, "unzip": {"-d"},
+    "tar": {"-f", "--file", "-C", "--directory", "-g", "--listed-incremental", "--index-file"},
+    "bsdtar": {"-f", "--file", "-C", "--directory"}, "make": {"-C"}, "time": {"-o", "--output"},
+}
 # Windows / PowerShell programs that delete or move directories (cmd //c rd /s /q logs, Remove-Item -Recurse logs)
 WINDOWS_DELETE_PROGRAMS = {"rd", "rmdir", "del", "erase", "remove-item", "ri"}
 WINDOWS_MOVE_PROGRAMS = {"move", "ren", "rename", "move-item", "mi", "rename-item", "rni"}
@@ -408,6 +713,7 @@ CWD_SUBSTITUTION_RE = re.compile(
 )
 HOME_VAR_RE = re.compile(r"\$\{HOME\}|\$HOME(?![A-Za-z0-9_])")
 PATH_SUBSTITUTION_RE = re.compile(r"\$\(([^()\n]*)\)(?=/)|`([^`\n]*)`(?=/)")
+COMMAND_SUBSTITUTION_RE = re.compile(r"\$\(([^()\n]*)\)|`([^`\n]*)`")
 FIND_DELETE_ACTIONS = {"-delete"}
 FIND_OUTPUT_ACTIONS = {"-fprint", "-fprint0", "-fprintf", "-fls"}
 FIND_EXEC_ACTIONS = {"-exec", "-execdir", "-ok", "-okdir"}
@@ -420,7 +726,8 @@ PIPE_TO_CODE_INTERPRETER_RE = re.compile(
     r"^[^|;&\n]*\|\s*(?:python[0-9.]*|node)\b(?!\s+[^\s|;&-][^\s|;&]*\.(?:py|js)\b)", re.IGNORECASE)
 HARNESS_PATH_CMD_RE = re.compile(
     r"scripts[\\/]+hooks[\\/]|\.agents[\\/]+hooks\.json|dossier_provenance\.py|record_evaluation\.py|"
-    r"\.agents[\\/]+agents[\\/]|\.claude[\\/]+agents[\\/]|\.claude[\\/]+settings|config[\\/]+user_profile\.json",
+    r"\.agents[\\/]+agents[\\/]|\.claude[\\/]+agents[\\/]|\.claude[\\/]+settings|config[\\/]+user_profile\.json|"
+    r"scripts[\\/]+report_issue\.sh",
     re.IGNORECASE,
 )
 INLINE_WRITE_MARKERS_RE = re.compile(
@@ -432,26 +739,40 @@ INLINE_WRITE_MARKERS_RE = re.compile(
     r"writeFileSync|writeFile\s*\(|unlinkSync|rmSync|openSync|"
     r"(?:\bfs|require\s*\(\s*['\"](?:node:)?fs(?:/promises)?['\"]\s*\))\.(?:rm|rmdir|write\w*|open\w*)\s*\(|"
     r"\b(?:rm|rmdir|rmdirSync|writeSync)\s*\(|"
-    r"\b(?:appendFile|copyFile|rename|symlink|truncate|cp)(?:Sync)?\s*\(|createWriteStream",
+    r"\b(?:appendFile|copyFile|rename|symlink|truncate|cp)(?:Sync)?\s*\(|createWriteStream|"
+    # Perl (File::Path, bareword list operators) and Ruby (FileUtils, File, Dir)
+    r"\bremove_tree\b|\brmtree\b|\brename\b|\bunlink\b|\bremove_entry\b|\bremove_dir\b|"
+    r"\bFileUtils\.\w+|\bFile\.(?:delete|rename|unlink)\b|\bDir\.(?:rmdir|delete|unlink)\b",
     re.IGNORECASE,
 )
 # Inline code acting on the logs/ directory itself (shutil.rmtree('logs'), fs.rmSync('logs', {recursive: true})):
 # the destructive markers apply to a 'logs' string literal (or a logs/ glob reaching a protected file); the strong
 # markers also apply to literals naming an ancestor of logs/ ('.', '..', '/', the repo root) or a glob ('*', 'log*').
-INLINE_STRING_LITERAL_RE = re.compile(r"(['\"])([^'\"\s]+)\1")
+INLINE_STRING_LITERAL_RE = re.compile(r"(['\"])([^'\"\s]*)\1")
 INLINE_LOGS_DIR_MARKERS_RE = re.compile(
-    r"rmtree|removedirs|\brename\w*\s*\(|\.replace\s*\(|\bremove\s*\(|unlink|\brm(?:dir)?(?:Sync)?\s*\(|rmSync|"
-    r"symlink|\.(?:hardlink|symlink)_to\s*\(|\blink(?:Sync)?\s*\(|shutil\.(?:move|copytree)|\bcp(?:Sync)?\s*\(|copyFile",
+    r"rmtree|removedirs|remove_tree|\brename\w*\s*\(|\brename\b|\.replace\s*\(|\bremove\s*\(|unlink|"
+    r"\brm(?:dir)?(?:Sync)?\s*\(|rmSync|symlink|\.(?:hardlink|symlink)_to\s*\(|\blink(?:Sync)?\s*\(|"
+    r"shutil\.(?:move|copytree)|\bcp(?:Sync)?\s*\(|copyFile|"
+    r"\bFileUtils\.\w+|\bFile\.(?:delete|rename)\b|\bDir\.(?:rmdir|delete)\b|\bremove_entry\b|\bremove_dir\b",
     re.IGNORECASE,
 )
+# Inline-code calls that hand a string to a shell (their string literals are judged as nested command lines)
+INLINE_SHELL_CALL_RE = re.compile(
+    r"(?:\b(?:os\.)?(?:system|popen[234]?|spawn[lvpe]*|exec[lvpe]+|posix_spawnp?|getoutput|getstatusoutput)|"
+    r"\bsubprocess\.\w+|\b(?:check_output|check_call|Popen|execSync|execFileSync|spawnSync|execFile|exec|spawn)|"
+    r"\bIO\.popen|\bOpen3\.\w+)\s*[(\[{]?",
+    re.IGNORECASE,
+)
+INLINE_QX_RE = re.compile(r"(?:%x|\bqx)\s*([({\[/|!])(.*?)[)}\]/|!]", re.DOTALL)
 INLINE_ANCESTOR_MARKERS_RE = re.compile(
-    r"rmtree|removedirs|rmSync|\brm\s*\([^)]*recursive|shutil\.move|\brename(?:s|Sync)?\s*\(", re.IGNORECASE
+    r"rmtree|removedirs|remove_tree|rmSync|\brm\s*\([^)]*recursive|shutil\.move|\brename(?:s|Sync)?\s*\(|\brename\b|"
+    r"\bFileUtils\.(?:rm_rf|rm_r|remove_dir|remove_entry|mv)\b", re.IGNORECASE
 )
 
 # File-tool targets
 HARNESS_FILES = {
     ".agents/hooks.json", "scripts/utils/dossier_provenance.py", "scripts/record_evaluation.py",
-    ".claude/settings.json", ".claude/settings.local.json", "config/user_profile.json",
+    ".claude/settings.json", ".claude/settings.local.json", "config/user_profile.json", "scripts/report_issue.sh",
 }
 HARNESS_DIRS = ("scripts/hooks/", ".agents/agents/", ".claude/agents/")
 BRAIN_PATH_RE = re.compile(r"(?:^|/)\.gemini/[^/]+/brain(?:/|$)", re.IGNORECASE)
@@ -982,6 +1303,43 @@ def check_leverage_gate(symbol: str, requested_leverage: int, base_dir: str, use
 # =============================================================================
 # Shell command analysis
 # =============================================================================
+class AuditBudgetExceeded(Exception):
+    """The ground-truth analysis of one hook evaluation exceeded AUDIT_MAX_SUBCOMMANDS or AUDIT_DEADLINE_SECONDS."""
+
+
+# One audit scope per hook evaluation (shared by every analyze_run_command call, nested line, script and cwd
+# candidate): sub-command counter, monotonic deadline and the memo of judged lines / scripts.
+_AUDIT: Dict[str, Any] = {"active": 0, "count": 0, "deadline": 0.0, "memo": {}}
+AUDIT_BUDGET_REASON = (
+    "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Ground Truth Protection): the command is too complex to audit (more than "
+    f"{AUDIT_MAX_SUBCOMMANDS} sub-command analyses or {AUDIT_DEADLINE_SECONDS:g}s of nested commands, scripts and "
+    "working directories). Split it into simpler commands."
+)
+
+
+@contextlib.contextmanager
+def _audit_scope():
+    """Opens the audit scope of a hook evaluation (re-entrant: an inner scope shares the outer budget)."""
+    if not _AUDIT["active"]:
+        _AUDIT.update(count=0, deadline=time.monotonic() + AUDIT_DEADLINE_SECONDS, memo={})
+    _AUDIT["active"] += 1
+    try:
+        yield
+    finally:
+        _AUDIT["active"] -= 1
+        if not _AUDIT["active"]:
+            _AUDIT["memo"] = {}
+
+
+def _audit_tick() -> None:
+    """Counts one sub-command analysis; raises AuditBudgetExceeded past the budget (callers deny: fail closed)."""
+    if not _AUDIT["active"]:
+        return
+    _AUDIT["count"] += 1
+    if _AUDIT["count"] > AUDIT_MAX_SUBCOMMANDS or time.monotonic() > _AUDIT["deadline"]:
+        raise AuditBudgetExceeded()
+
+
 def _split_operators(tok: str) -> List[str]:
     """Splits a shlex punctuation run into bash operators: ')>' -> ')', '>'; ';>' -> ';', '>'; '&&\\n' -> '&&', '\\n'."""
     if not tok or any(c not in SHELL_PUNCTUATION for c in tok):
@@ -995,19 +1353,136 @@ def _split_operators(tok: str) -> List[str]:
     return out
 
 
+def _shlex_tokens(text: str) -> List[str]:
+    lexer = shlex.shlex(text, posix=True, punctuation_chars=SHELL_PUNCTUATION)
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    return [part for tok in lexer for part in _split_operators(tok)]
+
+
+def _protect_quoted_newlines(command_line: str) -> str:
+    """Replaces only the line breaks lying INSIDE a '...' / "..." string by QUOTED_NEWLINE_SENTINEL, tracking bash
+    quote state: inside '...' a backslash is literal; outside quotes and inside "..." it escapes the next character
+    (an unquoted backslash-newline is left to the tokenizer); a comment (# at word start, outside quotes) runs to
+    the end of its line and never opens a quote. A line break between a closing quote and the next line's opening
+    quote stays a command separator. When the scan ends inside an open quote (an apostrophe in a heredoc body or a
+    comment, unbalanced text) nothing is replaced: over-splitting is the fail-safe direction."""
+    if "\n" not in command_line:
+        return command_line
+    out: List[str] = []
+    quote = ""
+    word_start = True
+    i, n = 0, len(command_line)
+    while i < n:
+        c = command_line[i]
+        if quote:
+            if c == "\\" and quote == '"' and i + 1 < n:
+                nxt = command_line[i + 1]
+                out.append(c + (QUOTED_NEWLINE_SENTINEL if nxt == "\n" else nxt))
+                i += 2
+                continue
+            if c == quote:
+                quote = ""
+            out.append(QUOTED_NEWLINE_SENTINEL if c == "\n" else c)
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            out.append(command_line[i:i + 2])
+            word_start = False
+            i += 2
+            continue
+        if c == "#" and word_start:
+            end = command_line.find("\n", i)
+            end = n if end < 0 else end
+            out.append(command_line[i:end])
+            i = end
+            continue
+        if c in "'\"":
+            quote = c
+        out.append(c)
+        word_start = c in WORD_BOUNDARY_CHARS
+        i += 1
+    return command_line if quote else "".join(out)
+
+
+def _has_unquoted_comment(command_line: str) -> bool:
+    """True when the text has a bash comment: '#' at the start of a word, outside '...' / "..." (same quote and
+    escape rules as _protect_quoted_newlines)."""
+    quote = ""
+    word_start = True
+    i, n = 0, len(command_line)
+    while i < n:
+        c = command_line[i]
+        if quote:
+            if c == "\\" and quote == '"':
+                i += 2
+                continue
+            if c == quote:
+                quote = ""
+            i += 1
+            continue
+        if c == "\\":
+            word_start = False
+            i += 2
+            continue
+        if c == "#" and word_start:
+            return True
+        if c in "'\"":
+            quote = c
+        word_start = c in WORD_BOUNDARY_CHARS
+        i += 1
+    return False
+
+
+def _auto_allow_blocker(command_line: str) -> Optional[str]:
+    """Why a command may not be auto-allowed (None when it may): it spans several lines, has a comment, a heredoc /
+    here-string, an ANSI-C $'...' string or a command substitution, or a token holds a line break. The analysis of
+    such text can miss a command, so an "allow" becomes "ask" (never a denial on its own)."""
+    text = command_line.rstrip()
+    if "\n" in text or "\r" in text:
+        return "it spans several lines"
+    for marker, label in AUTO_ALLOW_BLOCKERS:
+        if marker in text:
+            return f"it contains {label}"
+    if _has_unquoted_comment(text):
+        return "it contains a # comment"
+    if any("\n" in t or "\r" in t or QUOTED_NEWLINE_SENTINEL in t for t in _tokenize(text)):
+        return "an argument holds a line break"
+    return None
+
+
 def _tokenize(command_line: str) -> List[str]:
+    """Quote-aware tokens (shell operators split off). When the whole text does not parse (an apostrophe in a
+    heredoc body or a comment), each line is tokenized on its own and only the lines that still fail fall back to a
+    whitespace / operator split with their quote characters stripped. Line breaks inside quotes are still
+    QUOTED_NEWLINE_SENTINEL here, so a quoted line break ('<LF>') is never taken for a "\\n" command separator:
+    split on SHELL_SEPARATORS first, then pass every kept token through _restore_quoted_newline."""
+    command_line = _protect_quoted_newlines(command_line)
     try:
-        lexer = shlex.shlex(command_line, posix=True, punctuation_chars=SHELL_PUNCTUATION)
-        lexer.whitespace = " \t\r"
-        lexer.whitespace_split = True
-        lexer.commenters = ""
-        return [part for tok in lexer for part in _split_operators(tok)]
+        return _shlex_tokens(command_line)
     except Exception:
-        return re.split(r"\s+|(?=[;&|<>\n])|(?<=[;&|<>\n])", command_line)
+        out: List[str] = []
+        for n, line in enumerate(command_line.split("\n")):
+            if n:
+                out.append("\n")
+            try:
+                out += _shlex_tokens(line)
+            except Exception:
+                out += [t.strip("'\"") for t in re.split(r"\s+|(?=[;&|<>])|(?<=[;&|<>])", line)]
+        return out
+
+
+def _restore_quoted_newline(tok: str) -> str:
+    """Turns QUOTED_NEWLINE_SENTINEL back into the line break it stands for, as bash would pass it: nested command
+    strings (bash -c, eval, here-strings) are judged with their real lines and a lone quoted line break
+    (eval '<LF>' rm -rf logs) is an argument holding a real newline, never the sentinel."""
+    return tok.replace(QUOTED_NEWLINE_SENTINEL, "\n")
 
 
 def split_subcommands(command_line: str) -> List[List[str]]:
-    """Quote-aware split of compound shell commands (&&, ||, ;, |, &, newlines)."""
+    """Quote-aware split of compound shell commands (&&, ||, ;, |, &, newlines). A quoted line break stays inside
+    its sub-command as an argument holding a real newline."""
     subcommands: List[List[str]] = []
     current: List[str] = []
     for tok in _tokenize(command_line):
@@ -1018,7 +1493,7 @@ def split_subcommands(command_line: str) -> List[List[str]]:
                 subcommands.append(current)
                 current = []
         else:
-            current.append(tok)
+            current.append(_restore_quoted_newline(tok))
     if current:
         subcommands.append(current)
     return subcommands
@@ -1029,23 +1504,158 @@ def _tokenize_subcommand(cmd: str) -> List[str]:
     return [t for s in subs for t in s]
 
 
-def _program_index(tokens: List[str]) -> int:
-    """Index of the executed program, skipping VAR=value assignments and wrappers (env, nohup, timeout...)."""
-    i = 0
-    while i < len(tokens):
-        tok = tokens[i]
-        base = os.path.basename(tok).lower()
-        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tok):
+def _resolve_long(name: str, options: Dict[str, Any]) -> Optional[str]:
+    """getopt_long / git parse-options matching: the exact option name or its unique prefix; None when unknown or
+    ambiguous (the program would then reject it)."""
+    if name in options:
+        return name
+    candidates = [o for o in options if o.startswith(name)] if name else []
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _wrapper_options(name: str, tokens: List[str], i: int, info: Dict[str, Any]) -> int:
+    """Walks the options (and positional operands) of wrapper `name` from tokens[i]; returns the index after them.
+    Records env -C / sudo -D directories, time -o files, env -S / flock -c command strings."""
+    short_values, long_options, positionals = WRAPPER_SPECS[name]
+    n = len(tokens)
+    while i < n:
+        a = tokens[i]
+        if a == "--":
             i += 1
-        elif base in COMMAND_WRAPPERS or base == "timeout" or base == "xargs":
+            break
+        if a == "-" and name == "env":  # env - = env -i
             i += 1
-            while i < len(tokens) and (tokens[i].startswith("-") or re.match(r"^\d+[smhd]?$", tokens[i])):
-                i += 1
-        elif base == "uv" and i + 1 < len(tokens) and tokens[i + 1] == "run":
-            i += 2
+            continue
+        if not a.startswith("-") or a == "-":
+            break
+        i += 1
+        if a.startswith("--"):
+            opt, eq, value = a[2:].partition("=")
+            key = _resolve_long(opt, long_options) or opt
+            if long_options.get(key) is True and not eq and i < n:
+                value, i = tokens[i], i + 1
         else:
-            return i
-    return len(tokens)
+            key, value = "", None
+            for k, ch in enumerate(a[1:]):
+                if ch in short_values:
+                    key, value = ch, a[k + 2:]
+                    if not value and i < n:
+                        value, i = tokens[i], i + 1
+                    break
+        if key in ("C", "chdir") and name == "env" or key in ("D", "chdir") and name == "sudo":
+            info["chdirs"].append(value or "")
+        elif key in ("R", "chroot") and name == "sudo":
+            info["chdirs"].append(UNKNOWN_VALUE)  # paths now resolve inside another root
+        elif key in ("o", "output") and name == "time":
+            info["outputs"].append(value or "")
+        elif key in ("c", "command") and name == "flock":
+            info["nested"].append(value or "")
+        elif key in ("S", "split-string") and name == "env":
+            # env -S 'X=1 cmd args' [more args]: the string is split into the command line it runs
+            info["nested"].append(" ".join([value or ""] + [shlex.quote(t) for t in tokens[i:]]))
+            return n
+    i += min(positionals, n - i)
+    if name == "flock" and i < n and (tokens[i] in ("-c", "--command") or tokens[i].startswith("--command=")):
+        a = tokens[i]  # flock FILE -c 'cmd'
+        info["nested"].append(a.split("=", 1)[1] if "=" in a else (tokens[i + 1] if i + 1 < n else ""))
+        return n
+    return i
+
+
+def _xargs_options(tokens: List[str], i: int, info: Dict[str, Any]) -> int:
+    """Walks xargs options from tokens[i] (GNU findutils: -I R, -i[R], -n N, -P N, -d C, -0, -a FILE, --replace=R
+    ...); records them in info["xargs"] = {arg_file, delimiter, replace, cmd_index}; returns the command index."""
+    x: Dict[str, Any] = {"arg_file": False, "delimiter": False, "replace": None, "cmd_index": i}
+    n = len(tokens)
+    while i < n:
+        a = tokens[i]
+        if a == "--":
+            i += 1
+            break
+        if not a.startswith("-") or a == "-":
+            break
+        i += 1
+        if a.startswith("--"):
+            opt, eq, value = a[2:].partition("=")
+            key = _resolve_long(opt, XARGS_LONG_OPTIONS)
+            if XARGS_LONG_OPTIONS.get(key) is True and not eq and i < n:
+                value, i = tokens[i], i + 1
+            if key == "arg-file":
+                x["arg_file"] = True
+            elif key == "delimiter":
+                x["delimiter"] = True
+            elif key == "replace":
+                x["replace"] = value if eq else "{}"
+            continue
+        letters = a[1:]
+        for k, ch in enumerate(letters):
+            if ch in XARGS_VALUE_SHORT:
+                value = letters[k + 1:]
+                if not value and i < n:
+                    value, i = tokens[i], i + 1
+                if ch == "a":
+                    x["arg_file"] = True
+                elif ch == "d":
+                    x["delimiter"] = True
+                elif ch == "I":
+                    x["replace"] = value
+                break
+            if ch in XARGS_OPTIONAL_SHORT:
+                if ch == "i":
+                    x["replace"] = letters[k + 1:] or "{}"
+                break
+    x["cmd_index"] = i
+    info["xargs"] = x
+    return i
+
+
+def _command_start(tokens: List[str]) -> Tuple[int, Dict[str, Any]]:
+    """Cached _command_start_uncached (a command line re-judges the same sub-commands for every possible cwd and
+    nesting level). Callers must not mutate the returned info."""
+    return _command_start_cached(tuple(tokens))
+
+
+@functools.lru_cache(maxsize=4096)
+def _command_start_cached(tokens: Tuple[str, ...]) -> Tuple[int, Dict[str, Any]]:
+    return _command_start_uncached(list(tokens))
+
+
+def _command_start_uncached(tokens: List[str]) -> Tuple[int, Dict[str, Any]]:
+    """(index of the executed program, prefix info). Skips VAR=value / VAR+=value assignments, shell keywords
+    (if / then / do / { / !), `uv run` and wrappers with their options and operands (env -u X -C dir -S str,
+    sudo -u user -D dir, timeout -s SIG 5, nice -n 10, stdbuf -oL, time -o file, flock file, xargs -I {} -n 1 ...).
+    info = {assigns: [(var, value)] (VAR+=v is recorded as ${VAR}v), chdirs, outputs, nested, wrappers,
+    xargs: {arg_file, delimiter, replace, cmd_index} | None}."""
+    info: Dict[str, Any] = {"assigns": [], "chdirs": [], "outputs": [], "nested": [], "wrappers": [], "xargs": None}
+    i, n = 0, len(tokens)
+    while i < n:
+        tok = tokens[i]
+        m = ENV_ASSIGN_RE.match(tok)
+        if m:
+            info["assigns"].append((m.group(1), ("${" + m.group(1) + "}" if m.group(2) else "") + m.group(3)))
+            i += 1
+            continue
+        if tok in SHELL_PREFIX_KEYWORDS:
+            i += 1
+            continue
+        base = os.path.basename(tok).lower()
+        if base == "uv" and i + 1 < n and tokens[i + 1] == "run":
+            i += 2
+        elif base == "xargs":
+            info["wrappers"].append("xargs")
+            i = _xargs_options(tokens, i + 1, info)
+        elif base in WRAPPER_SPECS:
+            info["wrappers"].append(base)
+            i = _wrapper_options(base, tokens, i + 1, info)
+        else:
+            return i, info
+    return n, info
+
+
+def _program_index(tokens: List[str]) -> int:
+    """Index of the executed program, skipping VAR=value assignments, shell keywords and wrappers (env, nohup,
+    timeout, sudo, xargs ... with their options)."""
+    return _command_start(tokens)[0]
 
 
 def _program(tokens: List[str]) -> str:
@@ -1061,12 +1671,51 @@ def _symbol_count(text: str) -> int:
     return len({m.group(2).upper() for m in re.finditer(r"--symbol(?:\s+|=)(['\"]?)([A-Za-z0-9_]+)\1", text)})
 
 
+def _executed_script(tokens: List[str]) -> str:
+    """Script operand actually run by a sub-command: the program itself (./close_position.py) or the first operand
+    of a python interpreter (python3 -u scripts/x.py), also through wsl.exe [-d X] [--cd X] [-u X] [--|-e] cmd...;
+    "" for python -c / -m / stdin."""
+    idx = _program_index(tokens)
+    n = len(tokens)
+    if idx >= n:
+        return ""
+    program = os.path.basename(tokens[idx]).lower()
+    if re.sub(r"\.exe$", "", program) == "wsl":
+        linux_command = _wsl_command(tokens[idx + 1:])
+        return _executed_script(linux_command) if linux_command else tokens[idx]
+    if not PYTHON_PROGRAM_RE.match(program):
+        return tokens[idx]
+    i = idx + 1
+    while i < n:
+        tok = tokens[i]
+        if tok == "--":
+            return tokens[i + 1] if i + 1 < n else ""
+        if tok == "-":
+            return ""
+        if not tok.startswith("-"):
+            return tok
+        i += 1
+        if tok.startswith("--"):
+            if tok in PYTHON_LONG_VALUE_OPTIONS:
+                i += 1
+            continue
+        letters = tok[1:]
+        for k, ch in enumerate(letters):
+            if ch in "cm":
+                return ""
+            if ch in "WX":
+                if k == len(letters) - 1:
+                    i += 1
+                break
+    return ""
+
+
 def _subcommand_is_risk_reducing(tokens: List[str], text: str) -> bool:
     if not tokens:
         return False
     if DEPLOY_BATCH_RE.search(text):
         return False
-    if RISK_REDUCING_SCRIPTS_RE.search(text):
+    if RISK_REDUCING_SCRIPTS_RE.fullmatch(_executed_script(tokens).replace("\\", "/").rsplit("/", 1)[-1]):
         return True
     flags = _flags(tokens)
     if GUARDIAN_LOOP_RE.search(text) and not TRADE_ENGINE_RE.search(text):
@@ -1087,9 +1736,12 @@ def _is_redirect(tok: str) -> bool:
 
 
 def _redirect_targets(tokens: List[str]) -> List[str]:
+    """Files written by output redirects (> f, >> f, &> f, 1<> f); fd duplications (2>&1, >&-) are not files."""
     targets = []
     for i, tok in enumerate(tokens):
         if _is_redirect(tok) and i + 1 < len(tokens):
+            if tok.endswith(">&") and (tokens[i + 1].isdigit() or tokens[i + 1] == "-"):
+                continue
             targets.append(tokens[i + 1])
     return targets
 
@@ -1167,10 +1819,19 @@ def _glob_ground_truth(word: str) -> List[str]:
     return hits
 
 
+def _windows_form(word: str) -> bool:
+    """A path spelled in Windows form (C:\\x, C:/x, \\\\server\\share) or a drive mount (/mnt/c/x, Git Bash /c/x)."""
+    return bool(WINDOWS_FORM_PATH_RE.match((word or "").replace("\\", "/")))
+
+
 def _is_logs_dir(word: str, cwd: str = "", base_dir: str = "") -> bool:
-    """True when a word (braces expanded) names a `logs` directory: last component `logs` (logs, ./logs/,
-    /abs/repo/logs) or a glob that can expand to it (log*, lo[g]s, *). A glob with a directory part (build/*) only
-    counts when it can expand to the workspace logs/ (resolved against cwd / base_dir)."""
+    """True when a word (braces expanded) names a `logs` directory: ANY path whose last component is `logs`
+    (logs, ./logs/, ./x/../logs, /abs/repo/logs, /tmp/other/logs, build/logs, C:\\...\\logs, /mnt/c/.../logs,
+    /proc/self/cwd/logs): symlinks (/tmp/r -> repo), /proc/<pid>/cwd, junctions and 8.3 names alias the workspace
+    logs/ in ways the hook cannot resolve, so every directory named logs counts. A glob that can expand to logs
+    (log*, lo[g]s, *) is resolved against the tracked cwd and the workspace root; when it cannot be resolved (no
+    base_dir, a leading ~, a run-time value) it fails safe (True)."""
+    logs = _canon_path(base_dir).rstrip("/") + "/logs" if base_dir else ""
     for expanded in _expand_braces(word or ""):
         sp = _shell_path(expanded)
         head, _, last = sp.rpartition("/")
@@ -1179,12 +1840,22 @@ def _is_logs_dir(word: str, cwd: str = "", base_dir: str = "") -> bool:
             return True
         if not (SHELL_GLOB_RE.search(last) and fnmatch.fnmatchcase("logs", last)):
             continue
-        if not head or not base_dir or head.startswith("~"):
-            return True
-        logs = _canon_path(base_dir).rstrip("/") + "/logs"
+        if not base_dir or sp.startswith("~") or _unresolved(sp):
+            return True  # cannot resolve the glob ($X/lo*, ~/lo*): fail safe
         if fnmatch.fnmatchcase(logs, _canon_path(sp, cwd or base_dir)):
             return True
     return False
+
+
+# /proc/<pid>/cwd, /proc/<pid>/root, /proc/<pid>/fd (also via task/<tid>) and /dev/fd resolve against the process
+# that runs the command, not the hook: a path through them is unresolvable (an unknown cwd / ancestor of logs/).
+PROC_ALIAS_RE = re.compile(r"^(?:/proc/[^/]+/(?:task/[^/]+/)?(?:cwd|root|fd)|/dev/fd)(?:/|$)")
+
+
+def _proc_alias(word: str) -> bool:
+    """A path through /proc/<pid>/{cwd,root,fd} or /dev/fd (raw with repeated slashes / ./ squeezed, or normalised)."""
+    raw = re.sub(r"/(?:\./)+", "/", re.sub(r"/+", "/", (word or "").replace("\\", "/")))
+    return any(PROC_ALIAS_RE.match(p) for p in (raw, _shell_path(word or "")))
 
 
 def _word_value(word: str) -> str:
@@ -1205,7 +1876,8 @@ def _canon_path(path: str, cwd: str = "") -> str:
 
 
 def _reaches_logs_dir(word: str, cwd: str, base_dir: str) -> bool:
-    """True when a word (braces/globs expanded) is the logs dir or one of its ancestors (., .., /, ~, the repo...)."""
+    """True when a word (braces/globs expanded) is the logs dir or one of its ancestors (., .., /, ~, the repo...),
+    or a path through /proc/<pid>/cwd|root|fd or /dev/fd (unresolvable: counts as an ancestor)."""
     logs = _canon_path(base_dir).rstrip("/") + "/logs" if base_dir else "/logs"
     ancestors = [logs]
     while ancestors[-1] != "/":
@@ -1213,7 +1885,7 @@ def _reaches_logs_dir(word: str, cwd: str, base_dir: str) -> bool:
     for expanded in _expand_braces(word or ""):
         if not expanded:
             continue
-        if _is_logs_dir(expanded, cwd, base_dir):
+        if _is_logs_dir(expanded, cwd, base_dir) or _proc_alias(expanded):
             return True
         sp = _shell_path(expanded)
         if sp in (".", "..", "/", "~") or sp.endswith("/.."):
@@ -1391,6 +2063,8 @@ def _ground_truth_read_only(prog: str, args: List[str], assigned: bool = False,
         return True
     if prog == "find":
         return True  # judged by _find_ground_truth (destructive actions, -fprint outputs, -exec commands)
+    if prog in ("for", "select", "case"):
+        return True  # `for f in logs/*`: the word list is only expanded; the loop variable is a run-time value
     if prog == "git":
         # commit messages, greps and diffs may name them
         return _git_subcommand(args)[0] in GIT_READ_SUBCOMMANDS and not _git_runs_commands(args)
@@ -1421,6 +2095,256 @@ def _git_subcommand(args: List[str]) -> Tuple[str, List[str]]:
     return (args[i].lower(), args[i + 1:]) if i < len(args) else ("", [])
 
 
+def _git_c_dir(args: List[str]) -> str:
+    """The relative directory `git -C <dir>` changes the base to (cumulative), used to resolve operands against
+    logs/ (git -C logs grep -O x -- '*.json' searches inside logs/)."""
+    dirs: List[str] = []
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        if args[i] == "-C" and i + 1 < len(args):
+            dirs.append(args[i + 1])
+            i += 2
+        else:
+            i += 2 if args[i] in GIT_GLOBAL_VALUE_OPTIONS else 1
+    return "/".join(dirs)
+
+
+def _git_work_trees(args: List[str]) -> List[str]:
+    """Values of git's global --work-tree option (--work-tree=dir / --work-tree dir)."""
+    out: List[str] = []
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        a = args[i]
+        if a.startswith("--work-tree="):
+            out.append(a.split("=", 1)[1])
+        elif a == "--work-tree" and i + 1 < len(args):
+            out.append(args[i + 1])
+        i += 2 if a in GIT_GLOBAL_VALUE_OPTIONS else 1
+    return out
+
+
+def _git_base_dir_write(args: List[str], cwd: str, base_dir: str, strict: bool) -> bool:
+    """A git sub-command that can write the work tree (anything outside GIT_READ_SUBCOMMANDS) run with `-C <dir>` or
+    `--work-tree <dir>` inside logs/ (git -C logs checkout ., git --work-tree=logs checkout HEAD -- .) or, strict,
+    an unresolved directory (git -C "$D" clean -fdx)."""
+    sub, _ = _git_subcommand(args)
+    if not sub or sub in GIT_READ_SUBCOMMANDS:
+        return False
+    cdir = _git_c_dir(args)
+    for d in ([cdir] if cdir else []) + [_join_cwd(cdir, w) if cdir else w for w in _git_work_trees(args)]:
+        if _unresolved(d):
+            if strict:
+                return True
+            continue
+        if _is_logs_dir(d, cwd, base_dir) or _cwd_in_logs(_join_cwd(cwd, d), base_dir):
+            return True
+    return False
+
+
+def _pager_value_allowed(value: str) -> bool:
+    """A pager command (GIT_PAGER / PAGER / MANPAGER, core.pager, pager.<cmd>) that cannot write or run anything:
+    empty, or cat / less / more (bare or in /bin, /usr/bin) with read-only flags only (no +cmd, -o / -O / -k,
+    --log-file)."""
+    if not value.strip():
+        return True
+    try:
+        words = shlex.split(value)
+    except ValueError:
+        return False
+    prog = words[0]
+    if not (prog in PAGER_PROGRAMS or any(prog == d + p for d in SYSTEM_BIN_DIRS for p in PAGER_PROGRAMS)):
+        return False
+    return _less_flags_allowed(words[1:])
+
+
+def _less_flags_allowed(words: List[str]) -> bool:
+    """Only flags, none of which runs a command or writes a file (+cmd, -o / -O log file, -k lesskey, --log-file)."""
+    for w in words:
+        if not w.startswith("-") or w.lower().startswith(("--log-file", "--lesskey")):
+            return False
+        if not w.startswith("--") and re.search(r"[oOk]", w[1:]):
+            return False
+    return True
+
+
+def _editor_value_allowed(value: str) -> bool:
+    """An editor command (EDITOR / VISUAL / GIT_EDITOR / GIT_SEQUENCE_EDITOR, core.editor, sequence.editor) that
+    edits nothing: true, :, cat."""
+    v = value.strip()
+    return v in EDITOR_VALUES or any(v == d + e for d in SYSTEM_BIN_DIRS for e in ("true", "cat"))
+
+
+def _literal(value: Optional[str]) -> bool:
+    return value is not None and not _unresolved(value)
+
+
+def _env_assignment_denied(var: str, value: Optional[str], prog: str, prog_token: str, wrappers: List[str]) -> bool:
+    """Whether assigning env var `var` (value None = unknown) for program `prog` opens a command / config channel:
+    injection vars and command channels (ENV_DENY_OUTRIGHT, GIT_CONFIG_KEY_*) always; ENV / BASH_ENV when the
+    program is a shell, env, a script run by path, or nothing (standalone / export: it outlives the sub-command);
+    pager / editor vars and LESS unless their value is an allowlisted literal."""
+    if var in ENV_DENY_OUTRIGHT or var.startswith(ENV_DENY_PREFIXES):
+        return True
+    if var in ENV_STARTUP_VARS:
+        return (not prog or prog in ASSIGNING_BUILTINS or prog in SHELL_INTERPRETERS or prog == "env"
+                or "env" in wrappers or "/" in prog_token.replace("\\", "/"))
+    if var in ENV_PAGER_VARS:
+        return not (_literal(value) and _pager_value_allowed(value))
+    if var in ENV_EDITOR_VARS:
+        return not (_literal(value) and _editor_value_allowed(value))
+    if var == "LESS":  # options less reads from the environment (LESS=FRX, LESS=-R)
+        return not (_literal(value) and _less_flags_allowed(
+            [w if w.startswith(("-", "+")) else "-" + w for w in value.split()]))
+    return False
+
+
+def _declared_assignments(prog: str, args: List[str]) -> List[Tuple[str, Optional[str]]]:
+    """Variables a builtin assigns: export / declare / typeset / local / readonly NAME=value (NAME+=value as
+    ${NAME}value; a bare NAME keeps its value: None; declare -n ref=NAME aliases NAME: unknown), and read NAME,
+    printf -v NAME, mapfile NAME, getopts spec NAME, for / select NAME (values only known at run time)."""
+    out: List[Tuple[str, Optional[str]]] = []
+    if prog in DECLARE_BUILTINS:
+        nameref = any(re.match(r"^-[A-Za-z]*n", a) for a in args)
+        for a in args:
+            m = ENV_ASSIGN_RE.match(a)
+            if m:
+                out.append((m.group(1), ("${" + m.group(1) + "}" if m.group(2) else "") + m.group(3)))
+                if nameref:
+                    out.append((m.group(3), UNKNOWN_VALUE))
+            elif re.match(r"^[A-Za-z_]\w*$", a):
+                out.append((a, None))
+        return out
+    names: List[str] = []
+    if prog == "read":
+        skip = False
+        for j, a in enumerate(args):
+            if skip:
+                skip = False
+            elif re.match(r"^-[A-Za-z]*[adinNptu]$", a):
+                skip = True
+                if a.endswith("a") and j + 1 < len(args):
+                    names.append(args[j + 1])
+            elif not a.startswith("-"):
+                names.append(a)
+        names = names or ["REPLY"]
+    elif prog == "printf":
+        names = [args[j + 1] for j, a in enumerate(args[:-1]) if a == "-v"]
+    elif prog in ("mapfile", "readarray"):
+        positional = [a for a in args if not a.startswith("-")]
+        names = positional[-1:] or ["MAPFILE"]
+    elif prog == "getopts":
+        names = args[1:2]
+    elif prog in ("for", "select"):
+        names = args[:1]
+    elif prog == "unset":
+        names = [a for a in args if not a.startswith("-")]
+        return [(n, "") for n in names]
+    return [(n, UNKNOWN_VALUE) for n in names if re.match(r"^[A-Za-z_]\w*$", n)]
+
+
+def _git_key_value_denied(key: str, value: Optional[str]) -> bool:
+    """A git config key / value that runs a command or points git at code / config: dangerous keys are denied,
+    except pager keys with an allowlisted pager (or a boolean for pager.<cmd>), editor keys with true / : / cat and
+    protocol[.<name>].allow with never."""
+    if not GIT_CONFIG_DANGEROUS_RE.match(key or ""):
+        return False
+    if GIT_CONFIG_PAGER_KEY_RE.match(key):
+        return not (_literal(value) and (value.strip().lower() in GIT_BOOLEAN_VALUES or _pager_value_allowed(value)))
+    if GIT_CONFIG_EDITOR_KEY_RE.match(key):
+        return not (_literal(value) and _editor_value_allowed(value))
+    if GIT_CONFIG_PROTOCOL_KEY_RE.match(key):
+        return not (_literal(value) and value.strip().lower() == "never")
+    return True
+
+
+def _git_config_command_denied(rest: List[str]) -> bool:
+    """`git config ...` (options with values parsed: -f/--file, --blob, -t/--type, --default, --comment, --value,
+    --url; scopes; -z; --name-only; unique-prefix long options; get/set/unset/list/... sub-commands). A read only
+    with an explicit read action (--get*, -l/--list, get, list); edit / rename-section are denied; otherwise a
+    dangerous key (core.pager, alias.*, core.hooksPath ...) is denied unless its value is allowlisted."""
+    actions: set = set()
+    positionals: List[str] = []
+    skip = False
+    for j, a in enumerate(rest):
+        if skip:
+            skip = False
+            continue
+        if a == "--":
+            positionals += rest[j + 1:]
+            break
+        if a.startswith("--"):
+            opt, eq, _ = a[2:].partition("=")
+            key = _resolve_long(opt, GIT_CONFIG_LONG_OPTIONS)
+            if key is None and opt.startswith("no-"):
+                continue
+            if key is None:
+                actions.add("unknown")
+                continue
+            skip = GIT_CONFIG_LONG_OPTIONS[key] and not eq
+            actions.add(key)
+            continue
+        if a.startswith("-") and len(a) > 1:
+            for k, ch in enumerate(a[1:]):
+                if ch in GIT_CONFIG_VALUE_SHORT:
+                    skip = not a[k + 2:]
+                    break
+                if ch == "l":
+                    actions.add("list")
+                elif ch == "e":
+                    actions.add("edit")
+            continue
+        positionals.append(a)
+    if positionals and positionals[0].lower() in GIT_CONFIG_SUBCOMMANDS:
+        actions.add(positionals[0].lower())
+        positionals = positionals[1:]
+    if actions & GIT_CONFIG_READ_ACTIONS:
+        return False
+    if actions & {"edit", "rename-section"}:
+        return True
+    if not positionals:
+        return False
+    return _git_key_value_denied(positionals[0], positionals[1] if len(positionals) > 1 else None)
+
+
+def _git_config_denied(args: List[str]) -> bool:
+    """Git config that runs a command: `git -c key=value` / `--config-env=key=VAR` (hidden value: any dangerous
+    key) with a dangerous key, `git config` persisting one (see _git_config_command_denied), `git clone -c key=value`
+    and clone / init --template (hooks copied from a directory, like GIT_TEMPLATE_DIR)."""
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        a = args[i]
+        if a == "-c" and i + 1 < len(args):
+            key, eq, value = args[i + 1].partition("=")
+            if _git_key_value_denied(key, value if eq else None):
+                return True
+        elif a.startswith("--config-env"):
+            spec = a.split("=", 1)[1] if "=" in a else (args[i + 1] if i + 1 < len(args) else "")
+            if GIT_CONFIG_DANGEROUS_RE.match(spec.split("=", 1)[0]):
+                return True
+        i += 2 if a in GIT_GLOBAL_VALUE_OPTIONS else 1
+    sub, rest = _git_subcommand(args)
+    if sub == "config":
+        return _git_config_command_denied(rest)
+    if sub in ("clone", "init"):
+        for j, a in enumerate(rest):
+            opt = a[2:].split("=", 1)[0] if a.startswith("--") else ""
+            if opt and len(opt) >= 2 and "template".startswith(opt):
+                return True
+            if sub == "clone":
+                if a in ("-c", "--config") and j + 1 < len(rest):
+                    spec = rest[j + 1]
+                elif a.startswith("--config="):
+                    spec = a.split("=", 1)[1]
+                elif re.match(r"^-c.", a):
+                    spec = a[2:]
+                else:
+                    continue
+                key, eq, value = spec.partition("=")
+                if _git_key_value_denied(key, value if eq else None):
+                    return True
+    return False
+
+
 def _git_long_options(arg: str) -> List[str]:
     """GIT_RUN_LONG_OPTIONS an argument can select: the exact name, a longer spelling (--output-directory) or a
     unique-prefix abbreviation parse-options accepts (--op='cmd', --upl=cmd, --rece=, --exe=)."""
@@ -1432,10 +2356,47 @@ def _git_long_options(arg: str) -> List[str]:
             if name.startswith(o) or (len(name) >= shortest and o.startswith(name))]
 
 
+def _short_cluster_takes_next(letters: str, value_set: set) -> bool:
+    """True when a short-option cluster's trailing option takes the *next* token as its value (its value is not
+    glued): scanning left to right, stop at the first value-taking option; it consumes the next token only when it
+    is the last character of the cluster (-m 1), not when a value is glued to it (-m1, -tjson)."""
+    for i, c in enumerate(letters):
+        if c in value_set:
+            return not letters[i + 1:]
+    return False
+
+
+def _git_grep_cluster(arg: str) -> Dict[str, Any]:
+    """Parse a git grep short cluster honouring value-taking options: -eOrder = -e Order (the pattern), NOT -O;
+    -Orm / -nOrm = -O rm (open-files-in-pager). Returns {runs, pager, pattern, takes_next}."""
+    out = {"runs": False, "pager": None, "pattern": False, "takes_next": False}
+    if not re.match(r"^-[^-]", arg):
+        return out
+    letters = arg[1:]
+    i = 0
+    while i < len(letters):
+        c = letters[i]
+        if c == "O":                       # open-files-in-pager; the rest of the cluster is the pager (attached)
+            out["runs"] = True
+            if letters[i + 1:]:
+                out["pager"] = letters[i + 1:]
+            return out
+        if c in GIT_GREP_VALUE_SHORT:      # value-taking: the rest of the cluster is its value, stop scanning
+            if c in GIT_GREP_PATTERN_OPTS_SHORT:
+                out["pattern"] = True
+            out["takes_next"] = not letters[i + 1:]
+            return out
+        i += 1
+    return out
+
+
 def _git_short_cluster_runs(sub: str, arg: str) -> bool:
-    """A short-option cluster with O (grep -O<cmd>, -nOrm: n, then O takes 'rm') or, for diff/log/show, o."""
+    """A short-option cluster that runs a command: grep -O<cmd> / -nOrm (but not -eOrder) or, for diff/log/show,
+    an orderfile -o/-O that voids the read-only exemption."""
     if not re.match(r"^-[^-]", arg):
         return False
+    if sub == "grep":
+        return _git_grep_cluster(arg)["runs"]
     return "O" in arg[1:] or (sub in GIT_LOWER_O_SUBCOMMANDS and "o" in arg[1:])
 
 
@@ -1459,16 +2420,20 @@ def _git_exec_options(args: List[str]) -> Tuple[List[str], List[str]]:
     --exe=) run on a local repository operand (git fetch --upl='rm -rf logs;:' .). Operands are [] when no such
     option is present; patterns (-e .) are kept as operands, which errs toward denying."""
     sub, rest = _git_subcommand(args)
+    short_exec = GIT_SUBCOMMAND_SHORT_EXEC.get(sub, set())
+    short_maybe = GIT_SUBCOMMAND_SHORT_EXEC_MAYBE.get(sub, set())
     runs = False
     values: List[str] = []
-    operands: List[str] = []
-    skip = False
+    positionals: List[str] = []
+    post_dash: List[str] = []
+    saw_dash = pattern_given = skip = False
     for j, a in enumerate(rest):
         if skip:
             skip = False
             continue
         if a == "--":
-            operands += rest[j + 1:]
+            saw_dash = True
+            post_dash += rest[j + 1:]
             break
         names = [n for n in _git_long_options(a) if n in GIT_EXEC_LONG_OPTIONS]
         if names:
@@ -1478,16 +2443,50 @@ def _git_exec_options(args: List[str]) -> Tuple[List[str], List[str]]:
             elif any(n in GIT_EXEC_VALUE_OPTIONS for n in names) and j + 1 < len(rest):
                 values.append(rest[j + 1])
                 skip = True
-        elif re.match(r"^-[^-]", a) and "O" in a:
-            runs = runs or sub == "grep"  # diff/log/show -O<orderfile> only reads a file
-            if a[a.index("O") + 1:]:
-                values.append(a[a.index("O") + 1:])
-        elif not a.startswith("-"):
-            operands.append(a)
+            continue
+        if a.startswith("--"):
+            name = a[2:].split("=", 1)[0]
+            if sub == "grep":
+                # value-taking long options, unique prefixes included (--max-count 1, --threads 2, --thr 2)
+                key = _resolve_long(name, GIT_GREP_LONG_OPTIONS)
+                if "=" not in a and GIT_GREP_LONG_OPTIONS.get(key) is True and j + 1 < len(rest):
+                    skip = True
+            continue
+        if re.match(r"^-[^-]", a):
+            if sub == "grep":
+                cl = _git_grep_cluster(a)
+                if cl["runs"]:
+                    runs = True
+                    if cl["pager"]:
+                        values.append(cl["pager"])
+                pattern_given = pattern_given or cl["pattern"]
+                if cl["takes_next"] and j + 1 < len(rest):
+                    skip = True
+                continue
+            letters = a[1:]
+            alias = next((c for c in letters if c in short_exec | short_maybe), "")
+            if alias:                       # short alias of a command-running option (clone -u, rebase -x)
+                runs = True
+                glued = letters[letters.index(alias) + 1:]
+                if glued:
+                    values.append(glued)
+                elif j + 1 < len(rest):
+                    values.append(rest[j + 1])
+                    skip = alias in short_exec  # fetch / pull -u: judged, and still parsed as an operand
+            elif "O" in letters:            # diff/log/show -O<orderfile> only reads a file
+                runs = runs or sub == "grep"
+                if a[a.index("O") + 1:]:
+                    values.append(a[a.index("O") + 1:])
+            continue
+        positionals.append(a)
     if not runs:
         return values, []
-    if sub == "grep" and len(operands) <= 1:
-        operands.append(".")  # only a pattern: git grep searches the working directory
+    if sub == "grep":
+        operands = post_dash if saw_dash else (positionals if pattern_given else positionals[1:])
+        if not operands:
+            operands = ["."]  # only a pattern: git grep searches the working directory
+    else:
+        operands = positionals + post_dash
     return values, operands
 
 
@@ -1513,7 +2512,14 @@ def _rg_exec_options(args: List[str]) -> Tuple[List[str], List[str]]:
         elif a.startswith(tuple(o + "=" for o in RG_EXEC_OPTIONS)):
             pre = pre or a.startswith("--pre=")
             values.append(a.split("=", 1)[1])
-        elif not a.startswith("-"):
+        elif a.startswith("--"):
+            name = a[2:].split("=", 1)[0]
+            if "=" not in a and name in RG_VALUE_LONG and j + 1 < len(args):
+                skip = True  # skip the value of a value-taking long option (--max-depth 2, --threads 2)
+        elif a.startswith("-") and len(a) > 1:
+            if _short_cluster_takes_next(a[1:], RG_VALUE_SHORT) and j + 1 < len(args):
+                skip = True  # skip the value of a value-taking short option (-m 1, -t json, -A 2)
+        else:
             operands.append(a)
     if not pre:
         return values, []
@@ -1540,11 +2546,125 @@ def _git_wipes_logs(args: List[str]) -> bool:
     return False
 
 
+def _shell_args(args: List[str]) -> Dict[str, Any]:
+    """How a shell invocation (sh / bash / zsh / dash / ksh / fish ...) runs code: {command: the -c string or None,
+    script: the script operand or None, stdin: reads its commands from stdin (-s, or no script operand), info:
+    --version / --help only, rcfiles: --rcfile / --init-file}. Options are parsed with their values (-o opt,
+    +O opt, clusters such as -eo pipefail, --norc, --login)."""
+    out: Dict[str, Any] = {"command": None, "script": None, "stdin": False, "info": False, "rcfiles": []}
+    has_c = has_s = False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("--", "-"):
+            i += 1
+            break
+        if a.startswith("--"):
+            opt, eq, value = a[2:].partition("=")
+            if opt in ("rcfile", "init-file", "command"):
+                if not eq and i + 1 < len(args):
+                    value, i = args[i + 1], i + 1
+                if opt == "command":
+                    out["command"] = value
+                else:
+                    out["rcfiles"].append(value)
+            elif opt in ("version", "help"):
+                out["info"] = True
+            i += 1
+            continue
+        if a[:1] in "-+" and len(a) > 1:
+            letters = a[1:]
+            has_c = has_c or "c" in letters
+            has_s = has_s or "s" in letters
+            i += 1 + sum(1 for ch in letters if ch in "oO")  # -o / -O / +o take the next word
+            continue
+        break
+    rest = args[i:]
+    if out["command"] is not None:
+        return out
+    if has_c:
+        out["command"] = rest[0] if rest else ""
+    elif has_s or not rest:
+        out["stdin"] = True
+    else:
+        out["script"] = rest[0]
+    return out
+
+
+def _ps_param(arg: str) -> str:
+    """PowerShell CLI parameter name: leading '-', '--' or '/' stripped, lower-case, ':value' dropped."""
+    m = re.match(r"^(?:--?|/)([A-Za-z][\w-]*)", arg or "")
+    return m.group(1).lower() if m else ""
+
+
+def _ps_encoded_param(arg: str) -> bool:
+    """powershell / pwsh -EncodedCommand in any spelling PowerShell accepts: -e, -ec, -en, -enc, ..., -encodedc,
+    /enc, --enc (any prefix of encodedcommand: fail-safe). -EncodedArguments / -ea is not a command."""
+    p = _ps_param(arg)
+    return bool(p) and ("encodedcommand".startswith(p) or p == "ec")
+
+
+def _ps_command_param(arg: str) -> bool:
+    """powershell / pwsh -Command in any prefix spelling (-c, -com, /command, --command)."""
+    p = _ps_param(arg)
+    return bool(p) and "command".startswith(p)
+
+
+def _ps_param_value(args: List[str], i: int) -> Optional[str]:
+    """Value of the PowerShell parameter args[i]: glued after ':' (-enc:BASE64) or the next word."""
+    a = args[i]
+    if ":" in a[1:]:
+        return a.split(":", 1)[1]
+    return args[i + 1] if i + 1 < len(args) else None
+
+
+def _call_literals(code: str, start: int) -> List[str]:
+    """String literals of a call's arguments, from `start` to its closing bracket or the end of the statement."""
+    parts: List[str] = []
+    depth = 0
+    i, n = start, min(len(code), start + 2000)
+    while i < n:
+        ch = code[i]
+        if ch in "'\"":
+            j = code.find(ch, i + 1)
+            if j < 0:
+                break
+            parts.append(code[i + 1:j])
+            i = j + 1
+            continue
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            if depth == 0:
+                break
+            depth -= 1
+        elif ch in ";\n" and depth == 0:
+            break
+        i += 1
+    return parts
+
+
+def _inline_shell_strings(code: str) -> List[str]:
+    """Shell command lines inline code hands to a shell: the string literals of os.system / subprocess.* / popen /
+    exec* / spawn* / child_process.exec* / perl system / qx{} / ruby %x() / awk system() calls, joined
+    (subprocess.run(['rm', '-rf', 'logs']) -> 'rm -rf logs')."""
+    code = (code or "").replace('\\"', '"').replace("\\'", "'")
+    out: List[str] = []
+    for m in INLINE_SHELL_CALL_RE.finditer(code):
+        parts = _call_literals(code, m.end())
+        if parts:
+            out.append(" ".join(parts))
+    out += [m.group(2) for m in INLINE_QX_RE.finditer(code)]
+    return out
+
+
 def _nested_commands(prog: str, args: List[str]) -> List[str]:
     """Command strings a sub-command runs through another shell: sh/bash -c '...', eval ..., cmd /c ...,
-    powershell -Command ..., git -c values (core.fsmonitor='rm -rf logs', alias.x='!cmd') and the values of
-    command-running options (git grep -O<cmd> / --op=, fetch --upload-pack / --upl=, push --receive-pack / --exec,
-    rg --pre / --hostname-bin, less +!cmd / +|<mark>cmd)."""
+    powershell -Command / -EncodedCommand ..., git -c values (core.fsmonitor='rm -rf logs', alias.x='!cmd'), git
+    bisect run / submodule foreach, the values of command-running options (git grep -O<cmd> / --op=, fetch
+    --upload-pack / --upl=, push --receive-pack / --exec, rg --pre / --hostname-bin, less +!cmd / +|<mark>cmd, tar
+    --to-command / -I / -F / --checkpoint-action=exec=), watch, su / runuser / script / flock -c, and the shell
+    calls of inline interpreter code (os.system('...'), awk system("..."))."""
     if prog == "git":
         values = []
         for i, a in enumerate(args[:-1]):
@@ -1552,7 +2672,18 @@ def _nested_commands(prog: str, args: List[str]) -> List[str]:
                 values.append(args[i + 1].split("=", 1)[1].lstrip("!"))
             elif not a.startswith("-") and (i == 0 or args[i - 1] not in GIT_GLOBAL_VALUE_OPTIONS):
                 break  # the sub-command: its own -c options (git grep -c) are not config values
-        return values + _git_exec_options(args)[0]
+        nested = values + _git_exec_options(args)[0]
+        sub, rest = _git_subcommand(args)
+        # Sub-commands that run the rest of their argv as a shell command
+        if sub == "bisect" and rest[:1] == ["run"] and rest[1:]:
+            nested.append(" ".join(rest[1:]))
+        if sub == "submodule" and "foreach" in rest:
+            k = rest.index("foreach") + 1
+            while k < len(rest) and rest[k] in ("--recursive", "--quiet", "-q"):
+                k += 1
+            if rest[k:]:
+                nested.append(" ".join(rest[k:]))
+        return nested
     if prog == "rg":
         return _rg_exec_options(args)[0]
     if prog == "less":
@@ -1563,63 +2694,529 @@ def _nested_commands(prog: str, args: List[str]) -> List[str]:
                 values.append(m.group(1) if m.group(1) is not None else m.group(2))
         return values
     if prog in SHELL_INTERPRETERS:
-        has_c = skip = False
-        for a in args:
-            if skip:
-                skip = False
-            elif a in SHELL_VALUE_OPTIONS:
-                skip = True
-            elif a == "--":
-                continue
-            elif a.startswith(("-", "+")) and len(a) > 1:
-                has_c = has_c or (not a.startswith("--") and "c" in a[1:])
-            else:
-                return [a] if has_c else []  # without -c the first operand is a script file
-        return []
+        command = _shell_args(args)["command"]
+        return [command] if command is not None else []
     if prog == "eval":
         return [" ".join(args)] if args else []
     if prog == "cmd":
         return next(([" ".join(args[i + 1:])] for i, a in enumerate(args) if re.match(r"^/+[cCkK]$", a)), [])
     if prog in ("powershell", "pwsh"):
-        return next(([" ".join(args[i + 1:])] for i, a in enumerate(args)
-                     if re.match(r"^-(?:c|com|comm|comma|comman|command)$", a, re.IGNORECASE)), [])
+        out: List[str] = []
+        for i, a in enumerate(args):
+            if _ps_command_param(a):
+                return out + ([" ".join(args[i + 1:])] if i + 1 < len(args) else [])
+            if _ps_encoded_param(a):
+                value = _ps_param_value(args, i)
+                decoded = _decode_ps_encoded(value) if value else None  # base64 UTF-16LE; judged like -Command
+                if decoded is not None:
+                    out.append(decoded)
+        return out
+    if prog == "watch":  # watch [-n SECS] [-q N] ... cmd args: run through `sh -c`
+        i = 0
+        while i < len(args) and args[i].startswith("-") and args[i] != "--":
+            i += 2 if re.match(r"^-[A-Za-z]*[nq]$", args[i]) or args[i] in ("--interval", "--equexit") else 1
+        if i < len(args) and args[i] == "--":
+            i += 1
+        return [" ".join(args[i:])] if args[i:] else []
+    if prog in ("su", "runuser", "script", "flock"):
+        out = []
+        for i, a in enumerate(args):
+            if a in ("-c", "--command") and i + 1 < len(args):
+                out.append(args[i + 1])
+            elif a.startswith("--command="):
+                out.append(a.split("=", 1)[1])
+        return out
+    if prog in ("tar", "bsdtar"):
+        return _tar_parse(args)["nested"]
+    if SHELL_CALL_INTERPRETERS_RE.match(prog):
+        return _inline_shell_strings(" ".join(args))
     return []
 
 
+def _decode_ps_encoded(value: str) -> Optional[str]:
+    """Decodes a PowerShell -EncodedCommand payload (base64 of UTF-16LE). Returns None when undecodable."""
+    import base64
+    try:
+        return base64.b64decode(value, validate=False).decode("utf-16-le")
+    except Exception:
+        return None
+
+
+def _tar_parse(args: List[str]) -> Dict[str, Any]:
+    """GNU tar / bsdtar arguments: {extract (x, --extract, --get), stdout (O, --to-stdout), dests (-C dir,
+    --directory=dir), nested (--to-command, -I / --use-compress-program, -F / --info-script, --rsh-command,
+    --rmt-command, --checkpoint-action=exec=CMD), outputs (--index-file, -g / --listed-incremental, --volno-file)}.
+    The old-style first argument is a bundle (tar xzf a.tgz: the values of f / C ... follow in order); short
+    clusters stop at the first value-taking letter (tar -czf /tmp/o.tgz index.txt only creates)."""
+    out: Dict[str, Any] = {"extract": False, "stdout": False, "dests": [], "nested": [], "outputs": []}
+    letters: List[Tuple[str, Optional[str]]] = []
+    n = len(args)
+    i = 0
+    if args and not args[0].startswith("-"):
+        i = 1
+        for ch in args[0]:
+            if ch in TAR_VALUE_SHORT:
+                letters.append((ch, args[i] if i < n else ""))
+                i += 1
+            else:
+                letters.append((ch, None))
+    while i < n:
+        a = args[i]
+        i += 1
+        if a == "--":
+            break
+        if a.startswith("--"):
+            opt, eq, value = a[2:].partition("=")
+            opt = opt.lower()
+            if not eq and len(opt) >= 2 and any(o.startswith(opt) for o in TAR_VALUE_LONG) and i < n:
+                value, i = args[i], i + 1
+            if opt == "get" or (len(opt) >= 3 and "extract".startswith(opt)):
+                out["extract"] = True
+            if len(opt) >= 4 and "to-stdout".startswith(opt):
+                out["stdout"] = True
+            if len(opt) >= 3 and "directory".startswith(opt):
+                out["dests"].append(value)
+            if len(opt) >= 2 and any(o.startswith(opt) for o in TAR_EXEC_LONG):
+                out["nested"].append(value)
+            if opt.startswith("checkpoint-") and value.lower().startswith("exec="):
+                out["nested"].append(value[5:])
+            if len(opt) >= 3 and any(o.startswith(opt) for o in TAR_OUTPUT_LONG):
+                out["outputs"].append(value)
+            continue
+        if a.startswith("-") and len(a) > 1:
+            for k, ch in enumerate(a[1:]):
+                if ch in TAR_VALUE_SHORT:
+                    value = a[k + 2:]
+                    if not value and i < n:
+                        value, i = args[i], i + 1
+                    letters.append((ch, value))
+                    break
+                letters.append((ch, None))
+    for ch, value in letters:
+        if ch == "x":
+            out["extract"] = True
+        elif ch == "O":
+            out["stdout"] = True
+        elif ch == "C":
+            out["dests"].append(value or "")
+        elif ch in TAR_EXEC_SHORT:
+            out["nested"].append(value or "")
+        elif ch == "g":
+            out["outputs"].append(value or "")
+    return out
+
+
+def _archive_extracts(prog: str, args: List[str]) -> bool:
+    """True when an archive command extracts files to disk (not tar -t / -xO, unzip -l / -p ...)."""
+    if prog in ("tar", "bsdtar"):
+        parsed = _tar_parse(args)
+        return parsed["extract"] and not parsed["stdout"]
+    if prog == "unzip":
+        return not any(a in ("-l", "-t", "-v", "-z", "-Z", "-p") for a in args)
+    if prog in ("7z", "7za", "7zr"):
+        pos = [a for a in args if not a.startswith("-")]
+        return bool(pos) and pos[0].lower() in ("x", "e")
+    if prog == "expand-archive":
+        return True
+    return False
+
+
+def _archive_dests(prog: str, args: List[str]) -> List[str]:
+    """Destination directories of an extraction (tar -C / --directory, unzip -d, 7z -o<dir>, Expand-Archive
+    -DestinationPath or its 2nd positional); [''] = the cwd."""
+    dests: List[str] = []
+    if prog in ("tar", "bsdtar"):
+        dests = _tar_parse(args)["dests"]
+    elif prog == "unzip":
+        for i, a in enumerate(args):
+            if a == "-d" and i + 1 < len(args):
+                dests.append(args[i + 1])
+            elif re.match(r"^-d.", a):
+                dests.append(a[2:])
+    elif prog in ("7z", "7za", "7zr"):
+        dests = [a[2:] for a in args if re.match(r"^-o.", a)]
+    elif prog == "expand-archive":
+        positional: List[str] = []
+        i = 0
+        while i < len(args):
+            a = args[i]
+            p = _ps_param(a) if a.startswith("-") else ""
+            if p:
+                value = a.split(":", 1)[1] if ":" in a else None
+                takes = any(x.startswith(p) for x in ("destinationpath", "path", "literalpath"))
+                if takes and value is None and i + 1 < len(args):
+                    value, i = args[i + 1], i + 1
+                if "destinationpath".startswith(p):
+                    dests.append(value or "")
+            else:
+                positional.append(a)
+            i += 1
+        dests += positional[1:2]
+    return dests or [""]
+
+
+def _windows_copy_parse(prog: str, args: List[str]) -> Tuple[List[str], Optional[str], bool]:
+    """(sources, destination or None = the cwd, recursive) of robocopy / xcopy / cmd copy / Copy-Item. robocopy
+    copies the contents of a directory (/S /E /MIR recurse; /PURGE /MOV delete); Copy-Item recurses with -Recurse
+    (parameters by unique prefix: -Path / -LiteralPath / -Destination, or positional)."""
+    if prog in ("robocopy", "xcopy", "copy"):
+        switches = [a.lower().split(":", 1)[0] for a in args if WINDOWS_COPY_SWITCH_RE.match(a)]
+        ops = [a for a in args if not WINDOWS_COPY_SWITCH_RE.match(a) and a != "+"]
+        if prog == "copy":
+            return (ops[:-1] if len(ops) > 1 else ops), (ops[-1] if len(ops) > 1 else None), False
+        recursive = any(s in WINDOWS_RECURSIVE_SWITCHES for s in switches)
+        return ops[:1] + ops[2:], (ops[1] if len(ops) > 1 else None), recursive
+    sources: List[str] = []
+    dest: Optional[str] = None
+    recursive = False
+    positional: List[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        p = _ps_param(a) if a.startswith("-") else ""
+        if p:
+            value = a.split(":", 1)[1] if ":" in a else None
+            takes = any(x.startswith(p) for x in ("path", "literalpath", "destination") + PS_COPY_VALUE_PARAMS)
+            if takes and value is None and i + 1 < len(args):
+                value, i = args[i + 1], i + 1
+            if "destination".startswith(p):
+                dest = value
+            elif "path".startswith(p) or "literalpath".startswith(p):
+                sources += [s for s in (value or "").split(",") if s]
+            elif "recurse".startswith(p):
+                recursive = True
+        else:
+            positional.append(a)
+        i += 1
+    if not sources and positional:
+        sources, positional = positional[:1], positional[1:]
+    if dest is None and positional:
+        dest = positional[0]
+    return sources, dest, recursive
+
+
+def _unresolved(word: Optional[str]) -> bool:
+    """A word whose value is only known at run time ($VAR, ${VAR}, $(...) lifted to $__subst__, `...`)."""
+    return "$" in (word or "") or "`" in (word or "")
+
+
+def _relative_word(word: str) -> bool:
+    """A path operand resolved against the working directory (not /x, C:\\x, ~/x)."""
+    w = _word_value(word or "").replace("\\", "/")
+    return bool(w) and not w.startswith(("/", "~")) and not re.match(r"^[A-Za-z]:", w)
+
+
+def _inplace_files(prog: str, args: List[str]) -> List[str]:
+    """Files edited in place by sed -i / perl -i: the operands after the sed script / perl code (given with -e / -f /
+    --expression, else the first operand). -i[SUFFIX] ends a short cluster (the rest is the backup suffix)."""
+    files: List[str] = []
+    code_given = skip = False
+    value_letters = "efl" if prog == "sed" else "eEMmI"
+    for a in args:
+        if skip:
+            skip = False
+            continue
+        if a.startswith("--"):
+            name = a[2:].split("=", 1)[0]
+            if name in ("expression", "file", "line-length"):
+                code_given = code_given or name != "line-length"
+                skip = "=" not in a
+            continue
+        if a.startswith("-") and len(a) > 1:
+            for k, ch in enumerate(a[1:]):
+                if ch == "i":
+                    break
+                if ch in value_letters:
+                    code_given = code_given or ch in "efE"
+                    skip = not a[k + 2:]
+                    break
+            continue
+        files.append(a)
+    return files if code_given else files[1:]
+
+
+def _write_targets(prog: str, args: List[str]) -> List[str]:
+    """Operands a write / destructive program creates, overwrites, moves or deletes: every operand of rm / mv /
+    touch / tee ..., the destination of cp / install / ln / rsync (and its sources with --remove-source-files),
+    dd of=, the files of sed -i / perl -i, and Windows delete / move operands or copy destinations."""
+    if prog == "dd":
+        return [a[3:] for a in args if a.startswith("of=")]
+    if prog in ("sed", "perl"):
+        return _inplace_files(prog, args)
+    if prog in WINDOWS_COPY_PROGRAMS:
+        dest = _windows_copy_parse(prog, args)[1]
+        return [dest or "."]
+    operands, target = _split_operands(prog, args)
+    if prog in WINDOWS_DELETE_PROGRAMS | WINDOWS_MOVE_PROGRAMS:
+        operands = [o for o in operands if not WINDOWS_COPY_SWITCH_RE.match(o)]
+    if prog in ("cp", "install", "ln", "rsync") and not (prog == "rsync" and any(
+            a.startswith("--remove-source") for a in args)):
+        return [target] if target is not None else operands[-1:]
+    return operands + ([target] if target is not None else [])
+
+
+def _writes_relative_operand(prog: str, args: List[str], redirects: List[str]) -> bool:
+    """A redirect or a write / destructive operand given as a relative path (judged when the working directory is
+    inside logs/ or unknown)."""
+    if any(_relative_word(t) for t in redirects):
+        return True
+    if not _is_destructive_write(prog, args):
+        return False
+    return any(_relative_word(w) for w in _write_targets(prog, args) if not w.startswith("-"))
+
+
+def _unresolved_write(prog: str, prog_token: str, args: List[str], redirects: List[str], cwd: str,
+                      base_dir: str) -> bool:
+    """A value only known at run time in a write position: a redirect target, a write / destructive operand, an
+    output option (dd of=, --output=, curl -o, sort -o, tar -C ...), the root of a destructive find, an archive
+    destination, or the program itself ($RM, $(which rm)) acting on logs/, a protected file or another run-time
+    value."""
+    if any(_unresolved(t) for t in redirects):
+        return True
+    if _unresolved(prog_token):
+        return any(_unresolved(a) or _reaches_logs_dir(a, cwd, base_dir) or _ground_truth_named(a)
+                   or _glob_ground_truth(a) for a in args if not a.startswith("-"))
+    if _is_destructive_write(prog, args) and any(_unresolved(w) for w in _write_targets(prog, args)):
+        return True
+    options = OUTPUT_OPTIONS.get(prog, set())
+    for j, a in enumerate(args):
+        m = OUTPUT_VALUE_RE.match(a)
+        if m and _unresolved(a[m.end():]):
+            return True
+        if a in options and j + 1 < len(args) and _unresolved(args[j + 1]):
+            return True
+        if _unresolved(a) and any(len(o) == 2 and a.startswith(o) and len(a) > 2 for o in options):
+            return True
+    if prog == "find" and _find_is_destructive(args) and any(_unresolved(r) for r in _find_roots(args)):
+        return True
+    if prog in ARCHIVE_EXTRACT_PROGRAMS and _archive_extracts(prog, args):
+        return any(_unresolved(d) for d in _archive_dests(prog, args))
+    return False
+
+
+def _find_is_destructive(args: List[str]) -> bool:
+    """find with -delete, an output action (-fprint ...) or an -exec / -ok command that can modify files."""
+    if any(a in FIND_DELETE_ACTIONS or a in FIND_OUTPUT_ACTIONS for a in args):
+        return True
+    for i, a in enumerate(args):
+        if a in FIND_EXEC_ACTIONS:
+            end = next((j for j in range(i + 1, len(args)) if args[j] in (";", "+")), len(args))
+            if _exec_writes(args[i + 1:end]):
+                return True
+    return False
+
+
+def _script_targets(prog: str, prog_token: str, args: List[str], shell: str) -> List[Tuple[str, bool]]:
+    """Script files a sub-command runs as shell code: (word, by_path). A shell's script operand and --rcfile (bash
+    -o errexit f, sh -e -x f, bash --norc f), source f / . f, and (Bash only) a program invoked by path (./evil,
+    /tmp/evil, scripts/x, f.sh), which is judged only when it is a text file with a shell or no shebang."""
+    if prog in SHELL_INTERPRETERS:
+        parsed = _shell_args(args)
+        out = [(f, False) for f in parsed["rcfiles"]]
+        if parsed["script"] and parsed["script"] not in STDIN_SCRIPT_PATHS:
+            out.append((parsed["script"], False))
+        return out
+    if prog in (".", "source"):
+        operand = next((a for a in args if not a.startswith("-")), None)
+        return [(operand, False)] if operand and operand not in STDIN_SCRIPT_PATHS else []
+    # (a backslash is an escape in Bash, not a separator: only '/' or a C:\ drive path makes a path)
+    if shell == "bash" and prog_token and ("/" in prog_token or re.match(r"^[A-Za-z]:[\\/]", prog_token)
+                                           or prog.endswith(".sh")):
+        return [(prog_token, True)]
+    return []
+
+
+def _is_shell_script_data(data: bytes) -> bool:
+    """A file the shell would run as shell code: text (no NUL byte) with no shebang, or a #! sh / bash / zsh / dash
+    / ksh ... interpreter (also through /usr/bin/env [-S] bash)."""
+    head = data[:4096]
+    if b"\0" in head:
+        return False
+    if not head.startswith(b"#!"):
+        return True
+    words = head[2:].split(b"\n", 1)[0].decode("utf-8", "replace").split()
+    if not words:
+        return True
+    interpreter = os.path.basename(words[0])
+    if interpreter == "env":
+        rest = [w for w in words[1:] if not w.startswith("-") and "=" not in w]
+        interpreter = os.path.basename(rest[0]) if rest else ""
+    return interpreter in SHELL_INTERPRETERS
+
+
+def _pinned_desk_script(host_path: str, base_dir: str, data: bytes) -> bool:
+    """True only for a DESK_SHELL_SCRIPTS file (path resolved against the workspace root) whose bytes, as read by
+    the hook, match the pinned sha256: any other script under scripts/, or an edited copy, is judged strictly."""
+    try:
+        real = os.path.normcase(os.path.realpath(host_path))
+        for rel, digest in DESK_SHELL_SCRIPTS.items():
+            if real == os.path.normcase(os.path.realpath(os.path.join(base_dir, *rel.split("/")))):
+                return hashlib.sha256(data).hexdigest() == digest
+    except (OSError, ValueError):
+        return False
+    return False
+
+
+def _strip_comment_lines(content: str) -> str:
+    """Script text without its whole-line comments (a quote in a comment would unbalance the tokenizer)."""
+    return "\n".join("" if line.lstrip().startswith("#") else line for line in content.split("\n"))
+
+
+def _existing_file(word: str, cwd: str, base_dir: str) -> bool:
+    try:
+        return os.path.isfile(_host_path(word, _host_path(cwd, base_dir) if cwd else base_dir))
+    except (OSError, ValueError):
+        return False
+
+
+def _judge_script(word: str, cwd: str, base_dir: str, depth: int, cwd_unknown: bool, strict: bool,
+                  written: frozenset, by_path: bool = False) -> List[str]:
+    """Protected files a shell script file can write: its content is judged with the full line analysis, one
+    nesting level deeper (bounded by NESTED_DEPTH_LIMIT, so self-sourcing scripts deny). Denied outright when the same
+    command line writes it (strict), when its path is only known at run time or relative to an unknown cwd
+    (strict), and when it is larger than SCRIPT_READ_LIMIT, unreadable or not UTF-8. A missing file judges as
+    nothing. Only the first SCRIPT_HEAD_BYTES are read to classify a program invoked by path; the rest only when it
+    is a shell script. The content is judged strictly, except a sha256-pinned DESK_SHELL_SCRIPTS file (run-time
+    values / unknown cwd skipped); scripts it sources or runs are strict again. Memoised within an audit scope."""
+    key = ("script", word, cwd, base_dir, depth, cwd_unknown, strict, written, by_path)
+    memo = _AUDIT["memo"] if _AUDIT["active"] else None
+    if memo is not None and key in memo:
+        return memo[key]
+    result = _judge_script_uncached(word, cwd, base_dir, depth, cwd_unknown, strict, written, by_path)
+    if memo is not None:
+        memo[key] = result
+    return result
+
+
+def _judge_script_uncached(word: str, cwd: str, base_dir: str, depth: int, cwd_unknown: bool, strict: bool,
+                           written: frozenset, by_path: bool) -> List[str]:
+    deny = list(GROUND_TRUTH_FILES)
+    if not word:
+        return []
+    if strict and (posixpath.basename(_shell_path(word)).lower() in written or "*" in written):
+        return deny
+    if _unresolved(word) or (cwd_unknown and _relative_word(word)):
+        return deny if strict else []
+    try:
+        host = _host_path(word, _host_path(cwd, base_dir) if cwd else base_dir)
+        if not os.path.isfile(host):
+            return []
+        size = os.path.getsize(host)
+        with open(host, "rb") as fh:
+            data = fh.read(SCRIPT_HEAD_BYTES)
+            if by_path and not _is_shell_script_data(data):
+                return []  # a binary, or a script for another interpreter (Python / Node files: residual)
+            if size > SCRIPT_READ_LIMIT:
+                return deny
+            data += fh.read(SCRIPT_READ_LIMIT + 1 - len(data))
+    except (OSError, ValueError):
+        return deny
+    if len(data) > SCRIPT_READ_LIMIT:
+        return deny
+    try:
+        content = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return deny
+    return _ground_truth_line_hits(_strip_comment_lines(content), cwd, base_dir, depth=depth + 1,
+                                   cwd_unknown=cwd_unknown, strict=not _pinned_desk_script(host, base_dir, data),
+                                   written=written)
+
+
 def _ground_truth_writes(tokens: List[str], text: str, cwd: str = "", base_dir: str = "", depth: int = 0,
-                         shell: str = "bash") -> List[str]:
+                         shell: str = "bash", cwd_unknown: bool = False, strict: bool = True,
+                         written: frozenset = frozenset(), cwd_set: Tuple[str, ...] = ()) -> List[str]:
     """Protected ground-truth files a single shell sub-command can create, modify, move, delete or alias.
     shell="powershell" (this sub-command only; nested shells and find -exec are Bash): PS_READ_CMDLETS also read,
-    and `wsl.exe [options] [--] <linux command>` is judged as that Linux command."""
+    `wsl.exe [options] [--] <linux command>` is judged as that Linux command, and the Bash-only rules for run-time
+    values / unknown cwd / scripts by path do not apply. cwd_unknown: an earlier cd target could not be resolved.
+    strict=False (only the sha256-pinned DESK_SHELL_SCRIPTS) skips the run-time-value and unknown-cwd rules. written:
+    basenames of files the enclosing command lines write (a script run from one of them is denied). cwd_set: every
+    possible cwd of the enclosing line (nested lines start from all of them). Counts against the audit budget."""
+    _audit_tick()
     if depth > NESTED_DEPTH_LIMIT:
         return list(GROUND_TRUTH_FILES)  # pathological nesting: fail closed
+    all_files = list(GROUND_TRUTH_FILES)
+    cwd = cwd or base_dir
+    bash_rules = strict and shell == "bash"
     hits: List[str] = []
-    for target in _redirect_targets(tokens):
-        hits += _ground_truth_named(target) + _glob_ground_truth(target)
-    idx = _program_index(tokens)
-    prog = re.sub(r"\.exe$", "", _program(tokens))
+    idx, info = _command_start(tokens)
+    prog_token = tokens[idx] if idx < len(tokens) else ""
+    prog = re.sub(r"\.exe$", "", os.path.basename(prog_token).lower())
     args = _plain_args(tokens[idx + 1:] if idx < len(tokens) else [])
+    redirects = _redirect_targets(tokens) + info["outputs"]
+    for target in redirects:
+        hits += _ground_truth_named(target) + _glob_ground_truth(target)
     if shell == "powershell" and prog == "wsl":
         linux = _wsl_command(args)
         if linux is not None:
             if linux:
                 hits += _ground_truth_writes(linux, " ".join(linux), cwd, base_dir, depth + 1)
             return [p for p in GROUND_TRUTH_FILES if p in set(hits)]
+    # env -C dir / sudo -D dir: this sub-command runs in another directory
+    for d in info["chdirs"]:
+        if _unresolved(d) or not d or d.startswith(("~", "-")):
+            cwd_unknown = True
+        else:
+            cwd = _join_cwd(cwd, d)
+            cwd_unknown = cwd_unknown or _proc_alias(d)
     read_programs = GROUND_TRUTH_READ_PROGRAMS | (PS_READ_CMDLETS if shell == "powershell" else set())
-    assigned = any(ASSIGNMENT_RE.match(t) for t in tokens[:idx])
     mentioned = _ground_truth_named(text)
     for a in tokens:
         mentioned += _glob_ground_truth(_word_value(a))
-    if mentioned and not _ground_truth_read_only(prog, args, assigned, frozenset(read_programs)):
+    if mentioned and not _ground_truth_read_only(prog, args, bool(info["assigns"]), frozenset(read_programs)):
         hits += mentioned
-    # Nested shells (bash -c 'rm -rf logs', eval, cmd //c rd /s /q logs): the inner command line is judged too
-    for nested in _nested_commands(prog, args):
-        for sub in _ground_truth_subcommands(nested):
-            hits += _ground_truth_writes(sub, " ".join(sub), cwd, base_dir, depth + 1)
+    # Env-var command channels / config injection: VAR=v cmd, VAR+=v, env / sudo / nice env VAR=v, env -S,
+    # export / declare VAR=v, read VAR, printf -v VAR, for VAR in ...
+    if prog != "unset":
+        for var, value in info["assigns"] + _declared_assignments(prog, args):
+            if _env_assignment_denied(var, value, prog, prog_token, info["wrappers"]):
+                hits.extend(all_files)
+                break
+    # Git config that runs commands (-c / --config-env / git config / clone -c / --template) and work-tree writes
+    # through -C / --work-tree into logs/
+    if prog == "git" and (_git_config_denied(args) or _git_base_dir_write(args, cwd, base_dir, bash_rules)):
+        hits.extend(all_files)
+    # git's ext:: transport runs its URL as a shell command (git clone 'ext::sh -c rm% -rf% logs' /tmp/y)
+    if prog == "git" and any(a.lower().startswith("ext::") for a in args):
+        hits.extend(all_files)
+    # PowerShell -EncodedCommand (any prefix spelling) with a missing or undecodable payload: fail closed
+    if prog in ("powershell", "pwsh"):
+        for i, a in enumerate(args):
+            if _ps_encoded_param(a):
+                value = _ps_param_value(args, i)
+                if not value or _decode_ps_encoded(value) is None:
+                    hits.extend(all_files)
+    # A relative write (operand or redirect) from inside logs/ or from an unknown directory (cd "$X"; rm x.json)
+    if ((bash_rules and cwd_unknown) or _cwd_in_logs(cwd, base_dir)) and _writes_relative_operand(prog, args,
+                                                                                               redirects):
+        hits.extend(all_files)
+    # Run-time values ($VAR, $(...), `...`) in a write position
+    if bash_rules and _unresolved_write(prog, prog_token, args, redirects, cwd, base_dir):
+        hits.extend(all_files)
+    # A write / destructive operand through /proc/<pid>/cwd|root|fd or /dev/fd: it resolves against the command's
+    # process, not the hook's (rm -f /proc/self/cwd/logs/x, mv /proc/self/cwd/logs /tmp/x)
+    if _is_destructive_write(prog, args) and any(_proc_alias(w) for w in _write_targets(prog, args)):
+        hits.extend(all_files)
+    # Nested command lines (bash -c, eval, cmd /c, powershell -Command / -EncodedCommand, git -c values, rg --pre,
+    # env -S, flock -c, watch, tar --to-command, os.system('...') ...): the full, strict line analysis one level
+    # deeper, started from every possible cwd at once (memoised: the same text is judged once per cwd set)
+    nested_cwds = [cwd] if info["chdirs"] or not cwd_set else list(cwd_set)
+    for nested in _nested_commands(prog, args) + info["nested"]:
+        hits += _ground_truth_line_hits(nested, cwd, base_dir, depth=depth + 1, cwd_unknown=cwd_unknown,
+                                        written=written, cwds=nested_cwds)
+    # Shell script files (bash f, sh -e f, source f, ./f with a shell or no shebang): their content, same analysis
+    for word, by_path in _script_targets(prog, prog_token, args, shell):
+        hits += _judge_script(word, cwd, base_dir, depth, cwd_unknown, True, written, by_path)  # always strict
     # A command-running option over logs/ or an ancestor (rg --pre rm . logs, git fetch --upl=CMD .): the command
-    # runs on the protected files (or the local repository) whatever its value names
-    if any(_reaches_logs_dir(o, cwd, base_dir) for o in _command_option_operands(prog, args)):
-        hits.extend(GROUND_TRUTH_FILES)
+    # runs on the protected files (or the local repository) whatever its value names. `git -C <dir>` changes the
+    # base the operands resolve against (git -C logs grep -O x -- '*.json' searches inside logs/).
+    op_operands = _command_option_operands(prog, args)
+    if prog == "git" and op_operands:
+        cdir = _git_c_dir(args)
+        if cdir:
+            op_operands = op_operands + [cdir]
+    if any(_reaches_logs_dir(o, cwd, base_dir) for o in op_operands):
+        hits.extend(all_files)
     operands, target_dir = _split_operands(prog, args)
     if prog in WINDOWS_DELETE_PROGRAMS | WINDOWS_MOVE_PROGRAMS:
         operands = [o for o in operands if not WINDOWS_SWITCH_RE.match(o)]  # rd /s /q: switches, not paths
@@ -1627,34 +3224,55 @@ def _ground_truth_writes(tokens: List[str], text: str, cwd: str = "", base_dir: 
     recursive = _is_recursive(args) or (prog in WINDOWS_DELETE_PROGRAMS and any(a.lower() == "/s" for a in args))
     if prog in {"rm"} | WINDOWS_DELETE_PROGRAMS and recursive:
         if any(_reaches_logs_dir(a, cwd, base_dir) for a in operands):
-            hits.extend(GROUND_TRUTH_FILES)
+            hits.extend(all_files)
     elif (prog in LOGS_DIR_DESTRUCTIVE_PROGRAMS | WINDOWS_DELETE_PROGRAMS
           and any(_is_logs_dir(a, cwd, base_dir) for a in operands)):
-        hits.extend(GROUND_TRUTH_FILES)
+        hits.extend(all_files)
     if prog in {"mv"} | WINDOWS_MOVE_PROGRAMS and operands:
         sources, dest = (operands, target_dir) if target_dir is not None else (operands[:-1], operands[-1])
         # Moving the logs directory (or an ancestor) away, or a glob of unseen names into it;
         # `mv report.txt logs/` stays allowed.
         if (any(_reaches_logs_dir(s, cwd, base_dir) for s in sources)
                 or (dest and globbed and _is_logs_dir(dest, cwd, base_dir))):
-            hits.extend(GROUND_TRUTH_FILES)
-    if prog in LOGS_DIR_COPY_PROGRAMS and operands and (_is_recursive(args) or globbed):
+            hits.extend(all_files)
+    rsync_files_from = prog == "rsync" and any(a.startswith(("--files-from", "--include-from")) for a in args)
+    if prog in LOGS_DIR_COPY_PROGRAMS and operands and (_is_recursive(args) or globbed or rsync_files_from):
         sources, dest = (operands, target_dir) if target_dir is not None else (operands[:-1], operands[-1])
-        # Into logs/ (cp -r src/. logs, cp -t logs src/*), or a source dir named logs (any glob that can expand to
-        # one: /tmp/f/*) into logs/ or one of its ancestors (cp -r /tmp/f/* .)
+        # Into logs/ (cp -r src/. logs, cp -t logs src/*), a source dir named logs (any glob that can expand to one:
+        # /tmp/f/*) into logs/, or a recursive / glob / --files-from copy whose destination is logs/ or one of its
+        # ancestors (cp -r /tmp/f/* ., rsync -a /tmp/x/ ./, rsync --files-from=list / .)
         if ((dest and _is_logs_dir(dest, cwd, base_dir))
                 or any(_shell_path(s).rpartition("/")[2].lower() == "logs" for s in sources)
-                or (dest and _reaches_logs_dir(dest, cwd, base_dir) and any(_is_logs_dir(s) for s in sources))):
-            hits.extend(GROUND_TRUTH_FILES)
+                or (dest and _reaches_logs_dir(dest, cwd, base_dir))):
+            hits.extend(all_files)
+    # Windows / PowerShell copies (robocopy src dest /E, xcopy /S, copy, Copy-Item -Recurse): into logs/ unless it
+    # copies existing regular files one by one (copy a.txt logs), into an ancestor of logs/ when recursive
+    if prog in WINDOWS_COPY_PROGRAMS:
+        sources, dest, win_recursive = _windows_copy_parse(prog, args)
+        dest = dest or "."
+        if _is_logs_dir(dest, cwd, base_dir):
+            if (prog in ("robocopy", "xcopy") or win_recursive or not sources
+                    or any(SHELL_GLOB_RE.search(s) or not _existing_file(s, cwd, base_dir) for s in sources)):
+                hits.extend(all_files)
+        elif win_recursive and _reaches_logs_dir(dest, cwd, base_dir):
+            hits.extend(all_files)
+    # Archive extraction whose destination directory (-C / -d / -o / -DestinationPath, else the cwd) is logs/ or an
+    # ancestor (tar -x -C logs, unzip -d ., 7z x -o., Expand-Archive -DestinationPath logs); tar output files
+    if prog in ARCHIVE_EXTRACT_PROGRAMS and _archive_extracts(prog, args):
+        if any(_reaches_logs_dir(d or ".", cwd, base_dir) for d in _archive_dests(prog, args)):
+            hits.extend(all_files)
+    if prog in ("tar", "bsdtar"):
+        for out_file in _tar_parse(args)["outputs"]:
+            hits += _ground_truth_named(out_file) + _glob_ground_truth(out_file)
     if prog == "ln" and any(_is_logs_dir(a, cwd, base_dir) for a in operands + ([target_dir] if target_dir else [])):
         # A symlink/hard link to the logs dir is an alias that file tools would not recognise (ln -s logs st)
-        hits.extend(GROUND_TRUTH_FILES)
+        hits.extend(all_files)
     if re.search(r"\bmklink\b", text, re.IGNORECASE) and any(_is_logs_dir(w, cwd, base_dir) for w in text.split()):
-        hits.extend(GROUND_TRUTH_FILES)
+        hits.extend(all_files)
     if prog == "find":
         hits += _find_ground_truth(args, cwd, base_dir, depth)
     if prog == "git" and _git_wipes_logs(args):
-        hits.extend(GROUND_TRUTH_FILES)
+        hits.extend(all_files)
     return [p for p in GROUND_TRUTH_FILES if p in set(hits)]
 
 
@@ -1711,34 +3329,384 @@ def _inline_logs_dir_writes(command_line: str, cwd: str = "", base_dir: str = ""
     return [p for p in GROUND_TRUTH_FILES if p in set(hits)]
 
 
-def _lift_path_substitutions(command_line: str) -> str:
+def _lift_path_substitutions(command_line: str, runtime_prefix: bool = False) -> str:
     """Rewrites working-directory substitutions ($(pwd), `pwd`, $PWD, $(git rev-parse --show-toplevel)) to '.' and
-    $HOME to '~', and replaces a command substitution used as a path prefix ($(cmd)/logs) by '.', appending its
-    command as a separate line: unquoted, the tokenizer would split `$(pwd)/logs` into '$', '(', 'pwd', ')', '/logs'
-    and the path would never reach the rm / ln operand checks."""
+    $HOME to '~', replaces a command substitution used as a path prefix ($(cmd)/logs) by '.' (runtime_prefix: by
+    the run-time value $__subst__, whose `$__subst__/logs` _is_logs_dir treats as logs/), and any other one-line
+    command substitution ($(cmd), `cmd`) by $__subst__; each lifted command is appended as a separate line. Unquoted, the tokenizer would split `$(pwd)/logs` into '$', '(', 'pwd', ')', '/logs' and the path
+    would never reach the rm / ln operand checks."""
     line = HOME_VAR_RE.sub("~", CWD_SUBSTITUTION_RE.sub(".", command_line))
     lifted: List[str] = []
 
-    def lift(m: "re.Match") -> str:
+    def lift(m: "re.Match", replacement: str) -> str:
         inner = m.group(1) if m.group(1) is not None else m.group(2)
         if inner.strip():
             lifted.append(inner)
-        return "."
+        return replacement
 
-    line = PATH_SUBSTITUTION_RE.sub(lift, line)
+    line = PATH_SUBSTITUTION_RE.sub(lambda m: lift(m, "$__subst__" if runtime_prefix else "."), line)
+    for _ in range(NESTED_DEPTH_LIMIT):  # innermost first: $(echo $(date))
+        lifted_line = COMMAND_SUBSTITUTION_RE.sub(lambda m: lift(m, "$__subst__"), line)
+        if lifted_line == line:
+            break
+        line = lifted_line
     return line + "".join("\n" + c for c in lifted)
 
 
-def _ground_truth_subcommands(command_line: str) -> List[List[str]]:
-    """Sub-commands for the ground-truth check: path substitutions lifted, interpreter heredoc bodies dropped and
-    `find` predicates split off by escaped parentheses / `\\;` re-attached to their find (find . \\( -type f \\) -delete)."""
-    merged: List[List[str]] = []
-    for tokens in split_subcommands(_strip_interpreter_heredocs(_lift_path_substitutions(command_line))):
-        if merged and _program(merged[-1]) == "find" and (tokens[0].startswith("-") or tokens[0] in ("!", ",")):
-            merged[-1] = merged[-1] + tokens
+def _ground_truth_segments(command_line: str) -> List[Tuple[List[str], bool]]:
+    """(sub-command tokens, fed by a pipe from the previous sub-command) for the ground-truth check: substitutions
+    lifted, interpreter heredoc bodies dropped and `find` predicates split off by escaped parentheses / `\\;`
+    re-attached to their find (find . \\( -type f \\) -delete)."""
+    segments: List[Tuple[List[str], bool]] = []
+    current: List[str] = []
+    piped = False
+    for tok in _tokenize(_strip_interpreter_heredocs(_lift_path_substitutions(command_line, runtime_prefix=True))):
+        if not tok:
+            continue
+        if tok in SHELL_SEPARATORS:
+            if current:
+                segments.append((current, piped))
+                current = []
+            if tok in ("|", "|&"):
+                piped = True
+            elif tok != "(":
+                piped = False  # `a | (b; c)`: the subshell still reads the pipe
+            continue
+        current.append(_restore_quoted_newline(tok))
+    if current:
+        segments.append((current, piped))
+    merged: List[Tuple[List[str], bool]] = []
+    for tokens, piped in segments:
+        if merged and _program(merged[-1][0]) == "find" and (tokens[0].startswith("-") or tokens[0] in ("!", ",")):
+            merged[-1] = (merged[-1][0] + tokens, merged[-1][1])
         else:
-            merged.append(list(tokens))
+            merged.append((list(tokens), piped))
     return merged
+
+
+def _ground_truth_subcommands(command_line: str) -> List[List[str]]:
+    """Sub-commands for the ground-truth check (see _ground_truth_segments)."""
+    return [tokens for tokens, _ in _ground_truth_segments(command_line)]
+
+
+_VAR_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _is_destructive_write(prog: str, args: List[str]) -> bool:
+    """True for programs that create / overwrite / delete / move a path given as an operand."""
+    if (prog in WRITE_PROGRAMS or prog in WINDOWS_DELETE_PROGRAMS or prog in WINDOWS_MOVE_PROGRAMS
+            or prog in WINDOWS_COPY_PROGRAMS or prog == "rmdir"):
+        return True
+    if prog in ("sed", "perl") and any(re.match(r"^-[A-Za-z]*i", a) or a.startswith("--in-place") for a in args):
+        return True
+    return False
+
+
+def _substitute_vars(token: str, var_map: Dict[str, str]) -> str:
+    """Replace $VAR / ${VAR} by a known literal value (literal assignments earlier on the line)."""
+    return _VAR_REF_RE.sub(lambda m: var_map.get(m.group(1) or m.group(2), m.group(0)), token)
+
+
+def _update_var_map(tokens: List[str], var_map: Dict[str, str]) -> None:
+    """Tracks literal shell variables across a line: a standalone `D=logs` (or D+=x), `export / declare / local
+    D=logs` record a literal; a run-time value (D=$(...), read D, for D in ..., printf -v D, mapfile D), a prefix
+    assignment that only lasts for its command (D=x cmd) and `unset D` forget it, so a later $D stays unresolved."""
+    idx, info = _command_start(tokens)
+    prog = os.path.basename(tokens[idx]).lower() if idx < len(tokens) else ""
+    args = tokens[idx + 1:] if idx < len(tokens) else []
+    for var, value in info["assigns"]:
+        value = _substitute_vars(value, var_map)
+        if idx >= len(tokens) and not _unresolved(value):
+            var_map[var] = value
+        else:
+            var_map.pop(var, None)
+    if prog == "unset":
+        for a in args:
+            var_map.pop(a, None)
+        return
+    for var, value in _declared_assignments(prog, args):
+        if value is None:
+            continue  # export D: keeps its value
+        value = _substitute_vars(value, var_map)
+        if prog in DECLARE_BUILTINS and not _unresolved(value):
+            var_map[var] = value
+        else:
+            var_map.pop(var, None)
+
+
+def _substituted_segments(command_line: str) -> List[Tuple[List[str], bool]]:
+    """_ground_truth_segments with literal variables substituted in order (D=logs; rm -rf $D -> rm -rf logs)."""
+    var_map: Dict[str, str] = {}
+    out: List[Tuple[List[str], bool]] = []
+    for tokens, piped in _ground_truth_segments(command_line):
+        substituted = [_substitute_vars(t, var_map) for t in tokens]
+        _update_var_map(substituted, var_map)
+        out.append((substituted, piped))
+    return out
+
+
+def _join_cwd(base: str, rel: str) -> str:
+    """rel resolved against the directory base (absolute POSIX or Windows rel is returned as is)."""
+    raw = (rel or "").replace("\\", "/")
+    if raw.startswith("/") or re.match(r"^[A-Za-z]:", raw):
+        return raw
+    b = (base or "").replace("\\", "/")
+    return posixpath.normpath(posixpath.join(b, raw)) if b else posixpath.normpath(raw or ".")
+
+
+def _cwd_in_logs(cur_cwd: str, base_dir: str) -> bool:
+    """True when a working directory is the workspace's logs/ or below it, or (fail safe, see _is_logs_dir) a
+    directory named logs or below one anywhere (cd /proc/self/cwd/logs, cd /tmp/r/logs, env -C build/logs): a
+    `logs` component of the path relative to the workspace root, or of the whole path when it lies outside it."""
+    if not base_dir or not cur_cwd:
+        return False
+    raw = cur_cwd.replace("\\", "/")
+    if _windows_form(raw) and "logs" in [c.lower() for c in raw.split("/")]:
+        return True
+    root = _canon_path(base_dir).rstrip("/")
+    c = _canon_path(cur_cwd, base_dir)
+    rel = c[len(root):] if c == root or c.startswith(root + "/") else c
+    return "logs" in rel.split("/")
+
+
+def _apply_cd(tokens: List[str], cwds: List[str], unknown: bool) -> Tuple[List[str], bool]:
+    """Tracks `cd` / `pushd` across a line as a union: the new directory is ADDED to the possible working
+    directories (cd may fail, run in a subshell or after `false &&`), so tracking only ever adds denials. `cd`
+    with no operand, `cd -`, `cd ~/x`, `cd "$X"`, `cd $(...)`, `pushd +1` make the working directory unknown."""
+    idx = _program_index(tokens)
+    args = [a for a in _plain_args(tokens[idx + 1:]) if a not in ("-L", "-P", "-e", "-@", "-n", "--")]
+    target = args[0] if args else None
+    if target is None or target == "-" or target.startswith(("~", "+", "-")) or _unresolved(target):
+        return cwds, True
+    new = [_join_cwd(c, target) for c in cwds]
+    merged = cwds + [c for c in new if c not in cwds]
+    if len(merged) > 16:
+        return cwds, True
+    return merged, unknown or _proc_alias(target)  # cd /proc/self/cwd: resolves in the command's process
+
+
+def _written_basenames(subs: List[List[str]], depth: int = 0) -> set:
+    """Lower-case basenames of files a command line may write ('*' = names we cannot see): redirect targets and
+    time -o files; the write targets of writers (tee f, cp x f, dd of=f, sed -i f), output options (curl -o f,
+    --output=f); every word of inline interpreter code (python3 -c "open('f','w')") and of git sub-commands that
+    rewrite the work tree (git checkout f); '*' for archive extraction and recursive / glob copies; the same for the
+    nested command lines of each sub-command (bash -c '...')."""
+    out: set = set()
+    for tokens in subs:
+        idx, info = _command_start(tokens)
+        words: List[str] = list(_redirect_targets(tokens) + info["outputs"])
+        prog_token = tokens[idx] if idx < len(tokens) else ""
+        prog = re.sub(r"\.exe$", "", os.path.basename(prog_token).lower())
+        args = _plain_args(tokens[idx + 1:] if idx < len(tokens) else [])
+        if _is_destructive_write(prog, args) and prog not in CONTENT_PRESERVING_WRITERS:
+            words += _write_targets(prog, args)
+            if prog in LOGS_DIR_COPY_PROGRAMS | WINDOWS_COPY_PROGRAMS and (
+                    _is_recursive(args) or any(SHELL_GLOB_RE.search(a) for a in args)):
+                out.add("*")
+        options = OUTPUT_OPTIONS.get(prog, set())
+        for j, a in enumerate(args):
+            m = OUTPUT_VALUE_RE.match(a)
+            if m:
+                words.append(a[m.end():])
+            elif a in options and j + 1 < len(args):
+                words.append(args[j + 1])
+        if prog in ARCHIVE_EXTRACT_PROGRAMS and _archive_extracts(prog, args):
+            out.add("*")
+        if SHELL_CALL_INTERPRETERS_RE.match(prog) or (prog == "git" and _git_subcommand(args)[0] in
+                                                       GIT_WRITE_SUBCOMMANDS):
+            words += args
+        if depth < NESTED_DEPTH_LIMIT:  # bash -c 'echo ls > /tmp/a.sh'; bash /tmp/a.sh
+            for nested in _nested_commands(prog, args) + info["nested"]:
+                out |= _written_basenames(_ground_truth_subcommands(nested), depth + 1)
+        for t in words:
+            for w in re.findall(r"[^\s'\"();,=<>|&`{}\[\]]+", t or ""):
+                out.add(posixpath.basename(w.replace("\\", "/")).lower())
+    out.discard("")
+    return out
+
+
+def _xargs_command_read_only(cmd: List[str]) -> bool:
+    """An xargs command that only reads (default echo, cat, grep, wc, git log ...)."""
+    if not cmd:
+        return True
+    prog = re.sub(r"\.exe$", "", os.path.basename(cmd[0]).lower())
+    if _unresolved(cmd[0]):
+        return False
+    if prog in GROUND_TRUTH_READ_PROGRAMS or prog == "git":
+        return _ground_truth_read_only(prog, cmd[1:])
+    return prog in XARGS_READ_PROGRAMS
+
+
+def _is_confined_find(stage: List[str], cwds: List[str], unknown: bool, base_dir: str) -> bool:
+    """A producer stage that only lists paths provably outside logs/ and its ancestors: `find` over literal roots
+    (no glob / variable / ~; relative ones only with a known cwd) whose path and realpath are neither logs/, below
+    it nor an ancestor of it, without -L / -follow, and printing nothing but the paths (-print / -print0)."""
+    idx, info = _command_start(stage)
+    if idx >= len(stage) or os.path.basename(stage[idx]).lower() != "find" or info["wrappers"]:
+        return False
+    if any(t in ("<", "<<", "<<<") for t in stage):
+        return False
+    args = _plain_args(stage[idx + 1:])
+    if any(a in FIND_NON_LISTING_ACTIONS for a in args):
+        return False
+    for root in _find_roots(args):
+        if _unresolved(root) or SHELL_GLOB_RE.search(root) or root.startswith("~") or (unknown and _relative_word(root)):
+            return False
+        for c in cwds:
+            try:
+                real = os.path.realpath(_host_path(root, _host_path(c, base_dir) if c else base_dir))
+            except (OSError, ValueError):
+                return False
+            for path, base in ((root, c), (real, "")):
+                if (_reaches_logs_dir(path, base, base_dir) or _is_logs_dir(path, base, base_dir)
+                        or _cwd_in_logs(_join_cwd(base, path) if base else path, base_dir)):
+                    return False
+    return True
+
+
+def _xargs_unconfined(tokens: List[str], producers: List[List[str]], cwds: List[str], unknown: bool,
+                      base_dir: str) -> bool:
+    """`xargs` (also after wrappers: nice / timeout 5 / env / command / exec ... xargs) running anything but a
+    read-only command is denied unless it reads its items from a pipe whose every producer is a confined find
+    listing (_is_confined_find), and only deleters (rm / rmdir / unlink) or copiers with -t DIR (cp / mv / ln /
+    install) run on them. No producer (xargs rm < list), -a FILE, -d DELIM, -I / -i replacement, a shell, an
+    interpreter, env or another wrapper -> denied."""
+    idx, info = _command_start(tokens)
+    x = info["xargs"]
+    if x is None:
+        return False
+    cmd = _plain_args(tokens[x["cmd_index"]:])
+    if _xargs_command_read_only(cmd):
+        return False
+    if x["arg_file"] or x["delimiter"] or x["replace"] is not None or not producers:
+        return True
+    if any(t in ("<", "<<", "<<<", "<&") for t in tokens):
+        return True
+    prog = re.sub(r"\.exe$", "", os.path.basename(cmd[0]).lower())
+    if prog not in XARGS_DELETE_PROGRAMS:
+        if prog not in XARGS_TARGET_PROGRAMS or _split_operands(prog, cmd[1:])[1] is None:
+            return True
+    return not all(_is_confined_find(p, cwds, unknown, base_dir) for p in producers)
+
+
+def _stdin_shell_hits(tokens: List[str], producers: List[List[str]], cwds: List[str], unknown: bool, base_dir: str,
+                      depth: int, written: frozenset) -> List[str]:
+    """A shell reading its commands from stdin (`... | bash`, `bash -s`, `sh < f`, `source /dev/stdin`,
+    `bash <(curl ...)`) is denied unless its input is visible: a heredoc (its body is judged line by line), a
+    here-string (judged), `< file` or a single `cat <file>` / `cat < file` producer (the file is judged)."""
+    deny = list(GROUND_TRUTH_FILES)
+    idx, info = _command_start(tokens)
+    if idx >= len(tokens):
+        return []
+    prog = re.sub(r"\.exe$", "", os.path.basename(tokens[idx]).lower())
+    raw_args = tokens[idx + 1:]
+    args = _plain_args(raw_args)
+    if prog in SHELL_INTERPRETERS:
+        parsed = _shell_args(args)
+        if parsed["info"] or parsed["command"] is not None:
+            return []
+        if not (parsed["stdin"] or parsed["script"] in STDIN_SCRIPT_PATHS):
+            return []
+    elif prog in (".", "source"):
+        operand = next((a for a in args if not a.startswith("-")), None)
+        if operand is not None and operand not in STDIN_SCRIPT_PATHS:
+            return []
+    else:
+        return []
+
+    def judge(word: str) -> List[str]:
+        out: List[str] = []
+        for c in cwds:
+            out += _judge_script(word, c, base_dir, depth, unknown, True, written)
+        return out
+
+    for j, t in enumerate(raw_args):
+        if t in ("<<", "<<-"):
+            return []  # heredoc: the body is judged line by line with the rest of the command
+        if t == "<<<":
+            if j + 1 >= len(raw_args):
+                return deny
+            out: List[str] = []
+            for c in cwds:
+                out += _ground_truth_line_hits(raw_args[j + 1], c, base_dir, depth=depth + 1, cwd_unknown=unknown,
+                                               written=written)
+            return out
+        if t in ("<", "<&"):
+            target = raw_args[j + 1] if j + 1 < len(raw_args) else ""
+            if not target or target.isdigit() or target in SHELL_SEPARATORS:
+                return deny
+            return judge(target)
+    if len(producers) == 1:
+        p_idx, p_info = _command_start(producers[0])
+        rest = producers[0][p_idx + 1:]
+        if p_idx < len(producers[0]) and os.path.basename(producers[0][p_idx]).lower() == "cat" and \
+                not p_info["wrappers"]:
+            if len(rest) == 2 and rest[0] == "<":
+                return judge(rest[1])
+            if len(rest) == 1 and not rest[0].startswith("-"):
+                return judge(rest[0])
+    return deny
+
+
+def _ground_truth_line_hits(command_line: str, cwd: str, base_dir: str, shell: str = "bash", depth: int = 0,
+                            cwd_unknown: bool = False, strict: bool = True, written: frozenset = frozenset(),
+                            cwds: Optional[List[str]] = None) -> List[str]:
+    """Judge a whole command line: literal variables substituted in order, `cd` / `pushd` tracked as a union of
+    possible working directories (every sub-command is judged against each), xargs pipelines and shells reading
+    stdin checked against their producers, and the basenames written anywhere on the line (and the enclosing lines)
+    collected so that running a script written on the same line is denied. Nested command lines and script files
+    re-enter here one level deeper; beyond NESTED_DEPTH_LIMIT the line is denied. shell="powershell": per
+    sub-command only (no Bash tracking). strict=False (only the sha256-pinned DESK_SHELL_SCRIPTS): the run-time-value
+    and unknown-cwd rules are skipped; xargs, stdin-shell and every literal rule still apply. cwds: the possible
+    starting directories (default [cwd]). Within one audit scope the result is memoised per (text, cwds, flags)."""
+    if depth > NESTED_DEPTH_LIMIT:
+        return list(GROUND_TRUTH_FILES)
+    cwd = cwd or base_dir
+    start_cwds = list(dict.fromkeys(cwds)) if cwds else [cwd]
+    key = ("line", command_line, tuple(start_cwds), base_dir, shell, depth, cwd_unknown, strict, written)
+    memo = _AUDIT["memo"] if _AUDIT["active"] else None
+    if memo is not None and key in memo:
+        return memo[key]
+    result = _ground_truth_line_hits_uncached(command_line, start_cwds, base_dir, shell, depth, cwd_unknown, strict,
+                                              written)
+    if memo is not None:
+        memo[key] = result
+    return result
+
+
+def _ground_truth_line_hits_uncached(command_line: str, start_cwds: List[str], base_dir: str, shell: str, depth: int,
+                                     cwd_unknown: bool, strict: bool, written: frozenset) -> List[str]:
+    cwd = start_cwds[0]
+    if shell != "bash":
+        for tokens in _ground_truth_subcommands(command_line):
+            protected = _ground_truth_writes(tokens, " ".join(tokens), cwd, base_dir, depth, shell=shell)
+            if protected:
+                return protected
+        return []
+    segments = _substituted_segments(command_line)
+    written = frozenset(set(written) | _written_basenames([tokens for tokens, _ in segments]))
+    cwds, unknown = list(start_cwds), cwd_unknown
+    start = 0
+    for k, (tokens, piped) in enumerate(segments):
+        if not piped:
+            start = k
+        hits: List[str] = []
+        producers = [t for t, _ in segments[start:k]]
+        if _xargs_unconfined(tokens, producers, cwds, unknown, base_dir):
+            return list(GROUND_TRUTH_FILES)
+        hits += _stdin_shell_hits(tokens, producers, cwds, unknown, base_dir, depth, written)
+        text = " ".join(tokens)
+        for c in cwds:
+            hits += _ground_truth_writes(tokens, text, c, base_dir, depth, cwd_unknown=unknown, strict=strict,
+                                         written=written, cwd_set=tuple(cwds))
+        if hits:
+            return [p for p in GROUND_TRUTH_FILES if p in set(hits)]
+        prog = _program(tokens)
+        if prog in ("cd", "pushd"):
+            cwds, unknown = _apply_cd(tokens, cwds, unknown)
+        elif prog == "popd":
+            unknown = True
+    return []
 
 
 def _resolve_script_path(token: str, cwd: str, base_dir: str) -> Optional[str]:
@@ -2093,7 +4061,17 @@ def analyze_run_command(command_line: str, cwd: str, base_dir: str, shell: str =
     normalize_powershell_command, whose read-only cmdlets may name ground-truth files). Returns
     {deny: reason|None, force_ask: reason|None, trading: [subcommand text], risk_reducing: bool,
      neutral_only: bool, record_eval: {...}|None}
+    Runs inside the evaluation's audit scope; exceeding the work budget denies (fail closed).
     """
+    with _audit_scope():
+        try:
+            return _analyze_run_command(command_line, cwd, base_dir, shell)
+        except AuditBudgetExceeded:
+            return {"deny": AUDIT_BUDGET_REASON, "force_ask": None, "trading": [], "batch": [],
+                    "risk_reducing": False, "all_safe": False, "record_eval": None}
+
+
+def _analyze_run_command(command_line: str, cwd: str, base_dir: str, shell: str = "bash") -> Dict[str, Any]:
     result: Dict[str, Any] = {
         "deny": None, "force_ask": None, "trading": [], "batch": [], "risk_reducing": False,
         "all_safe": True, "record_eval": None,
@@ -2152,16 +4130,20 @@ def analyze_run_command(command_line: str, cwd: str, base_dir: str, shell: str =
     #     ... and inline code destroying / moving / aliasing the logs/ directory itself (shutil.rmtree('logs'))
     if inline:
         protected = _inline_logs_dir_writes(command_line, cwd, base_dir)
+        #     ... and shell commands inline code runs (os.system('rm -rf logs'), subprocess.run(['rm', ...]))
+        for nested in _inline_shell_strings(command_line):
+            protected = protected or _ground_truth_line_hits(nested, cwd, base_dir, depth=1)
         if protected:
             result["deny"] = ground_truth_denial(protected)
             return result
 
-    # 4b. Ground-truth state (GROUND_TRUTH_FILES) may only be written by its sanctioned desk script
-    for tokens in _ground_truth_subcommands(command_line):
-        protected = _ground_truth_writes(tokens, " ".join(tokens), cwd, base_dir, shell=shell)
-        if protected:
-            result["deny"] = ground_truth_denial(protected)
-            return result
+    # 4b. Ground-truth state (GROUND_TRUTH_FILES) may only be written by its sanctioned desk script. A Bash line is
+    #     judged whole, with `cd` / literal-variable tracking and xargs-pipeline analysis; a PowerShell statement
+    #     (already split by the PowerShell scanner) is judged per sub-command.
+    protected = _ground_truth_line_hits(command_line, cwd, base_dir, shell=shell)
+    if protected:
+        result["deny"] = ground_truth_denial(protected)
+        return result
 
     for tokens in subcommands:
         text = " ".join(tokens)
@@ -2588,7 +4570,19 @@ def evaluate_trade_opening(cmd: str, args: dict, mcp_args: dict, base_dir: str,
 # =============================================================================
 def evaluate_shell_command(command_line: str, cwd: str, base_dir: str, conversation_id: Optional[str],
                            shell: str = "bash") -> Tuple[str, str]:
-    """(decision, reason) for a shell command line (Bash, or PowerShell text normalised by scan_powershell)."""
+    """(decision, reason) for a shell command line (Bash, or PowerShell text normalised by scan_powershell). An
+    "allow" (risk-reducing exit or gated trade opening) needs a flat single-line command (_auto_allow_blocker);
+    otherwise it is downgraded to "ask"."""
+    decision, reason = _evaluate_shell_command(command_line, cwd, base_dir, conversation_id, shell)
+    if decision == "allow":
+        blocker = _auto_allow_blocker(command_line)
+        if blocker:
+            return "ask", (reason + f" Not auto-allowed because {blocker}; user confirmation required.").strip()
+    return decision, reason
+
+
+def _evaluate_shell_command(command_line: str, cwd: str, base_dir: str, conversation_id: Optional[str],
+                            shell: str = "bash") -> Tuple[str, str]:
     analysis = analyze_run_command(command_line, cwd, base_dir, shell=shell)
     if analysis["deny"]:
         return "deny", analysis["deny"]
@@ -2688,6 +4682,11 @@ def evaluate_powershell_command(command: str, cwd: str, base_dir: str, conversat
     decision, reason = max(results, key=lambda r: PS_DECISION_RANK.get(r[0], PS_DECISION_RANK["deny"]))
     if bodies and decision == "allow":
         return "ask", (reason + " The command contains nested PowerShell blocks; user confirmation required.").strip()
+    if decision == "allow" and ("\n" in command.rstrip() or "\r" in command.rstrip()):
+        return "ask", (reason + " The command spans several lines; user confirmation required.").strip()
+    if decision == "allow" and "`" in command:
+        return "ask", (reason + " The command contains a PowerShell backtick escape; user confirmation "
+                                "required.").strip()
     return decision, reason
 
 
@@ -2748,10 +4747,12 @@ def evaluate_payload(payload: dict) -> Tuple[str, str, str]:
 
     # ---------------------------------------------------------------- shell commands
     if call["kind"] == "run_command":
-        if call["shell"] == "powershell":
-            decision, reason = evaluate_powershell_command(call["command"], call["cwd"], base_dir, conversation_id)
-        else:
-            decision, reason = evaluate_shell_command(call["command"], call["cwd"], base_dir, conversation_id)
+        with _audit_scope():  # one work budget for every statement / body / wsl line of this command
+            if call["shell"] == "powershell":
+                decision, reason = evaluate_powershell_command(call["command"], call["cwd"], base_dir,
+                                                               conversation_id)
+            else:
+                decision, reason = evaluate_shell_command(call["command"], call["cwd"], base_dir, conversation_id)
         return decision, reason, tool_label
 
     # ---------------------------------------------------------------- anything else
