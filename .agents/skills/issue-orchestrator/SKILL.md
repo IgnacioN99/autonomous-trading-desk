@@ -1,0 +1,59 @@
+---
+name: issue-orchestrator
+description: >-
+  End-to-end GitHub issue workflow for this repository, run by the main agent: pick or take issue N,
+  create its own worktree and fix/issue-N-* branch, map the code with the read-only issue_locator
+  subagent, write the design decisions, implement with the issue_fixer subagent, audit each round
+  with the read-only issue_auditor subagent (up to 3 rounds), verify the full suite, commit, push,
+  open the PR, run the pr-review skill, merge when CI is green, open follow-up issues and clean up.
+  Use when the user asks to work, fix or take an issue ("trabajá el issue 95", /issue-orchestrator
+  95) or to pick the next one. Development work only: it never places orders.
+---
+
+# Issue Orchestrator
+
+You (the main agent) orchestrate; three subagents with minimal tools do the focused work. All three run on Opus and start with a clean context, so everything they need goes into files in the issue work directory and into a precise task message.
+
+| Role | Subagent | Tools | Writes |
+|---|---|---|---|
+| Locator | `issue_locator` | read, grep, list (read-only) | nothing; its report is its final response |
+| Fixer | `issue_fixer` | read, grep, list, edit, write, shell behind `scripts/hooks/issue_fixer_guard.py` | code, tests, `fixer_report.md` |
+| Auditor | `issue_auditor` | read, grep, list (read-only) | nothing; its verdict is its final response |
+
+Only the orchestrator uses the internet (Binance, GitHub or library docs), git history commands that write, `gh` and the desk scripts below. Subagents never get those tools.
+
+**Work directory** (gitignored): `<WORKTREE>/logs/issue_work/` with `issue.json`, `locator.md`, `design.md`, `fixer_report.md`, `audit_round<k>.md` and `review/` (`diff.patch`, `files.txt`, `checks.json`, `checks.log`). Subagents exchange information only through these files, never through long pasted context.
+
+## Rules
+
+- This is development work, not a trading session: the trading code freeze does not apply, but never place orders, never run the executor, loops or ledger sync, and never edit runtime files under `logs/` other than `logs/issue_work/`.
+- One issue per worktree; never edit the main checkout. Every shell command in a worktree starts with `cd <WORKTREE> && ` (the working directory resets between calls).
+- Write commit messages, PR bodies and issue bodies to files under `<WORKTREE>/logs/issue_work/` with the file-write tool and pass them with `-F` / `--body-file`: the pre-trade hook classifies whole command texts, and heredocs that mention protected logs are denied.
+- Report to the user briefly in their language after each milestone (worktree ready, fixer done, audit verdict, PR, review, merge). Subagents' long outputs stay in files.
+
+## Steps
+
+1. **Select the issue.** If the user named one, take it. Otherwise list open issues (`gh issue list --state open --json number,title,labels`) and pick by `severity:*` then `priority:*`. Skip issues whose likely files overlap open PRs (`gh pr list`), other worktrees (`git worktree list`) or other local agent sessions (ask them which files they touch and tell them yours). Prefer issues you can finish without user input.
+2. **Create the worktree:** `python3 scripts/dev/issue_workspace.py init <N> --slug <short-kebab-slug>`. It fetches, creates `<repo>-wt-issue-<N>` on `fix/issue-<N>-<slug>` from `origin/main` and writes `issue.json`. Read the issue yourself.
+3. **Research (orchestrator only).** If the fix depends on external behaviour (Binance endpoints, weights or error codes, GitHub or Claude Code features), look it up now and record the facts with their sources in `design.md`.
+4. **Locate.** Launch the `issue_locator` subagent (Claude Code: Agent tool with `subagent_type: "issue_locator"`) with this task message: `WORKTREE=<abs path>. Map issue #<N> (logs/issue_work/issue.json) for the fixer: files, callers, persistence, tests and fixtures, docs, constraints and design options.` Save its report verbatim to `<WORKTREE>/logs/issue_work/locator.md`.
+5. **Design.** Decide every open question yourself (consult an advisor when one is available and the issue is non-trivial), then write `<WORKTREE>/logs/issue_work/design.md` with: problem summary; numbered mandatory decisions (data sources, fail-closed behaviour in PROD vs TESTNET, function placement that keeps mocked tests valid, docs to update); "Do not touch" (files owned by other work, CLI flags another session's allowlist depends on); required tests; verification command; constraints (AGENTS.md byte cap, generated files, hermetic tests). The fixer must not invent design.
+6. **Implement.** Launch the `issue_fixer` subagent (`subagent_type: "issue_fixer"`) with: `WORKTREE=<abs path>. Issue #<N>, round 1. Implement logs/issue_work/design.md; follow your output contract.` Keep its id: later rounds continue the SAME fixer conversation (Claude Code: SendMessage to its agentId) so it keeps its context.
+7. **Audit loop (max 3 fixer rounds).**
+   a. Run `python3 scripts/dev/issue_workspace.py review-context <WORKTREE>` (diff plus untracked files, compileall, sync check and the full unittest run, written to `review/`).
+   b. Launch the `issue_auditor` subagent (`subagent_type: "issue_auditor"`) with: `WORKTREE=<abs path>. Audit issue #<N>, round <k>.` On later rounds continue the same auditor so it re-checks its previous findings. Save its verdict to `<WORKTREE>/logs/issue_work/audit_round<k>.md`.
+   c. `VERDICT: CHANGES_REQUESTED`: send the fixer `Round <k+1>: resolve logs/issue_work/audit_round<k>.md (required changes only).` and repeat from (a). You may also forward non-blocking notes that are small and safety-relevant (they then count as part of the round).
+   d. `VERDICT: APPROVE`: continue. If round 3 ends without approval, stop: report the open findings to the user and ask how to proceed.
+8. **Verify yourself.** Bring the branch up to date (`cd <WORKTREE> && git fetch -q origin`, then fast-forward or merge `origin/main`; stash only your own uncommitted changes around a fast-forward) and run the full gate in the worktree: `python3 -m compileall -q scripts/ tests/ && python3 scripts/dev/sync_claude_assets.py --check && python3 -m unittest discover tests/`. Never continue on a red suite.
+9. **Commit, push, PR.** Stage exactly the intended files (never `logs/issue_work/`), commit with a message file ending in the attribution trailer your harness requires, `git push -u origin <branch>`, then `gh pr create --base main --head <branch> --title "<type>(<scope>): <summary> (#<N>)" --body-file <file>`. The body starts with `Closes #<N>` and covers the problem, the fix (decisions as implemented), tests and the exact suite result.
+10. **PR review.** Run the `pr-review` skill (`.agents/skills/pr-review/SKILL.md`) on the PR, from the worktree, and post the report without asking. If a domain reviewer requires changes, run another fixer round with those findings (it counts toward the 3-round budget), re-verify, push and re-run the review.
+11. **Merge.** When every reviewer approves and CI is green (`gh pr checks <n>`): if `origin/main` moved, integrate it, re-run the gate and push, wait for CI again; then `gh pr merge <n> --merge` and confirm the issue closed.
+12. **Follow-ups (without asking).** Turn every non-blocking note from the auditor and the domain reviewers into new issues, grouped by theme, each with labels `severity:<low|medium|high>`, `priority:<P1|P2|P3>`, a category (`cat:risk_gate`, `cat:tool_error`, ...) and `bug` / `enhancement` / `documentation`; bodies with the problem, file:line evidence and acceptance criteria, written to files first.
+13. **Clean up:** `python3 scripts/dev/issue_workspace.py cleanup <N>` (removes the worktree and the local branch only after the PR is merged; GitHub deletes the remote branch). If the pr-review Stop hook still reports a pending review for this already-reviewed PR, close it with `python3 scripts/ci/pr_review_state.py done --reason no_pr`.
+14. **Report** to the user: PR link, what changed in plain terms, rounds needed, suite result, review link, follow-up issue numbers, and the suggested next issue. Pick the next issue only when the user asked for more than one.
+
+## Failure handling
+
+- A subagent that reports BLOCKED or a guard denial: read its report, fix the design or the environment yourself, then continue the same subagent. Never let a subagent work around a guard.
+- A failing check you cannot attribute to the change (flaky or network-dependent test): rerun once; if it persists, record it as a follow-up issue and say so in the PR body.
+- Never force-push, never merge with red CI or a CHANGES REQUIRED review, never delete a worktree whose PR is not merged unless the user says so (`cleanup <N> --force`).
