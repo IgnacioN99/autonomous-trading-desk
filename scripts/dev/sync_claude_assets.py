@@ -68,12 +68,19 @@ CLAUDE_AGENT_HOOKS = {
     "issue_fixer": (
         "hooks:\n"
         "  PreToolUse:\n"
-        "    - matcher: Bash\n"
+        "    - matcher: Bash|Edit|Write|MultiEdit|NotebookEdit\n"
         "      hooks:\n"
         "        - type: command\n"
         "          command: 'python3 \"$CLAUDE_PROJECT_DIR\"/scripts/hooks/issue_fixer_guard.py || exit 2'"
     ),
 }
+# Agents that work in an issue worktree named in their task message rather than in the session's checkout
+WORKTREE_AGENTS = {"issue_locator", "issue_fixer", "issue_auditor"}
+REPO_PATHS_LINE = ("Relative paths (e.g. `logs/...`, `research/`, `docs/`) are relative to the repository root, "
+                   "your working directory.")
+WORKTREE_PATHS_LINE = ("Relative paths below (e.g. `logs/issue_work/...`, `tests/`) are relative to WORKTREE, the "
+                       "issue worktree named in your task message,\n  not to your working directory: always use "
+                       "absolute paths under WORKTREE.")
 CLAUDE_MODELS = {"inherit", "sonnet", "opus", "haiku"}
 AGY_ONLY_KEYS = {"mainAgent", "subagent", "commandExecutionPolicy", "inheritCustomizations", "inheritMcp"}
 # agy vocabulary that must not survive in a generated description
@@ -170,7 +177,7 @@ You are running as a Claude Code subagent. The instructions below were written f
 - Tools: `view_file` = Read, `grep_search` = Grep, `list_dir` = Glob, `search_web` = WebSearch,
   `read_url_content` = WebFetch{write_map}. Use only the tools you were given{read_only}.
 - `send_message` does not exist here: {delivery}
-- Relative paths (e.g. `logs/...`, `research/`, `docs/`) are relative to the repository root, your working directory.
+- {paths_line}
 </claude_code_runtime>
 """
 
@@ -348,6 +355,7 @@ def render_agent(source_rel: str, text: str) -> tuple:
                    "`multi_replace_file_content` = Edit" if set(tools) & CLAUDE_WRITE_TOOLS else ""),
         read_only=" (read-only: you cannot run commands or edit files)" if read_only else "",
         delivery=agent_delivery(name),
+        paths_line=WORKTREE_PATHS_LINE if name in WORKTREE_AGENTS else REPO_PATHS_LINE,
     )
     content = "\n".join(out) + "\n\n" + banner(source_rel) + "\n" + note + "\n" + body.rstrip("\n") + "\n"
     return os.path.join(CLAUDE_AGENTS_DIR, f"{name}.md"), content

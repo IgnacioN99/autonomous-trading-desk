@@ -56,8 +56,9 @@ transcript's agentType), `verify_review.py`, then `gh pr comment <n> --body-file
 ## Issue workflow
 
 "Work issue N" runs the `issue-orchestrator` skill in the main session: `scripts/dev/issue_workspace.py init`
-(worktree + branch), `issue_locator` (read-only), your `design.md`, `issue_fixer` (edits and tests; its Bash goes
-through `scripts/hooks/issue_fixer_guard.py`, an allowlist with no git writes, gh, network or desk scripts),
+(worktree + branch), `issue_locator` (read-only), your `design.md`, `issue_fixer` (edits and tests; its edits and
+Bash go through `scripts/hooks/issue_fixer_guard.py`: confined to the issue worktree, never the main checkout, and
+an allowlist with no git writes, gh, network or desk scripts),
 `issue_workspace.py review-context` + `issue_auditor` (read-only, up to 3 rounds), your own full-suite run, PR,
 `pr-review`, merge on green CI, follow-up issues and `issue_workspace.py cleanup`. The three agents run on opus
 and never use the internet; on Windows run the flow from WSL (the fixer's guard fails closed without `python3`).

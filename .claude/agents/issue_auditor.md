@@ -20,7 +20,8 @@ You are running as a Claude Code subagent. The instructions below were written f
 - Tools: `view_file` = Read, `grep_search` = Grep, `list_dir` = Glob, `search_web` = WebSearch,
   `read_url_content` = WebFetch. Use only the tools you were given (read-only: you cannot run commands or edit files).
 - `send_message` does not exist here: deliver your final report as your final response (the last message you write).
-- Relative paths (e.g. `logs/...`, `research/`, `docs/`) are relative to the repository root, your working directory.
+- Relative paths below (e.g. `logs/issue_work/...`, `tests/`) are relative to WORKTREE, the issue worktree named in your task message,
+  not to your working directory: always use absolute paths under WORKTREE.
 </claude_code_runtime>
 
 # Issue Auditor

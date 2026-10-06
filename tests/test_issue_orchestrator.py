@@ -21,122 +21,211 @@ from scripts.dev import issue_workspace as iw  # noqa: E402
 from scripts.dev import sync_claude_assets as gen  # noqa: E402
 from scripts.hooks import issue_fixer_guard as guard  # noqa: E402
 
-WT = "/repo-wt-issue-7"
+def _git(cwd, *args):
+    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout
 
+
+def _make_repo(root: str, name: str = "trading") -> str:
+    repo = os.path.join(root, name)
+    os.makedirs(os.path.join(repo, "scripts", "hooks"))
+    Path(repo, "README.md").write_text("x\n")
+    Path(repo, "scripts", "hooks", "issue_fixer_guard.py").write_text("# running guard\n")
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "add", ".")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init")
+    return repo
+
+
+# {wt} = the linked issue worktree, {main} = the main checkout (where the running hooks live)
 ALLOWED = [
-    f"cd {WT} && python3 -m unittest discover tests/ 2>&1 | tail -5",
-    f"cd {WT} && python3 -m unittest tests.test_issue_orchestrator -v",
-    f"cd {WT} && python3 -m compileall -q scripts/ tests/ && python3 scripts/dev/sync_claude_assets.py --check",
-    "python3 scripts/dev/sync_claude_assets.py",
-    "python3 -B tests/test_issue_orchestrator.py",
-    f"python3 {WT}/tests/test_issue_orchestrator.py",
-    "python3 -m pytest -q tests/test_issue_orchestrator.py",
-    "git diff --stat",
-    "git -C /repo-wt-issue-7 status --short",
-    "git log --oneline -5 -- scripts/dev",
-    "git show HEAD:scripts/dev/issue_workspace.py | head -20",
-    "grep -rn 'gh pr' scripts | head",
-    'find . -name "*.py" | xargs grep -n issue_workspace',
-    "ls -la tests && wc -l scripts/dev/*.py",
-    "sed -n 1,40p scripts/dev/issue_workspace.py",
-    "cat logs/issue_work/design.md",
-    "env PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_x",
-    "timeout 600 python3 -m unittest discover tests/",
-    "echo 'git push is only a string here'",
-    "mkdir -p tests/fixtures && cp a b",
+    "cd {wt} && python3 -m unittest discover tests/ 2>&1 | tail -5",
+    "cd {wt} && python3 -m unittest tests.test_issue_orchestrator -v",
+    "cd {wt} && python3 -m compileall -q scripts/ tests/ && python3 scripts/dev/sync_claude_assets.py --check",
+    "cd {wt} && python3 scripts/dev/sync_claude_assets.py",
+    "cd {wt} && python3 -B tests/test_issue_orchestrator.py",
+    "cd {wt} && python3 {wt}/tests/test_issue_orchestrator.py",
+    "cd {wt} && python3 -m pytest -q tests/test_issue_orchestrator.py",
+    "cd {wt} && git diff --stat",
+    "cd {wt} && git status --short && git log --oneline -5 -- scripts/dev",
+    "cd {wt} && git show HEAD:scripts/dev/issue_workspace.py | head -20",
+    "cd {wt} && grep -rn 'gh pr' scripts | head",
+    'cd {wt} && find . -name "*.py" | xargs grep -n issue_workspace',
+    "cd {wt} && ls -la tests && wc -l scripts/dev/*.py",
+    "cd {wt} && sed -n 1,40p scripts/dev/issue_workspace.py",
+    "cd {wt} && sed -i 's/old/new/g' scripts/app.py",
+    "cd {wt} && cat logs/issue_work/design.md",
+    "cd {wt} && env PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_x",
+    "cd {wt} && timeout 600 python3 -m unittest discover tests/",
+    "cd {wt} && echo 'git push is only a string here'",
+    "cd {wt} && mkdir -p tests/fixtures && cp a b",
+    "cd {wt}\npython3 -m unittest tests.test_x",
+    "cd {wt}/scripts && cd .. && ls",
 ]
 
 DENIED = [
-    ("git commit -m fix", "read-only git"),
-    ("git add -A", "read-only git"),
-    ("cd /x && git push -u origin fix/issue-7", "read-only git"),
-    ("git stash", "read-only git"),
-    ("git checkout main", "read-only git"),
-    ("git reset --hard HEAD", "read-only git"),
-    ("ls; git merge origin/main", "read-only git"),
-    ("ls\ngit rebase main", "read-only git"),
-    ("git -c alias.st=!sh status", "git -c"),
-    ("git diff --ext-diff", "external program"),
-    ("git grep -Ovim foo", "external program"),
-    ("git", "bare `git`"),
-    ("gh pr create --fill", "not available"),
-    ("curl https://fapi.binance.com/fapi/v1/time", "not available"),
-    ("wget http://example.com", "not available"),
-    ("pip install requests", "not available"),
-    ("python3 -m pip install requests", "not allowed"),
-    ("python3 -c 'print(1)'", "inline code"),
-    ("python3 -", "stdin"),
-    ("python3", "interactive"),
-    ("python3 scripts/sync_session_state.py", "only tests"),
-    ("python3 scripts/trading_doctor.py", "only tests"),
-    ("python3 scripts/loops/position_guardian_loop.py --once", "only tests"),
-    ("./scripts/report_issue.sh --title x", "direct execution"),
-    ("scripts/report_issue.sh", "direct execution"),
-    ("bash -c 'git push'", "not available"),
-    ("sh scripts/x.sh", "not available"),
-    ("eval git push", "not available"),
-    ("echo $(git push)", "command substitution"),
-    ("echo `git push`", "backtick"),
-    ("diff <(ls) <(ls)", "process substitution"),
-    ("cat > tests/x.py <<EOF\nprint(1)\nEOF", "heredoc"),
-    ("env A=1 git push", "read-only git"),
-    ("timeout 5 git stash", "read-only git"),
-    ("nice -n 5 gh issue list", "not available"),
-    ("find . | xargs -n 1 gh", "not available"),
-    ("sudo ls", "not available"),
-    ("wsl.exe -d Ubuntu -- ls", "not available"),
-    ("node -e 'x'", "not available"),
-    ("ls 'unterminated", "unparseable"),
+    ("cd {wt} && git commit -m fix", "read-only git"),
+    ("cd {wt} && git add -A", "read-only git"),
+    ("cd {wt} && git push -u origin fix/issue-7", "read-only git"),
+    ("cd {wt} && git stash", "read-only git"),
+    ("cd {wt} && git checkout main", "read-only git"),
+    ("cd {wt} && git reset --hard HEAD", "read-only git"),
+    ("cd {wt}; ls; git merge origin/main", "read-only git"),
+    ("cd {wt}\nls\ngit rebase main", "read-only git"),
+    ("cd {wt} && git -c alias.st=!sh status", "git -c"),
+    ("cd {wt} && git diff --ext-diff", "external program"),
+    ("cd {wt} && git grep -Ovim foo", "external program"),
+    ("cd {wt} && git", "bare `git`"),
+    ("cd {wt} && gh pr create --fill", "not available"),
+    ("cd {wt} && curl https://fapi.binance.com/fapi/v1/time", "not available"),
+    ("cd {wt} && wget http://example.com", "not available"),
+    ("cd {wt} && pip install requests", "not available"),
+    ("cd {wt} && python3 -m pip install requests", "not allowed"),
+    ("cd {wt} && python3 -c 'print(1)'", "inline code"),
+    ("cd {wt} && python3 -", "stdin"),
+    ("cd {wt} && python3", "interactive"),
+    ("cd {wt} && python3 scripts/sync_session_state.py", "only tests"),
+    ("cd {wt} && python3 scripts/trading_doctor.py", "only tests"),
+    ("cd {wt} && python3 scripts/loops/position_guardian_loop.py --once", "only tests"),
+    ("cd {wt} && ./scripts/report_issue.sh --title x", "direct execution"),
+    ("cd {wt} && scripts/report_issue.sh", "direct execution"),
+    ("cd {wt} && bash -c 'git push'", "not available"),
+    ("cd {wt} && sh scripts/x.sh", "not available"),
+    ("cd {wt} && eval git push", "not available"),
+    ("cd {wt} && echo $(git push)", "command substitution"),
+    ("cd {wt} && echo `git push`", "backtick"),
+    ("cd {wt} && diff <(ls) <(ls)", "process substitution"),
+    ("cd {wt} && cat > tests/x.py <<EOF\nprint(1)\nEOF", "heredoc"),
+    ("cd {wt} && env A=1 git push", "read-only git"),
+    ("cd {wt} && env -S 'gh issue list'", "env -S"),
+    ("cd {wt} && timeout 5 git stash", "read-only git"),
+    ("cd {wt} && nice -n 5 gh issue list", "not available"),
+    ("cd {wt} && find . | xargs -n 1 gh", "not available"),
+    ("cd {wt} && find . -name x -exec gh issue list ;", "find -exec"),
+    ("cd {wt} && awk 'BEGIN{{system(\"gh\")}}'", "not available"),
+    ("cd {wt} && sed -n '1e gh issue list' f", "sed e/w"),
+    ("cd {wt} && sed 's/a/b/e' f", "sed e/w"),
+    ("cd {wt} && sed 's/a/b/w /tmp/out' f", "sed e/w"),
+    ("cd {wt} && make test", "not available"),
+    ("cd {wt} && sudo ls", "not available"),
+    ("cd {wt} && wsl.exe -d Ubuntu -- ls", "not available"),
+    ("cd {wt} && node -e 'x'", "not available"),
+    ("cd {wt} && ls 'unterminated", "unparseable"),
     ("", "empty"),
+    # confinement: worktree first, never the main checkout
+    ("python3 -m unittest discover tests/", "must start with `cd"),
+    ("git diff", "must start with `cd"),
+    ("cd {main} && python3 -m unittest discover tests/", "must start with `cd"),
+    ("cd tests && ls", "must start with `cd"),
+    ("cd /tmp && ls", "must start with `cd"),
+    ("cd {wt} && cd {main} && ls", "leaves the issue worktree"),
+    ("cd {wt} && sed -i s/x/y/ {main}/scripts/hooks/issue_fixer_guard.py", "main checkout"),
+    ("cd {wt} && cp tests/x.py ../trading/scripts/hooks/issue_fixer_guard.py", "main checkout"),
+    ("cd {wt} && echo x > {main}/scripts/hooks/issue_fixer_guard.py", "main checkout"),
+    ("cd {wt} && sed -i s/x/y/ \"$CLAUDE_PROJECT_DIR\"/scripts/hooks/issue_fixer_guard.py", "CLAUDE_PROJECT_DIR"),
+    ("cd {wt} && cat ~/.gitconfig", "home-directory"),
 ]
-
-
-def run_hook(payload) -> tuple:
-    stdin = io.StringIO(payload if isinstance(payload, str) else json.dumps(payload))
-    err = io.StringIO()
-    with mock.patch.object(sys, "stdin", stdin), mock.patch.object(sys, "stderr", err):
-        code = guard.main()
-    return code, err.getvalue()
 
 
 class TestIssueFixerGuard(unittest.TestCase):
 
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp()
+        cls.main = _make_repo(cls.tmp)
+        cls.wt = os.path.join(cls.tmp, "trading-wt-issue-7")
+        _git(cls.main, "worktree", "add", "-q", cls.wt, "-b", "fix/issue-7-x")
+        os.makedirs(os.path.join(cls.wt, "scripts"), exist_ok=True)
+        cls.conf = guard.Confinement.from_project_dir(cls.main)
+
+    @classmethod
+    def tearDownClass(cls):
+        subprocess.run(["rm", "-rf", cls.tmp], check=False)
+
+    def fmt(self, cmd):
+        return cmd.format(wt=self.wt, main=self.main)
+
+    def run_hook(self, payload, project_dir=None):
+        stdin = io.StringIO(payload if isinstance(payload, str) else json.dumps(payload))
+        err = io.StringIO()
+        env = {"CLAUDE_PROJECT_DIR": project_dir or self.main}
+        with mock.patch.object(sys, "stdin", stdin), mock.patch.object(sys, "stderr", err), \
+                mock.patch.dict(os.environ, env):
+            code = guard.main()
+        return code, err.getvalue()
+
     def test_allowed_commands(self):
         for cmd in ALLOWED:
             with self.subTest(cmd=cmd):
-                self.assertEqual(guard.evaluate(cmd), "", cmd)
+                self.assertEqual(guard.evaluate(self.fmt(cmd), self.conf), "", cmd)
 
     def test_denied_commands(self):
         for cmd, why in DENIED:
             with self.subTest(cmd=cmd):
-                reason = guard.evaluate(cmd)
+                reason = guard.evaluate(self.fmt(cmd), self.conf)
                 self.assertTrue(reason, f"should be denied: {cmd!r}")
                 self.assertIn(why, reason, cmd)
 
+    def test_edit_tools_are_confined_to_the_worktree(self):
+        allowed = [f"{self.wt}/scripts/app.py", f"{self.wt}/tests/test_new.py", f"{self.wt}/AGENTS.md",
+                   f"{self.wt}/.agents/agents/issue_fixer/agent.md", f"{self.wt}/logs/issue_work/fixer_report.md",
+                   f"{self.wt}/scripts/hooks/pre_trade_guard.py"]
+        denied = [
+            (f"{self.main}/scripts/hooks/issue_fixer_guard.py", "outside the issue worktrees"),
+            (f"{self.main}/README.md", "outside the issue worktrees"),
+            ("/etc/hosts", "outside the issue worktrees"),
+            ("scripts/app.py", "absolute path"),
+            (f"{self.wt}/.git/config", "git internals"),
+            (f"{self.wt}/.claude/agents/issue_fixer.md", ".claude/"),
+            (f"{self.wt}/.claude/settings.json", ".claude/"),
+            (f"{self.wt}/.agents/hooks.json", "hook configuration"),
+            (f"{self.wt}/logs/session_state.json", "logs/issue_work/"),
+            (f"{self.wt}/logs/issue_work", "logs/issue_work/"),
+            (f"{self.wt}/scripts/../../trading/README.md", "outside the issue worktrees"),
+        ]
+        for tool in ("Edit", "Write", "MultiEdit"):
+            for path in allowed:
+                with self.subTest(tool=tool, path=path):
+                    payload = {"tool_name": tool, "tool_input": {"file_path": path}}
+                    self.assertEqual(guard.evaluate_payload(payload, self.conf), "")
+            for path, why in denied:
+                with self.subTest(tool=tool, path=path):
+                    payload = {"tool_name": tool, "tool_input": {"file_path": path}}
+                    self.assertIn(why, guard.evaluate_payload(payload, self.conf))
+        nb = {"tool_name": "NotebookEdit", "tool_input": {"notebook_path": f"{self.main}/x.ipynb"}}
+        self.assertIn("outside", guard.evaluate_payload(nb, self.conf))
+
     def test_hook_contract(self):
-        self.assertEqual(run_hook({"tool_name": "Bash", "tool_input": {"command": "git diff"}}), (0, ""))
-        code, err = run_hook({"tool_name": "Bash", "tool_input": {"command": "git push"}})
+        ok = {"tool_name": "Bash", "tool_input": {"command": f"cd {self.wt} && git diff"}}
+        self.assertEqual(self.run_hook(ok), (0, ""))
+        code, err = self.run_hook({"tool_name": "Bash", "tool_input": {"command": f"cd {self.wt} && git push"}})
         self.assertEqual(code, 2)
         self.assertIn("BLOCKED by issue_fixer_guard", err)
-        # Other tools are governed by the fixer's tool list, not by this guard
-        self.assertEqual(run_hook({"tool_name": "Edit", "tool_input": {"file_path": "x"}})[0], 0)
-        # Fail closed on malformed input
-        self.assertEqual(run_hook("not json")[0], 2)
-        self.assertEqual(run_hook("[1, 2]")[0], 2)
-        self.assertEqual(run_hook({"tool_name": "Bash", "tool_input": {}})[0], 2)
+        edit = {"tool_name": "Edit", "tool_input": {"file_path": f"{self.main}/scripts/hooks/issue_fixer_guard.py"}}
+        self.assertEqual(self.run_hook(edit)[0], 2)
+        edit_ok = {"tool_name": "Write", "tool_input": {"file_path": f"{self.wt}/tests/test_new.py"}}
+        self.assertEqual(self.run_hook(edit_ok)[0], 0)
+        # The guard resolves the main checkout also when the session runs inside a worktree
+        self.assertEqual(self.run_hook(edit, project_dir=self.wt)[0], 2)
+        # Tools outside its matcher pass through
+        self.assertEqual(self.run_hook({"tool_name": "Read", "tool_input": {"file_path": "/etc/hosts"}})[0], 0)
+        # Fail closed on malformed input or an unresolvable repository
+        self.assertEqual(self.run_hook("not json")[0], 2)
+        self.assertEqual(self.run_hook("[1, 2]")[0], 2)
+        self.assertEqual(self.run_hook({"tool_name": "Bash", "tool_input": {}})[0], 2)
+        plain = tempfile.mkdtemp()
+        try:
+            self.assertEqual(self.run_hook(ok, project_dir=plain)[0], 2)
+        finally:
+            os.rmdir(plain)
 
     def test_runs_as_a_script(self):
         script = REPO_ROOT / "scripts" / "hooks" / "issue_fixer_guard.py"
-        payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "gh issue list"}})
-        res = subprocess.run([sys.executable, str(script)], input=payload, capture_output=True, text=True)
-        self.assertEqual(res.returncode, 2)
-        res = subprocess.run([sys.executable, str(script)], input=payload.replace("gh issue list", "git status"),
-                             capture_output=True, text=True)
-        self.assertEqual(res.returncode, 0)
-
-
-def _git(cwd, *args):
-    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout
+        env = dict(os.environ, CLAUDE_PROJECT_DIR=self.main)
+        for command, expected in ((f"cd {self.wt} && gh issue list", 2), (f"cd {self.wt} && git status", 0)):
+            payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
+            res = subprocess.run([sys.executable, str(script)], input=payload, capture_output=True, text=True,
+                                 env=env)
+            self.assertEqual(res.returncode, expected, command)
 
 
 class TestIssueWorkspaceReviewContext(unittest.TestCase):

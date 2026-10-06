@@ -17,7 +17,7 @@ You (the main agent) orchestrate; three subagents with minimal tools do the focu
 | Role | Subagent | Tools | Writes |
 |---|---|---|---|
 | Locator | `issue_locator` | read, grep, list (read-only) | nothing; its report is its final response |
-| Fixer | `issue_fixer` | read, grep, list, edit, write, shell behind `scripts/hooks/issue_fixer_guard.py` | code, tests, `fixer_report.md` |
+| Fixer | `issue_fixer` | read, grep, list, edit, write, shell; edits and shell confined to the issue worktree by `scripts/hooks/issue_fixer_guard.py` | code, tests, `fixer_report.md` |
 | Auditor | `issue_auditor` | read, grep, list (read-only) | nothing; its verdict is its final response |
 
 Only the orchestrator uses the internet (Binance, GitHub or library docs), git history commands that write, `gh` and the desk scripts below. Subagents never get those tools.
