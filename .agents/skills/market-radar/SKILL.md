@@ -58,9 +58,9 @@ sorted by confidence. `--top 0` (default) returns all of them.
  "leverage_standard": 3, "qualified_count": 4, "count": 1, "generated_at_utc": "2026-10-04T12:00:00Z",
  "latency_ms": 4200,
  "candidates": [{"symbol": "SOLUSDT", "direction": "LONG", "confidence": 85, "tier": "Tier S (...)",
-   "tier_code": "S", "interval": "15m", "price": 142.1, "trigger": 142.4, "sl": 139.4, "tp1": 146.9,
-   "tp2": 152.9, "rr": 4.0, "risk_pct": 1.9, "rsi": 26.4, "rsi_15m": 26.4, "vol_ratio": 2.1,
-   "lower_wick": 63.0, "upper_wick": 5.0, "reasons": ["..."], "roe_est_pct": 22.8,
+   "tier_code": "S", "interval": "15m", "price": 142.1, "trigger": 142.4, "trigger_distance_pct": 0.21,
+   "sl": 139.4, "tp1": 147.8, "tp2": 154.4, "rr": 4.0, "risk_pct": 2.11, "rsi": 26.4, "rsi_15m": 26.4, "vol_ratio": 2.1,
+   "lower_wick": 63.0, "upper_wick": 5.0, "reasons": ["..."], "roe_est_pct": 25.3,
    "micro": {"taker_ratio": 0.82, "oi_change_pct": 0.4, "oi_z_score": 1.3, "funding_rate_pct": 0.01,
              "regime": "NEUTRAL_CONSOLIDATION", "absorption": "BULLISH_ABSORPTION", "oib_ratio": -0.1,
              "vwap_deviation_pct": -0.8, "cascade_risk": "BASELINE", "...": "..."}}]}
@@ -72,6 +72,10 @@ sorted by confidence. `--top 0` (default) returns all of them.
   micro fetch) or `micro.taker_candle_matched: false` (no taker row for it) → no absorption bonus, reason says so.
 - Prices are floats (unrounded); `micro` is `null` when order-flow data was unavailable.
 - `roe_est_pct` = `risk_pct × rr × leverage_standard` (informational).
+- All levels are measured from `trigger` (the effective entry): `risk_pct = |trigger − sl| / trigger`, TP1 =
+  1.8R (or EMA 20 if farther), TP2 = 4.0R, `rr` and the TP1 ≥ 0.50% friction filter. `price` and
+  `trigger_distance_pct` are informational. `risk_pct` floor 1.4% (below it the SL is widened to 1.5%); ceiling
+  5.0%: rows above it are dropped from the output (TP2 out of intraday reach).
 
 ## 2. YOLO moonshot slot — `broad_yolo_scanner.py`
 

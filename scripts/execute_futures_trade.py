@@ -2633,7 +2633,8 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out):
     elif not filters:
         return fail("filters", f"Symbol filters unavailable for {sym}; TPs deferred to the next run.")
     else:
-        tp1_qty, tp2_qty = split_take_profit_quantities(qty, filters, entry_px)
+        # The TP1 leg is a LIMIT at the record's TP1 price: check its minNotional there (issue #42).
+        tp1_qty, tp2_qty = split_take_profit_quantities(qty, filters, tp1_p if tp1_p > 0 else entry_px)
     if not rec.get('tp_placed'):
         need1 = tp1_qty > 0 and ids['tp1_order_id'] is None
         need2 = tp2_qty > 0 and ids['tp2_order_id'] is None
@@ -2797,6 +2798,20 @@ def execute_complete_trade(
     if tp2_price is None or float(tp2_price) <= 0:
         tp2_price = effective_entry * (1.0 + 0.06) if is_long else effective_entry * (1.0 - 0.06)
 
+    # Round SL and TP prices to the tick BEFORE the gates (issue #42), so the gates check exactly what is submitted.
+    sl_p = round_price(sl_price, filters['tickSize'], filters['precision_price'])
+    tp1_p = round_price(tp1_price, filters['tickSize'], filters['precision_price'])
+    tp2_p = round_price(tp2_price, filters['tickSize'], filters['precision_price'])
+    # Fail closed if rounding collapsed a level onto the entry or onto the wrong side of it (checked before any write).
+    if sl_p <= 0 or (sl_p >= effective_entry if is_long else sl_p <= effective_entry):
+        return {"success": False, "error": (f"Rounded Stop Loss {sl_p} (from {sl_price}) is not on the loss side of the "
+                                            f"effective entry {effective_entry} for a {'LONG' if is_long else 'SHORT'}. "
+                                            "Execution aborted (fail-closed).")}
+    if tp1_p <= 0 or (tp1_p <= effective_entry if is_long else tp1_p >= effective_entry):
+        return {"success": False, "error": (f"Rounded TP1 {tp1_p} (from {tp1_price}) is not on the profit side of the "
+                                            f"effective entry {effective_entry} for a {'LONG' if is_long else 'SHORT'}. "
+                                            "Execution aborted (fail-closed).")}
+
     # 1b. Pending resting entries (Issue #33, PROD): no new entry of any type on a symbol with a pending resting
     # entry (or an unreadable registry). An untriggered STOP_MARKET or a LIMIT entry rests on the book and only gets
     # its SL/TPs on fill (--protect-pending / position guardian loop). Checked before any write.
@@ -2865,9 +2880,12 @@ def execute_complete_trade(
     raw_qty = notional_target / effective_entry
     total_qty = round_step(raw_qty, filters['stepSize'], filters['precision_qty'])
     min_notional = filters.get('minNotional', 5.0)
-    if total_qty * effective_entry < min_notional:
+    # Binance does not document whether an untriggered conditional entry's notional is checked at the trigger or at
+    # the mark/last price (issue #42): use the lower of the two, which satisfies both readings.
+    notional_ref = min(effective_entry, cur_price) if resting_kind == 'STOP_MARKET' else effective_entry
+    if total_qty * notional_ref < min_notional:
         bumped_qty = round_step(total_qty + filters['stepSize'], filters['stepSize'], filters['precision_qty'])
-        if bumped_qty * effective_entry >= min_notional:
+        if bumped_qty * notional_ref >= min_notional:
             total_qty = bumped_qty
     if total_qty < filters['minQty']:
         return {"success": False, "error": f"Quantity {total_qty} lower than minimum allowed {filters['minQty']}"}
@@ -2876,7 +2894,7 @@ def execute_complete_trade(
     liq_entry_price = effective_entry
     mmr, maint_amount, mmr_source = get_maint_margin_bracket(symbol, total_qty * liq_entry_price, target_env=target_env)
     gate_ok, gate_err = check_mechanical_gates(
-        direction, cur_price, sl_price, tp1_price, total_qty, effective_leverage,
+        direction, cur_price, sl_p, tp1_p, total_qty, effective_leverage,
         bypass_delta_gate=bypass_delta_gate, target_env=target_env, is_yolo=is_yolo,
         maint_margin_ratio=mmr, maint_amount=maint_amount, mmr_source=mmr_source,
         liq_entry_price=liq_entry_price, entry_price=effective_entry, live_snapshot=live_snapshot
@@ -2885,13 +2903,8 @@ def execute_complete_trade(
         return {"success": False, "hard_gate_rejection": True, "error": gate_err}
 
     # 5. Split TPs asymmetrically (30% TP1 / 70% TP2) to preserve positive right-tail skewness
-    # and prevent premature profit truncation.
-    tp1_qty, tp2_qty = split_take_profit_quantities(total_qty, filters, cur_price)
-
-    # 6. Round SL and TP prices
-    sl_p = round_price(sl_price, filters['tickSize'], filters['precision_price'])
-    tp1_p = round_price(tp1_price, filters['tickSize'], filters['precision_price'])
-    tp2_p = round_price(tp2_price, filters['tickSize'], filters['precision_price'])
+    # and prevent premature profit truncation. The TP1 leg is a LIMIT at tp1_p, so its minNotional is checked there.
+    tp1_qty, tp2_qty = split_take_profit_quantities(total_qty, filters, tp1_p)
 
     def register_or_cancel(kind, entry_id, price):
         """Records the resting entry for post-fill protection; if that fails the entry is cancelled (fail closed)."""

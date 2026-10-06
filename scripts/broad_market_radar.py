@@ -29,6 +29,10 @@ import microstructure_engine as me
 SUPPORTED_INTERVALS = ("5m", "15m", "1h")
 DEFAULT_INTERVAL = "15m"
 DEFAULT_UNIVERSE = 80
+# Stop distance from the trigger, in % (issue #84): below the floor the SL is widened to 1.5%; above the ceiling the
+# row is flagged and dropped from the qualified list (TP2 = 4R would be out of intraday reach).
+MIN_RISK_PCT = 1.4
+MAX_RISK_PCT = 5.0
 
 def calculate_ema(series, period):
     if len(series) < period:
@@ -215,16 +219,17 @@ def analyze_single_symbol(symbol, interval=DEFAULT_INTERVAL):
         score_short += 10
         short_reasons.append(f"Overextension vs EMA 20 ({dist_to_ema:+.1f}%)")
 
-    # Determine Direction
+    # Determine Direction. Every level is measured from the effective entry, the breakout trigger the order enters
+    # at (issue #86); `price` stays informational.
     if score_long >= 45 and score_long > score_short:
         direction = "LONG"
         confidence = min(score_long, 95)
         reasons = long_reasons
-        entry = current_price
         trigger = candle_high * 1.0005
+        entry = trigger
         sl = min(candle_low, wick_low) - (1.3 * atr)
         risk_pct = ((entry - sl) / entry) * 100
-        if risk_pct < 1.4:
+        if risk_pct < MIN_RISK_PCT:
             sl = entry * 0.985
             risk_pct = 1.5
         tp1 = max(ema20, entry * (1 + risk_pct * 1.8 / 100))
@@ -234,11 +239,11 @@ def analyze_single_symbol(symbol, interval=DEFAULT_INTERVAL):
         direction = "SHORT"
         confidence = min(score_short, 95)
         reasons = short_reasons
-        entry = current_price
         trigger = candle_low * 0.9995
+        entry = trigger
         sl = max(candle_high, wick_high) + (1.3 * atr)
         risk_pct = ((sl - entry) / entry) * 100
-        if risk_pct < 1.4:
+        if risk_pct < MIN_RISK_PCT:
             sl = entry * 1.015
             risk_pct = 1.5
         tp1 = min(ema20, entry * (1 - risk_pct * 1.8 / 100))
@@ -247,7 +252,7 @@ def analyze_single_symbol(symbol, interval=DEFAULT_INTERVAL):
     else:
         return None
 
-    # FINANCIAL FRICTION FILTER:
+    # FINANCIAL FRICTION FILTER (measured from the trigger):
     # Roundtrip taker fee (0.10%) + conservative spread (0.03%) = 0.13%
     # If distance to TP1 is less than 3.5x friction (< 0.45%), disqualify
     expected_gain_tp1_pct = abs(tp1 - entry) / entry * 100
@@ -272,7 +277,7 @@ def analyze_single_symbol(symbol, interval=DEFAULT_INTERVAL):
     else:
         tier = "Tier B+ (Moderate Opportunity)"
 
-    return {
+    row = {
         "symbol": symbol,
         "direction": direction,
         "confidence": confidence,
@@ -281,6 +286,7 @@ def analyze_single_symbol(symbol, interval=DEFAULT_INTERVAL):
         "interval": interval,
         "price": current_price,
         "trigger": trigger,
+        "trigger_distance_pct": round(abs(trigger - current_price) / current_price * 100, 2),
         "sl": sl,
         "tp1": tp1,
         "tp2": tp2,
@@ -294,6 +300,12 @@ def analyze_single_symbol(symbol, interval=DEFAULT_INTERVAL):
         "wick_candle_open_time": wick_candle_open_time,  # open time (ms) of the closed candle both wicks come from
         "reasons": reasons
     }
+    # Issue #84: a stop this far from the trigger puts TP2 (4R) out of intraday reach. The row is flagged here and
+    # dropped by scan_all_liquid_pairs after the microstructure enrichment.
+    if risk_pct > MAX_RISK_PCT:
+        row["risk_pct_over_ceiling"] = True
+        row["disqualify_reason"] = f"risk_pct {risk_pct:.2f}% > {MAX_RISK_PCT}% intraday ceiling"
+    return row
 
 def enrich_candidate_microstructure(cand):
     sym = cand['symbol']
@@ -400,8 +412,8 @@ def scan_all_liquid_pairs(top_n=DEFAULT_UNIVERSE, interval=DEFAULT_INTERVAL):
     with ThreadPoolExecutor(max_workers=8) as ex:
         enriched_results = list(ex.map(enrich_candidate_microstructure, raw_results))
 
-    # Filter qualified candidates only (>= 55% confidence)
-    qualified = [c for c in enriched_results if c['confidence'] >= 55]
+    # Filter qualified candidates only (>= 55% confidence, risk_pct within the intraday ceiling, issue #84)
+    qualified = [c for c in enriched_results if c['confidence'] >= 55 and not c.get('risk_pct_over_ceiling')]
     qualified.sort(key=lambda x: x['confidence'], reverse=True)
     return qualified
 
@@ -458,7 +470,7 @@ def print_text_report(payload):
     for c in payload["candidates"]:
         m = c.get('micro') or {}
         print(f"• {c['tier']} | {c['symbol']} ({c['direction']}) -> {c['confidence']}%")
-        print(f"  Entry: {c['price']} | Trigger: {c['trigger']:.4f} | SL: {c['sl']:.4f} (-{c['risk_pct']}%) | "
+        print(f"  Price: {c['price']} | Trigger (entry):{c['trigger']:.4f} | SL: {c['sl']:.4f} (-{c['risk_pct']}%) | "
               f"TP1: {c['tp1']:.4f} | TP2: {c['tp2']:.4f} | R:R {c['rr']}:1 | "
               f"ROE est ({payload['leverage_standard']}x): +{c['roe_est_pct']}%")
         print(f"  Flow: Taker={m.get('taker_ratio', 1.0):.2f} | OI={m.get('oi_change_pct', 0.0):+.2f}% | "

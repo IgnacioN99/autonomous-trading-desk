@@ -79,14 +79,16 @@ class TestBriefSizesFromTrigger(unittest.TestCase):
 
     def test_without_trigger_falls_back_to_current_price(self):
         price, sl = 0.0025, 0.0024
-        res = self._enrich({"symbol": "BEAMXUSDT", "direction": "LONG", "price": price, "sl": sl})
+        res = self._enrich({"symbol": "BEAMXUSDT", "direction": "LONG", "price": price, "sl": sl,
+                            "tp1": 0.0026, "tp2": 0.0029})   # issue #86: rows without tp1/tp2 are skipped
         self.assertEqual(res.sizing_entry_price, price)
         self.assertEqual(res.trigger_price, price)
 
     def test_zero_or_null_trigger_agrees_between_sizing_and_trigger_price(self):
         price, sl = 0.0025, 0.0024
         for trig in (0, 0.0, None):
-            res = self._enrich({"symbol": "BEAMXUSDT", "direction": "LONG", "price": price, "trigger": trig, "sl": sl})
+            res = self._enrich({"symbol": "BEAMXUSDT", "direction": "LONG", "price": price, "trigger": trig, "sl": sl,
+                                "tp1": 0.0026, "tp2": 0.0029})
             self.assertEqual(res.sizing_entry_price, price, trig)
             self.assertEqual(res.trigger_price, price, trig)
 
