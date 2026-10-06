@@ -13,6 +13,12 @@ This watchdog audits live positions and:
 2. If slightly in profit, aggressively ratchets SL to Break-Even.
 3. If frozen at entry, issues a defensive close recommendation or triggers auto-close (--auto-exit).
 
+Holding time and the dead-alpha verdict come from utils/position_timing.py, shared with the ledger sync and the
+position guardian (issue #92): the entry time of each LIVE position is resolved from Binance fills (userTrades),
+then the trades audit log, else UNKNOWN. An unknown entry time is reported as such (elapsed_hours None plus a
+warning) and is never dead alpha; it is never "now" (0.0h) and never positionRisk updateTime.
+Dead alpha = held >= max_hours AND mark within 1.2% of entry AND |ROE| < 15%.
+
 Usage:
   python3 scripts/trading_drift_watchdog.py [--env testnet|mainnet] [--max-hours 4.0] [--auto-exit]
 """
@@ -20,19 +26,19 @@ Usage:
 import os
 import sys
 import time
-import json
 import datetime
 import argparse
 
 # Ensure local path resolution
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import execute_futures_trade as eft
-from utils.atomic_writer import read_json_safe, atomic_append_jsonl
 from utils.env_resolver import resolve_env
+from utils import position_timing as pt
 
-LOGS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
-STATE_FILE = os.path.join(LOGS_DIR, "session_state.json")
-AUDIT_LOG = os.path.join(LOGS_DIR, "trades_audit.jsonl")
+
+def _audit_log_path():
+    return os.path.join(eft._workspace_dir(), "logs", "trades_audit.jsonl")
+
 
 def audit_dead_alpha(target_env: str = None, max_hours: float = 4.0, auto_exit: bool = False):
     target_env = resolve_env(target_env)
@@ -48,14 +54,15 @@ def audit_dead_alpha(target_env: str = None, max_hours: float = 4.0, auto_exit: 
 
     if not active:
         print("✅ ZERO OPEN POSITIONS: Zero temporal drift. Clean portfolio.")
-        return {"active_count": 0, "dead_alpha_count": 0, "positions": []}
+        return {"active_count": 0, "dead_alpha_count": 0, "unknown_holding_count": 0, "unknown_holding_symbols": [],
+                "positions": []}
 
-    state = read_json_safe(STATE_FILE, default={})
-    meta_positions = {p["symbol"]: p for p in state.get("active_positions", [])}
     now_ts = int(time.time())
+    audit_path = _audit_log_path()
 
     results = []
     dead_alpha_detected = []
+    unknown_holding = []
 
     for p in active:
         sym = p["symbol"]
@@ -64,22 +71,16 @@ def audit_dead_alpha(target_env: str = None, max_hours: float = 4.0, auto_exit: 
         entry_p = float(p["entryPrice"])
         mark_p = float(p["markPrice"])
         unpnl = float(p.get("unRealizedProfit", 0))
-        margin = float(p.get("isolatedMargin", 0))
-        roe_pct = (unpnl / margin * 100) if margin > 0 else 0.0
+        roe_pct = pt.position_roe_pct(p)
 
-        meta = meta_positions.get(sym, {})
-        entry_time_ts = meta.get("entry_time_ts", now_ts)
-        elapsed_sec = now_ts - entry_time_ts
-        elapsed_hours = round(elapsed_sec / 3600.0, 2)
-
-        sl_price = meta.get("sl_price")
-        price_diff_pct = abs(mark_p - entry_p) / entry_p * 100
-
-        # Quantitative Dead Alpha Criterion:
-        # Exceeded max_hours AND price has not moved more than 1.2% from entry (stagnant dead range)
-        is_stagnant = price_diff_pct < 1.2 and abs(roe_pct) < 15.0
-        is_overdue = elapsed_hours >= max_hours
-        is_dead_alpha = is_overdue and is_stagnant
+        entry_time_ts, entry_source = pt.resolve_entry_time(sym, direction, p["positionAmt"], target_env,
+                                                            entry_price=entry_p, fetch=eft.send_signed_request,
+                                                            audit_path=audit_path)
+        elapsed_hours = pt.holding_hours(entry_time_ts, now_ts)
+        verdict = pt.assess_dead_alpha(elapsed_hours=elapsed_hours, entry_price=entry_p, mark_price=mark_p,
+                                       roe_pct=roe_pct, max_hours=max_hours)
+        is_dead_alpha = verdict["is_dead_alpha"]
+        price_diff_pct = verdict["price_diff_pct"]
 
         item = {
             "symbol": sym,
@@ -88,6 +89,9 @@ def audit_dead_alpha(target_env: str = None, max_hours: float = 4.0, auto_exit: 
             "entry_price": entry_p,
             "mark_price": mark_p,
             "elapsed_hours": elapsed_hours,
+            "entry_time_ts": entry_time_ts,
+            "entry_time_source": entry_source,
+            "holding_verdict": verdict["verdict"],
             "unrealized_pnl_usdt": unpnl,
             "roe_pct": roe_pct,
             "is_dead_alpha": is_dead_alpha,
@@ -95,13 +99,26 @@ def audit_dead_alpha(target_env: str = None, max_hours: float = 4.0, auto_exit: 
         }
 
         print(f"\n• Position: {sym} ({direction}) | Entry: {entry_p} | Mark: {mark_p}")
-        print(f"  Holding Duration: {elapsed_hours}h (Limit: {max_hours}h) | PnL: ${unpnl:+.2f} USDT ({roe_pct:+.1f}% ROE)")
+        if elapsed_hours is None:
+            item["warning"] = (f"Holding time UNKNOWN for {sym}: no reconcilable Binance fill and no matching "
+                               f"trades_audit record. Temporal audit not possible for this position.")
+            unknown_holding.append(sym)
+            print(f"  Holding Duration: UNKNOWN (Limit: {max_hours}h) | PnL: ${unpnl:+.2f} USDT ({roe_pct:+.1f}% ROE)")
+            print(f"  ⚠️  WARNING: {item['warning']}")
+        else:
+            print(f"  Holding Duration: {elapsed_hours}h (Limit: {max_hours}h, source: {entry_source}) | "
+                  f"PnL: ${unpnl:+.2f} USDT ({roe_pct:+.1f}% ROE)")
 
         if is_dead_alpha:
             dead_alpha_detected.append(item)
             print(f"  🚨 ALERT [DEAD ALPHA]: Original thesis expired after {elapsed_hours}h in tight range ({price_diff_pct:.2f}% price movement).")
             
-            if auto_exit:
+            if auto_exit and not pt.is_autonomous_close_allowed(entry_source):
+                # Holding time not from Binance fills (trades_audit): report only, never an autonomous close.
+                print(f"  ⚠️  AUTO-EXIT SKIPPED: holding time from {entry_source}, not Binance fills. Review manually.")
+                item["action_taken"] = "RECOMMEND_EXIT"
+                item["auto_exit_skipped"] = f"entry time source {entry_source}: report only"
+            elif auto_exit:
                 print(f"  ⚡ TRIGGERING AUTO-EXIT: Closing position at market to recycle capital...")
                 close_res = eft.close_position_market(sym, target_env=target_env)
                 item["action_taken"] = "AUTO_EXIT_CLOSED"
@@ -110,18 +127,21 @@ def audit_dead_alpha(target_env: str = None, max_hours: float = 4.0, auto_exit: 
             else:
                 print(f"  ⚠️  RECOMMENDATION: Market close or tighten SL to Break-Even immediately to eliminate risk.")
                 item["action_taken"] = "RECOMMEND_EXIT"
-        else:
+        elif elapsed_hours is not None:
             print(f"  ✅ Temporal Health OK (Within operational horizon or trending)")
 
         results.append(item)
 
     print("\n" + "=" * 70)
-    print(f"SUMMARY: {len(active)} position(s) evaluated | {len(dead_alpha_detected)} with Dead Alpha.")
+    print(f"SUMMARY: {len(active)} position(s) evaluated | {len(dead_alpha_detected)} with Dead Alpha"
+          f" | {len(unknown_holding)} with UNKNOWN holding time.")
     print("=" * 70)
 
     return {
         "active_count": len(active),
         "dead_alpha_count": len(dead_alpha_detected),
+        "unknown_holding_count": len(unknown_holding),
+        "unknown_holding_symbols": unknown_holding,
         "positions": results
     }
 

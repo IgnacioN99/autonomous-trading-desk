@@ -249,7 +249,7 @@ python3 scripts/execute_futures_trade.py --close-position --symbol BTCUSDT  # re
 python3 scripts/execute_futures_trade.py --audit-orphans                    # or --auto-heal
 ```
 
-Structural trailing stops, dead-alpha checks and the orphan audit run in the background **position guardian** (`scripts/loops/position_guardian_loop.py`). It never opens positions; state lives in `logs/guardian_state.json`:
+Structural trailing stops, dead-alpha checks and the orphan audit run in the background **position guardian** (`scripts/loops/position_guardian_loop.py`). It never opens positions; state lives in `logs/guardian_state.json`. Dead alpha means held ≥ 4h, mark within 1.2% of entry and |ROE| < 15% (`scripts/utils/position_timing.py`, shared with the doctor's `trading_drift_watchdog.py`); the guardian also requires the 15m range stall (< 0.40% over the last 6 bars). Holding time comes from Binance fills, then a `logs/trades_audit.jsonl` record matching the live entry price (±0.5%) and size; when neither resolves it is UNKNOWN and the position is never flagged or closed. Dead-alpha positions are only reported unless `--close-dead-alpha`, which closes only when the holding time comes from Binance fills:
 ```bash
 python3 scripts/loops/position_guardian_loop.py --once --dry-run --json   # report only
 python3 scripts/loops/position_guardian_loop.py --once --env prod         # one protective cycle
@@ -386,7 +386,8 @@ autonomous-trading-desk/
 │   │   ├── atomic_writer.py           # POSIX atomic ledger persistence
 │   │   ├── dossier_provenance.py      # Dossier extraction & provenance verification
 │   │   ├── env_resolver.py            # Centralized environment resolver & security enforcer
-│   │   └── issue_telemetry.py         # Issue reporter telemetry, labels & six-section body
+│   │   ├── issue_telemetry.py         # Issue reporter telemetry, labels & six-section body
+│   │   └── position_timing.py         # Shared holding time (fills → audit → UNKNOWN) & dead-alpha verdict
 │   ├── broad_market_radar.py          # Concurrent 80+ pair screener (15m/5m/1h)
 │   ├── dynamic_exit_manager.py        # Chandelier ATR structural trailing stop
 │   ├── execute_futures_trade.py       # Fail-closed order deployment engine & hard gates
@@ -403,7 +404,7 @@ autonomous-trading-desk/
 │   ├── sync_notion_journal.py         # Notion Journal reconciler vs Binance ledger
 │   ├── sync_session_state.py          # Real Binance ledger synchronization (~600ms)
 │   ├── trading_doctor.py              # Pre-flight diagnostic & health sensor
-│   ├── trading_drift_watchdog.py      # Dead alpha detector & telemetry watchdog
+│   ├── trading_drift_watchdog.py      # Dead alpha detector & telemetry watchdog (utils/position_timing.py)
 │   └── user_profile.py                # User profile & onboarding profiler
 ├── .env.example                       # Sanitized credentials template (Testnet default)
 ├── .gitignore                         # Zero-leak security exclusions

@@ -35,7 +35,11 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import execute_futures_trade as eft
+import sync_session_state as sss
 from utils.env_resolver import resolve_env, is_prod_environment, find_workspace_root
+
+# The temporal (dead-alpha) audit only runs on a ledger synced within this window (issue #92).
+LEDGER_MAX_AGE_FOR_TEMPORAL_AUDIT_S = 300
 
 HOOK_SCRIPT_SUFFIXES = (".py", ".sh", ".bash", ".js", ".mjs", ".cjs", ".ts", ".rb", ".pl")
 HOOK_HEARTBEAT_MAX_AGE_S = 24 * 3600
@@ -272,6 +276,49 @@ def check_pretool_hook(base_dir: str = None, run_selftest: bool = True, timeout_
     report["ok"] = denied_by_any and not report["critical"]
     return report
 
+def _read_session_state():
+    try:
+        with open(sss.STATE_FILE, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        return state if isinstance(state, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _norm_env(env):
+    try:
+        return resolve_env(str(env)) if env else None
+    except ValueError:
+        return str(env).strip().lower()
+
+
+def ensure_fresh_ledger(target_env: str, max_age_s: int = LEDGER_MAX_AGE_FOR_TEMPORAL_AUDIT_S) -> tuple:
+    """Issue #92: the temporal audit runs on a ledger synced within max_age_s. The ledger
+    (sync_session_state.STATE_FILE) is synced in-process when it is missing, or stale/invalid for the SAME env.
+    A ledger of the other environment (fresh or stale) is never overwritten (another session may own it): no sync,
+    the watchdog still runs (it resolves holding time from the live exchange, not the ledger) and a warning is
+    returned. Returns (ok, detail, warning | None); ok False means the temporal audit must be skipped (never 0.0h)."""
+    state = _read_session_state()
+    if state is not None and os.path.exists(sss.STATE_FILE):
+        age = time.time() - os.path.getmtime(sss.STATE_FILE)
+        ledger_env = _norm_env(state.get("target_env"))
+        fresh_valid = state.get("is_valid", True) is not False and age <= max_age_s
+        if ledger_env and ledger_env != _norm_env(target_env):
+            return True, "other-env ledger kept", (
+                f"session_state.json belongs to {str(ledger_env).upper()} ({int(age)}s old); not overwritten by the "
+                f"{str(target_env).upper()} doctor (temporal audit runs on live positions without a ledger sync).")
+        if fresh_valid:
+            return True, f"ledger fresh ({int(age)}s)", None
+    try:
+        synced = sss.sync_session_state(target_env)
+    except Exception as e:
+        return False, f"ledger sync raised {type(e).__name__}: {e}", None
+    if not isinstance(synced, dict) or not synced.get("is_valid", False):
+        err = synced.get("error") if isinstance(synced, dict) else synced
+        return False, f"ledger sync returned an invalid state ({err})", None
+    return True, "ledger synced in-process", None
+
+
 def run_doctor(target_env: str = None, auto_heal: bool = False) -> int:
     target_env = resolve_env(target_env)
     start_time = time.time()
@@ -439,18 +486,34 @@ def run_doctor(target_env: str = None, auto_heal: bool = False) -> int:
                 ok_items.append(f"{len(active_positions)} active position(s), all with verified Stop Loss on Binance")
                 print(f"✅ [ORPHAN AUDIT] {len(active_positions)} active position(s) — All protected with Stop Loss.")
 
-                # 4b. Dead Alpha & Temporal Drift Sensor
-                try:
-                    import trading_drift_watchdog as tdw
-                    drift_report = tdw.audit_dead_alpha(target_env=target_env, max_hours=4.0, auto_exit=False)
-                    dead_count = drift_report.get("dead_alpha_count", 0)
-                    if dead_count > 0:
-                        warnings.append(f"Detected {dead_count} position(s) with Dead Alpha (>4h stagnant).")
-                        print(f"⚠️  [DEAD ALPHA] {dead_count} stagnant position(s) exceed intraday holding threshold.")
-                    else:
-                        ok_items.append("Active position holding health OK (Zero Dead Alpha).")
-                except Exception:
-                    pass
+                # 4b. Dead Alpha & Temporal Drift Sensor (issue #92: fresh ledger first, never fail-open)
+                ledger_ok, ledger_detail, ledger_warning = ensure_fresh_ledger(target_env)
+                if ledger_warning:
+                    warnings.append(ledger_warning)
+                    print(f"⚠️  [STATE LEDGER] {ledger_warning}")
+                if not ledger_ok:
+                    msg = f"Temporal audit skipped: ledger could not be synced ({ledger_detail})."
+                    warnings.append(msg)
+                    print(f"⚠️  [DEAD ALPHA] {msg}")
+                else:
+                    try:
+                        import trading_drift_watchdog as tdw
+                        drift_report = tdw.audit_dead_alpha(target_env=target_env, max_hours=4.0, auto_exit=False)
+                        dead_count = drift_report.get("dead_alpha_count", 0)
+                        unknown = drift_report.get("unknown_holding_symbols") or []
+                        if dead_count > 0:
+                            warnings.append(f"Detected {dead_count} position(s) with Dead Alpha (>4h stagnant).")
+                            print(f"⚠️  [DEAD ALPHA] {dead_count} stagnant position(s) exceed intraday holding threshold.")
+                        if unknown:
+                            warnings.append(f"Holding time UNKNOWN for {unknown}: no Binance fill or trades_audit "
+                                            "record; dead alpha cannot be assessed for them.")
+                            print(f"⚠️  [DEAD ALPHA] Holding time UNKNOWN for {unknown}.")
+                        if not dead_count and not unknown:
+                            ok_items.append("Active position holding health OK (Zero Dead Alpha).")
+                    except Exception as e:
+                        msg = f"Temporal audit failed: {type(e).__name__}: {e}"
+                        warnings.append(msg)
+                        print(f"⚠️  [DEAD ALPHA] {msg}")
             else:
                 ok_items.append("Zero open positions. Zero unhedged exposure.")
                 print("✅ [ORPHAN AUDIT] Clean portfolio. Zero open positions.")
@@ -459,12 +522,15 @@ def run_doctor(target_env: str = None, auto_heal: bool = False) -> int:
         print(f"❌ [ORPHAN AUDIT] Error querying positions and orders: {e}")
 
     # 5. session_state.json Freshness Audit
-    logs_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
-    state_file = os.path.join(logs_dir, "session_state.json")
+    # Same file the temporal audit syncs in-process (sync_session_state.STATE_FILE, issue #92).
+    state_file = sss.STATE_FILE
     if os.path.exists(state_file):
         mtime = os.path.getmtime(state_file)
         age_sec = time.time() - mtime
-        if age_sec > 1800:
+        if (_read_session_state() or {}).get("is_valid", True) is False:
+            warnings.append("session_state.json is INVALID (last ledger sync failed). Run `sync_session_state.py`.")
+            print("⚠️  [STATE LEDGER] session_state.json is INVALID (last ledger sync failed). Sync required.")
+        elif age_sec > 1800:
             warnings.append(f"session_state.json is stale ({int(age_sec/60)} minutes old). Run `sync_session_state.py`.")
             print(f"⚠️  [STATE LEDGER] session_state.json is {int(age_sec/60)} min old. Sync recommended.")
         else:

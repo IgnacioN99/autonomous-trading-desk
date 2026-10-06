@@ -20,6 +20,8 @@ from typing import Dict, List, Any
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import execute_futures_trade as eft
 from utils.portfolio_exposure import compute_exposure, LONG_HEAVY, SHORT_HEAVY
+from utils import position_timing as pt
+from utils.env_resolver import resolve_env
 
 LOGS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
 STATE_FILE = os.path.join(LOGS_DIR, "session_state.json")
@@ -34,7 +36,8 @@ def get_start_of_day_utc() -> int:
 def load_audit_metadata(target_env: str = None) -> Dict[str, dict]:
     """Loads latest metadata from trades_audit.jsonl keyed by symbol, strictly filtered by target_env."""
     meta = {}
-    norm_env = str(target_env).lower() if target_env else None
+    # Env aliases normalised on both sides ("mainnet" == "prod"), same as utils/position_timing (issue #92).
+    norm_env = pt._norm_env(target_env)
     if os.path.exists(AUDIT_LOG):
         try:
             with open(AUDIT_LOG, "r", encoding="utf-8") as f:
@@ -43,7 +46,7 @@ def load_audit_metadata(target_env: str = None) -> Dict[str, dict]:
                     if line:
                         try:
                             record = json.loads(line)
-                            rec_env = str(record.get("target_env", "")).lower()
+                            rec_env = pt._norm_env(record.get("target_env"))
                             if norm_env and rec_env and rec_env != norm_env:
                                 continue
                             sym = record.get("symbol")
@@ -105,6 +108,7 @@ def sync_session_state(target_env: str = None) -> dict:
     if target_env is None:
         cfg = eft.load_env()
         target_env = (os.environ.get("BINANCE_API_ENV") or cfg.get("BINANCE_API_ENV", "prod")).lower()
+    target_env = resolve_env(target_env)  # "mainnet" -> "prod": one spelling in the ledger (issue #92)
     os.makedirs(LOGS_DIR, exist_ok=True)
     audit_meta = load_audit_metadata(target_env=target_env)
     now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -151,6 +155,11 @@ def sync_session_state(target_env: str = None) -> dict:
         roe_pct = (unrealized_pnl / margin * 100) if margin > 0 else 0.0
 
         meta_trade = audit_meta.get(sym, {})
+        # Entry time of the CURRENT position (issue #92): Binance fills, then a matching trades_audit record, else
+        # UNKNOWN (null). Never positionRisk updateTime and never "now" (that reported 0.0h holding).
+        entry_ts, entry_source = pt.resolve_entry_time(sym, direction, p.get("positionAmt"), target_env,
+                                                       entry_price=entry_p, fetch=eft.send_signed_request,
+                                                       audit_path=AUDIT_LOG)
         active_positions.append({
             "symbol": sym,
             "direction": direction,
@@ -163,8 +172,10 @@ def sync_session_state(target_env: str = None) -> dict:
             "notional_usdt": round(notional, 2),
             "margin_usdt": round(margin, 2),
             "entry_order_id": meta_trade.get("entry_order_id"),
-            "entry_time_ts": meta_trade.get("timestamp") or (int(p.get("updateTime", 0)) // 1000 if p.get("updateTime") else now_ts),
-            "entry_time_utc": datetime.datetime.fromtimestamp(meta_trade.get("timestamp") or (int(p.get("updateTime", 0)) // 1000 if p.get("updateTime") else now_ts), datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "entry_time_ts": entry_ts,
+            "entry_time_utc": (datetime.datetime.fromtimestamp(entry_ts, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                               if entry_ts else "UNKNOWN"),
+            "entry_time_source": entry_source,
             "sl_price": meta_trade.get("sl_price"),
             "sl_algo_id": meta_trade.get("sl_algo_id"),
             "tp1_price": meta_trade.get("tp1_price"),
@@ -383,6 +394,7 @@ if __name__ == "__main__":
 
     cfg = eft.load_env()
     default_env = (os.environ.get("BINANCE_API_ENV") or cfg.get("BINANCE_API_ENV", "prod")).lower()
-    target_env = args.env or args.env_pos or default_env
+    # Normalised ("mainnet"/"production" -> "prod"), so the ledger's target_env compares equal across callers (#92).
+    target_env = resolve_env(args.env or args.env_pos or default_env)
     state = sync_session_state(target_env=target_env)
     print(format_markdown_summary(state))

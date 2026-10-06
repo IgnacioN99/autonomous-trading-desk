@@ -20,6 +20,12 @@ Per cycle:
      +2.0x ATR_15m of favourable excursion since entry on closed 15m bars, or TP1 fill; the Chandelier stop is
      then anchored to the extreme since entry. Take-profit orders are never re-based.
   4. Dead-alpha check: reported only; positions are closed (reduce-only) only with --close-dead-alpha.
+     DEAD_ALPHA_STALLED requires BOTH the 15m range stall (last 6 closed 15m bars < 0.40%) AND the shared
+     holding-time verdict also used by the doctor's watchdog (utils/position_timing.py: held >= 4h, mark within
+     1.2% of entry, |ROE| < 15%; entry time from Binance fills, then trades_audit). Issue #92: a stall alone no
+     longer qualifies (status STALLED_WITHIN_HORIZON), an unknown holding time is never closed
+     (status UNKNOWN_HOLDING_TIME), and a holding time from trades_audit (not Binance fills) is report-only
+     (close_blocked). The holding time is only looked up when the 15m stall fires.
   5. Unknown resting entries (execute_futures_trade.find_unregistered_resting_entries, all symbols): an opening
      order resting on the exchange without a logs/pending_entries.json record (e.g. deleted registry) would get
      no SL on fill; each one is reported (unknown_resting_entry action + pending_unknown_entry error, so
@@ -58,7 +64,11 @@ State file (logs/guardian_state.json):
       "trailing": {"success", "updated", "reason", "previous_sl", "new_sl"?, "planned_sl"?,
                    "activation_reason"?: "tp1_filled" | "r_multiple" | "atr_expansion" | null,
                    "reference_source"?: "trade_audit" | "current_stop", "message"} | null,
-      "dead_alpha": {"status", "range_pct", "recommendation", "message"} | null,
+      "dead_alpha": {"status": "DEAD_ALPHA_STALLED" | "HEALTHY_MOMENTUM" | "STALLED_WITHIN_HORIZON" |
+                                "UNKNOWN_HOLDING_TIME" | "UNKNOWN", "range_pct", "recommendation", "message",
+                     # only when the 15m stall fired:
+                     "elapsed_hours"?: float | null, "entry_time_source"?: "userTrades" | "trades_audit" | "UNKNOWN",
+                     "holding_verdict"?: "DEAD_ALPHA" | "HEALTHY" | "UNKNOWN", "close_blocked"?: str} | null,
       "error": str | null
     }],
     "actions": [ACTION, ...],
@@ -95,6 +105,7 @@ import execute_futures_trade as eft
 import dynamic_exit_manager as dem
 from utils.env_resolver import resolve_env
 from utils.atomic_writer import atomic_write_json, atomic_append_jsonl
+from utils import position_timing as pt
 
 SCHEMA_VERSION = 1
 DEFAULT_INTERVAL_SECONDS = 300
@@ -135,6 +146,19 @@ def _position_view(p):
         "dead_alpha": None,
         "error": None,
     }
+
+
+def holding_verdict(p, view, target_env, now_ts=None):
+    """Shared holding-time dead-alpha verdict for one positionRisk row (utils/position_timing, issue #92): entry time
+    from Binance fills, then trades_audit, else UNKNOWN; same criteria and ROE as trading_drift_watchdog."""
+    entry_ts, source = pt.resolve_entry_time(view["symbol"], view["side"], p.get("positionAmt"), target_env,
+                                             entry_price=view["entry_price"], fetch=eft.send_signed_request,
+                                             audit_path=os.path.join(eft._workspace_dir(), "logs", "trades_audit.jsonl"))
+    elapsed = pt.holding_hours(entry_ts, now_ts)
+    res = pt.assess_dead_alpha(elapsed_hours=elapsed, entry_price=view["entry_price"], mark_price=view["mark_price"],
+                               roe_pct=pt.position_roe_pct(p))
+    res["entry_time_source"] = source
+    return res
 
 
 class GuardianCycle:
@@ -205,7 +229,7 @@ class GuardianCycle:
             self._trail(p, view)
 
         # 3. Dead alpha (report only unless --close-dead-alpha)
-        self._dead_alpha(view)
+        self._dead_alpha(p, view)
 
     def _heal_orphan(self, p, view):
         """Returns 'healed', 'closed', 'dry_run' or 'failed'."""
@@ -255,7 +279,14 @@ class GuardianCycle:
                     view["protected"] = False
             self.error(sym, "trailing", res.get("error") or res.get("message"))
 
-    def _dead_alpha(self, view):
+    def _dead_alpha(self, p, view):
+        """Dead alpha = the shared holding-time verdict (utils/position_timing.assess_dead_alpha: held >= 4h AND
+        within 1.2% of entry AND |ROE| < 15%, same as the doctor's watchdog) AND the 15m range stall
+        (dynamic_exit_manager.check_dead_alpha_timeout). Issue #92: a stall alone no longer qualifies, so a position
+        is never flagged (or closed with --close-dead-alpha) before max_hours, and an UNKNOWN holding time is
+        report-only (status UNKNOWN_HOLDING_TIME), never closed. The holding time (a userTrades call) is only
+        looked up when the 15m stall fires. --close-dead-alpha closes only when the entry time comes from Binance
+        fills; a trades_audit-sourced DEAD_ALPHA_STALLED is report-only (close_blocked, REVIEW_MANUALLY)."""
         sym = view["symbol"]
         try:
             da = dem.check_dead_alpha_timeout(sym, target_env=self.env)
@@ -263,7 +294,31 @@ class GuardianCycle:
             self.error(sym, "dead_alpha", e)
             return
         view["dead_alpha"] = {k: da.get(k) for k in ("status", "range_pct", "recommendation", "message")}
-        if da.get("status") != "DEAD_ALPHA_STALLED" or not self.close_dead_alpha:
+        if da.get("status") != "DEAD_ALPHA_STALLED":
+            return  # no 15m stall: no holding-time lookup (saves a userTrades call per position per cycle)
+        try:
+            verdict = holding_verdict(p, view, self.env)
+        except Exception as e:
+            verdict = {"verdict": pt.VERDICT_UNKNOWN, "elapsed_hours": None, "entry_time_source": pt.SOURCE_UNKNOWN}
+            self.error(sym, "dead_alpha", f"holding time unresolved: {type(e).__name__}: {e}")
+        view["dead_alpha"].update(elapsed_hours=verdict.get("elapsed_hours"),
+                                  entry_time_source=verdict.get("entry_time_source"),
+                                  holding_verdict=verdict.get("verdict"))
+        if verdict.get("verdict") != pt.VERDICT_DEAD_ALPHA:
+            if verdict.get("verdict") == pt.VERDICT_UNKNOWN:
+                view["dead_alpha"].update(status="UNKNOWN_HOLDING_TIME", recommendation="HOLD",
+                                          message=f"{sym}: 15m range stalled but holding time is UNKNOWN; not dead alpha.")
+            else:
+                view["dead_alpha"].update(status="STALLED_WITHIN_HORIZON", recommendation="HOLD",
+                                          message=f"{sym}: 15m range stalled but the position is not dead alpha yet "
+                                                  f"(held {verdict.get('elapsed_hours')}h, needs >= "
+                                                  f"{pt.DEFAULT_MAX_HOURS}h and stagnant).")
+        if view["dead_alpha"].get("status") != "DEAD_ALPHA_STALLED" or not self.close_dead_alpha:
+            return
+        if not pt.is_autonomous_close_allowed(verdict.get("entry_time_source")):
+            # Holding time from trades_audit (not Binance fills): verdict reported, never an autonomous close.
+            view["dead_alpha"].update(recommendation="REVIEW_MANUALLY",
+                                      close_blocked=f"entry time source {verdict.get('entry_time_source')}: report only")
             return
         if self.dry_run:
             self.action(sym, "dead_alpha_close", False, {"planned": True, "reason": "dry_run", "dead_alpha": view["dead_alpha"]})
