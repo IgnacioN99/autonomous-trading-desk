@@ -56,7 +56,8 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
 7. EVALUATION TRAIL PROTECTION:
    Writes into logs/evaluations/, Antigravity brain transcripts or Claude Code subagent transcripts
    are denied, and so are agent-set transcript-root overrides (AGY_BRAIN_DIRS / CLAUDE_PROJECTS_DIRS);
-   harness files (incl. .claude/agents/) require explicit confirmation (force_ask).
+   harness files (incl. .claude/agents/) require explicit confirmation (force_ask), and so do file-tool writes to
+   git config / hook files (GIT_EXEC_CONFIG_PATH_RE, see 8).
 8. GROUND TRUTH PROTECTION (GROUND_TRUTH_FILES):
    Runtime state that gates PROD orders has exactly one sanctioned writer, which writes it from Python:
    logs/session_state.json <- scripts/sync_session_state.py; logs/guardian_state.json (guardian liveness
@@ -154,6 +155,26 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    `git config` is a read only with an explicit read action (--get*, -l / --list, get, list); edit /
    rename-section are denied; clone / init --template are denied; a writing git sub-command with -C / --work-tree
    inside logs/ is denied; any git argument starting with ext:: (a transport that runs a shell command) is denied.
+   The same channel through the files themselves (GIT_EXEC_CONFIG_PATH_RE, matched on the normalised path
+   whatever the root, case-insensitive: .git/config, .git/config.worktree, .git/hooks[/...],
+   .git/worktrees/<x>/config* | commondir | gitdir, .git/modules/.../config | hooks, a bare .git gitdir file,
+   any .gitconfig* basename, .config/git/config, /etc/gitconfig; also through a glob whose dot-component can
+   expand to .git / .gitconfig; not .git/info/, whose exclude / attributes / sparse-checkout run nothing by
+   themselves) is denied with its own reason (Git Config Channel Protection): a redirect, the write targets of a
+   writer (tee, cp / install / rsync / mv destination, chmod / touch, dd of=, sed / perl -i, Windows copies /
+   moves), every operand of a link (ln, link, cp -l / -s / --link / --symbolic-link, rsync --link-dest: a link
+   aliases its source, ln -s .git/config x; echo y >> x), an output option (curl -o, --output=), an archive
+   destination, relative words against the tracked cwd (cd .git/hooks && echo x > pre-commit), inline code with a
+   write call next to such a string literal, and (catch-all, Bash and PowerShell) any other program outside the
+   read-only allowlist and GIT_EXEC_CONFIG_MODELLED_PROGRAMS naming one in an argument (patch, sponge, ed, ex,
+   vim -c wq, awk -i inplace, perl -e 'open(F,q(>>.git/config))', code .git/config, Set-Content, Out-File ...;
+   du / tree / od / hexdump / nl and xxd without -r read). HOME= /
+   XDG_CONFIG_HOME= in front of git (prefix or env) and git --git-dir[=]<x> are denied like GIT_DIR. git itself
+   is otherwise left to the key rules above (git config -f .git/config user.name x, git commit -F
+   .git/COMMIT_EDITMSG stay allowed), and reads (cat, grep, Get-Content, git config --get / -f F --list, cp
+   .git/config /tmp/x), pure deletions (rm, del) and moving a hook away (mv .git/hooks/x /tmp) are unaffected.
+   Recursive / glob copies and archive extraction into the repo root (cp -r /tmp/e/.git ., tar -xf x.tar) are
+   already denied above as writes into an ancestor of logs/.
    Also denied: inline interpreters (Python / Node / Perl / Ruby) with write calls naming them, or with destructive
    calls next to a 'logs' literal / logs/ glob (rmtree, remove_tree, rmSync, unlink, rename, FileUtils.rm_rf,
    File.delete, Dir.rmdir ...) or recursive deletes/moves next to an ancestor literal ('.', '..', the repo). Both
@@ -181,16 +202,22 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    their plain space-joined text (after `cd DIR &&` for --cd DIR) is judged once more as a Bash line by the whole
    decision engine (nested wsl calls up to NESTED_DEPTH_LIMIT levels, deeper is denied); the most restrictive
    result wins. The join drops the quoting Git Bash / PowerShell may add around arguments with spaces, so it can
-   split more than Linux does: it only ever makes a decision stricter.
+   split differently from Linux (wsl.exe -- bash -c 'rm -rf logs' re-parses as bash -c rm ...): it is an extra
+   check, not a complete model, which is why the command's own tokens are judged too. Every wsl.exe [options]
+   [-e | --] <cmd>
+   (Bash and PowerShell alike) also has <cmd>'s own tokens (quoting kept) judged as a Linux sub-command (from an
+   unknown cwd after --cd), so wsl.exe -e rm -rf logs and wsl.exe -- bash -c 'rm -rf logs' are denied; a Bash
+   line still goes through every rule with its outer tokens (PAGER=most wsl.exe -e git log, wsl.exe -e ls > $Y).
    Not covered (residual, defense in depth; the executor-side fail-closed checks are the primary control): Python /
    Node / other non-shell script files (run by their interpreter or by path with their shebang), interpreters
    reading code from a file we do not open (PYTHONPATH / sitecustomize, NODE_OPTIONS --require, PERL5OPT), command
    text only known at run time (eval "$(...)", a $(cmd) program with no operands), writes by programs whose
    semantics we do not model (make, docker, parallel, ssh to localhost ...), git commands run in another
-   repository whose config the agent wrote (git -C /tmp/r status), direct writes to git config / hook files
-   (.git/config, .git/hooks/*, ~/.gitconfig, ~/.config/git/config) that a later git command executes, run-time
-   values and unknown cwd inside the pinned scripts/report_issue.sh, and a missing pending_entries.json still reads
-   as empty in the executor (tracked as follow-ups).
+   repository whose config the agent wrote (git -C /tmp/r status), git config files only named at run time
+   ($XDG_CONFIG_HOME/git/config is denied as a run-time write, a config file pulled in by include.path from an
+   arbitrary path is not recognised), file targets of a sed script's own w / W / s///w commands naming a git
+   config path (sed 'w .git/config' x), run-time values and unknown cwd inside the pinned scripts/report_issue.sh,
+   and a missing pending_entries.json still reads as empty in the executor (tracked as follow-ups).
 9. CLAUDE CODE POWERSHELL TOOL (Windows) AND NOTEBOOKEDIT:
    NotebookEdit is a file tool (notebook_path). PowerShell commands are scanned for analysis only (Unicode quotes
    and dashes mapped to ASCII; quote-aware: '...' literal, backtick escapes in "..." and bare text; comments
@@ -200,7 +227,11 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    restrictive result wins and a command with bodies is never auto-allowed. Statements are judged exactly like Bash
    (trading primitives, deploy batches, raw Binance HTTP, evaluation trail, harness, ground truth; read-only cmdlets
    such as Get-Content / Select-String may name ground-truth files; wsl.exe [options] -- <cmd> is judged as the
-   Linux command and its joined arguments once more as a Bash line, as in 8). A backstop then denies a command naming a ground-truth file (literally, through a
+   Linux command and its joined arguments once more as a Bash line, as in 8).
+   Git config / hook paths next to a write construct are denied (Git Config Channel Protection, see 8). This
+   backstop is coarse on purpose: a read that also writes elsewhere (Get-Content .git/config > out.txt,
+   Copy-Item .git/config backup.txt) is denied too. A backstop then denies a command naming a ground-truth file
+   (literally, through a
    logs/ glob or an 8.3 short name), the evaluation trail or the logs/ directory unless every statement starts with
    a read-only / navigation cmdlet and nothing in it can write or run code (write cmdlets and aliases anywhere,
    redirection other than to $null, .NET static / method calls, ${provider:path} variables, iex / Invoke-Command /
@@ -459,7 +490,7 @@ SCRIPT_HEAD_BYTES = 4096
 # Desk shell scripts judged with relaxed rules (run-time values and unknown cwd only), pinned by the sha256 of their
 # bytes: an edited copy (or any other file under scripts/) is judged strictly. Update the pin with the script.
 DESK_SHELL_SCRIPTS = {
-    "scripts/report_issue.sh": "d5312e54cec20033c5c04fc57a849d489f99cbd74b1d8f1c81a55ad3cb5c5fb9",
+    "scripts/report_issue.sh": "85c9e4a508fb84f47f74d74f0e2668b63f04759d2bb74051c03f7e7381e8895f",
 }
 # Fail-closed work budget of one hook evaluation (all nested lines, scripts and cwd candidates together)
 AUDIT_MAX_SUBCOMMANDS = 5000
@@ -786,6 +817,47 @@ HARNESS_PATH_CMD_RE = re.compile(
     r"\.agents[\\/]+agents[\\/]|\.claude[\\/]+agents[\\/]|\.claude[\\/]+settings|config[\\/]+user_profile\.json|"
     r"scripts[\\/]+report_issue\.sh",
     re.IGNORECASE,
+)
+# Git config / hook files a later, innocent git command executes (core.fsmonitor, hooks, aliases, include.path):
+# matched on the normalised path (forward slashes, no drive, '.' / '..' collapsed, lower case) whatever the root, so
+# ./.git/config, /abs/repo/.git/hooks/pre-commit, ~/.gitconfig and $HOME/.config/git/config all match. A bare .git
+# is a gitdir file in a worktree / submodule (gitdir: <path>): rewriting it redirects git to another repository.
+# .gitignore, .gitattributes, .gitmodules, .github/ and .git/info/ (exclude, attributes, sparse-checkout: they run
+# nothing by themselves) do not match.
+GIT_EXEC_CONFIG_PATH_RE = re.compile(
+    r"(?:^|/)(?:\.git(?:/(?:config(?:\.worktree)?|hooks(?:/.*)?|"
+    r"worktrees/[^/]+(?:/(?:config[^/]*|commondir|gitdir))?|"
+    r"modules/(?:.+/)?(?:config(?:\.worktree)?|hooks(?:/.*)?)))?|"
+    r"\.gitconfig[^/]*|\.config/git/config|etc/gitconfig)$", re.IGNORECASE)
+# Pure deletions plant no payload in a git config / hook file
+GIT_EXEC_CONFIG_DELETE_PROGRAMS = {"rm", "rmdir", "unlink", "shred", "rd", "del", "erase", "remove-item", "ri"}
+# Programs whose write operands are modelled one by one (or that only print / navigate / run nested lines judged on
+# their own): the catch-all (any other program naming a git config / hook path) leaves them to those rules, so
+# `cp .git/config /tmp/x` and `mv .git/hooks/x /tmp` stay allowed. git itself is judged by the git config key rules.
+GIT_EXEC_CONFIG_MODELLED_PROGRAMS = {"cp", "mv", "tee", "truncate", "chmod", "chown", "install", "dd", "rsync",
+                                     "touch", "sed", "tar", "bsdtar", "unzip", "7z", "7za", "7zr", "robocopy",
+                                     "xcopy", "copy", "copy-item", "cpi", "move", "ren", "rename", "move-item", "mi",
+                                     "rename-item", "rni", "git", "wsl", "echo", "printf", "true", ":", "test", "[",
+                                     "basename", "dirname", "realpath", "readlink"}
+# Link options of cp (-l / -s / --link / --symbolic-link) and rsync (--link-dest=DIR): a link aliases its SOURCE,
+# so every operand counts (ln -s .git/config x; echo y >> x)
+CP_LINK_LONG_OPTIONS = ("--link", "--symbolic-link")
+# Extra read-only programs for the git catch-all (xxd only without -r / -revert, which writes its second operand)
+GIT_EXEC_CONFIG_READ_PROGRAMS = {"du", "tree", "od", "hexdump", "nl", "xxd"}
+# Env vars that move where git reads its global config from (HOME/.gitconfig, $XDG_CONFIG_HOME/git/config): denied
+# in front of git like GIT_DIR / GIT_CONFIG_GLOBAL
+GIT_HOME_ENV_VARS = {"HOME", "XDG_CONFIG_HOME"}
+# Path-like words inside an argument (perl -e 'open(F,q(>>.git/config))', vim -c 'w .git/config')
+GIT_PATH_WORD_RE = re.compile(r"[^\s'\"();,=<>|&`{}\[\]]+")
+# Pseudo hit key (next to the GROUND_TRUTH_FILES keys) for a shell write to a git config / hook file
+GIT_EXEC_CONFIG_KEY = "__git_exec_config__"
+GIT_EXEC_CONFIG_REASON = (
+    "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Git Config Channel Protection): Commands must not write git config or hook "
+    "files (.git/config, .git/config.worktree, .git/hooks/, .git/worktrees/*/config, "
+    ".git/modules/*/config|hooks, a .git gitdir file, ~/.gitconfig, ~/.config/git/config, /etc/gitconfig): a "
+    "later git command runs what they configure (core.fsmonitor, hooks, aliases, include.path); nor point git at "
+    "another config or repository (HOME= / XDG_CONFIG_HOME= in front of git, git --git-dir). Use `git config "
+    "<key> <value>` (judged by the git config key rules) or the file tools (explicit confirmation)."
 )
 INLINE_WRITE_MARKERS_RE = re.compile(
     r"\.write\s*\(|write_text\s*\(|write_bytes\s*\(|dump\s*\(|open\s*\([^)]*['\"][rwabxt+]*[wax+][rwabxt+]*['\"]|"
@@ -1967,11 +2039,44 @@ def _subcommand_writes_path(tokens: List[str], text: str, path_re: re.Pattern, i
 # Ground-truth runtime state (session_state / guardian_state / pending_entries)
 # -----------------------------------------------------------------------------
 def ground_truth_denial(paths: List[str]) -> str:
-    """Denial reason naming each protected file and its sole sanctioned writer (GROUND_TRUTH_FILES order)."""
+    """Denial reason naming each protected file and its sole sanctioned writer (GROUND_TRUTH_FILES order), and the
+    git config / hook channel when GIT_EXEC_CONFIG_KEY is among the hits."""
     keys = [p for p in GROUND_TRUTH_FILES if p in set(paths)]
-    return "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Ground Truth Protection): " + "; ".join(
+    git_channel = GIT_EXEC_CONFIG_KEY in set(paths)
+    if git_channel and not keys:
+        return GIT_EXEC_CONFIG_REASON
+    reason = "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Ground Truth Protection): " + "; ".join(
         f"{p} may only be written by {GROUND_TRUTH_FILES[p]}" for p in keys
     ) + "."
+    return reason + " " + GIT_EXEC_CONFIG_REASON if git_channel else reason
+
+
+def _protected_hits(hits: List[str]) -> List[str]:
+    """Ground-truth keys (GROUND_TRUTH_FILES order) among the hits, then GIT_EXEC_CONFIG_KEY when present."""
+    found = set(hits)
+    return [p for p in GROUND_TRUTH_FILES if p in found] + ([GIT_EXEC_CONFIG_KEY] if GIT_EXEC_CONFIG_KEY in found
+                                                            else [])
+
+
+def _git_exec_config_path(word: str) -> bool:
+    """A word (option value / braces expanded) naming a git config or hook file (GIT_EXEC_CONFIG_PATH_RE) or a
+    directory holding them. A glob counts when a dot-component can expand to .git / .gitconfig* (.gi?/config,
+    .git/hoo*/x) or it spells .config/git/<config glob>; shells never expand a bare * to a dot name."""
+    for expanded in _expand_braces(_word_value(word or "")):
+        p = _shell_path(expanded).lower()
+        if not p:
+            continue
+        if GIT_EXEC_CONFIG_PATH_RE.search(p):
+            return True
+        if SHELL_GLOB_RE.search(p):
+            parts = p.split("/")
+            if any(c.startswith(".") and (fnmatch.fnmatchcase(".git", c) or fnmatch.fnmatchcase(".gitconfig", c))
+                   for c in parts):
+                return True
+            if (len(parts) >= 3 and fnmatch.fnmatchcase(".config", parts[-3]) and fnmatch.fnmatchcase("git", parts[-2])
+                    and fnmatch.fnmatchcase("config", parts[-1])):
+                return True
+    return False
 
 
 def _ground_truth_named(text: str) -> List[str]:
@@ -2284,6 +2389,16 @@ def _git_subcommand(args: List[str]) -> Tuple[str, List[str]]:
     while i < len(args) and args[i].startswith("-"):
         i += 2 if args[i] in GIT_GLOBAL_VALUE_OPTIONS else 1
     return (args[i].lower(), args[i + 1:]) if i < len(args) else ("", [])
+
+
+def _git_dir_option(args: List[str]) -> bool:
+    """git's global --git-dir=<x> / --git-dir <x> (like GIT_DIR: git reads that repository's config and hooks)."""
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        if args[i] == "--git-dir" or args[i].startswith("--git-dir="):
+            return True
+        i += 2 if args[i] in GIT_GLOBAL_VALUE_OPTIONS else 1
+    return False
 
 
 def _git_c_dir(args: List[str]) -> str:
@@ -3313,6 +3428,57 @@ def _judge_script_uncached(word: str, cwd: str, base_dir: str, depth: int, cwd_u
                                    written=written)
 
 
+def _git_exec_config_writes(prog: str, args: List[str], redirects: List[str], cwd: str, assigned: bool,
+                            read_programs: frozenset) -> bool:
+    """A sub-command (not git itself) that writes a git config / hook file (GIT_EXEC_CONFIG_PATH_RE): a redirect
+    target, the write targets of a writer (tee, cp / install / rsync / mv destination, chmod / touch, dd of=, sed -i,
+    Windows copies / moves), EVERY operand of a link (ln, link, cp -l / -s / --link / --symbolic-link, rsync
+    --link-dest: a link aliases its source), an output option (curl -o, --output=), an archive extraction
+    destination or a tar output file; relative words are also judged against the tracked cwd (cd .git/hooks && echo
+    x > pre-commit). Pure deletions (rm, unlink, shred, del ...) plant nothing and are left alone. Catch-all (Bash
+    and PowerShell): any other program outside the read-only allowlist and GIT_EXEC_CONFIG_MODELLED_PROGRAMS naming
+    such a path in an argument (patch, sponge, ed, vim -c wq, awk -i inplace, perl -e 'open(F,q(>>.git/config))',
+    Set-Content, Out-File ...)."""
+    words = list(redirects)
+    operands, target = _split_operands(prog, args)
+    link = prog in ("ln", "link") or (prog == "cp" and any(
+        a in CP_LINK_LONG_OPTIONS or (re.match(r"^-[A-Za-z]+$", a) and re.search(r"[ls]", a)) for a in args))
+    if link:
+        words += operands + ([target] if target is not None else [])
+    elif prog == "mv":  # its destination only: moving a config / hook away plants nothing
+        words += [target] if target is not None else operands[-1:]
+    elif _is_destructive_write(prog, args) and prog not in GIT_EXEC_CONFIG_DELETE_PROGRAMS:
+        words += _write_targets(prog, args)
+    if prog == "rsync":
+        words += [a.split("=", 1)[1] for a in args if a.startswith("--link-dest=")]
+    options = OUTPUT_OPTIONS.get(prog, set())
+    for j, a in enumerate(args):
+        m = OUTPUT_VALUE_RE.match(a)
+        if m:
+            words.append(a[m.end():])
+        elif a in options and j + 1 < len(args):
+            words.append(args[j + 1])
+    if prog in ARCHIVE_EXTRACT_PROGRAMS and _archive_extracts(prog, args):
+        words += [d or "." for d in _archive_dests(prog, args)]
+    if prog in ("tar", "bsdtar"):
+        words += _tar_parse(args)["outputs"]
+    for w in words:
+        if not w:
+            continue
+        if _git_exec_config_path(w):
+            return True
+        if cwd and _relative_word(w) and not _unresolved(w) and _git_exec_config_path(posixpath.join(cwd, w)):
+            return True
+    if (link or prog in GIT_EXEC_CONFIG_MODELLED_PROGRAMS or prog in GIT_EXEC_CONFIG_DELETE_PROGRAMS
+            or prog in SHELL_INTERPRETERS or prog in CHDIR_PROGRAMS
+            or (prog in GIT_EXEC_CONFIG_READ_PROGRAMS and not assigned
+                and not (prog == "xxd" and any(re.match(r"^-[A-Za-z]*r", a) or a.startswith("-rev") for a in args)))
+            or _ground_truth_read_only(prog, args, assigned, read_programs)):
+        return False
+    return any(_git_exec_config_path(a) or any(_git_exec_config_path(w) for w in GIT_PATH_WORD_RE.findall(a))
+               for a in args)
+
+
 def _ground_truth_writes(tokens: List[str], text: str, cwd: str = "", base_dir: str = "", depth: int = 0,
                          shell: str = "bash", cwd_unknown: bool = False, strict: bool = True,
                          written: frozenset = frozenset(), cwd_set: Tuple[str, ...] = ()) -> List[str]:
@@ -3337,12 +3503,18 @@ def _ground_truth_writes(tokens: List[str], text: str, cwd: str = "", base_dir: 
     redirects = _redirect_targets(tokens) + info["outputs"]
     for target in redirects:
         hits += _ground_truth_named(target) + _glob_ground_truth(target)
-    if shell == "powershell" and prog == "wsl":
+    # wsl.exe [options] [-e | --] <cmd> (Bash and PowerShell): <cmd> runs in Linux, judged with its own tokens (from
+    # an unknown cwd after --cd). A Bash line then also goes through every rule below with its outer tokens (VAR=v
+    # wsl.exe ..., redirects, run-time values), as before the unwrap; PowerShell keeps its per-cmdlet rules only.
+    if prog == "wsl":
         linux = _wsl_command(args)
         if linux is not None:
             if linux:
-                hits += _ground_truth_writes(linux, " ".join(linux), cwd, base_dir, depth + 1)
-            return [p for p in GROUND_TRUTH_FILES if p in set(hits)]
+                hits += _ground_truth_writes(linux, " ".join(linux), cwd, base_dir, depth + 1,
+                                             cwd_unknown=cwd_unknown or _wsl_cd(args) is not None, strict=strict,
+                                             written=written, cwd_set=cwd_set)
+            if shell == "powershell":
+                return _protected_hits(hits)
     # env -C dir / sudo -D dir: this sub-command runs in another directory
     for d in info["chdirs"]:
         if _unresolved(d) or not d or d.startswith(("~", "-")):
@@ -3356,6 +3528,14 @@ def _ground_truth_writes(tokens: List[str], text: str, cwd: str = "", base_dir: 
         mentioned += _glob_ground_truth(_word_value(a))
     if mentioned and not _ground_truth_read_only(prog, args, bool(info["assigns"]), frozenset(read_programs)):
         hits += mentioned
+    # Git config / hook files written directly (a later git command runs them); git itself is left to the git
+    # config key rules (git config -f .git/config <key> <value>)
+    # HOME= / XDG_CONFIG_HOME= in front of git (prefix or env) move its global config, --git-dir its repository
+    if prog == "git" and (any(var in GIT_HOME_ENV_VARS for var, _value in info["assigns"]) or _git_dir_option(args)):
+        hits.append(GIT_EXEC_CONFIG_KEY)
+    if prog != "git" and _git_exec_config_writes(prog, args, redirects, cwd, bool(info["assigns"]),
+                                                    frozenset(read_programs)):
+        hits.append(GIT_EXEC_CONFIG_KEY)
     # Env-var command channels / config injection: VAR=v cmd, VAR+=v, env / sudo / nice env VAR=v, env -S,
     # export / declare VAR=v, read VAR, printf -v VAR, for VAR in ...
     if prog != "unset":
@@ -3464,7 +3644,7 @@ def _ground_truth_writes(tokens: List[str], text: str, cwd: str = "", base_dir: 
         hits += _find_ground_truth(args, cwd, base_dir, depth)
     if prog == "git" and _git_wipes_logs(args):
         hits.extend(all_files)
-    return [p for p in GROUND_TRUTH_FILES if p in set(hits)]
+    return _protected_hits(hits)
 
 
 def _heredoc_feeds_interpreter(line: str, m: "re.Match") -> bool:
@@ -3517,7 +3697,7 @@ def _inline_logs_dir_writes(command_line: str, cwd: str = "", base_dir: str = ""
         hits += _glob_ground_truth(literal)
         if strong and _reaches_logs_dir(literal, cwd, base_dir):
             hits.extend(GROUND_TRUTH_FILES)
-    return [p for p in GROUND_TRUTH_FILES if p in set(hits)]
+    return _protected_hits(hits)
 
 
 def _lift_path_substitutions(command_line: str, runtime_prefix: bool = False) -> str:
@@ -3891,7 +4071,7 @@ def _ground_truth_line_hits_uncached(command_line: str, start_cwds: List[str], b
             hits += _ground_truth_writes(tokens, text, c, base_dir, depth, cwd_unknown=unknown, strict=strict,
                                          written=written, cwd_set=tuple(cwds))
         if hits:
-            return [p for p in GROUND_TRUTH_FILES if p in set(hits)]
+            return _protected_hits(hits)
         prog = _program(tokens)
         if prog in ("cd", "pushd"):
             cwds, unknown = _apply_cd(tokens, cwds, unknown)
@@ -4262,7 +4442,8 @@ def powershell_backstop(command_line: str, cwd: str, base_dir: str) -> Tuple[Opt
     logs_dir = bool(logs_words)
     logs_literal = any(not SHELL_GLOB_RE.search(w) for w in logs_words)
     harness = bool(HARNESS_PATH_CMD_RE.search(command_line))
-    if not (ground_truth or trail or logs_dir or harness):
+    git_config = any(_git_exec_config_path(w) for w in words)
+    if not (ground_truth or trail or logs_dir or harness or git_config):
         return None, None
     construct = _powershell_write_construct(command_line, tokens)
     unlisted = None if construct else _powershell_unlisted_command(tokens)
@@ -4277,6 +4458,8 @@ def powershell_backstop(command_line: str, cwd: str, base_dir: str) -> Tuple[Opt
         return ground_truth_denial(ground_truth) + suffix, None
     if (logs_literal and how) or (logs_dir and construct):
         return ground_truth_denial(list(GROUND_TRUTH_FILES)).rstrip(".") + " (they live in logs/)." + suffix, None
+    if git_config and construct:
+        return GIT_EXEC_CONFIG_REASON + f" PowerShell {construct} next to a git config / hook path.", None
     if harness and construct:
         return None, ("PowerShell command modifies trading harness files (hooks, dossier provenance, profile). "
                       "Explicit confirmation required.")
@@ -4406,6 +4589,9 @@ def _analyze_run_command(command_line: str, cwd: str, base_dir: str, shell: str 
     #     are split into many sub-commands (newlines, parentheses), separating the path from the write call.
     if inline and INLINE_WRITE_MARKERS_RE.search(command_line):
         named = _ground_truth_named(command_line)
+        #     ... and git config / hook files named by a string literal (open('.git/hooks/pre-commit', 'w'))
+        if any(_git_exec_config_path(m.group(2)) for m in INLINE_STRING_LITERAL_RE.finditer(command_line)):
+            named.append(GIT_EXEC_CONFIG_KEY)
         if named:
             result["deny"] = ground_truth_denial(named)
             return result
@@ -4688,6 +4874,22 @@ def _ground_truth_alias_target(target: str, base_dir: str) -> Optional[str]:
     return GROUND_TRUTH_BASENAMES[m.group(1).lower()] if m else None
 
 
+def _git_exec_config_file_target(target: str, abs_norm: str, rel: str, base_dir: str) -> bool:
+    """A file-tool target that is a git config / hook file (GIT_EXEC_CONFIG_PATH_RE) by its workspace-relative,
+    normalised absolute (~ expanded) or raw path, or once symlinks are resolved."""
+    raw = re.sub(r"^file:/*", "/", (target or "").strip(), flags=re.IGNORECASE)
+    candidates = [rel, abs_norm, raw]
+    try:
+        candidates.append(os.path.realpath(_host_path(target, base_dir)))
+    except (OSError, ValueError):
+        pass
+    for candidate in candidates:
+        path = _shell_path(_strip_windows_aliases(candidate or ""))
+        if path and GIT_EXEC_CONFIG_PATH_RE.search(path.lower()):
+            return True
+    return False
+
+
 def evaluate_file_write(target: str, content: str, base_dir: str) -> Tuple[str, str]:
     if not target:
         return "force_ask", "File write without a resolvable target path."
@@ -4706,6 +4908,9 @@ def evaluate_file_write(target: str, content: str, base_dir: str) -> Tuple[str, 
         return "deny", ground_truth_denial([protected])
     if rel_l in HARNESS_FILES or any(rel_l.startswith(d) for d in HARNESS_DIRS):
         return "force_ask", f"'{rel}' is a trading harness file (hooks / dossier provenance / evaluator). Explicit confirmation required."
+    if _git_exec_config_file_target(target, abs_norm, rel, base_dir):
+        return "force_ask", (f"'{rel or abs_norm}' is a git config / hook file: a later git command runs what it "
+                             "configures (core.fsmonitor, hooks, aliases). Explicit confirmation required.")
     if content and WRITE_ENDPOINT_PRIMITIVES_RE.search(content):
         return "force_ask", f"'{rel or abs_norm}' contains order-placing primitives. Explicit confirmation required."
     if content and not (rel_l.startswith("scripts/") or rel_l.startswith("tests/")) and SCRIPT_TRADING_PRIMITIVES_RE.search(content):

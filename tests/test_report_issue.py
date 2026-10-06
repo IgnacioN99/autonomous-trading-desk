@@ -448,6 +448,54 @@ class TestReportIssueViaGh(unittest.TestCase):
         self.assertIn("priority:P2", entry["labels"])
         self.assertFalse(any(c.startswith("api -X POST") for c in self.calls()))
 
+    @unittest.skipUnless(shutil.which("git"), "requires git")
+    def test_dotenv_loads_only_reporter_keys(self):
+        """Issue #99: .env keys are exported only when they belong to the reporter (GITHUB_*, ISSUE_REPORTER_*,
+        BINANCE_API_ENV); GIT_CONFIG_* (core.fsmonitor run by the telemetry's git status), BASH_ENV and any other
+        key never reach the git / gh / python3 commands the script runs."""
+        tmp = self.isolated_copy(with_helper=True)
+        git = ["git", "-C", tmp, "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"]
+        subprocess.run(git + ["init", "-q"], check=True, capture_output=True)
+        subprocess.run(git + ["add", "-A"], check=True, capture_output=True)
+        subprocess.run(git + ["commit", "-q", "-m", "fixture"], check=True, capture_output=True)
+        fsmonitor_marker = os.path.join(tmp, "fsmonitor_ran")
+        bash_env_marker = os.path.join(tmp, "bash_env_ran")
+        bash_env = os.path.join(tmp, "bash_env.sh")
+        with open(bash_env, "w", encoding="utf-8") as f:
+            f.write(f"touch '{bash_env_marker}'\n")
+        with open(os.path.join(tmp, ".env"), "w", encoding="utf-8") as f:
+            f.write("# reporter settings\n"
+                    "GITHUB_REPO=fromenv/repo\n"
+                    "GIT_CONFIG_COUNT=1\n"
+                    "GIT_CONFIG_KEY_0=core.fsmonitor\n"
+                    f"GIT_CONFIG_VALUE_0=touch {fsmonitor_marker}\n"
+                    f"BASH_ENV={bash_env}\n"
+                    "UNRELATED_SETTING=1\n")
+        # A gh wrapper that records the environment it receives, then behaves like the stub
+        spy_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, spy_dir, True)
+        env_dump = os.path.join(spy_dir, "gh_env.txt")
+        with open(os.path.join(spy_dir, "gh"), "w", encoding="utf-8") as f:
+            f.write(f"#!/usr/bin/env bash\nenv > '{env_dump}'\nexec '{os.path.join(self.stub_dir, 'gh')}' \"$@\"\n")
+        os.chmod(os.path.join(spy_dir, "gh"), 0o755)
+        self.env.pop("GITHUB_REPO", None)
+        for key in ("GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "BASH_ENV", "UNRELATED_SETTING"):
+            self.env.pop(key, None)
+
+        res = self.run_script("--title", "t", "--error", "e", script=os.path.join(tmp, "scripts", "report_issue.sh"),
+                              path_prefix=spy_dir)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        # The allowlisted key was loaded from .env ...
+        self.assertTrue(any("repos/fromenv/repo/issues" in c for c in self.calls()), self.calls())
+        # ... and nothing else was exported
+        with open(env_dump, encoding="utf-8") as f:
+            exported = {line.split("=", 1)[0] for line in f if "=" in line}
+        for key in ("GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "BASH_ENV", "UNRELATED_SETTING"):
+            self.assertNotIn(key, exported)
+        self.assertIn("GITHUB_REPO", exported)
+        self.assertFalse(os.path.exists(fsmonitor_marker), "core.fsmonitor from .env ran")
+        self.assertFalse(os.path.exists(bash_env_marker), "BASH_ENV from .env ran")
+
     # (k)
     def test_telemetry_degrades_without_helper(self):
         tmp = self.isolated_copy(with_helper=False)
