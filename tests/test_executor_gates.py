@@ -199,6 +199,19 @@ class TestEnforceEvaluationDossier(_TempWorkspace):
         ok, reason, _ = eft.enforce_evaluation_dossier("SOLUSDT", "LONG", "prod", confirmed=True, base_dir=self.root)
         self.assertTrue(ok, reason)
 
+    def test_prod_requires_confirmation_uses_hook_truthiness(self):
+        """Issue #63: same truthiness as pre_trade_guard (True / 'true' / '1' / 'yes')."""
+        for value in ("yes", "1", "TRUE"):
+            with self.subTest(value=value):
+                self.write_subagent_dossier([{"symbol": "SOLUSDT", "direction": "LONG", "tier": "A",
+                                              "requires_user_confirmation": value}])
+                ok, reason, _ = eft.enforce_evaluation_dossier("SOLUSDT", "LONG", "prod", base_dir=self.root)
+                self.assertFalse(ok)
+                self.assertIn("pending explicit user confirmation", reason)
+                ok, reason, _ = eft.enforce_evaluation_dossier("SOLUSDT", "LONG", "prod", confirmed=True,
+                                                               base_dir=self.root)
+                self.assertTrue(ok, reason)
+
     def test_prod_yolo_candidate_always_requires_confirmation(self):
         """Issue #52: a YOLO dossier candidate is never fast-tracked, even with requires_user_confirmation false."""
         for cand in ({"symbol": "PEPEUSDT", "direction": "LONG", "tier": "S", "is_yolo": True,

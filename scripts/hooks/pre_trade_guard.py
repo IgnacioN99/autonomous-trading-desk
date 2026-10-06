@@ -586,6 +586,20 @@ def _is_true(value: Any) -> bool:
     return value is True or str(value).strip().lower() == "true"
 
 
+def _arg_truthy(value: Any) -> bool:
+    """Same truthiness as execute_futures_trade._truthy (True, 'true', '1', 'yes'); used to mirror executor flags."""
+    value = _decode_value(value)
+    return value is True or str(value).strip().lower() in ("true", "1", "yes")
+
+
+# argparse accepts prefixes of --is-yolo / --is_yolo (--is, --is-, --is_y...); the executor treats them as YOLO.
+# They are the only executor options starting with --is (tests pin this against the executor's argparse).
+IS_YOLO_FLAG_RE = re.compile(r"(?<![\w-])--is(?:[-_][a-z]*)?(?![\w-])", re.IGNORECASE)
+# Executor confirmation flags. Only the exact tokens count: abbreviations argparse would also accept are deliberately
+# not recognised (a missed confirmation denies, which fails closed).
+EXECUTOR_CONFIRM_OPTIONS = ("--confirmed", "--user-confirmed")
+
+
 def parse_mcp_arguments(args_dict: dict) -> dict:
     """Extracts dictionary of arguments from tool call args regardless of serialization."""
     if not args_dict:
@@ -872,12 +886,14 @@ def check_dossier(symbol: str, direction: Optional[str], env: str, base_dir: str
     return True, reason, cand
 
 
-def _candidate_is_yolo(cand: Optional[dict]) -> bool:
+def _candidate_is_yolo(cand: Optional[dict], truthy=_is_true) -> bool:
+    """`truthy=_arg_truthy` matches the executor's _dossier_candidate_is_yolo (stricter for confirmation gates);
+    the default keeps the narrower notion where YOLO status *authorizes* more leverage."""
     if not isinstance(cand, dict):
         return False
     tier = str(cand.get("tier", "")).lower()
     strategy = str(cand.get("strategy", "")).lower()
-    return _is_true(cand.get("is_yolo")) or "yolo" in tier or "yolo" in strategy
+    return truthy(cand.get("is_yolo")) or "yolo" in tier or "yolo" in strategy
 
 
 def leverage_limits(user_prof: dict) -> Tuple[int, int, int]:
@@ -1055,6 +1071,58 @@ def _program(tokens: List[str]) -> str:
 
 def _flags(tokens: List[str]) -> set:
     return {tok.split("=", 1)[0].lower() for tok in tokens if tok.startswith("-")}
+
+
+def _shell_c_operand_index(args: List[str]) -> Optional[int]:
+    """Index in `args` (the arguments of sh/bash/...) of the command string run with -c (-c, -lc, -ec...), if any."""
+    has_c = skip = False
+    for i, a in enumerate(args):
+        if skip:
+            skip = False
+        elif a in SHELL_VALUE_OPTIONS:
+            skip = True
+        elif a == "--":
+            continue
+        elif a.startswith(("-", "+")) and len(a) > 1:
+            has_c = has_c or (not a.startswith("--") and "c" in a[1:])
+        else:
+            return i if has_c else None  # without -c the first operand is a script file
+    return None
+
+
+def executor_confirmed(cmd: str, tokens: Optional[List[str]] = None, depth: int = 0) -> bool:
+    """
+    True only if the executor itself would receive --confirmed / --user-confirmed (exact tokens; abbreviations and
+    =value forms are not recognised, which fails closed). Flags are read from the tokens after the
+    execute_futures_trade script path (not env assignments or wrappers before it) and up to a shell comment.
+    When the script sits inside the -c string of sh/bash/... (e.g. wsl.exe -- bash -lc '...'), that string is
+    re-tokenised and every segment running the executor must be confirmed; arguments after the -c string are
+    the shell's $0/$1..., never the executor's.
+    """
+    if depth > NESTED_DEPTH_LIMIT:
+        return False
+    tokens = list(tokens) if tokens is not None else _tokenize_subcommand(cmd)
+    idx = _program_index(tokens)
+    while idx < len(tokens) and not TRADE_ENGINE_RE.search(tokens[idx]):
+        idx += 1
+    if idx >= len(tokens):
+        return False
+    for p in range(_program_index(tokens), idx):
+        prog = os.path.basename(tokens[p]).lower()
+        if prog.endswith(".exe"):
+            prog = prog[:-4]
+        if prog not in SHELL_INTERPRETERS:
+            continue
+        rel = _shell_c_operand_index(tokens[p + 1:])
+        if rel is not None and p + 1 + rel == idx:
+            segments = [seg for seg in split_subcommands(tokens[idx]) if TRADE_ENGINE_RE.search(" ".join(seg))]
+            return bool(segments) and all(executor_confirmed("", seg, depth + 1) for seg in segments)
+    for tok in tokens[idx + 1:]:
+        if tok.startswith("#"):
+            break
+        if tok in EXECUTOR_CONFIRM_OPTIONS:
+            return True
+    return False
 
 
 def _symbol_count(text: str) -> int:
@@ -1563,19 +1631,8 @@ def _nested_commands(prog: str, args: List[str]) -> List[str]:
                 values.append(m.group(1) if m.group(1) is not None else m.group(2))
         return values
     if prog in SHELL_INTERPRETERS:
-        has_c = skip = False
-        for a in args:
-            if skip:
-                skip = False
-            elif a in SHELL_VALUE_OPTIONS:
-                skip = True
-            elif a == "--":
-                continue
-            elif a.startswith(("-", "+")) and len(a) > 1:
-                has_c = has_c or (not a.startswith("--") and "c" in a[1:])
-            else:
-                return [a] if has_c else []  # without -c the first operand is a script file
-        return []
+        i = _shell_c_operand_index(args)
+        return [args[i]] if i is not None else []
     if prog == "eval":
         return [" ".join(args)] if args else []
     if prog == "cmd":
@@ -2091,11 +2148,12 @@ def analyze_run_command(command_line: str, cwd: str, base_dir: str, shell: str =
     """
     Classifies a shell command (shell="powershell": a command already normalised by
     normalize_powershell_command, whose read-only cmdlets may name ground-truth files). Returns
-    {deny: reason|None, force_ask: reason|None, trading: [subcommand text], risk_reducing: bool,
+    {deny: reason|None, force_ask: reason|None, trading: [subcommand text], trading_tokens: [its tokens],
+     risk_reducing: bool,
      neutral_only: bool, record_eval: {...}|None}
     """
     result: Dict[str, Any] = {
-        "deny": None, "force_ask": None, "trading": [], "batch": [], "risk_reducing": False,
+        "deny": None, "force_ask": None, "trading": [], "trading_tokens": [], "batch": [], "risk_reducing": False,
         "all_safe": True, "record_eval": None,
     }
     if not command_line.strip():
@@ -2216,6 +2274,7 @@ def analyze_run_command(command_line: str, cwd: str, base_dir: str, shell: str =
                 result["all_safe"] = False  # read-only position listing: normal permission policy (ask)
             else:
                 result["trading"].append(text)
+                result["trading_tokens"].append(tokens)
             continue
 
         if _subcommand_is_risk_reducing(tokens, text):
@@ -2441,7 +2500,8 @@ def evaluate_file_write(target: str, content: str, base_dir: str) -> Tuple[str, 
 # Trade gates (opening orders through the sanctioned choke point)
 # =============================================================================
 def evaluate_trade_opening(cmd: str, args: dict, mcp_args: dict, base_dir: str,
-                           conversation_id: Optional[str], env_hint_cmd: str = "") -> Tuple[str, str]:
+                           conversation_id: Optional[str], env_hint_cmd: str = "",
+                           tokens: Optional[List[str]] = None) -> Tuple[str, str]:
     now_ts = int(time.time())
     target_sym = extract_target_symbol(cmd, args)
 
@@ -2469,12 +2529,14 @@ def evaluate_trade_opening(cmd: str, args: dict, mcp_args: dict, base_dir: str,
             "are strictly FORBIDDEN in PROD environment."
         )
 
+    # Only what the executor would parse as --confirmed / --user-confirmed (agy/MCP args: executor truthiness)
+    is_confirmed = executor_confirmed(cmd, tokens)
+    for key in ("confirmed", "user_confirmed"):
+        if _arg_truthy(args.get(key)) or _arg_truthy(mcp_args.get(key)):
+            is_confirmed = True
+
     # USER PROFILE GATES: AUTONOMOUS TIER S & YOLO SLOT
     if is_prod and not user_prof.get("autonomous_execution_tier_s", False):
-        is_confirmed = bool(re.search(r"--(?:confirmed|user[-_]confirmed)\b", cmd, re.IGNORECASE))
-        for key in ("confirmed", "user_confirmed"):
-            if _is_true(args.get(key)) or _is_true(mcp_args.get(key)):
-                is_confirmed = True
         if not is_confirmed:
             return "deny", (
                 "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Autonomous Execution Disabled):\n"
@@ -2485,7 +2547,8 @@ def evaluate_trade_opening(cmd: str, args: dict, mcp_args: dict, base_dir: str,
             )
 
     std_lev, _ceiling, _yolo_cap = leverage_limits(user_prof)
-    is_yolo_trade = "--is-yolo" in cmd or "--is_yolo" in cmd or _is_true(args.get("is_yolo")) or _is_true(mcp_args.get("is_yolo"))
+    is_yolo_trade = (bool(IS_YOLO_FLAG_RE.search(cmd))
+                     or _arg_truthy(args.get("is_yolo")) or _arg_truthy(mcp_args.get("is_yolo")))
     trade_lev = 3
     m_lev = re.search(r"--leverage(?:\s+|=)(\d+)", cmd)
     if m_lev:
@@ -2522,6 +2585,20 @@ def evaluate_trade_opening(cmd: str, args: dict, mcp_args: dict, base_dir: str,
             )
         if _candidate_is_yolo(cand) and not user_prof.get("yolo_slot_enabled", False):
             return "deny", "🚨 BLOCKED BY PRE-TOOL-USE HOOK (YOLO Slot Disabled): Candidate requires YOLO moonshot slot, which is disabled in user profile."
+        # Mirror of execute_futures_trade.enforce_evaluation_dossier (PROD), same order (issue #63)
+        if is_prod and isinstance(cand, dict) and _arg_truthy(cand.get("requires_user_confirmation")) and not is_confirmed:
+            return "deny", (
+                f"🚨 BLOCKED BY PRE-TOOL-USE HOOK (User Confirmation Required): The evaluator approved {target_sym} "
+                "pending explicit user confirmation (requires_user_confirmation=true).\n"
+                "👉 Ask the user to confirm in chat and re-run with the '--confirmed' flag."
+            )
+        if is_prod and (is_yolo_trade or _candidate_is_yolo(cand, truthy=_arg_truthy)) and not is_confirmed:
+            return "deny", (
+                f"🚨 BLOCKED BY PRE-TOOL-USE HOOK (YOLO Confirmation): {target_sym} is a YOLO entry. YOLO entries "
+                "are never fast-tracked (not even with autonomous_execution_tier_s) and always require explicit "
+                "user confirmation in PROD.\n"
+                "👉 Ask the user to confirm in chat and re-run with the '--confirmed' flag."
+            )
 
     # GATE 2: DELTA-NEUTRAL & SESSION STATE AUDIT
     if not has_bypass_delta:
@@ -2617,6 +2694,7 @@ def evaluate_shell_command(command_line: str, cwd: str, base_dir: str, conversat
                 "'scripts/execute_futures_trade.py' after a clean-room evaluation."
             )
         analysis["trading"] = analysis["batch"]
+        analysis["trading_tokens"] = []
 
     if len(analysis["trading"]) > 1:
         return "deny", (
@@ -2626,8 +2704,9 @@ def evaluate_shell_command(command_line: str, cwd: str, base_dir: str, conversat
 
     if analysis["trading"]:
         sub = analysis["trading"][0]
+        sub_tokens = analysis["trading_tokens"][0] if analysis["trading_tokens"] else None
         decision, reason = evaluate_trade_opening(sub, {"CommandLine": sub}, {}, base_dir, conversation_id,
-                                                  env_hint_cmd=command_line)
+                                                  env_hint_cmd=command_line, tokens=sub_tokens)
         if decision == "allow" and not analysis["all_safe"]:
             decision = "force_ask" if analysis["force_ask"] else "ask"
             reason = reason + " Compound command contains other sub-commands; user confirmation required."
