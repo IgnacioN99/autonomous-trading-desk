@@ -15,7 +15,10 @@ Per cycle:
      emergency stop (execute_futures_trade.heal_orphan_position); if the stop cannot be verified,
      the position is closed with a reduce-only market order (fail-safe auto-destruct policy).
   3. Structural trailing (dynamic_exit_manager.update_position_to_structural_stop): place-then-cancel,
-     never loosens. YOLO positions are skipped until TP1 has filled (right-tail preservation).
+     never loosens. YOLO positions are skipped until TP1 has filled (right-tail preservation). Activation
+     gate (Issue #95): the planned SL is kept (reason "trail_not_activated") until +1.0R of planned risk or
+     +2.0x ATR_15m of favourable excursion since entry on closed 15m bars, or TP1 fill; the Chandelier stop is
+     then anchored to the extreme since entry. Take-profit orders are never re-based.
   4. Dead-alpha check: reported only; positions are closed (reduce-only) only with --close-dead-alpha.
   5. Unknown resting entries (execute_futures_trade.find_unregistered_resting_entries, all symbols): an opening
      order resting on the exchange without a logs/pending_entries.json record (e.g. deleted registry) would get
@@ -52,7 +55,9 @@ State file (logs/guardian_state.json):
       "leverage": int, "unrealized_pnl": float, "liquidation_price": float,
       "protected": bool, "stop_price": float | null,
       "is_yolo": bool, "yolo_source": str | null, "tp1_filled": bool | null,
-      "trailing": {"success", "updated", "reason", "previous_sl", "new_sl"?, "planned_sl"?, "message"} | null,
+      "trailing": {"success", "updated", "reason", "previous_sl", "new_sl"?, "planned_sl"?,
+                   "activation_reason"?: "tp1_filled" | "r_multiple" | "atr_expansion" | null,
+                   "reference_source"?: "trade_audit" | "current_stop", "message"} | null,
       "dead_alpha": {"status", "range_pct", "recommendation", "message"} | null,
       "error": str | null
     }],
@@ -234,7 +239,8 @@ class GuardianCycle:
             self.error(sym, "trailing", e)
             view["trailing"] = {"success": False, "updated": False, "reason": "exception", "message": str(e)}
             return
-        keys = ("success", "updated", "reason", "previous_sl", "new_sl", "planned_sl", "message", "error", "warnings")
+        keys = ("success", "updated", "reason", "previous_sl", "new_sl", "planned_sl", "activation_reason",
+                "reference_source", "message", "error", "warnings")
         view["trailing"] = {k: res.get(k) for k in keys if k in res}
         if res.get("updated"):
             view["stop_price"] = res.get("new_sl")
