@@ -472,7 +472,7 @@ class TestRestingEntryProdGates(ExecutorHarness):
 
     def test_existing_position_rejected(self):
         write_guardian_state(self.ws)
-        self.positions = [{"symbol": "SOLUSDT", "positionAmt": "-1.5"}]
+        self.positions = [{"symbol": "SOLUSDT", "positionAmt": "-1.5", "markPrice": "100", "unRealizedProfit": "0"}]
         self.assertGateRejected(self._prod_stop(), "already has an open position")
 
     def test_position_query_failure_rejected(self):

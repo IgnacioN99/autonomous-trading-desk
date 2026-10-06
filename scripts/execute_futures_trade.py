@@ -88,6 +88,9 @@ JSON schemas (stable; extra keys may be added, existing keys are never renamed):
       utils/portfolio_exposure.compute_exposure) and the unregistered-entry check; each takes the stricter of the
       file and the live view, and a failed live read, a missing/corrupt session_state.json or a missing registry
       while opening orders rest rejects the order. PROD equity is read live from /fapi/v2/balance.
+      Issue #119: Gate 1 classifies filled positions plus resting opening orders and also rejects an order that
+      would itself tip a non-empty book heavy in its direction; Gate 2 sizes the loss cap on
+      min(wallet balance, balance + unrealized PnL of the snapshot's positionRisk rows).
 """
 
 import os
@@ -132,7 +135,8 @@ except Exception:  # pragma: no cover - exercised only on broken installs
 # pipeline (scripts/utils/gate_limits.py, issue #64).
 from utils.gate_limits import MIN_TP1_DISTANCE, YOLO_MAX_LOSS_MARGIN_FRACTION, YOLO_MIN_LOSS_CAP_USDT
 # Portfolio delta classification shared with sync_session_state.py; PROD gates apply it to the live exchange view.
-from utils.portfolio_exposure import compute_exposure, LONG_HEAVY, SHORT_HEAVY
+from utils.portfolio_exposure import (compute_exposure, book_exposure, project_order, resting_opening_legs,
+                                      unrealized_pnl_total, LONG_HEAVY, SHORT_HEAVY)
 
 # Liquidation gate parameters
 DEFAULT_MAINT_MARGIN_RATIO = 0.01      # Conservative fallback when /fapi/v1/leverageBracket is unavailable
@@ -1312,6 +1316,14 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
     PROD (issue #101): Gate 0A and Gate 1 are anchored to the exchange via `live_snapshot` (the order attempt's
     fetch_live_gate_snapshot; fetched here when None, a read failure rejects) and take the stricter of
     logs/session_state.json (a cache) and the live view. TESTNET makes no extra exchange call.
+    PROD (issue #119): Gate 1's live book = filled positionRisk notional + resting opening orders
+    (utils/portfolio_exposure.resting_opening_legs, quantity-less MCP algos sized from logs/pending_entries.json);
+    it rejects when that book is heavy in the order's direction and, on a non-empty book, when adding the order
+    (total_qty x effective entry) would make it so. Gate 2 (standard orders) caps the loss at
+    min(wallet balance, balance + unrealized PnL of the snapshot's open positions) x risk_pct_equity x 1.25; a
+    missing unRealizedProfit on an open position rejects. Sizing (execute_complete_trade margin) still uses the wallet
+    balance from get_account_equity, so with large open losses a full-size standard order is rejected by Gate 2
+    rather than sized down. TESTNET skips Gate 1 and keeps the 10000 fallback.
     """
     ref = entry_price if entry_price else cur_price
     target_env = resolve_env(target_env)
@@ -1420,25 +1432,54 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
         if not isinstance(file_exposure, dict):
             return False, "MECHANICAL HARD GATE REJECTION: FAIL-CLOSED — session_state.json portfolio_exposure is malformed. Order blocked."
         file_bias = file_exposure.get('delta_bias') or state_data.get('portfolio_delta_bias', 'NEUTRAL')
-        # Issue #101: the file is a cache; the live positionRisk classification (same compute_exposure as the sync)
-        # is applied too and the stricter of the two wins.
+        # Issue #101: the file is a cache; the live classification (same compute_exposure as the sync) is applied too
+        # and the stricter of the two wins. Issue #119: the live book is the filled positionRisk notional plus the
+        # opening orders resting on the exchange (resting_opening_legs; MCP algos without a quantity take it from
+        # their logs/pending_entries.json record).
         live_exp = live_snapshot["exposure"]
-        live_bias = live_exp["delta_bias"]
+        entries, reg_err = load_pending_entries()
+        if reg_err:
+            return False, (f"MECHANICAL HARD GATE REJECTION: FAIL-CLOSED — {reg_err}; cannot measure the resting "
+                           "opening orders for the delta-neutral gate. Order blocked.")
+        records = [r for r in entries.values() if isinstance(r, dict) and r.get('target_env') == target_env]
+        resting = [dict(resting_entry_info(source, kind, o), executed_qty=o.get('executedQty'))
+                   for source, kind, o in live_resting_opening_orders(live_snapshot)]
+        try:
+            legs = resting_opening_legs(resting, records)
+        except ValueError as e:
+            return False, (f"MECHANICAL HARD GATE REJECTION: FAIL-CLOSED — {e}. The delta-neutral gate cannot "
+                           "measure the portfolio. Order blocked.")
+        rest_long = sum(l['notional'] for l in legs if l['side'] == 'LONG')
+        rest_short = sum(l['notional'] for l in legs if l['side'] == 'SHORT')
+        pre = book_exposure(live_exp['long_notional'] + rest_long, live_exp['short_notional'] + rest_short)
         blocked = LONG_HEAVY if is_long else SHORT_HEAVY
-        sources = [name for name, bias in (("live exchange positionRisk", live_bias), ("session_state.json", file_bias))
+        live_name = "live exchange positionRisk + resting opening orders" if legs else "live exchange positionRisk"
+        sources = [name for name, bias in ((live_name, pre['delta_bias']), ("session_state.json", file_bias))
                    if bias == blocked]
+        book_note = (f"live delta_ratio {pre['delta_ratio']:+.2f}, long {pre['long_notional']:.2f} / short "
+                     f"{pre['short_notional']:.2f} USDT incl. resting long {rest_long:.2f} / short {rest_short:.2f}")
         if sources:
-            source_note = (f" Source: {' and '.join(sources)} (live delta_ratio {live_exp['delta_ratio']:+.2f}, "
-                           f"long {live_exp['long_notional']:.2f} / short {live_exp['short_notional']:.2f} USDT; "
-                           f"session_state.json bias {file_bias}).")
+            source_note = f" Source: {' and '.join(sources)} ({book_note}; session_state.json bias {file_bias})."
             if is_long:
                 return False, ("MECHANICAL HARD GATE REJECTION: Portfolio is in LONG_HEAVY state (+Delta imbalanced). Opening additional Longs is strictly prohibited. Short hedge or neutral portfolio required."
                                + source_note)
             return False, ("MECHANICAL HARD GATE REJECTION: Portfolio is in SHORT_HEAVY state (-Delta imbalanced). Opening additional Shorts is strictly prohibited. Long hedge or neutral portfolio required."
                            + source_note)
+        # Issue #119 new-order rule: on a non-empty book, the order itself may not tip the book heavy in its own
+        # direction (post = pre + total_qty x effective entry on its side). An empty book always passes.
+        if pre['long_notional'] + pre['short_notional'] > 0:
+            order_notional = abs(total_qty * ref)
+            post = project_order(pre, is_long, order_notional)
+            if post['delta_bias'] == blocked:
+                side = "LONG" if is_long else "SHORT"
+                return False, (f"MECHANICAL HARD GATE REJECTION: This {side} order ({order_notional:.2f} USDT notional) "
+                               f"would push the portfolio into {blocked} state (post-order delta_ratio "
+                               f"{post['delta_ratio']:+.2f} beyond ±0.35; pre-order {book_note}). Reduce the size or "
+                               "hedge first.")
 
     # --- GATE 2: Dynamic Equity Risk Gate (Finding 13) ---
     potential_dollar_loss = abs(ref - sl_price) * total_qty
+    equity_note = ""
     try:
         import quant_risk_engine as qre
         account_equity = qre.get_account_equity(target_env)
@@ -1465,10 +1506,23 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
         margin_est = (ref * total_qty / max(leverage, 1))
         max_allowed_loss = max(YOLO_MIN_LOSS_CAP_USDT, margin_est * YOLO_MAX_LOSS_MARGIN_FRACTION)
     else:
+        # Issue #119: the cap is sized on min(wallet balance, balance + unrealized PnL), so open losses lower it and
+        # open gains never raise it. /fapi/v2/balance has no marginBalance and its crossUnPnl excludes isolated
+        # positions (the desk mandates isolated margin), so the uPnL comes from the live snapshot's positionRisk rows
+        # (KEYS /fapi/v2/positionRisk, MCP positionInformationV2: unRealizedProfit); no extra request. A missing or
+        # unparseable unRealizedProfit on an open position rejects (fail closed).
+        wallet_balance = account_equity
+        try:
+            unrealized = unrealized_pnl_total(live_snapshot["exposure"])
+        except (ValueError, KeyError, TypeError) as e:
+            return False, (f"MECHANICAL HARD GATE REJECTION: FAIL-CLOSED — cannot read the unrealized PnL of the "
+                           f"open positions for the monetary risk cap ({e}). Order blocked.")
+        account_equity = min(wallet_balance, wallet_balance + unrealized)
+        equity_note = f" = min(wallet balance ${wallet_balance:.2f}, balance + unrealized PnL ${unrealized:+.2f})"
         max_allowed_loss = account_equity * risk_fraction * 1.25
 
     if potential_dollar_loss > max_allowed_loss:
-        return False, f"MECHANICAL HARD GATE REJECTION: Monetary risk exceeds allowed cap (${potential_dollar_loss:.2f} > ${max_allowed_loss:.2f} USDT, entry ref {ref}, equity: ${account_equity:.2f}, risk fraction: {risk_fraction*100:.2f}% + buffer). Adjust margin or position size."
+        return False, f"MECHANICAL HARD GATE REJECTION: Monetary risk exceeds allowed cap (${potential_dollar_loss:.2f} > ${max_allowed_loss:.2f} USDT, entry ref {ref}, equity: ${account_equity:.2f}{equity_note}, risk fraction: {risk_fraction*100:.2f}% + buffer). Adjust margin or position size."
 
     # --- GATE 3: Financial Friction and Fee Gate ---
     if tp1_price and not is_testnet:
@@ -1774,7 +1828,8 @@ def fetch_live_gate_snapshot(target_env):
     """
     PROD gate inputs read from the exchange, fetched ONCE per order attempt (issue #101): three all-symbol GETs,
     /fapi/v2/positionRisk, /fapi/v1/openAlgoOrders and /fapi/v1/openOrders. Gate 0A (max open positions), Gate 1
-    (delta-neutral) and the unregistered-resting-entry check (1d) all read this snapshot, so editing or deleting
+    (delta-neutral, incl. resting opening orders), Gate 2 (unrealized PnL of the open positions, issue #119) and the
+    unregistered-resting-entry check (1d) all read this snapshot, so editing or deleting
     logs/session_state.json / logs/pending_entries.json cannot make a gate pass that the live state would fail.
     Returns (snapshot, error): snapshot = {"env", "fetched_at", "positions": [rows], "exposure":
     utils.portfolio_exposure.compute_exposure(rows), "open_algo_orders": [...], "open_orders": [...]}; error is

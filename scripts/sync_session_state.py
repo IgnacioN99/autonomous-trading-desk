@@ -55,6 +55,48 @@ def load_audit_metadata(target_env: str = None) -> Dict[str, dict]:
             pass
     return meta
 
+def write_error_state(err_msg: str, now_ts: int, now_utc: str, target_env: str, btc_price: float) -> dict:
+    """Writes and returns the fail-closed state (is_valid False, delta_bias UNKNOWN, zeroed figures, error text) used
+    when the ledger positions cannot be read or classified: never a 0-position DELTA_BALANCED state (Finding 6)."""
+    error_state = {
+        "is_valid": False,
+        "error": err_msg,
+        "last_updated_ts": now_ts,
+        "last_updated_utc": now_utc,
+        "target_env": target_env,
+        "macro_btc": {
+            "price_usdt": btc_price
+        },
+        "portfolio_exposure": {
+            "total_active_positions": 0,
+            "long_notional_usdt": 0.0,
+            "short_notional_usdt": 0.0,
+            "net_notional_delta_usdt": 0.0,
+            "delta_bias": "UNKNOWN",
+            "delta_advice": f"🚨 LEDGER SYNC FAILED: {err_msg}",
+            "total_floating_pnl_usdt": 0.0
+        },
+        "active_positions": [],
+        "active_sl_algo_orders": [],
+        "active_tp_limit_orders": [],
+        "closed_today_summary": {
+            "closed_trades_count": 0,
+            "wins": 0,
+            "losses": 0,
+            "win_rate_pct": 0.0,
+            "gross_realized_pnl_usdt": 0.0,
+            "commissions_usdt": 0.0,
+            "net_realized_pnl_usdt": 0.0
+        }
+    }
+    try:
+        from utils.atomic_writer import atomic_write_json
+        atomic_write_json(STATE_FILE, error_state)
+    except Exception:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(error_state, f, indent=2, ensure_ascii=False)
+    return error_state
+
 def sync_session_state(target_env: str = None) -> dict:
     """
     Synchronizes directly against the Binance Futures ledger (Mainnet/Testnet)
@@ -81,86 +123,53 @@ def sync_session_state(target_env: str = None) -> dict:
     # Finding 6: If positionRisk API call returns an error dict, exception, or non-list,
     # DO NOT write session_state.json with 0 positions and DELTA_BALANCED.
     if not isinstance(pos_res, list) or (isinstance(pos_res, dict) and ("code" in pos_res or "error" in pos_res or "msg" in pos_res)):
-        err_msg = f"Failed to fetch positionRisk from ledger: {pos_res}"
-        error_state = {
-            "is_valid": False,
-            "error": err_msg,
-            "last_updated_ts": now_ts,
-            "last_updated_utc": now_utc,
-            "target_env": target_env,
-            "macro_btc": {
-                "price_usdt": btc_price
-            },
-            "portfolio_exposure": {
-                "total_active_positions": 0,
-                "long_notional_usdt": 0.0,
-                "short_notional_usdt": 0.0,
-                "net_notional_delta_usdt": 0.0,
-                "delta_bias": "UNKNOWN",
-                "delta_advice": f"🚨 LEDGER SYNC FAILED: {err_msg}",
-                "total_floating_pnl_usdt": 0.0
-            },
-            "active_positions": [],
-            "active_sl_algo_orders": [],
-            "active_tp_limit_orders": [],
-            "closed_today_summary": {
-                "closed_trades_count": 0,
-                "wins": 0,
-                "losses": 0,
-                "win_rate_pct": 0.0,
-                "gross_realized_pnl_usdt": 0.0,
-                "commissions_usdt": 0.0,
-                "net_realized_pnl_usdt": 0.0
-            }
-        }
-        try:
-            from utils.atomic_writer import atomic_write_json
-            atomic_write_json(STATE_FILE, error_state)
-        except Exception:
-            with open(STATE_FILE, "w", encoding="utf-8") as f:
-                json.dump(error_state, f, indent=2, ensure_ascii=False)
-        return error_state
+        return write_error_state(f"Failed to fetch positionRisk from ledger: {pos_res}", now_ts, now_utc,
+                                 target_env, btc_price)
 
     active_positions = []
-    # Portfolio delta classification shared with the executor's PROD gates (utils/portfolio_exposure.py, issue #101)
-    exposure = compute_exposure(pos_res if isinstance(pos_res, list) else [])
+    # Portfolio delta classification shared with the executor's PROD gates (utils/portfolio_exposure.py, issue #101).
+    # A malformed row (issue #117) is a failed sync: same fail-closed state as a failed positionRisk read.
+    try:
+        exposure = compute_exposure(pos_res)
+    except ValueError as e:
+        return write_error_state(f"Malformed positionRisk data from ledger: {e}", now_ts, now_utc, target_env,
+                                 btc_price)
     long_notional = exposure["long_notional"]
     short_notional = exposure["short_notional"]
 
-    if isinstance(pos_res, list):
-        for live_pos in exposure["active_positions"]:
-                p = live_pos["row"]
-                amt = live_pos["qty"]
-                sym = p["symbol"]
-                direction = live_pos["side"]
-                entry_p = float(p.get("entryPrice", 0))
-                mark_p = float(p.get("markPrice", 0))
-                unrealized_pnl = float(p.get("unRealizedProfit", 0))
-                leverage = int(p.get("leverage", 3))
-                notional = live_pos["notional"]
-                margin = notional / leverage if leverage > 0 else 0.0
-                roe_pct = (unrealized_pnl / margin * 100) if margin > 0 else 0.0
+    for live_pos in exposure["active_positions"]:
+        p = live_pos["row"]
+        amt = live_pos["qty"]
+        sym = p["symbol"]
+        direction = live_pos["side"]
+        entry_p = float(p.get("entryPrice", 0))
+        mark_p = float(p.get("markPrice", 0))
+        unrealized_pnl = float(p.get("unRealizedProfit", 0))
+        leverage = int(p.get("leverage", 3))
+        notional = live_pos["notional"]
+        margin = notional / leverage if leverage > 0 else 0.0
+        roe_pct = (unrealized_pnl / margin * 100) if margin > 0 else 0.0
 
-                meta_trade = audit_meta.get(sym, {})
-                active_positions.append({
-                    "symbol": sym,
-                    "direction": direction,
-                    "qty": amt,
-                    "entry_price": entry_p,
-                    "mark_price": mark_p,
-                    "unrealized_pnl_usdt": round(unrealized_pnl, 4),
-                    "roe_pct": round(roe_pct, 2),
-                    "leverage": leverage,
-                    "notional_usdt": round(notional, 2),
-                    "margin_usdt": round(margin, 2),
-                    "entry_order_id": meta_trade.get("entry_order_id"),
-                    "entry_time_ts": meta_trade.get("timestamp") or (int(p.get("updateTime", 0)) // 1000 if p.get("updateTime") else now_ts),
-                    "entry_time_utc": datetime.datetime.fromtimestamp(meta_trade.get("timestamp") or (int(p.get("updateTime", 0)) // 1000 if p.get("updateTime") else now_ts), datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-                    "sl_price": meta_trade.get("sl_price"),
-                    "sl_algo_id": meta_trade.get("sl_algo_id"),
-                    "tp1_price": meta_trade.get("tp1_price"),
-                    "tp2_price": meta_trade.get("tp2_price")
-                })
+        meta_trade = audit_meta.get(sym, {})
+        active_positions.append({
+            "symbol": sym,
+            "direction": direction,
+            "qty": amt,
+            "entry_price": entry_p,
+            "mark_price": mark_p,
+            "unrealized_pnl_usdt": round(unrealized_pnl, 4),
+            "roe_pct": round(roe_pct, 2),
+            "leverage": leverage,
+            "notional_usdt": round(notional, 2),
+            "margin_usdt": round(margin, 2),
+            "entry_order_id": meta_trade.get("entry_order_id"),
+            "entry_time_ts": meta_trade.get("timestamp") or (int(p.get("updateTime", 0)) // 1000 if p.get("updateTime") else now_ts),
+            "entry_time_utc": datetime.datetime.fromtimestamp(meta_trade.get("timestamp") or (int(p.get("updateTime", 0)) // 1000 if p.get("updateTime") else now_ts), datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "sl_price": meta_trade.get("sl_price"),
+            "sl_algo_id": meta_trade.get("sl_algo_id"),
+            "tp1_price": meta_trade.get("tp1_price"),
+            "tp2_price": meta_trade.get("tp2_price")
+        })
 
     # 3. Active Algo Orders (Stop Loss) on Binance
     algos_res = eft.send_signed_request("GET", "/fapi/v1/openAlgoOrders", target_env=target_env)
