@@ -44,6 +44,11 @@ import test_guard_bypasses as tgb  # noqa: E402  (fixtures only; its TestCases a
 
 GENERATOR = REPO_ROOT / "scripts" / "dev" / "sync_claude_assets.py"
 READ_ONLY_CLAUDE_TOOLS = {"Read", "Grep", "Glob", "WebSearch", "WebFetch"}
+ISSUE_AGENT_TOOLS = {
+    "issue_locator": {"Read", "Grep", "Glob"},
+    "issue_fixer": {"Read", "Grep", "Glob", "Bash", "Write", "Edit"},
+    "issue_auditor": {"Read", "Grep", "Glob"},
+}
 SESSION = "5e55105e-0000-4000-8000-000000000001"
 
 
@@ -111,10 +116,17 @@ class TestGeneratedClaudeAssets(unittest.TestCase):
             text = path.read_text(encoding="utf-8")
             fm = frontmatter(text)
             self.assertEqual(fm["name"], path.stem)
-            self.assertEqual(set(fm) - {"name", "description", "tools", "model"}, set(), path)
             tools = {t.strip() for t in fm["tools"].split(",")}
-            self.assertTrue(tools <= READ_ONLY_CLAUDE_TOOLS, f"{path}: {tools}")
-            self.assertEqual(fm.get("model"), "inherit")
+            if path.stem in ISSUE_AGENT_TOOLS:
+                # Issue workflow agents run on opus; only the guarded fixer holds write tools and a hook
+                self.assertEqual(tools, ISSUE_AGENT_TOOLS[path.stem], path)
+                self.assertEqual(fm.get("model"), "opus", path)
+                extra = {"hooks"} if path.stem in gen.WRITE_AGENTS else set()
+                self.assertEqual(set(fm) - {"name", "description", "tools", "model"}, extra, path)
+            else:
+                self.assertEqual(set(fm) - {"name", "description", "tools", "model"}, set(), path)
+                self.assertTrue(tools <= READ_ONLY_CLAUDE_TOOLS, f"{path}: {tools}")
+                self.assertEqual(fm.get("model"), "inherit")
             self.assertIsNone(re.search(r"invoke_subagent|send_message|conversationId|TypeName", fm["description"]))
             self.assertIn(gen.GENERATED_MARKER, text)
             self.assertIn("<claude_code_runtime>", text)

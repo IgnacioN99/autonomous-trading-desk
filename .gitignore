@@ -27,6 +27,7 @@ logs/*.jsonl
 logs/*.md
 logs/evaluations/*
 logs/pr_review/
+logs/issue_work/
 !logs/.gitkeep
 !logs/evaluations/.gitkeep
 
@@ -45,6 +46,8 @@ skills-lock.json
 !.agents/skills/trade-execution-planner/**
 !.agents/skills/pr-review/
 !.agents/skills/pr-review/**
+!.agents/skills/issue-orchestrator/
+!.agents/skills/issue-orchestrator/**
 !.agents/skills/market-radar/
 
 # =================================================================
@@ -115,3 +118,4 @@ Thumbs.db
 !.claude/skills/market-radar/
 !.claude/skills/trade-execution-planner/
 !.claude/skills/pr-review/
+!.claude/skills/issue-orchestrator/

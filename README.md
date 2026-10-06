@@ -192,7 +192,7 @@ Ready for algorithmic execution.
 
 ### Running with Claude Code
 1. Launch `claude` from the repository root. `CLAUDE.md` imports `AGENTS.md` and `.agents/rules/*.md`; `.claude/settings.json` wires the same hooks as agy (`pre_trade_guard.py`, `post_trade_sync.py`, `post_pr_review_hook.py`, `pr_review_stop_hook.py --claude`).
-2. Subagents (`isolated_market_evaluator`, `<domain>_reviewer`) and skills (`market-radar`, `trade-execution-planner`, `pr-review`) are generated from `.agents/` by `python3 scripts/dev/sync_claude_assets.py`; never edit `.claude/agents/` or `.claude/skills/` by hand (the test suite runs the generator with `--check`). Restart the session after adding or renaming a subagent.
+2. Subagents (`isolated_market_evaluator`, `<domain>_reviewer`, `issue_locator`, `issue_fixer`, `issue_auditor`) and skills (`market-radar`, `trade-execution-planner`, `pr-review`, `issue-orchestrator`) are generated from `.agents/` by `python3 scripts/dev/sync_claude_assets.py`; never edit `.claude/agents/` or `.claude/skills/` by hand (the test suite runs the generator with `--check`). Restart the session after adding or renaming a subagent.
 3. Evaluation flow: `python3 scripts/prime_evaluator_brief.py` → Agent tool with `subagent_type: "isolated_market_evaluator"` → `python3 scripts/record_evaluation.py --from-claude-subagent <agentId>` → `scripts/execute_futures_trade.py`. The recorder only accepts transcripts whose `meta.json` says `agentType: "isolated_market_evaluator"`.
 4. Windows: copy `.claude/settings.local.json.example` to `.claude/settings.local.json` and fill in `<WSL_DISTRO>` / `<REPO_PATH_IN_WSL>` so the hooks run with the WSL Python.
 
@@ -321,6 +321,17 @@ Flow (all helpers are deterministic):
 
 Headless fallback without an interactive agy session (e.g. CI with `GEMINI_API_KEY`): `python3 scripts/ci/run_pr_audit.py origin/main logs/pr_review/report.md` builds one prompt from the same agent definitions.
 
+### 8. Issue Workflow (Orchestrator + Subagents)
+Ask the agent to work an issue ("work issue 95") or run `/issue-orchestrator 95`. The [`issue-orchestrator` skill](.agents/skills/issue-orchestrator/SKILL.md) runs in the main session and drives three Opus subagents with minimal tools, none of which can use the internet:
+
+| Subagent | Tools | Role |
+|---|---|---|
+| `issue_locator` | read, grep, list | Maps files, callers, persistence, tests and docs the fix must touch |
+| `issue_fixer` | read, grep, list, edit, write, guarded shell | Implements the orchestrator's `design.md` with tests; its edits and Bash run through `scripts/hooks/issue_fixer_guard.py` (confined to the issue worktree, never the main checkout where the hooks live; allowlist: read-only git, unittest/compileall, tests; no commits, gh, network, installs or desk scripts) |
+| `issue_auditor` | read, grep, list | Audits the diff and the deterministic check results; `VERDICT: APPROVE` or `CHANGES_REQUESTED` (max 3 fixer rounds) |
+
+Flow: `python3 scripts/dev/issue_workspace.py init <N> --slug <slug>` (own worktree and `fix/issue-N-*` branch) → locator → design → fixer → `issue_workspace.py review-context <worktree>` + auditor → full suite by the orchestrator → commit, push, PR → `/pr-review` → merge on green CI → follow-up issues with severity/priority labels → `issue_workspace.py cleanup <N>`. Working files live in `<worktree>/logs/issue_work/` (gitignored).
+
 ---
 
 ## 📂 Repository Structure
@@ -339,6 +350,7 @@ autonomous-trading-desk/
 │   ├── mcp_config.json                # Workspace MCP servers for agy (Notion, Binance gateway)
 │   └── skills/
 │       ├── market-radar/              # Read-only CLI scanners with --json output
+│       ├── issue-orchestrator/        # /issue-orchestrator: issue -> worktree -> fix -> audit -> PR -> merge
 │       ├── pr-review/                 # /pr-review: multi-agent PR review orchestration
 │       └── trade-execution-planner/   # Core execution & market radar skill
 │                                      # (third-party Binance skills may also live here; not part of the flow)
@@ -373,8 +385,10 @@ autonomous-trading-desk/
 │   │   ├── pr_review_state.py         # Pending auto-review marker
 │   │   └── run_pr_audit.py            # Headless PR review fallback (agy -p / Gemini API)
 │   ├── dev/
+│   │   ├── issue_workspace.py         # Issue worktrees, auditor review context and cleanup
 │   │   └── sync_claude_assets.py      # Generates .claude/agents + .claude/skills from .agents/ (--check)
 │   ├── hooks/
+│   │   ├── issue_fixer_guard.py       # issue_fixer confinement: worktree-only edits + Bash allowlist
 │   │   ├── pre_trade_guard.py         # Mechanical hard gate hook (<15ms, fail-closed)
 │   │   ├── post_trade_sync.py         # Auto ground-truth sync on fills
 │   │   ├── post_pr_review_hook.py     # Arms the PR review after gh pr create / push
