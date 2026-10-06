@@ -48,7 +48,7 @@ class GuardHarness(unittest.TestCase):
     """Isolated workspace (temp dir) with profile, fresh session state and a fake Antigravity brain."""
 
     def setUp(self):
-        self._env = patch.dict(os.environ, dict(OFFLINE_ENV), clear=False)
+        self._env = patch.dict(os.environ, dict(OFFLINE_ENV, WSL_DISTRO_NAME="Ubuntu"), clear=False)
         self._env.start()
         os.environ.pop("BINANCE_API_ENV", None)
         self.tmp = tempfile.TemporaryDirectory()
@@ -2041,12 +2041,32 @@ class TestLoneQuotedNewlineAndWslAutoAllow(GuardHarness):
                          "scripts/trading_doctor.py")
         self.assertEqual(sanctioned("scripts/trading_doctor.py", "/c/Repo", "/mnt/c/Repo", False),
                          "scripts/trading_doctor.py")
-        self.assertEqual(sanctioned("/c/repo/scripts/trading_doctor.py", "", "/mnt/c/Repo", False),
+        self.assertEqual(sanctioned("/c/repo/scripts/trading_doctor.py", "C:\\Repo", "/mnt/c/Repo", False),
                          "scripts/trading_doctor.py")
-        self.assertEqual(sanctioned("scripts/trading_doctor.py", "\\\\wsl.localhost\\Ubuntu\\home\\u\\r", "/home/u/r",
-                                    False), "scripts/trading_doctor.py")
-        self.assertEqual(sanctioned("scripts/trading_doctor.py", "\\\\wsl$\\Ubuntu\\home\\u\\r", "/home/u/r",
-                                    False), "scripts/trading_doctor.py")
+        self.assertEqual(sanctioned("/c/repo/scripts/trading_doctor.py", "/c/Repo", "/mnt/c/Repo", False),
+                         "scripts/trading_doctor.py")
+        # Issue #110: Git Bash /c/x is the C: drive only for a Windows-side session cwd (else a Linux directory)
+        for cwd in ("", "/mnt/c/Repo", "/home/u"):
+            self.assertIsNone(sanctioned("/c/repo/scripts/trading_doctor.py", cwd, "/mnt/c/Repo", False), cwd)
+        # Issue #110: \\wsl.localhost\<distro>\x maps to /x only for this distro (WSL_DISTRO_NAME, case-insensitive)
+        with patch.dict(os.environ, {"WSL_DISTRO_NAME": "Ubuntu"}):
+            for cwd in ("\\\\wsl.localhost\\Ubuntu\\home\\u\\r", "\\\\wsl$\\Ubuntu\\home\\u\\r",
+                        "\\\\WSL.LOCALHOST\\ubuntu\\home\\u\\r"):
+                self.assertEqual(sanctioned("scripts/trading_doctor.py", cwd, "/home/u/r", False),
+                                 "scripts/trading_doctor.py", cwd)
+            self.assertEqual(sanctioned("\\\\wsl$\\Ubuntu\\home\\u\\r\\scripts\\trading_doctor.py", "C:\\Repo",
+                                        "/home/u/r", False), "scripts/trading_doctor.py")
+            # round 2: a UNC script operand maps only from a Windows-side cwd outside wsl
+            self.assertIsNone(sanctioned("\\\\wsl$\\Ubuntu\\home\\u\\r\\scripts\\trading_doctor.py", "", "/home/u/r",
+                                         False))
+            for cwd in ("\\\\wsl.localhost\\Debian\\home\\u\\r", "\\\\wsl$\\Other\\home\\u\\r"):
+                self.assertIsNone(sanctioned("scripts/trading_doctor.py", cwd, "/home/u/r", False), cwd)
+            self.assertIsNone(sanctioned("\\\\wsl$\\Debian\\home\\u\\r\\scripts\\trading_doctor.py", "", "/home/u/r",
+                                         False))
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("WSL_DISTRO_NAME", None)
+            self.assertIsNone(sanctioned("scripts/trading_doctor.py", "\\\\wsl$\\Ubuntu\\home\\u\\r", "/home/u/r",
+                                         False))
         self.assertIsNone(sanctioned("/c/Repo/scripts/trading_doctor.py", "", "/mnt/c/Repo", True))  # Linux /c
         self.assertIsNone(sanctioned("/home/u/R/scripts/trading_doctor.py", "", "/home/u/r", False))  # Linux case
         self.assertIsNone(sanctioned("C:\\Repo\\scripts\\trading_doctor.py", "", "/mnt/c/Repo", True))
@@ -2205,7 +2225,7 @@ class TestRiskReducingIdentityAndWslReparse(GuardHarness):
                   f"python3 {self.E} --close-position --symbol BTCUSDT",
                   self.WSL + f"python3 {self.E} --close-position --symbol BTCUSDT --env prod --json",
                   f"python3 {self.E} --auto-heal", f"python3 {self.E} --audit-orphans --env prod",
-                  f"python3 {self.E} --protect-pending", f"python3 {self.E} --move-breakeven --symbol=BTCUSDT --force",
+                  f"python3 {self.E} --protect-pending", f"python3 {self.E} --move-breakeven --symbol=BTCUSDT --is-yolo",
                   "python3 scripts/loops/position_guardian_loop.py --once",
                   self.WSL + "python3 scripts/loops/night_cutoff_loop.py --env prod",
                   "python3 scripts/trading_doctor.py --heal",
@@ -2288,18 +2308,143 @@ class TestRiskReducingPrefixesAndWindowsCwd(GuardHarness):
                         "C:\\Desk\\Trading\\scripts\\..", "C:/Desk/Trading/"):
                 for c in (f"python3 {self.E} --close-position --symbol BTCUSDT", self.DOCTOR,
                           f"wsl.exe -d Ubuntu -- python3 {self.E} --move-breakeven --symbol BTCUSDT",
-                          "python3 /c/Desk/Trading/scripts/trading_doctor.py --heal",
                           "python3 C:\\\\Desk\\\\Trading\\\\scripts\\\\trading_doctor.py --heal"):
                     self.assertEqual(self.claude(c, cwd=cwd), "allow", f"{cwd}: {c}")
+                # Issue #110: a Git Bash /c/... script is the C: drive only when the session cwd is Windows-side
+                git_bash = "python3 /c/Desk/Trading/scripts/trading_doctor.py --heal"
+                if cwd.startswith("/mnt/"):
+                    self.assertEqual(self.claude(git_bash, cwd=cwd), "ask", f"{cwd}: {git_bash}")
+                else:
+                    self.assertEqual(self.claude(git_bash, cwd=cwd), "allow", f"{cwd}: {git_bash}")
                 self.assertEqual(self.claude("python scripts\\execute_futures_trade.py --auto-heal", "PowerShell",
                                              cwd), "allow", cwd)
             for cwd in ("C:\\Other", "/c/Desk", "D:\\Desk\\Trading"):
                 self.assertNotEqual(self.claude(self.DOCTOR, cwd=cwd), "allow", cwd)
+            # A native Linux cwd: /c/... is a Linux directory (also with no cwd at all)
+            for cwd in ("/mnt/c/Desk/Trading", "/home/u", None):
+                self.assertEqual(self.claude("python3 /c/Desk/Trading/scripts/trading_doctor.py --heal", cwd=cwd),
+                                 "ask", cwd)
             # Inside wsl a /c/... path is a Linux directory, not the C: drive
             self.assertNotEqual(self.claude("wsl.exe -- python3 /c/Desk/Trading/scripts/trading_doctor.py --heal",
                                             cwd="C:\\Desk\\Trading"), "allow")
         finally:
             self.root = real_root
+
+
+class TestRiskAutoAllowResiduals(GuardHarness):
+    """Issues #110 / #111: only RISK_WRAPPERS keep the risk-reducing auto-allow (sudo / chroot / ... ask), a forced
+    break-even asks, and a gated trade opening next to a blocked risk-reducing sub-command never ends "allow"."""
+
+    E = "scripts/execute_futures_trade.py"
+    DOCTOR = "python3 scripts/trading_doctor.py --heal"
+
+    def decisions(self, command_line):
+        """(agy, Claude Code Bash, PowerShell) decisions."""
+        claude = self.run_guard({"tool_name": "Bash", "tool_input": {"command": command_line}})
+        return (self.agy(self.cmd(command_line)).get("decision"),
+                claude.get("hookSpecificOutput", {}).get("permissionDecision",
+                                                         "deny" if claude.get("__exit_code__") == 2 else "ask"),
+                pre_trade_guard.evaluate_powershell_command(command_line, self.root, self.root, None)[0])
+
+    def assertAsk(self, command_line):
+        for label, decision in zip(("agy", "bash", "powershell"), self.decisions(command_line)):
+            self.assertEqual(decision, "ask", f"{label}: {command_line}")
+
+    def test_privileged_root_and_shell_changing_wrappers_ask(self):
+        close = f"python3 {self.E} --close-position --symbol BTCUSDT"
+        for c in (f"sudo -i {self.DOCTOR}", f"sudo -s {self.DOCTOR}", f"sudo -E {self.DOCTOR}", f"sudo {self.DOCTOR}",
+                  f"sudo -u root {close}", f"sudo --login {close}", f"doas {self.DOCTOR}",
+                  f"chroot /tmp {self.DOCTOR}", f"setsid {self.DOCTOR}", f"ionice -c 3 {self.DOCTOR}",
+                  f"taskset 1 {self.DOCTOR}", f"flock /tmp/l {self.DOCTOR}", f"time {self.DOCTOR}",
+                  f"exec {self.DOCTOR}", f"command {self.DOCTOR}", f"uv run {self.DOCTOR}",
+                  f"nice sudo {self.DOCTOR}", f"timeout 60 sudo -i {close}", f"env BINANCE_API_ENV=prod sudo {close}",
+                  f"wsl.exe -e sudo -i {self.DOCTOR}", f"wsl.exe -d Ubuntu -- sudo -E {close}",
+                  f"wsl.exe -d Ubuntu -- chroot /tmp {self.DOCTOR}"):
+            self.assertAsk(c)
+
+    def test_allowlisted_wrappers_keep_the_auto_allow(self):
+        for c in (f"timeout 60 {self.DOCTOR}", f"timeout -s KILL 60 python3 {self.E} --auto-heal",
+                  f"nice -n 10 {self.DOCTOR}", f"nohup {self.DOCTOR}", f"stdbuf -oL python3 {self.E} --auto-heal",
+                  f"env BINANCE_API_ENV=prod {self.DOCTOR}",
+                  f"nice timeout 60 env BINANCE_API_ENV=prod python3 -u {self.E} --close-position --symbol BTCUSDT",
+                  f"wsl.exe -d Ubuntu -- nohup timeout 60 {self.DOCTOR}"):
+            self.assertEqual(self.decisions(c), ("allow", "allow", "allow"), c)
+
+    def test_forced_break_even_asks(self):
+        for flags in ("--move-breakeven --symbol BTCUSDT --force", "--move-breakeven --symbol=BTCUSDT --force",
+                      "--move-breakeven --symbol PEPEUSDT --is-yolo --force",
+                      "--move-breakeven --symbol BTCUSDT --force --env prod --json"):
+            c = f"python3 {self.E} {flags}"
+            self.assertAsk(c)
+            self.assertIn("--force", self.agy(self.cmd(c)).get("reason", ""), c)
+        # --force only acts with --move-breakeven: next to another risk flag it is a no-op and stays allowed
+        self.assertEqual(self.decisions(f"python3 {self.E} --close-position --symbol BTCUSDT --force"),
+                         ("allow", "allow", "allow"))
+        for flags in ("--move-breakeven --symbol BTCUSDT", "--move-breakeven --symbol PEPEUSDT --is-yolo"):
+            c = f"python3 {self.E} {flags}"
+            self.assertEqual(self.decisions(c), ("allow", "allow", "allow"), c)
+
+    def test_wsl_user_and_foreign_distribution_ask(self):
+        for c in (f"wsl.exe -u root -- {self.DOCTOR}", f"wsl.exe --user root -- {self.DOCTOR}",
+                  f"wsl.exe -d Ubuntu -u root -e python3 {self.E} --auto-heal",
+                  f"wsl.exe -d Debian -- {self.DOCTOR}", f"wsl --distribution Other -e python3 {self.E} --auto-heal",
+                  f"wsl.exe -e wsl.exe -u root -- {self.DOCTOR}",
+                  f"wsl.exe --shell-type login -- {self.DOCTOR}", f"wsl.exe --shell-type LOGIN -e {self.DOCTOR}",
+                  f"wsl.exe -d Ubuntu --shell-type=login -- {self.DOCTOR}"):
+            self.assertAsk(c)
+        for c in (f"wsl.exe --shell-type standard -- {self.DOCTOR}", f"wsl.exe --shell-type none -e {self.DOCTOR}"):
+            self.assertEqual(self.decisions(c), ("allow", "allow", "allow"), c)
+        for c in (f"MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu -- python3 {self.E} --auto-heal",
+                  f"wsl.exe -d ubuntu -- {self.DOCTOR}", f"wsl.exe --distribution UBUNTU -e {self.DOCTOR}",
+                  f"wsl.exe -- {self.DOCTOR}"):
+            self.assertEqual(self.decisions(c), ("allow", "allow", "allow"), c)
+        os.environ.pop("WSL_DISTRO_NAME", None)  # unknown own distro: any -d asks, no -d still allowed
+        self.assertAsk(f"wsl.exe -d Ubuntu -- {self.DOCTOR}")
+        self.assertEqual(self.decisions(f"wsl.exe -- {self.DOCTOR}"), ("allow", "allow", "allow"))
+
+    def test_unc_paths_map_only_from_a_windows_cwd_outside_wsl(self):
+        sanctioned = pre_trade_guard._sanctioned_script
+        unc = "//wsl.localhost/Ubuntu/home/u/r/scripts/trading_doctor.py"
+        self.assertEqual(sanctioned(unc, "C:\\Repo", "/home/u/r", False), "scripts/trading_doctor.py")
+        self.assertIsNone(sanctioned(unc, "C:\\Repo", "/home/u/r", True))  # inside wsl: a Linux // path
+        for cwd in ("", "/home/u/r", "/mnt/c/Repo"):  # Linux-native cwd
+            self.assertIsNone(sanctioned(unc, cwd, "/home/u/r", False), cwd)
+        self.assertEqual(pre_trade_guard._lexical_host_path("//wsl.localhost/Ubuntu/x", git_bash=False),
+                         "//wsl.localhost/Ubuntu/x")
+
+    def test_move_breakeven_off_the_sanctioned_path_asks_never_denies(self):
+        for c in ("python3 /tmp/elsewhere/scripts/execute_futures_trade.py --move-breakeven --symbol PEPEUSDT --is-yolo",
+                  f"python3 {self.E} --move-breakeven --symbol PEPEUSDT --is-yolo --unknown",
+                  f"python3 {self.E} --move-breakeven --symbol PEPEUSDT --is-y",
+                  f"python3 {self.E} --move-breakeven --symbol PEPEUSDT --is-yolo --forc"):
+            self.assertAsk(c)
+        # An opening option next to --move-breakeven is still judged by the trade gates (no dossier: deny)
+        self.assertEqual(self.agy(self.cmd(f"python3 {self.E} --move-breakeven --symbol PEPEUSDT --direction LONG"))
+                         .get("decision"), "deny")
+
+    def test_directory_change_before_a_pure_opening_keeps_the_gate_decision(self):
+        opening = f"python3 {self.E} --symbol BTCUSDT --direction LONG"
+        with patch.object(pre_trade_guard, "evaluate_trade_opening", return_value=("allow", "Gates passed.")):
+            for line in (f"cd {self.root} && {opening}", f"pushd {self.root} && {opening}"):
+                self.assertEqual(pre_trade_guard._evaluate_shell_command(line, self.root, self.root, None)[0],
+                                 "allow", line)
+            # ... but a blocked risk-reducing sub-command next to the opening still asks
+            line = f"cd {self.root} && {opening} && python3 {self.E} --auto-heal"
+            self.assertEqual(pre_trade_guard._evaluate_shell_command(line, self.root, self.root, None)[0], "ask")
+
+    def test_trade_opening_with_blocked_risk_reducing_subcommand_never_allowed(self):
+        opening = f"python3 {self.E} --symbol BTCUSDT --direction LONG"
+        with patch.object(pre_trade_guard, "evaluate_trade_opening", return_value=("allow", "Gates passed.")):
+            for line in (f"{opening} && sudo python3 {self.E} --auto-heal",
+                         f"{opening} && PYTHONPATH=/tmp/x {self.DOCTOR}",
+                         f"{opening} && wsl.exe -e env -C /tmp {self.DOCTOR}"):
+                analysis = pre_trade_guard.analyze_run_command(line, self.root, self.root)
+                self.assertTrue(analysis["risk_blocker"], line)
+                decision, _reason = pre_trade_guard._evaluate_shell_command(line, self.root, self.root, None)
+                self.assertEqual(decision, "ask", line)
+            # Unchanged: a gated opening alone still passes
+            self.assertEqual(pre_trade_guard._evaluate_shell_command(opening, self.root, self.root, None)[0],
+                             "allow")
 
 
 class TestGitConfigFileChannels(GuardHarness):
