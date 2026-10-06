@@ -100,6 +100,10 @@ class _PipelineFakes(unittest.TestCase):
             patch("screening_pipeline.enrich_and_size_candidate", side_effect=lambda c, env=None: _setup(c["symbol"])),
             patch("sync_session_state.sync_session_state", return_value={"portfolio_exposure": {}, "active_positions": []}),
         ]
+        # Issue #66: the pipeline records the YOLO status in logs/yolo_scan_health.json; keep the real logs/ clean.
+        health_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(health_dir.cleanup)
+        patches.append(patch("utils.yolo_scan_health.HEALTH_FILE", os.path.join(health_dir.name, "yolo_scan_health.json")))
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
@@ -359,8 +363,9 @@ class TestYoloLevelsFromTrigger(unittest.TestCase):
 
     def test_loss_cap_of_35pct_margin_drops_high_leverage_entries(self):
         row = _audit_row("1000PEPEUSDT", 2.6, 30.0)
-        ok = bys.build_levels(row, "LONG", dict(YOLO_SIZING, leverage=8))    # ~4.2% x 8 = 0.34 <= 0.35
-        too_much = bys.build_levels(row, "LONG", dict(YOLO_SIZING, leverage=9))  # ~4.2% x 9 = 0.38 > 0.35
+        # Issue #66: ATR 1.8% -> trigger buffer 0.18% (was the 0.08% floor), stop ~4.3% from the trigger.
+        ok = bys.build_levels(row, "LONG", dict(YOLO_SIZING, leverage=8))    # ~4.3% x 8 = 0.34 <= 0.35
+        too_much = bys.build_levels(row, "LONG", dict(YOLO_SIZING, leverage=9))  # ~4.3% x 9 = 0.39 > 0.35
         cand = self._slot(ok).candidates[0]  # genuinely valid: TP1 2.2R, TP2 4.5R from the trigger
         self.assertEqual(cand.leverage, 8)
         self.assertGreaterEqual((cand.tp1 - cand.trigger) / (cand.trigger - cand.sl), sp.YOLO_MIN_R_TP1)
@@ -458,6 +463,7 @@ class TestCliExitsDespiteHungYoloScan(_PipelineFakes):
             patch("quant_risk_engine.scan_coingrated_market_pairs", return_value=[]).start()
             patch("funding_arbitrage.scan_top_funding_opportunities", return_value=[]).start()
             patch("sync_session_state.sync_session_state", return_value={{}}).start()
+            patch("utils.yolo_scan_health.HEALTH_FILE", sys.argv[1]).start()  # issue #66: keep logs/ clean
             sp._run_cli(["--json", "--env", "prod"])
         """)
         with tempfile.TemporaryDirectory() as tmp:
@@ -465,7 +471,8 @@ class TestCliExitsDespiteHungYoloScan(_PipelineFakes):
             with open(path, "w", encoding="utf-8") as f:
                 f.write(runner)
             t0 = time.time()
-            res = subprocess.run([sys.executable, path], capture_output=True, text=True, timeout=20)
+            res = subprocess.run([sys.executable, path, os.path.join(tmp, "yolo_scan_health.json")],
+                                 capture_output=True, text=True, timeout=20)
             elapsed = time.time() - t0
         self.assertLess(elapsed, 15.0)
         self.assertEqual(res.returncode, 0, res.stderr[-2000:])

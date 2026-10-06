@@ -101,6 +101,8 @@ def _urlopen(klines_by_symbol):
         url = getattr(req, "full_url", req)
         if "ticker/24hr" in url:
             return _Resp(tickers)
+        if "ticker/bookTicker" in url:
+            return _Resp([])  # issue #66: no book data -> spread unknown, trigger buffer from ATR / floor
         for sym, ks in klines_by_symbol.items():
             if "/fapi/v1/klines" in url and f"symbol={sym}&" in url:
                 return _Resp(ks)
@@ -369,7 +371,7 @@ class TestRoundedWorstCaseChecks(unittest.TestCase):
         self.assertEqual(bys.yolo_gate_failures(BORDERLINE_LONG), ["loss_cap"])
         self.assertIsNone(sp._to_yolo_candidate(BORDERLINE_LONG))
         with patch.object(bys, "build_levels",
-                          side_effect=lambda r, d, s: dict(BORDERLINE_LONG, symbol=r["symbol"], direction=d)):
+                          side_effect=lambda r, d, s, spread=None: dict(BORDERLINE_LONG, symbol=r["symbol"], direction=d)):
             data = _scan({"WIFUSDT": LONG_OK})
         self.assertEqual(data["longs"][0]["gate_failures"], ["loss_cap"])
         self.assertIsNone(data["recommendation"])
