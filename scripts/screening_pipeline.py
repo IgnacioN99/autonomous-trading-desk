@@ -234,6 +234,15 @@ def enrich_and_size_candidate(c: dict, target_env: Optional[str] = None) -> Opti
         # than the current price, so it is also conservative for MARKET deployments.
         # Single expression for both sizing and trigger_price (a 0/None trigger falls back to the price).
         sizing_entry = float(c.get("trigger") or entry)
+        # Issue #86: never invent take profits; R:R is measured from the sizing entry, not copied from the radar.
+        if c.get("tp1") is None or c.get("tp2") is None:
+            print(f"Radar row for {sym} has no tp1/tp2; candidate skipped (fail closed).", file=sys.stderr)
+            return None
+        tp1, tp2 = float(c["tp1"]), float(c["tp2"])
+        sl_dist = abs(sizing_entry - sl)
+        if sl_dist <= 0:
+            return None
+        rr_ratio = round(abs(tp2 - sizing_entry) / sl_dist, 2)
 
         target_env = resolve_env(target_env)
 
@@ -260,9 +269,9 @@ def enrich_and_size_candidate(c: dict, target_env: Optional[str] = None) -> Opti
             current_price=entry,
             trigger_price=sizing_entry,
             sl_price=sl,
-            tp1_price=float(c.get("tp1", entry * 1.02)),
-            tp2_price=float(c.get("tp2", entry * 1.04)),
-            rr_ratio=float(c.get("rr", 3.0)),
+            tp1_price=tp1,
+            tp2_price=tp2,
+            rr_ratio=rr_ratio,
             risk_pct=round(abs(sizing_entry - sl) / sizing_entry * 100, 2),
             sizing_entry_price=sizing_entry,
             rsi_15m=float(c.get("rsi_15m", 50)),

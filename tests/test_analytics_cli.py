@@ -101,17 +101,18 @@ def fake_urlopen(routes, log=None):
     return _urlopen
 
 
-def radar_long_klines(n=55):
-    """Steady decline, a climax-volume candle with a ~94% lower absorption wick, then the still-open candle on
+def radar_long_klines(n=55, wick_low=0.975):
+    """Steady decline, a climax-volume candle with a ~86% lower absorption wick, then the still-open candle on
     climax volume (Tier S LONG). The wick candle is the last CLOSED one (klines[-2]): since issue #20 the radar
-    reads both wicks from it, never from the forming candle."""
+    reads both wicks from it, never from the forming candle. `wick_low` (x the wick candle open) keeps the stop
+    within the 5% risk_pct ceiling measured from the trigger (issue #84); a deeper low pushes it above."""
     ks, price = [], 100.0
     for i in range(n - 2):
         o, c = price, price * 0.995
         ks.append([i, str(o), str(o * 1.001), str(c * 0.999), str(c), "100"])
         price = c
     o = price
-    ks.append([n - 2, str(o), str(o * 1.004), str(o * 0.94), str(o * 1.002), "400"])
+    ks.append([n - 2, str(o), str(o * 1.004), str(o * wick_low), str(o * 1.002), "400"])
     o = o * 1.002
     ks.append([n - 1, str(o), str(o * 1.001), str(o * 0.999), str(o * 1.0005), "400"])
     return ks

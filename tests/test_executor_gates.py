@@ -735,8 +735,9 @@ class TestExecutorSizesAtEffectiveEntry(unittest.TestCase):
         res, orders, gates = self._execute(order_type="STOP_MARKET", trigger_price=102.347,
                                            sl_price=None, tp1_price=None, tp2_price=None)
         self.assertTrue(res["success"], res.get("error"))
-        self.assertAlmostEqual(gates.call_args.args[2], 102.34 * 0.98)
-        self.assertAlmostEqual(gates.call_args.args[3], 102.34 * 1.03)
+        # Issue #42: the gates check the tick-rounded (ROUND_DOWN) levels that are submitted
+        self.assertEqual(gates.call_args.args[2], 100.29)   # 102.34 * 0.98 = 100.2932
+        self.assertEqual(gates.call_args.args[3], 105.41)   # 102.34 * 1.03 = 105.4102
 
     def test_breached_trigger_uses_current_price(self):
         res, orders, gates = self._execute(order_type="STOP_MARKET", trigger_price=99.5)

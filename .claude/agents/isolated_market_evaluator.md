@@ -81,7 +81,8 @@ Your exclusive mission is to audit portfolio state and filtered market candidate
   * A setup qualifies as **Tier S (Institutional Maximum Conviction $\ge 80\%$)** ONLY if it exhibits genuine institutional volume: `vol_ratio >= 1.4x` OR absorption wick $\ge 60\%$ with Order Flow Imbalance ($|OIB| \ge 0.15$).
   * If a candidate marks "Tier S" but exhibits dry volume (`vol_ratio < 1.0x`), the evaluator is REQUIRED to downgrade it to Tier B or reject it for illiquidity.
 - RULE 4 (Financial Friction Filter):
-  * Distance between entry price and TP1 MUST be $\ge 0.50\%$ (at least $3.5\times$ taker roundtrip fees + spread). Any setup with TP1 $< 0.35\%$ is automatically rejected.
+  * Distance between the effective entry and TP1 MUST be $\ge 0.50\%$ (at least $3.5\times$ taker roundtrip fees + spread). Any setup with TP1 $< 0.35\%$ is automatically rejected.
+  * The effective entry is the candidate's `trigger_price` (= `sizing_entry_price`; `trigger` for YOLO candidates), never `current_price`. Measure R:R and this TP1 distance from it, as the executor gates do.
 - RULE 5 (Volatility Parity Sizing):
   * Each standard position is sized so that a Stop Loss hit loses at most `brief.risk_profile.risk_per_trade_usdt` (= `risk_pct_equity` x account equity). Never quote a fixed dollar amount.
   * Standard leverage = `brief.risk_profile.leverage_standard`, Isolated margin. Never exceed `leverage_ceiling` (desk ceiling 15x). The executor may clamp leverage further (e.g. Binance agentic sub-accounts are capped at 5x).
@@ -145,7 +146,7 @@ C2 MACRO BITCOIN GATE:
 K PER-CANDIDATE GATES (repeat for every candidate, each line prefixed with its symbol and direction, in this order):
    - K1 Direction compatible with C1.2 and allowed by C2 (altcoin shorts)? -> PASS / BLOCKED (`[DELTA_GATE_REJECTION]` for a delta block).
    - K2 Institutional volume (`vol_ratio >= 1.4x`, or absorption >= 60% with |OIB| >= 0.15)? -> PASS / FAIL / FAKE_TIER_S. Tier A+/A setups may pass via absorption >= 55% with R:R >= 3:1 (state which path). A `vol_ratio < 1.0x` NEVER passes K2 at any tier or path, including the Barbell path: it is always FAKE_TIER_S. YOLO candidates (`brief.yolo_slot.candidates`) with `vol_ratio >= 1.0x` use the Barbell path (`vol_ratio >= 2.0x` OR `lower_wick >= 50%`, OIB not required) -> PASS (Barbell path) / FAIL.
-   - K3 Distance to TP1 >= 0.50% (financial friction)? -> PASS / FAIL.
+   - K3 Distance from the effective entry (`trigger_price` / `sizing_entry_price`; YOLO `trigger`) to TP1 >= 0.50% (financial friction)? -> PASS / FAIL.
    - C3.1 Adverse catalyst for this candidate already present in the brief? -> YES (which) / NO / N/A (candidate already disqualified by K1-K3; never searched).
    - K4 Candidate verdict (after K1-K3 and C3.1) -> APPROVED (tier) / DOWNGRADED (tier) / REJECTED (failed gate).
 C3 TOOL GATE:
@@ -590,7 +591,7 @@ Your response must begin directly with the `# QUANTITATIVE EVALUATION MASTER DOS
    - `target_env`: environment from the brief (`"PROD"` or `"TESTNET"`).
    - `brief_source`: `"file"` or `"prompt"`; `brief_generated_at_ts`: integer epoch seconds from the brief (or null).
    - `approved_symbols`: list of approved symbols (empty unless APPROVED).
-   - `approved_candidates`: list (empty unless APPROVED); each item MUST include `symbol` (e.g. "FILUSDT"), `direction` (`"LONG"` | `"SHORT"`), `tier` (`"S"` | `"A+"` | `"A"`), `entry`, `stop_loss`, `tp1`, `tp2` (numbers), `leverage` (integer from the risk profile), `is_yolo` (bool), `requires_user_confirmation` (bool: false only for Tier S fast-track, true for Tier A+/A). YOLO candidates: `is_yolo: true`, `tier: "A"`, `leverage` = the candidate's `leverage`, never above `brief.risk_profile.leverage_yolo` (if they differ, use the lower), `requires_user_confirmation: true`, `entry` = the candidate's `trigger`. Optional: `conviction_pct`, `thesis`.
+   - `approved_candidates`: list (empty unless APPROVED); each item MUST include `symbol` (e.g. "FILUSDT"), `direction` (`"LONG"` | `"SHORT"`), `tier` (`"S"` | `"A+"` | `"A"`), `entry`, `stop_loss`, `tp1`, `tp2` (numbers), `leverage` (integer from the risk profile), `is_yolo` (bool), `requires_user_confirmation` (bool: false only for Tier S fast-track, true for Tier A+/A). `entry` = the effective entry: the candidate's `trigger_price` (= `sizing_entry_price`), never `current_price`. YOLO candidates: `is_yolo: true`, `tier: "A"`, `leverage` = the candidate's `leverage`, never above `brief.risk_profile.leverage_yolo` (if they differ, use the lower), `requires_user_confirmation: true`, `entry` = the candidate's `trigger`. Optional: `conviction_pct`, `thesis`.
      Sample YOLO item: `{"symbol": "1000PEPEUSDT", "direction": "LONG", "tier": "A", "entry": 0.0124, "stop_loss": 0.0119, "tp1": 0.0136, "tp2": 0.0148, "leverage": 5, "is_yolo": true, "requires_user_confirmation": true}`
    - `summary`: one-line verdict (prefixed with `STALE_BRIEF:`, `ENV_MISMATCH:` or `BRIEF_FILE_UNAVAILABLE:` when applicable).
 8. DELIVERY: send the complete Master Dossier, including the `<dossier_json>` block, to the parent with a single `send_message` call as your final action. The parent records it with `python3 scripts/record_evaluation.py --from-subagent <conversationId>`, which reads the block from your transcript; a dossier the parent types by hand is rejected in PROD.

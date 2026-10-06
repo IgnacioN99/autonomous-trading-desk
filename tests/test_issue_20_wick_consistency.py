@@ -185,11 +185,15 @@ class TestRadarStopBeyondWick(unittest.TestCase):
         f = lambda j: [float(k[j]) for k in klines]  # noqa: E731
         return bmr.calculate_atr(f(2), f(3), f(4), period=14)
 
-    def _assert_levels_from_sl(self, cand, sign):
-        entry, sl = cand["price"], cand["sl"]
+    def _assert_levels_from_sl(self, cand, sign, klines):
+        # Issue #86: every level is measured from the trigger (the effective entry), not from the current price
+        entry, sl = cand["trigger"], cand["sl"]
         risk_pct = abs(entry - sl) / entry * 100
         self.assertGreaterEqual(risk_pct, 1.4)   # no risk-floor override in these fixtures
         self.assertAlmostEqual(cand["risk_pct"], round(risk_pct, 2))
+        ema20 = bmr.calculate_ema([float(k[4]) for k in klines], period=20)[-1]
+        pick = max if sign > 0 else min
+        self.assertAlmostEqual(cand["tp1"], pick(ema20, entry * (1 + sign * risk_pct * 1.8 / 100)))
         self.assertAlmostEqual(cand["tp2"], entry * (1 + sign * risk_pct * 4.0 / 100))
         self.assertAlmostEqual(cand["rr"], round(abs(cand["tp2"] - entry) / abs(entry - sl), 2))
 
@@ -201,7 +205,7 @@ class TestRadarStopBeyondWick(unittest.TestCase):
         self.assertLess(float(klines[-2][3]), float(klines[-1][3]))   # the wick candle holds the extreme
         self.assertLess(cand["sl"], wick_low)
         self.assertAlmostEqual(cand["sl"], wick_low - 1.3 * self._atr(klines))
-        self._assert_levels_from_sl(cand, +1)
+        self._assert_levels_from_sl(cand, +1, klines)
 
     def test_short_sl_strictly_above_wick_candle_high(self):
         klines = upper_wick_short_klines()
@@ -213,7 +217,7 @@ class TestRadarStopBeyondWick(unittest.TestCase):
         self.assertGreater(wick_high, float(klines[-1][2]))
         self.assertGreater(cand["sl"], wick_high)
         self.assertAlmostEqual(cand["sl"], wick_high + 1.3 * self._atr(klines))
-        self._assert_levels_from_sl(cand, -1)
+        self._assert_levels_from_sl(cand, -1, klines)
 
     def test_forming_candle_extreme_still_used_when_beyond_the_wick(self):
         long_k = mixed_wick_klines()
@@ -221,14 +225,14 @@ class TestRadarStopBeyondWick(unittest.TestCase):
         cand = self._analyze(long_k)
         self.assertEqual(cand["direction"], "LONG")
         self.assertAlmostEqual(cand["sl"], float(long_k[-1][3]) - 1.3 * self._atr(long_k))
-        self._assert_levels_from_sl(cand, +1)
+        self._assert_levels_from_sl(cand, +1, long_k)
 
         short_k = upper_wick_short_klines()
         short_k[-1][2] = repr(float(short_k[-2][2]) * 1.03)  # forming candle overshoots the wick high
         cand = self._analyze(short_k)
         self.assertEqual(cand["direction"], "SHORT")
         self.assertAlmostEqual(cand["sl"], float(short_k[-1][2]) + 1.3 * self._atr(short_k))
-        self._assert_levels_from_sl(cand, -1)
+        self._assert_levels_from_sl(cand, -1, short_k)
 
     def test_shared_fixture_sl_below_the_absorbed_wick(self):
         klines = tac.radar_long_klines()
