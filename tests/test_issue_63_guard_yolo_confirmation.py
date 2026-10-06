@@ -93,8 +93,11 @@ class TestYoloConfirmationProd(YoloGuardHarness):
         for label, res in cases.items():
             with self.subTest(case=label):
                 self.assertDenied(res, YOLO_GATE)
-        # A confirmation before the comment still counts
-        self.assertAllowed(self.deploy("--confirmed # user said yes"))
+        # A confirmation before the comment still counts: the confirmation gates pass, and #53's
+        # "no auto-allow with a # comment" rule turns the allow into an ask.
+        res = self.deploy("--confirmed # user said yes")
+        self.assertEqual(res.get("decision"), "ask", res)
+        self.assertNotNewGate(res)
 
     def test_executor_confirmed_helper(self):
         ok = pre_trade_guard.executor_confirmed
