@@ -12,8 +12,22 @@ Enforces Nassim Taleb Barbell Convexity:
   on 6-significant-digit prices with an adverse rounding margin. Gates run on every qualified row before the
   --top cut; gate-passing rows are listed first (score order within each group), failing rows are flagged; the
   `recommendation` is the top gate-passing long (or null, slot EMPTY).
+- Spread- and ATR-aware trigger buffer (issue #66): the breakout trigger sits `buffer` beyond the signal candle
+  extreme (LONG high x (1 + buffer), SHORT low x (1 - buffer)) with
+  buffer = min(TRIGGER_BUFFER_MAX, max(TRIGGER_BUFFER, TRIGGER_SPREAD_MULT x spread, TRIGGER_ATR_FRAC x ATR%)),
+  i.e. floor 0.08%, cap 0.5%. The spread is (ask - bid) / mid from one bookTicker request; a missing spread or ATR
+  term is skipped (the buffer is not a gate). Rows carry `trigger_buffer_pct` and `spread_pct` (null if unknown).
 
-Read-only: uses public Binance Futures market data and never places orders.
+Request weight per run (Binance IP limit: 2400 / minute, shared with the 80-pair radar that runs concurrently in
+screening_pipeline.py): 24hr ticker without symbol 40 + bookTicker without symbol 5 + klines limit=40 1 per
+symbol (~45 + universe size). The scan uses YOLO_SCAN_WORKERS concurrent kline requests, reports the highest
+`X-MBX-USED-WEIGHT-1M` header seen as `max_used_weight_1m` (null when no header was seen) and warns on stderr at
+WEIGHT_WARN_THRESHOLD. On HTTP 429 (rate limit) or 418 (IP auto-ban) it stops issuing requests and raises
+RateLimitedError (the 24hr universe fetch never falls back to CORE_MEMES on 429/418). An optional cancel_event
+(set by the pipeline when its time budget expires) also stops further requests.
+
+Read-only: uses public Binance Futures market data and never places orders. scan_yolo() and everything it calls
+must stay side-effect free (see the scan_yolo docstring): the pipeline may hard-exit while a scan is running.
 
 CLI:
     python3 scripts/broad_yolo_scanner.py [--json] [--top N] [--interval 15m|5m|1h] [--env prod|testnet]
@@ -27,6 +41,8 @@ import time
 import argparse
 import contextlib
 import math
+import threading
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
@@ -52,7 +68,16 @@ MIN_RISK_PCT = 2.2
 MAX_RISK_PCT = 5.5
 TP1_R = 2.2
 TP2_R = 4.5
-TRIGGER_BUFFER = 0.0008  # next-candle confirmation trigger beyond the signal candle extreme
+TRIGGER_BUFFER = 0.0008  # floor of the next-candle confirmation trigger beyond the signal candle extreme
+TRIGGER_SPREAD_MULT = 1.0  # buffer >= 1x the bid/ask spread (as a fraction of mid)
+TRIGGER_ATR_FRAC = 0.1  # buffer >= 10% of the ATR (as a fraction of price)
+TRIGGER_BUFFER_MAX = 0.005  # buffer cap: 0.5%
+
+# Request budget (issue #66). The scan runs concurrently with the 80-pair radar in screening_pipeline.py.
+YOLO_SCAN_WORKERS = 8
+WEIGHT_HEADER = "X-MBX-USED-WEIGHT-1M"
+WEIGHT_WARN_THRESHOLD = 1800  # 75% of Binance's 2400 request weight / minute IP limit
+RATE_LIMIT_HTTP_CODES = (429, 418)  # 429 = limit broken (back off), 418 = IP auto-banned after ignoring 429s
 
 # Executor gates applied to every row (yolo_gate_failures). The loss cap (GATE 2, YOLO) and the friction floor
 # (GATE 3) come from scripts/utils/gate_limits.py, the module execute_futures_trade.py enforces.
@@ -86,13 +111,94 @@ CORE_MEMES = [
     "BRETTUSDT", "FARTCOINUSDT", "GOATUSDT", "PNUTUSDT", "ACTUSDT", "MEWUSDT"
 ]
 
-def get_yolo_universe():
-    """Returns (symbols, from_live_ticker). Memes by keyword plus extreme movers (>= 4% and >= $5M volume)."""
+class RateLimitedError(RuntimeError):
+    """Binance answered HTTP 429 (rate limit) or 418 (IP auto-ban): the scan stopped issuing requests."""
+
+
+class ScanCancelledError(RuntimeError):
+    """The caller set the scan's cancel_event (e.g. the pipeline's time budget expired)."""
+
+
+class _ScanGuard:
+    """Per-scan request state: rate-limit trip, caller cancellation and the highest used-weight header seen."""
+
+    def __init__(self, cancel_event=None):
+        self.cancel_event = cancel_event
+        self.rate_limited = threading.Event()
+        self.rate_limit_code = None
+        self.max_used_weight = None
+        self._weight_warned = False
+        self._lock = threading.Lock()
+
+    def cancelled(self):
+        return self.cancel_event is not None and self.cancel_event.is_set()
+
+    def stopped(self):
+        return self.rate_limited.is_set() or self.cancelled()
+
+    def trip(self, code):
+        with self._lock:
+            if self.rate_limit_code is None:
+                self.rate_limit_code = int(code)
+        self.rate_limited.set()
+
+    def note_weight(self, resp):
+        """Tracks X-MBX-USED-WEIGHT-1M (tolerates missing headers and mocks without .headers)."""
+        headers = getattr(resp, "headers", None)
+        getter = getattr(headers, "get", None)
+        if not callable(getter):
+            return
+        try:
+            raw = getter(WEIGHT_HEADER)
+            if isinstance(raw, bytes):
+                raw = raw.decode()
+            if isinstance(raw, bool) or not isinstance(raw, (str, int)):
+                return
+            used = int(str(raw).strip())
+        except (TypeError, ValueError, UnicodeDecodeError):
+            return
+        with self._lock:
+            if self.max_used_weight is None or used > self.max_used_weight:
+                self.max_used_weight = used
+            warn = used >= WEIGHT_WARN_THRESHOLD and not self._weight_warned
+            if warn:
+                self._weight_warned = True
+        if warn:
+            sys.stderr.write(f"WARNING: Binance request weight {used}/2400 per minute used by this IP "
+                             f"(>= {WEIGHT_WARN_THRESHOLD}) during the YOLO scan.\n")
+
+    def raise_if_stopped(self):
+        if self.rate_limited.is_set():
+            raise RateLimitedError(f"Binance rate limit (HTTP {self.rate_limit_code})")
+        if self.cancelled():
+            raise ScanCancelledError("YOLO scan cancelled by the caller")
+
+
+def _get_json(url, timeout, guard=None):
+    """GET `url` and decode JSON. HTTP 429/418 trip the guard and raise RateLimitedError; a stopped guard raises
+    before any request is issued."""
+    if guard is not None:
+        guard.raise_if_stopped()
+    req = urllib.request.Request(url, headers={"User-Agent": "BinanceAgentic/1.0"}, method="GET")
     try:
-        url = f"{BASE_FAPI}/fapi/v1/ticker/24hr"
-        req = urllib.request.Request(url, headers={"User-Agent": "BinanceAgentic/1.0"})
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode())
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if guard is not None:
+                guard.note_weight(resp)
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code in RATE_LIMIT_HTTP_CODES:
+            if guard is not None:
+                guard.trip(e.code)
+            raise RateLimitedError(f"Binance rate limit (HTTP {e.code})") from None
+        raise
+
+
+def get_yolo_universe(guard=None):
+    """Returns (symbols, from_live_ticker). Memes by keyword plus extreme movers (>= 4% and >= $5M volume).
+    Falls back to CORE_MEMES on errors, except HTTP 429/418 (RateLimitedError is raised: never keep hitting
+    Binance after a rate limit)."""
+    try:
+        data = _get_json(f"{BASE_FAPI}/fapi/v1/ticker/24hr", 5, guard)
 
         candidates = set()
         for d in data:
@@ -112,16 +218,45 @@ def get_yolo_universe():
                 candidates.add(sym)
 
         return sorted(list(candidates)), True
+    except (RateLimitedError, ScanCancelledError):
+        raise
     except Exception as e:
         sys.stderr.write(f"Error fetching ticker list: {e}\n")
         return list(CORE_MEMES), False
 
-def audit_symbol(symbol, interval="15m"):
+def get_spreads(universe, guard=None):
+    """{symbol: (ask - bid) / mid} for the universe from ONE bookTicker request without symbol (weight 5).
+    Non-rate-limit errors return {} (the spread only widens the trigger buffer; it is not a gate)."""
+    wanted = set(universe)
+    try:
+        data = _get_json(f"{BASE_FAPI}/fapi/v1/ticker/bookTicker", 5, guard)
+    except (RateLimitedError, ScanCancelledError):
+        raise
+    except Exception as e:
+        sys.stderr.write(f"Error fetching book tickers (trigger buffer without spread): {e}\n")
+        return {}
+    spreads = {}
+    for d in data if isinstance(data, list) else []:
+        try:
+            sym = d.get("symbol")
+            if sym not in wanted:
+                continue
+            bid, ask = float(d["bidPrice"]), float(d["askPrice"])
+        except (AttributeError, KeyError, TypeError, ValueError):
+            continue
+        mid = (ask + bid) / 2
+        if math.isfinite(mid) and bid > 0 and ask >= bid:
+            spreads[sym] = (ask - bid) / mid
+    return spreads
+
+def audit_symbol(symbol, interval="15m", guard=None):
+    """Kline audit of one symbol (None on any error). Returns None without a request once `guard` is stopped
+    (rate limit or caller cancellation)."""
+    if guard is not None and guard.stopped():
+        return None
     url = f"{BASE_FAPI}/fapi/v1/klines?symbol={symbol}&interval={interval}&limit=40"
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "BinanceAgentic/1.0"})
-        with urllib.request.urlopen(req, timeout=4) as resp:
-            klines = json.loads(resp.read().decode())
+        klines = _get_json(url, 4, guard)
 
         if len(klines) < 25:
             return None
@@ -209,15 +344,37 @@ def resolve_yolo_sizing(target_env):
         "yolo_slot_enabled": bool(prof.get("yolo_slot_enabled", False)),
     }
 
-def build_levels(r, direction, sizing):
+def _valid_fraction(x):
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return None
+    return x if math.isfinite(x) and x >= 0 else None
+
+def trigger_buffer(spread_frac=None, atr_pct=None):
+    """Trigger buffer as a fraction of price: min(TRIGGER_BUFFER_MAX, max(TRIGGER_BUFFER,
+    TRIGGER_SPREAD_MULT x spread_frac, TRIGGER_ATR_FRAC x atr_pct / 100)). Missing or invalid terms are skipped."""
+    terms = [TRIGGER_BUFFER]
+    spread = _valid_fraction(spread_frac)
+    if spread is not None:
+        terms.append(TRIGGER_SPREAD_MULT * spread)
+    atr = _valid_fraction(atr_pct)
+    if atr is not None:
+        terms.append(TRIGGER_ATR_FRAC * atr / 100)
+    return min(TRIGGER_BUFFER_MAX, max(terms))
+
+def build_levels(r, direction, sizing, spread=None):
     """Trigger, SL, TP1/TP2 and bounded-capital sizing for a qualified candidate.
     The entry is the breakout trigger, so the SL distance (risk_pct), TP1/TP2, ROE, qty and max loss are all
-    measured from the trigger, not from the current price (issue #52)."""
+    measured from the trigger, not from the current price (issue #52). The trigger buffer is spread- and
+    ATR-aware (trigger_buffer(); `spread` = (ask - bid) / mid or None)."""
     cur_p = r['price']
     leverage = sizing["leverage"]
     margin = sizing["margin_usdt"]
+    buffer = trigger_buffer(spread, r.get('atr_pct'))
+    spread_frac = _valid_fraction(spread)
     if direction == "LONG":
-        trigger = r['high'] * (1 + TRIGGER_BUFFER)
+        trigger = r['high'] * (1 + buffer)
         sl = max(trigger * (1 - MAX_RISK_PCT / 100), r['low'] - (SL_ATR_MULT * r['atr']))
         risk_pct = (trigger - sl) / trigger * 100
         if risk_pct < MIN_RISK_PCT:
@@ -227,7 +384,7 @@ def build_levels(r, direction, sizing):
         tp2 = trigger * (1 + risk_pct * TP2_R / 100)
         score = r['score_long']
     else:
-        trigger = r['low'] * (1 - TRIGGER_BUFFER)
+        trigger = r['low'] * (1 - buffer)
         sl = min(trigger * (1 + MAX_RISK_PCT / 100), r['high'] + (SL_ATR_MULT * r['atr']))
         risk_pct = (sl - trigger) / trigger * 100
         if risk_pct < MIN_RISK_PCT:
@@ -264,6 +421,8 @@ def build_levels(r, direction, sizing):
         "lower_wick": r['lower_wick'],
         "upper_wick": r['upper_wick'],
         "atr_pct": r['atr_pct'],
+        "trigger_buffer_pct": round(buffer * 100, 4),
+        "spread_pct": round(spread_frac * 100, 4) if spread_frac is not None else None,
     }
 
 def _sig(x, digits=YOLO_SIG_DIGITS):
@@ -331,18 +490,42 @@ def _flag_gates(row):
     row["gate_failures"] = failures
     return row
 
-def scan_yolo(target_env, interval="15m", top=5):
-    """Runs the full YOLO scan and returns the JSON-ready payload (raises on unrecoverable data errors)."""
+def scan_yolo(target_env, interval="15m", top=5, cancel_event=None):
+    """Runs the full YOLO scan and returns the JSON-ready payload (raises on unrecoverable data errors).
+
+    Raises RateLimitedError on HTTP 429/418 (no further requests are issued) and ScanCancelledError when
+    `cancel_event` (optional threading.Event) is set; queued kline work is dropped in both cases.
+
+    SIDE-EFFECT CONTRACT (issue #66): screening_pipeline.py may os._exit() the process while this scan is still
+    running in its thread. scan_yolo and everything it calls must therefore stay side-effect free:
+      - only read-only requests: HTTP GET market data, plus the read-only account reads behind the YOLO margin
+        (user_profile.get_yolo_margin -> quant_risk_engine.get_account_equity: GET /fapi/v1/time and signed GET
+        /fapi/v2/balance with KEYS auth, or a read-only MCP `tools/call` JSON-RPC POST such as
+        futures_usds.futuresAccountBalanceV3 with BINANCE_AUTH_MODE=MCP);
+      - no order or other write endpoints (REST or MCP);
+      - no file writes except the idempotent os.makedirs of the config dir done by user_profile.load_user_profile;
+      - no atexit handlers or finalizers it relies on.
+    Health recording (utils/yolo_scan_health.py) happens in the pipeline's main thread, never here.
+    """
+    guard = _ScanGuard(cancel_event)
     sizing = resolve_yolo_sizing(target_env)
-    universe, live = get_yolo_universe()
+    guard.raise_if_stopped()
+    universe, live = get_yolo_universe(guard)
+    spreads = get_spreads(universe, guard)
 
     results = []
-    with ThreadPoolExecutor(max_workers=16) as executor:
-        futures = {executor.submit(audit_symbol, sym, interval): sym for sym in universe}
+    executor = ThreadPoolExecutor(max_workers=YOLO_SCAN_WORKERS)
+    try:
+        futures = [executor.submit(audit_symbol, sym, interval, guard) for sym in universe]
         for f in as_completed(futures):
             res = f.result()
             if res:
                 results.append(res)
+            if guard.stopped():
+                break
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)  # queued work is dropped once the guard stopped
+    guard.raise_if_stopped()
     if not results:
         raise RuntimeError(f"No kline data could be fetched for the {len(universe)}-symbol YOLO universe.")
 
@@ -352,9 +535,9 @@ def scan_yolo(target_env, interval="15m", top=5):
     # (wide-wick top scorers are the most likely to fail the loss cap at high leverage). Gate-passing rows come
     # first; the sort is stable, so score order is kept within each group. Failing rows still fill the list when
     # fewer than `top` rows pass.
-    longs = sorted((_flag_gates(build_levels(r, "LONG", sizing)) for r in qual_longs),
+    longs = sorted((_flag_gates(build_levels(r, "LONG", sizing, spreads.get(r['symbol']))) for r in qual_longs),
                    key=lambda c: not c["gate_ok"])[:top]
-    shorts = sorted((_flag_gates(build_levels(r, "SHORT", sizing)) for r in qual_shorts),
+    shorts = sorted((_flag_gates(build_levels(r, "SHORT", sizing, spreads.get(r['symbol']))) for r in qual_shorts),
                     key=lambda c: not c["gate_ok"])[:top]
     surges = sorted(results, key=lambda x: x['vol_ratio'], reverse=True)[:8]
 
@@ -376,6 +559,7 @@ def scan_yolo(target_env, interval="15m", top=5):
         "universe_size": len(universe),
         "universe_from_live_ticker": live,
         "scanned": len(results),
+        "max_used_weight_1m": guard.max_used_weight,
         "filters": {
             "min_vol_ratio": MIN_VOL_RATIO,
             "min_wick_pct": MIN_WICK_PCT,

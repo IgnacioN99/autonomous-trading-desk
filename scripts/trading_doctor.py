@@ -10,6 +10,7 @@ Verifies:
 4. Available Capital and USDT Balance
 5. Forensic Orphan Position Audit (Fail CLOSED if position lacks Stop Loss on ledger)
 6. State Ledger Freshness (session_state.json)
+7. Barbell YOLO scan health (logs/yolo_scan_health.json; WARN only, when yolo_slot_enabled)
 
 Usage:
   python3 scripts/trading_doctor.py [--env testnet|mainnet] [--heal]
@@ -118,6 +119,28 @@ def read_hook_heartbeat(base_dir: str, now_ts: float = None) -> dict:
         "decision": hb.get("decision"),
         "last_seen_utc": hb.get("last_seen_utc"),
     }
+
+
+def check_yolo_scan_health(profile: dict) -> tuple:
+    """WARN-only Barbell YOLO scan health (issue #66), from logs/yolo_scan_health.json written by
+    screening_pipeline.py / prime_evaluator_brief.py. Returns (level, message) with level "skip" (slot disabled),
+    "info" (no scan recorded yet), "ok" or "warn". Never critical."""
+    if not bool((profile or {}).get("yolo_slot_enabled", False)):
+        return "skip", "YOLO slot disabled in the user profile."
+    from utils import yolo_scan_health as ysh
+    health = ysh.read_health()
+    if not health:
+        return "info", "No YOLO scan recorded yet."
+    try:
+        count = int(health.get("consecutive_unavailable", 0))
+    except (TypeError, ValueError):
+        count = 0
+    if count >= ysh.YOLO_UNAVAILABLE_WARN_AFTER:
+        reason = str(health.get("last_unavailable_reason") or "unspecified")[:200]
+        return "warn", (f"YOLO scan UNAVAILABLE in {count} consecutive runs (last reason: {reason}). "
+                        "If it persists, open a MEDIUM issue: ./scripts/report_issue.sh --category tool_error "
+                        "--severity MEDIUM.")
+    return "ok", f"YOLO scan healthy (last status {health.get('last_status', 'UNKNOWN')}, {count} consecutive UNAVAILABLE)."
 
 
 def check_pretool_hook(base_dir: str = None, run_selftest: bool = True, timeout_cap_s: int = 30) -> dict:
@@ -450,6 +473,21 @@ def run_doctor(target_env: str = None, auto_heal: bool = False) -> int:
     else:
         warnings.append("session_state.json does not exist yet. Run `sync_session_state.py`.")
         print("⚠️  [STATE LEDGER] session_state.json does not exist. Run `sync_session_state.py`.")
+
+    # 5b. Barbell YOLO scan health (WARN only, never critical; issue #66)
+    try:
+        import user_profile as up
+        level, msg = check_yolo_scan_health(up.load_user_profile())
+    except Exception as e:
+        level, msg = "info", f"YOLO scan health unreadable ({type(e).__name__})."
+    if level == "warn":
+        warnings.append(msg)
+        print(f"⚠️  [YOLO_SCAN] {msg}")
+    elif level == "ok":
+        ok_items.append(msg)
+        print(f"✅ [YOLO_SCAN] {msg}")
+    elif level == "info":
+        print(f"ℹ️  [YOLO_SCAN] {msg}")
 
     # 6. Shadow Desk Counterfactual Audit
     try:

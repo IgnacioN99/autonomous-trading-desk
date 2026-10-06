@@ -29,6 +29,7 @@ import fetch_newsletters as fn
 import broad_yolo_scanner as bys
 from utils.env_resolver import resolve_env
 from utils.gate_limits import MIN_TP1_DISTANCE, YOLO_MAX_LOSS_MARGIN_FRACTION
+from utils import yolo_scan_health
 
 # Barbell YOLO slot (issue #52): the memecoin scanner runs concurrently under a hard time budget so it can
 # never block or break the standard scan (prime_evaluator_brief.py gives the whole pipeline 60 s).
@@ -40,6 +41,9 @@ YOLO_FILTER_TEXT = (f"climax volume >= {bys.MIN_VOL_RATIO}x or buyer absorption 
                     f"(volume >= {bys.MIN_VOL_FLOOR}x)")
 YOLO_INACTIVE_STATUS = f"INACTIVE: Preserving capital. No memecoin exceeds {YOLO_FILTER_TEXT}."
 YOLO_DISABLED_STATUS = "DISABLED: yolo_slot_enabled is false in the user profile."
+YOLO_RATE_LIMITED_REASON = "YOLO scan rate-limited by Binance"
+_UNAVAILABLE_PREFIX = "UNAVAILABLE: "
+_UNAVAILABLE_SUFFIX = ". YOLO slot kept empty."
 # The evaluator never sees a YOLO entry that the executor would reject when entered at the trigger. The gate checks
 # live in broad_yolo_scanner.yolo_gate_failures (shared with the standalone scanner) and use the executor's own
 # limits from utils/gate_limits.py: friction floor (execute_futures_trade.py GATE 3, TP1 >= 0.35% from the entry)
@@ -325,14 +329,19 @@ def _yolo_slot_enabled() -> bool:
 def _start_yolo_scan(target_env: str) -> Future:
     """Runs broad_yolo_scanner.scan_yolo in a daemon thread. Unlike a `with ThreadPoolExecutor` block (which
     joins its workers on exit), a hung scan cannot hold the pipeline past its budget. The scanner's own
-    non-daemon kline workers are cut off at CLI exit by `_run_cli` (hard exit while the scan is running)."""
+    non-daemon kline workers are cut off at CLI exit by `_run_cli` (hard exit while the scan is running).
+    The returned Future carries `yolo_cancel_event` (threading.Event): the pipeline sets it when the bounded wait
+    times out so the scanner stops issuing requests (issue #66)."""
     fut: Future = Future()
+    cancel_event = threading.Event()
+    fut.yolo_cancel_event = cancel_event
 
     def _run():
         if not fut.set_running_or_notify_cancel():
             return
         try:
-            fut.set_result(bys.scan_yolo(target_env, interval=YOLO_SCAN_INTERVAL, top=YOLO_SCAN_TOP))
+            fut.set_result(bys.scan_yolo(target_env, interval=YOLO_SCAN_INTERVAL, top=YOLO_SCAN_TOP,
+                                         cancel_event=cancel_event))
         except BaseException as e:  # surfaced to the pipeline as UNAVAILABLE
             fut.set_exception(e)
 
@@ -344,7 +353,26 @@ def _yolo_unavailable(reason: str, detail: Optional[str] = None) -> Tuple[str, Y
     server-controlled text) is only logged to stderr, never forwarded to the evaluator."""
     if detail:
         print(f"YOLO slot UNAVAILABLE ({reason}): {detail}", file=sys.stderr)
-    return f"UNAVAILABLE: {reason}. YOLO slot kept empty.", YoloSlot(status="UNAVAILABLE", interval=YOLO_SCAN_INTERVAL)
+    return (f"{_UNAVAILABLE_PREFIX}{reason}{_UNAVAILABLE_SUFFIX}",
+            YoloSlot(status="UNAVAILABLE", interval=YOLO_SCAN_INTERVAL))
+
+def _unavailable_reason(yolo_status: str) -> str:
+    """Fixed reason text of a `_yolo_unavailable` sentence (what the brief shows; never exception messages)."""
+    text = str(yolo_status)
+    if text.startswith(_UNAVAILABLE_PREFIX):
+        text = text[len(_UNAVAILABLE_PREFIX):]
+    if text.endswith(_UNAVAILABLE_SUFFIX):
+        text = text[:-len(_UNAVAILABLE_SUFFIX)]
+    return text
+
+def _record_yolo_health(yolo_status: str, yolo_slot: YoloSlot) -> None:
+    """Persists the run's final YOLO slot status (logs/yolo_scan_health.json, read by trading_doctor.py).
+    Main thread only, after the bounded wait; fail-open."""
+    try:
+        reason = _unavailable_reason(yolo_status) if yolo_slot.status == "UNAVAILABLE" else None
+        yolo_scan_health.record_scan(yolo_slot.status, reason)
+    except Exception as e:
+        print(f"YOLO scan health not recorded ({type(e).__name__})", file=sys.stderr)
 
 _sig = bys._sig  # plain float rounded to 6 significant digits
 
@@ -444,99 +472,115 @@ def execute_screening_pipeline(top_pairs_count: int = 80, target_env: Optional[s
         except Exception as e:
             yolo_result = _yolo_unavailable(f"user profile unavailable ({type(e).__name__})", detail=str(e))
 
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        f_macro = executor.submit(fetch_macro_btc)
-        f_radar = executor.submit(bmr.scan_all_liquid_pairs, top_pairs_count)
-        f_statarb = executor.submit(qre.scan_coingrated_market_pairs)
-        f_funding = executor.submit(fa.scan_top_funding_opportunities, 20_000_000, 3)
-        f_news = executor.submit(fetch_news_summary)
-
-        macro_data = f_macro.result()
-        raw_candidates = f_radar.result()
-        raw_statarb = f_statarb.result()
-        raw_funding = f_funding.result()
-        news_data = f_news.result()
-
-    # Filter and type candidate setups (top 6 balanced)
-    parsed_candidates: List[CandidateSetup] = []
-    with ThreadPoolExecutor(max_workers=6) as c_exec:
-        futures = [c_exec.submit(enrich_and_size_candidate, c, target_env) for c in raw_candidates[:10]]
-        for fut in as_completed(futures):
-            res = fut.result()
-            if res:
-                parsed_candidates.append(res)
-
-    # Sync live portfolio state and apply Delta-Neutral guardrail
-    portfolio_ctx = None
+    # If a non-YOLO task raises after the scan started, stop the scan from issuing further requests.
+    standard_scan_done = False
     try:
-        s_state = sss.sync_session_state(target_env=target_env)
-        p_exp = s_state.get("portfolio_exposure", {})
-        portfolio_ctx = {
-            "total_active_positions": p_exp.get("total_active_positions", 0),
-            "delta_bias": p_exp.get("delta_bias", "DELTA_BALANCED"),
-            "delta_advice": p_exp.get("delta_advice", ""),
-            "long_notional_usdt": p_exp.get("long_notional_usdt", 0.0),
-            "short_notional_usdt": p_exp.get("short_notional_usdt", 0.0),
-            "active_symbols": [p["symbol"] for p in s_state.get("active_positions", [])]
-        }
-        
-        # DELTA-NEUTRAL GUARDRAIL:
-        # If live portfolio is already skewed, prioritize the opposing hedging direction
-        delta_bias = portfolio_ctx["delta_bias"]
-        if delta_bias == "LONG_HEAVY":
-            parsed_candidates.sort(key=lambda x: (x.direction == "SHORT", x.tier.startswith("Tier S"), x.confidence), reverse=True)
-        elif delta_bias == "SHORT_HEAVY":
-            parsed_candidates.sort(key=lambda x: (x.direction == "LONG", x.tier.startswith("Tier S"), x.confidence), reverse=True)
-        else:
-            parsed_candidates.sort(key=lambda x: (x.tier.startswith("Tier S"), x.confidence), reverse=True)
-    except Exception:
-        parsed_candidates.sort(key=lambda x: (x.tier.startswith("Tier S"), x.confidence), reverse=True)
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            f_macro = executor.submit(fetch_macro_btc)
+            f_radar = executor.submit(bmr.scan_all_liquid_pairs, top_pairs_count)
+            f_statarb = executor.submit(qre.scan_coingrated_market_pairs)
+            f_funding = executor.submit(fa.scan_top_funding_opportunities, 20_000_000, 3)
+            f_news = executor.submit(fetch_news_summary)
 
-    top_candidates = parsed_candidates[:6]
+            macro_data = f_macro.result()
+            raw_candidates = f_radar.result()
+            raw_statarb = f_statarb.result()
+            raw_funding = f_funding.result()
+            news_data = f_news.result()
 
-    # Actionable or cointegrated Stat-Arb pairs
-    stat_arb_list: List[StatArbPair] = []
-    for p in raw_statarb:
+        # Filter and type candidate setups (top 6 balanced)
+        parsed_candidates: List[CandidateSetup] = []
+        with ThreadPoolExecutor(max_workers=6) as c_exec:
+            futures = [c_exec.submit(enrich_and_size_candidate, c, target_env) for c in raw_candidates[:10]]
+            for fut in as_completed(futures):
+                res = fut.result()
+                if res:
+                    parsed_candidates.append(res)
+
+        # Sync live portfolio state and apply Delta-Neutral guardrail
+        portfolio_ctx = None
         try:
-            stat_arb_list.append(StatArbPair(
-                pair=p["pair"],
-                symbol_a=p["symbol_a"],
-                symbol_b=p["symbol_b"],
-                price_a=float(p["price_a"]),
-                price_b=float(p["price_b"]),
-                correlation=float(p["correlation"]),
-                hedge_ratio_beta=float(p["hedge_ratio_beta"]),
-                hedge_ratio_beta_dynamic_10d=float(p.get("hedge_ratio_beta_dynamic_10d", p["hedge_ratio_beta"])),
-                beta_drift_pct=float(p.get("beta_drift_pct", 0.0)),
-                pci_r2_mr=float(p.get("pci_r2_mr", 0.0)),
-                target_unwind_z=float(p.get("target_unwind_z", 0.5 if float(p["z_score"]) > 0 else -0.5)),
-                notional_a=float(p.get("notional_a", 20.0)),
-                notional_b=float(p.get("notional_b", 20.0)),
-                margin_a=float(p.get("margin_a", 6.67)),
-                margin_b=float(p.get("margin_b", 6.67)),
-                sample_bars=int(p.get("sample_bars", 1000)),
-                adf_pvalue=float(p.get("adf_pvalue", 1.0)),
-                coint_pvalue=float(p.get("coint_pvalue", 1.0)),
-                mackinnon_crit_5pct=float(p.get("mackinnon_crit_5pct", -3.34)),
-                half_life_hours=float(p.get("half_life_hours", 999.0)),
-                is_cointegrated=bool(p.get("is_cointegrated", False)),
-                z_score=float(p["z_score"]),
-                action=p["action"],
-                recommendation=p.get("recommendation"),
-                is_actionable=bool(p.get("is_actionable", False))
-            ))
+            s_state = sss.sync_session_state(target_env=target_env)
+            p_exp = s_state.get("portfolio_exposure", {})
+            portfolio_ctx = {
+                "total_active_positions": p_exp.get("total_active_positions", 0),
+                "delta_bias": p_exp.get("delta_bias", "DELTA_BALANCED"),
+                "delta_advice": p_exp.get("delta_advice", ""),
+                "long_notional_usdt": p_exp.get("long_notional_usdt", 0.0),
+                "short_notional_usdt": p_exp.get("short_notional_usdt", 0.0),
+                "active_symbols": [p["symbol"] for p in s_state.get("active_positions", [])]
+            }
+        
+            # DELTA-NEUTRAL GUARDRAIL:
+            # If live portfolio is already skewed, prioritize the opposing hedging direction
+            delta_bias = portfolio_ctx["delta_bias"]
+            if delta_bias == "LONG_HEAVY":
+                parsed_candidates.sort(key=lambda x: (x.direction == "SHORT", x.tier.startswith("Tier S"), x.confidence), reverse=True)
+            elif delta_bias == "SHORT_HEAVY":
+                parsed_candidates.sort(key=lambda x: (x.direction == "LONG", x.tier.startswith("Tier S"), x.confidence), reverse=True)
+            else:
+                parsed_candidates.sort(key=lambda x: (x.tier.startswith("Tier S"), x.confidence), reverse=True)
         except Exception:
-            pass
+            parsed_candidates.sort(key=lambda x: (x.tier.startswith("Tier S"), x.confidence), reverse=True)
+
+        top_candidates = parsed_candidates[:6]
+
+        # Actionable or cointegrated Stat-Arb pairs
+        stat_arb_list: List[StatArbPair] = []
+        for p in raw_statarb:
+            try:
+                stat_arb_list.append(StatArbPair(
+                    pair=p["pair"],
+                    symbol_a=p["symbol_a"],
+                    symbol_b=p["symbol_b"],
+                    price_a=float(p["price_a"]),
+                    price_b=float(p["price_b"]),
+                    correlation=float(p["correlation"]),
+                    hedge_ratio_beta=float(p["hedge_ratio_beta"]),
+                    hedge_ratio_beta_dynamic_10d=float(p.get("hedge_ratio_beta_dynamic_10d", p["hedge_ratio_beta"])),
+                    beta_drift_pct=float(p.get("beta_drift_pct", 0.0)),
+                    pci_r2_mr=float(p.get("pci_r2_mr", 0.0)),
+                    target_unwind_z=float(p.get("target_unwind_z", 0.5 if float(p["z_score"]) > 0 else -0.5)),
+                    notional_a=float(p.get("notional_a", 20.0)),
+                    notional_b=float(p.get("notional_b", 20.0)),
+                    margin_a=float(p.get("margin_a", 6.67)),
+                    margin_b=float(p.get("margin_b", 6.67)),
+                    sample_bars=int(p.get("sample_bars", 1000)),
+                    adf_pvalue=float(p.get("adf_pvalue", 1.0)),
+                    coint_pvalue=float(p.get("coint_pvalue", 1.0)),
+                    mackinnon_crit_5pct=float(p.get("mackinnon_crit_5pct", -3.34)),
+                    half_life_hours=float(p.get("half_life_hours", 999.0)),
+                    is_cointegrated=bool(p.get("is_cointegrated", False)),
+                    z_score=float(p["z_score"]),
+                    action=p["action"],
+                    recommendation=p.get("recommendation"),
+                    is_actionable=bool(p.get("is_actionable", False))
+                ))
+            except Exception:
+                pass
+        standard_scan_done = True
+    finally:
+        if not standard_scan_done and f_yolo is not None:
+            cancel_event = getattr(f_yolo, "yolo_cancel_event", None)
+            if cancel_event is not None:
+                cancel_event.set()
 
     # Barbell YOLO Slot Status (bounded wait; any failure or timeout leaves the slot empty)
     if f_yolo is not None:
         try:
             yolo_result = build_yolo_slot(f_yolo.result(timeout=max(0.0, yolo_deadline - time.time())))
         except FutureTimeoutError:
+            cancel_event = getattr(f_yolo, "yolo_cancel_event", None)
+            if cancel_event is not None:
+                cancel_event.set()  # the timed-out scan stops issuing requests
             yolo_result = _yolo_unavailable(f"YOLO scan exceeded its {YOLO_SCAN_TIMEOUT_S}s budget")
+        except bys.RateLimitedError as e:
+            yolo_result = _yolo_unavailable(YOLO_RATE_LIMITED_REASON, detail=str(e))
         except Exception as e:
             yolo_result = _yolo_unavailable(f"YOLO scan failed ({type(e).__name__})", detail=str(e))
     yolo_status, yolo_slot = yolo_result
+    if include_yolo:
+        _record_yolo_health(yolo_status, yolo_slot)
 
     t1 = time.time()
     latency_ms = int((t1 - t0) * 1000)
@@ -558,7 +602,15 @@ def execute_screening_pipeline(top_pairs_count: int = 80, target_env: Optional[s
 def _exit_without_waiting_for_yolo(code: int) -> None:
     """CLI only. If the YOLO scan outlived its budget, the scanner's inner ThreadPoolExecutor workers would be joined
     at interpreter exit and keep this process alive after the payload was emitted (prime_evaluator_brief.py waits
-    for the subprocess with a 60 s timeout and would then drop the whole payload). Flush and hard-exit instead."""
+    for the subprocess with a 60 s timeout and would then drop the whole payload). Flush and hard-exit instead.
+
+    os._exit skips atexit handlers, finalizers and pending writes of the still-running scan thread. This is only
+    safe because of the side-effect contract of broad_yolo_scanner.scan_yolo (issue #66): the scan and everything
+    it calls make only read-only requests (HTTP GET market data and read-only account reads, including a read-only
+    MCP tools/call for the balance in MCP auth mode), never call order or other write endpoints, write no files
+    (except the idempotent os.makedirs of the config dir in user_profile.load_user_profile) and rely on no atexit
+    handlers or finalizers. Anything with side effects (e.g. the YOLO health record) runs in the main thread
+    before this point."""
     fut = _last_yolo_future
     if fut is None or fut.done():
         return

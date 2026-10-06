@@ -87,7 +87,7 @@ RSI ≥ 45, score ≥ 50. Margin comes from the profile (`yolo_margin_fixed`, el
 
 ```json
 {"status": "ok", "command": "yolo", "env": "prod", "interval": "15m", "universe_size": 96,
- "universe_from_live_ticker": true, "scanned": 94,
+ "universe_from_live_ticker": true, "scanned": 94, "max_used_weight_1m": 312,
  "filters": {"min_vol_ratio": 2.0, "min_wick_pct": 50.0, "min_vol_floor": 1.0, "long_max_rsi": 65.0, "short_min_rsi": 45.0, "min_score": 50.0,
    "min_tp1_distance": 0.0035, "max_loss_margin_fraction": 0.35, "min_r_tp1": 1.8, "min_rr_tp2": 3.0, "rounding_margin": 0.0005},
  "sizing": {"margin_usdt": 12.0, "leverage": 10, "leverage_ceiling": 15, "margin_mode": "ISOLATED", "yolo_slot_enabled": true},
@@ -96,7 +96,8 @@ RSI ≥ 45, score ≥ 50. Margin comes from the profile (`yolo_margin_fixed`, el
    "sl": 1.972, "risk_pct": 2.9, "tp1": 2.161, "tp2": 2.296, "roe_tp1_pct": 63.8, "roe_tp2_pct": 130.5,
    "leverage": 10, "margin_usdt": 12.0, "notional_usdt": 120.0, "qty": 59.08, "max_loss_usdt": 3.48,
    "gain_tp1_usdt": 7.66, "gain_tp2_usdt": 15.66, "rsi": 41.2, "vol_ratio": 3.4, "lower_wick": 61.0,
-   "upper_wick": 4.0, "atr_pct": 1.8, "gate_ok": true, "gate_failures": []},
+   "upper_wick": 4.0, "atr_pct": 1.8, "trigger_buffer_pct": 0.18, "spread_pct": 0.0497,
+   "gate_ok": true, "gate_failures": []},
  "longs": ["<same shape as recommendation>"], "shorts": ["<same shape, direction SHORT>"],
  "volume_surges": [{"symbol": "WIFUSDT", "vol_ratio": 3.4, "rsi": 41.2, "atr_pct": 1.8, "price": 2.01}]}
 ```
@@ -115,6 +116,17 @@ RSI ≥ 45, score ≥ 50. Margin comes from the profile (`yolo_margin_fixed`, el
 - `recommendation` is the top long with `gate_ok: true` (or `null`); shorts are hedges only.
 - Levels are measured from `trigger` (the breakout entry): `risk_pct`, TP1 = +2.2R, TP2 = +4.5R, ROE, `qty`
   and `max_loss_usdt`.
+- Trigger buffer (spread- and ATR-aware): LONG `trigger` = candle high × (1 + buffer), SHORT = candle low ×
+  (1 − buffer), with buffer = min(0.5%, max(0.08%, 1.0 × spread, 0.1 × ATR%)). `spread_pct` is (ask − bid) / mid
+  from one bookTicker request (`null` when unavailable: the buffer then uses ATR and the floor);
+  `trigger_buffer_pct` is the buffer applied.
+- Request weight per run: 24hr ticker 40 + bookTicker 5 + ~1 per symbol of klines, with 8 concurrent kline
+  workers. `max_used_weight_1m` is the highest `X-MBX-USED-WEIGHT-1M` header seen (`null` if none); a stderr
+  warning is printed at 1800 of the 2400/minute IP limit. On HTTP 429/418 the scan stops issuing requests and
+  fails (exit 1, no fallback universe); inside `screening_pipeline.py` the slot becomes
+  `UNAVAILABLE: YOLO scan rate-limited by Binance. YOLO slot kept empty.`
+- Every pipeline run that requests the YOLO scan records its final slot status in `logs/yolo_scan_health.json`;
+  `trading_doctor.py` warns (`[YOLO_SCAN]`, never critical) after 3 consecutive `UNAVAILABLE` runs.
 - Do not move a YOLO stop to break-even before TP1 fills.
 
 ## 3. Volatility parity sizing — `quant_risk_engine.py parity`
