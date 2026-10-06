@@ -361,8 +361,9 @@ BINANCE_BATCH_ORDER_OPS = {"placemultipleorders"}
 SHELL_SEPARATORS = {"&&", "||", ";", "|", "&", "\n", ";;", "|&", "(", ")"}
 REDIRECT_TOKENS = {">", ">>", ">|", "&>", "&>>", ">&", "<>"}
 SHELL_PUNCTUATION = "();<>|&\n"
-# A quoted string made only of line breaks: an argument ('<newline>'), not a command separator
-QUOTED_NEWLINE_RE = re.compile(r"(['\"])[ \t\r]*\n[ \t\r\n]*\1")
+# Stands for a line break inside a '...' / "..." string (an argument, not a command separator)
+QUOTED_NEWLINE_SENTINEL = "__newline__"
+WORD_BOUNDARY_CHARS = " \t\r\n;&|()<>"
 # bash operators, longest first: shlex returns punctuation runs (')>', ';>', '<>') as one token
 SHELL_OPERATORS = ("&>>", "<<<", "&&", "||", ";;", "|&", ">>", ">|", ">&", "&>", "<>", "<<", "<&",
                    "(", ")", ";", "|", "&", "\n", ">", "<")
@@ -467,9 +468,16 @@ RISK_FLAG_SCRIPTS_RE = re.compile(
 )
 RISK_REDUCING_FLAGS = {"--close-position", "--close_position", "--auto-heal", "--auto_heal",
                        "--audit-orphans", "--audit_orphans", "--heal", "--protect-pending", "--protect_pending"}
+# Matched against the base name of the script a sub-command executes (_executed_script), never a word anywhere
 RISK_REDUCING_SCRIPTS_RE = re.compile(
     r"\b(?:night_cutoff_loop|audit_orphan_positions|close_position_market|close_position)\.py\b"
 )
+PYTHON_PROGRAM_RE = re.compile(r"^python[0-9.]*(?:\.exe)?$")
+PYTHON_LONG_VALUE_OPTIONS = {"--check-hash-based-pycs"}
+# Text an auto-allow cannot vouch for: the analysis may not see every command it runs (a comment or an
+# apostrophe hiding the next lines, heredoc bodies, ANSI-C strings, command substitutions)
+AUTO_ALLOW_BLOCKERS = (("<<", "a heredoc / here-string"), ("$'", "an ANSI-C $'...' string"),
+                       ("`", "a backtick command substitution"), ("$(", "a $(...) command substitution"))
 
 # Trading primitives that must never appear in inline code (python -c, heredocs, piped interpreters)
 INLINE_TRADING_PRIMITIVES_RE = re.compile(
@@ -1351,11 +1359,104 @@ def _shlex_tokens(text: str) -> List[str]:
     return [part for tok in lexer for part in _split_operators(tok)]
 
 
+def _protect_quoted_newlines(command_line: str) -> str:
+    """Replaces only the line breaks lying INSIDE a '...' / "..." string by QUOTED_NEWLINE_SENTINEL, tracking bash
+    quote state: inside '...' a backslash is literal; outside quotes and inside "..." it escapes the next character
+    (an unquoted backslash-newline is left to the tokenizer); a comment (# at word start, outside quotes) runs to
+    the end of its line and never opens a quote. A line break between a closing quote and the next line's opening
+    quote stays a command separator. When the scan ends inside an open quote (an apostrophe in a heredoc body or a
+    comment, unbalanced text) nothing is replaced: over-splitting is the fail-safe direction."""
+    if "\n" not in command_line:
+        return command_line
+    out: List[str] = []
+    quote = ""
+    word_start = True
+    i, n = 0, len(command_line)
+    while i < n:
+        c = command_line[i]
+        if quote:
+            if c == "\\" and quote == '"' and i + 1 < n:
+                nxt = command_line[i + 1]
+                out.append(c + (QUOTED_NEWLINE_SENTINEL if nxt == "\n" else nxt))
+                i += 2
+                continue
+            if c == quote:
+                quote = ""
+            out.append(QUOTED_NEWLINE_SENTINEL if c == "\n" else c)
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            out.append(command_line[i:i + 2])
+            word_start = False
+            i += 2
+            continue
+        if c == "#" and word_start:
+            end = command_line.find("\n", i)
+            end = n if end < 0 else end
+            out.append(command_line[i:end])
+            i = end
+            continue
+        if c in "'\"":
+            quote = c
+        out.append(c)
+        word_start = c in WORD_BOUNDARY_CHARS
+        i += 1
+    return command_line if quote else "".join(out)
+
+
+def _has_unquoted_comment(command_line: str) -> bool:
+    """True when the text has a bash comment: '#' at the start of a word, outside '...' / "..." (same quote and
+    escape rules as _protect_quoted_newlines)."""
+    quote = ""
+    word_start = True
+    i, n = 0, len(command_line)
+    while i < n:
+        c = command_line[i]
+        if quote:
+            if c == "\\" and quote == '"':
+                i += 2
+                continue
+            if c == quote:
+                quote = ""
+            i += 1
+            continue
+        if c == "\\":
+            word_start = False
+            i += 2
+            continue
+        if c == "#" and word_start:
+            return True
+        if c in "'\"":
+            quote = c
+        word_start = c in WORD_BOUNDARY_CHARS
+        i += 1
+    return False
+
+
+def _auto_allow_blocker(command_line: str) -> Optional[str]:
+    """Why a command may not be auto-allowed (None when it may): it spans several lines, has a comment, a heredoc /
+    here-string, an ANSI-C $'...' string or a command substitution, or a token holds a line break. The analysis of
+    such text can miss a command, so an "allow" becomes "ask" (never a denial on its own)."""
+    text = command_line.rstrip()
+    if "\n" in text or "\r" in text:
+        return "it spans several lines"
+    for marker, label in AUTO_ALLOW_BLOCKERS:
+        if marker in text:
+            return f"it contains {label}"
+    if _has_unquoted_comment(text):
+        return "it contains a # comment"
+    if any("\n" in t or "\r" in t or QUOTED_NEWLINE_SENTINEL in t for t in _tokenize(text)):
+        return "an argument holds a line break"
+    return None
+
+
 def _tokenize(command_line: str) -> List[str]:
     """Quote-aware tokens (shell operators split off). When the whole text does not parse (an apostrophe in a
     heredoc body or a comment), each line is tokenized on its own and only the lines that still fail fall back to a
-    whitespace / operator split with their quote characters stripped."""
-    command_line = QUOTED_NEWLINE_RE.sub("__newline__", command_line)
+    whitespace / operator split with their quote characters stripped. Line breaks inside quotes are still
+    QUOTED_NEWLINE_SENTINEL here, so a quoted line break ('<LF>') is never taken for a "\\n" command separator:
+    split on SHELL_SEPARATORS first, then pass every kept token through _restore_quoted_newline."""
+    command_line = _protect_quoted_newlines(command_line)
     try:
         return _shlex_tokens(command_line)
     except Exception:
@@ -1370,8 +1471,16 @@ def _tokenize(command_line: str) -> List[str]:
         return out
 
 
+def _restore_quoted_newline(tok: str) -> str:
+    """Turns QUOTED_NEWLINE_SENTINEL back into the line break it stands for, as bash would pass it: nested command
+    strings (bash -c, eval, here-strings) are judged with their real lines and a lone quoted line break
+    (eval '<LF>' rm -rf logs) is an argument holding a real newline, never the sentinel."""
+    return tok.replace(QUOTED_NEWLINE_SENTINEL, "\n")
+
+
 def split_subcommands(command_line: str) -> List[List[str]]:
-    """Quote-aware split of compound shell commands (&&, ||, ;, |, &, newlines)."""
+    """Quote-aware split of compound shell commands (&&, ||, ;, |, &, newlines). A quoted line break stays inside
+    its sub-command as an argument holding a real newline."""
     subcommands: List[List[str]] = []
     current: List[str] = []
     for tok in _tokenize(command_line):
@@ -1382,7 +1491,7 @@ def split_subcommands(command_line: str) -> List[List[str]]:
                 subcommands.append(current)
                 current = []
         else:
-            current.append(tok)
+            current.append(_restore_quoted_newline(tok))
     if current:
         subcommands.append(current)
     return subcommands
@@ -1560,12 +1669,51 @@ def _symbol_count(text: str) -> int:
     return len({m.group(2).upper() for m in re.finditer(r"--symbol(?:\s+|=)(['\"]?)([A-Za-z0-9_]+)\1", text)})
 
 
+def _executed_script(tokens: List[str]) -> str:
+    """Script operand actually run by a sub-command: the program itself (./close_position.py) or the first operand
+    of a python interpreter (python3 -u scripts/x.py), also through wsl.exe [-d X] [--cd X] [-u X] [--|-e] cmd...;
+    "" for python -c / -m / stdin."""
+    idx = _program_index(tokens)
+    n = len(tokens)
+    if idx >= n:
+        return ""
+    program = os.path.basename(tokens[idx]).lower()
+    if re.sub(r"\.exe$", "", program) == "wsl":
+        linux_command = _wsl_command(tokens[idx + 1:])
+        return _executed_script(linux_command) if linux_command else tokens[idx]
+    if not PYTHON_PROGRAM_RE.match(program):
+        return tokens[idx]
+    i = idx + 1
+    while i < n:
+        tok = tokens[i]
+        if tok == "--":
+            return tokens[i + 1] if i + 1 < n else ""
+        if tok == "-":
+            return ""
+        if not tok.startswith("-"):
+            return tok
+        i += 1
+        if tok.startswith("--"):
+            if tok in PYTHON_LONG_VALUE_OPTIONS:
+                i += 1
+            continue
+        letters = tok[1:]
+        for k, ch in enumerate(letters):
+            if ch in "cm":
+                return ""
+            if ch in "WX":
+                if k == len(letters) - 1:
+                    i += 1
+                break
+    return ""
+
+
 def _subcommand_is_risk_reducing(tokens: List[str], text: str) -> bool:
     if not tokens:
         return False
     if DEPLOY_BATCH_RE.search(text):
         return False
-    if RISK_REDUCING_SCRIPTS_RE.search(text):
+    if RISK_REDUCING_SCRIPTS_RE.fullmatch(_executed_script(tokens).replace("\\", "/").rsplit("/", 1)[-1]):
         return True
     flags = _flags(tokens)
     if GUARDIAN_LOOP_RE.search(text) and not TRADE_ENGINE_RE.search(text):
@@ -3206,7 +3354,7 @@ def _ground_truth_segments(command_line: str) -> List[Tuple[List[str], bool]]:
             elif tok != "(":
                 piped = False  # `a | (b; c)`: the subshell still reads the pipe
             continue
-        current.append(tok)
+        current.append(_restore_quoted_newline(tok))
     if current:
         segments.append((current, piped))
     merged: List[Tuple[List[str], bool]] = []
@@ -4402,7 +4550,19 @@ def evaluate_trade_opening(cmd: str, args: dict, mcp_args: dict, base_dir: str,
 # =============================================================================
 def evaluate_shell_command(command_line: str, cwd: str, base_dir: str, conversation_id: Optional[str],
                            shell: str = "bash") -> Tuple[str, str]:
-    """(decision, reason) for a shell command line (Bash, or PowerShell text normalised by scan_powershell)."""
+    """(decision, reason) for a shell command line (Bash, or PowerShell text normalised by scan_powershell). An
+    "allow" (risk-reducing exit or gated trade opening) needs a flat single-line command (_auto_allow_blocker);
+    otherwise it is downgraded to "ask"."""
+    decision, reason = _evaluate_shell_command(command_line, cwd, base_dir, conversation_id, shell)
+    if decision == "allow":
+        blocker = _auto_allow_blocker(command_line)
+        if blocker:
+            return "ask", (reason + f" Not auto-allowed because {blocker}; user confirmation required.").strip()
+    return decision, reason
+
+
+def _evaluate_shell_command(command_line: str, cwd: str, base_dir: str, conversation_id: Optional[str],
+                            shell: str = "bash") -> Tuple[str, str]:
     analysis = analyze_run_command(command_line, cwd, base_dir, shell=shell)
     if analysis["deny"]:
         return "deny", analysis["deny"]
@@ -4502,6 +4662,11 @@ def evaluate_powershell_command(command: str, cwd: str, base_dir: str, conversat
     decision, reason = max(results, key=lambda r: PS_DECISION_RANK.get(r[0], PS_DECISION_RANK["deny"]))
     if bodies and decision == "allow":
         return "ask", (reason + " The command contains nested PowerShell blocks; user confirmation required.").strip()
+    if decision == "allow" and ("\n" in command.rstrip() or "\r" in command.rstrip()):
+        return "ask", (reason + " The command spans several lines; user confirmation required.").strip()
+    if decision == "allow" and "`" in command:
+        return "ask", (reason + " The command contains a PowerShell backtick escape; user confirmation "
+                                "required.").strip()
     return decision, reason
 
 

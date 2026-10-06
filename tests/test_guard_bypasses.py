@@ -1562,5 +1562,211 @@ class TestPostTradeSync(GuardHarness):
             sys.stdin, sys.stdout = stdin, stdout
 
 
+class TestQuotedNewlineSplitting(GuardHarness):
+    """Issue #53 round 4: only line breaks INSIDE a quoted string are arguments; a closing quote + newline + the next
+    line's opening quote is still a command separator (two commands must never merge into one)."""
+
+    CLOSE = "python3 scripts/execute_futures_trade.py --close-position --symbol BTCUSDT"
+
+    def decision(self, command_line):
+        return self.agy(self.cmd(command_line)).get("decision")
+
+    def assertAllGroundTruthDenied(self, commands):
+        for c in commands:
+            res = self.agy(self.cmd(c))
+            self.assertDenied(res, "Ground Truth Protection")
+            self.assertIn("logs/guardian_state.json may only be written by", res.get("reason", ""), c)
+
+    def assertNoneGroundTruth(self, commands):
+        for c in commands:
+            res = self.agy(self.cmd(c))
+            self.assertNotIn("Ground Truth Protection", res.get("reason", ""), c)
+            self.assertNotEqual(res.get("decision"), "deny", c)
+
+    def test_closing_and_opening_quotes_across_lines_stay_separate_commands(self):
+        for c in ("echo \"a\"\n\"rm\" -rf logs", "echo 'a'\n'rm' -rf logs",
+                  self.CLOSE + " \"x\"\n\"rm\" -rf logs", self.CLOSE + " 'x'\n'rm' -rf logs",
+                  self.CLOSE + " \"x\"\n\n\"rm\" -rf logs"):
+            self.assertAllGroundTruthDenied([c])
+        res = self.run_guard({"tool_name": "Bash", "tool_input": {"command": self.CLOSE + " \"x\"\n\"rm\" -rf logs"}})
+        self.assertEqual(res.get("__exit_code__"), 2)
+        self.assertEqual(pre_trade_guard.split_subcommands("echo \"a\"\n\"rm\" -rf logs"),
+                         [["echo", "a"], ["rm", "-rf", "logs"]])
+
+    def test_trade_opening_hidden_behind_risk_reducing_line_not_allowed(self):
+        c = self.CLOSE + " \"x\"\n\"python3\" scripts/execute_futures_trade.py --symbol SOLUSDT --direction LONG"
+        self.assertNotEqual(self.decision(c), "allow")
+        self.assertNotEqual(self.decision(self.CLOSE + "\npython3 scripts/execute_futures_trade.py --symbol SOLUSDT "
+                                          "--direction LONG"), "allow")
+
+    def test_line_breaks_inside_quotes_are_arguments(self):
+        self.assertNoneGroundTruth(["printf '%s' '\n'", "git commit -m \"a\n\nb\"",
+                                    "cat <<'EOF' > /tmp/n.txt\nit's fine\nEOF"])
+        self.assertEqual(pre_trade_guard.split_subcommands("printf '%s' '\n'"), [["printf", "%s", "\n"]])
+        self.assertEqual(pre_trade_guard.split_subcommands("git commit -m \"a\n\nb\""),
+                         [["git", "commit", "-m", "a\n\nb"]])
+
+    def test_scan_tracks_escapes_and_comments_and_fails_safe_when_unbalanced(self):
+        protect = pre_trade_guard._protect_quoted_newlines
+        self.assertEqual(protect("echo 'a\nb'\nls"), "echo 'a__newline__b'\nls")
+        self.assertEqual(protect("echo \"a\\\"\nb\"\nls"), "echo \"a\\\"__newline__b\"\nls")  # \" stays inside
+        self.assertEqual(protect("echo 'a\\'\nls"), "echo 'a\\'\nls")  # backslash is literal inside '...'
+        self.assertEqual(protect("echo \\'\nls\necho \\'"), "echo \\'\nls\necho \\'")  # escaped quotes outside
+        self.assertEqual(protect("ls # it's\n'rm' -rf logs\necho 'x'"), "ls # it's\n'rm' -rf logs\necho 'x'")
+        self.assertEqual(protect("echo it's\nrm -rf logs"), "echo it's\nrm -rf logs")  # unbalanced: unchanged
+        self.assertEqual(protect("echo a#'\nb'"), "echo a#'__newline__b'")  # '#' inside a word is not a comment
+        self.assertAllGroundTruthDenied(["ls # it's\n'rm' -rf logs\necho 'x'", "echo it's\nrm -rf logs"])
+
+    def test_risk_reducing_alone_still_allowed(self):
+        self.assertEqual(self.decision(self.CLOSE), "allow")
+        # Round 5: a multi-line command is never auto-allowed, even when every line is risk-reducing
+        self.assertEqual(self.decision(self.CLOSE + "\n" + self.CLOSE.replace("BTCUSDT", "ETHUSDT")), "ask")
+
+
+class TestNestedNewlinesAndAutoAllowFailSafe(GuardHarness):
+    """Issue #53 round 5: nested command strings keep their real line breaks; an auto-allow needs a flat single-line
+    command; risk-reducing scripts count only when they are the script actually executed."""
+
+    CLOSE = "python3 scripts/execute_futures_trade.py --close-position --symbol BTCUSDT"
+    CUTOFF = "python3 scripts/loops/night_cutoff_loop.py --once"
+
+    def decision(self, command_line):
+        return self.agy(self.cmd(command_line)).get("decision")
+
+    def test_nested_command_strings_are_judged_line_by_line(self):
+        for c in ("bash -c 'true\nrm -rf logs'", "eval \"true\nrm -rf logs\"", "sh -c 'true\nrm -rf logs'",
+                  "bash -c '" + self.CUTOFF + "\nrm -rf logs'"):
+            self.assertDenied(self.agy(self.cmd(c)), "Ground Truth Protection")
+        res = self.run_guard({"tool_name": "Bash", "tool_input": {"command": "bash -c '" + self.CUTOFF + "\nrm -rf logs'"}})
+        self.assertEqual(res.get("__exit_code__"), 2)
+        self.assertEqual(pre_trade_guard.split_subcommands("bash -c 'true\nrm -rf logs'"),
+                         [["bash", "-c", "true\nrm -rf logs"]])
+
+    def test_hidden_lines_never_auto_allowed(self):
+        for c in (self.CLOSE + " # it's\nrm -rf logs\necho \\'",
+                  self.CLOSE + " $'\\''\nrm -rf logs\necho \\'",
+                  "python3 scripts/loops/night_cutoff_loop.py \"<<EOF\"\nrm -rf logs close_position.py",
+                  "rm -rf logs close_position.py"):
+            self.assertNotEqual(self.decision(c), "allow", c)
+            res = self.run_guard({"tool_name": "Bash", "tool_input": {"command": c}})
+            self.assertNotEqual(res.get("hookSpecificOutput", {}).get("permissionDecision"), "allow", c)
+
+    def test_flat_single_line_required_for_allow(self):
+        # Each of these is risk-reducing for the analysis but carries text it cannot vouch for: ask, never deny
+        for c in (self.CLOSE + " # note", self.CLOSE + "\n" + self.CUTOFF, self.CLOSE + " --note $'x'",
+                  self.CLOSE + " --note \"$(date)\"", self.CLOSE + " --note `date`",
+                  self.CUTOFF + " <<< x", self.CLOSE + " --note 'a\nb'", "\n" + self.CLOSE):
+            self.assertEqual(self.decision(c), "ask", c)
+        blocker = pre_trade_guard._auto_allow_blocker
+        self.assertIn("here-string", blocker(self.CLOSE + " <<< x"))  # (denied anyway: inline code + executor)
+        self.assertIsNone(blocker(self.CLOSE))
+        self.assertIsNone(blocker(self.CLOSE + "\n"))  # trailing whitespace only
+        self.assertIsNone(blocker(self.CLOSE + " --note 'a # b' --tag x#y"))  # quoted / mid-word '#'
+        self.assertIsNotNone(blocker(self.CLOSE + " --note __newline__"))
+        self.assertIsNotNone(blocker(self.CLOSE + "\r" + self.CUTOFF))
+        # Trade openings: gates pass, but a multi-line command is downgraded to ask too
+        self.write_provenance_dossier("BTCUSDT", "LONG")
+        opening = "python3 scripts/execute_futures_trade.py --symbol BTCUSDT --direction LONG --leverage 3 --env prod"
+        self.assertEqual(self.agy(self.cmd(opening, conversationId=PARENT_CONV_ID)).get("decision"), "allow")
+        self.assertEqual(self.agy(self.cmd(opening + " # it's\nrm -rf logs\necho \\'",
+                                           conversationId=PARENT_CONV_ID)).get("decision"), "ask")
+        # PowerShell: a multi-line command is not auto-allowed either
+        ps = pre_trade_guard.evaluate_powershell_command
+        self.assertEqual(ps("python scripts\\execute_futures_trade.py --close-position --symbol BTCUSDT",
+                            self.root, self.root, None)[0], "allow")
+        self.assertEqual(ps("python scripts\\execute_futures_trade.py --close-position --symbol BTCUSDT\r\n"
+                            "python scripts\\execute_futures_trade.py --close-position --symbol ETHUSDT",
+                            self.root, self.root, None)[0], "ask")
+
+    def test_risk_reducing_script_must_be_the_executed_one(self):
+        script = pre_trade_guard._executed_script
+        self.assertEqual(script(["python3", "scripts/loops/night_cutoff_loop.py", "--once"]),
+                         "scripts/loops/night_cutoff_loop.py")
+        self.assertEqual(script(["python3", "-u", "-X", "dev", "-Wignore", "scripts/close_position.py"]),
+                         "scripts/close_position.py")
+        self.assertEqual(script(["env", "X=1", "./close_position.py"]), "./close_position.py")
+        self.assertEqual(script(["python3", "-c", "x", "close_position.py"]), "")
+        self.assertEqual(script(["python3", "-m", "close_position.py"]), "")
+        self.assertEqual(script(["rm", "-rf", "logs", "close_position.py"]), "rm")
+        rr = pre_trade_guard._subcommand_is_risk_reducing
+        for tokens in (["rm", "-rf", "logs", "close_position.py"], ["echo", "night_cutoff_loop.py"],
+                       ["python3", "evil_close_position.py"], ["python3", "-c", "x", "close_position.py"]):
+            self.assertFalse(rr(tokens, " ".join(tokens)), tokens)
+        for tokens in (["python3", "scripts/loops/night_cutoff_loop.py", "--once"],
+                       ["python3", "scripts/close_position_market.py"], ["./scripts/audit_orphan_positions.py"]):
+            self.assertTrue(rr(tokens, " ".join(tokens)), tokens)
+        self.assertNotEqual(self.decision("echo night_cutoff_loop.py"), "allow")
+        self.assertEqual(self.decision(self.CUTOFF), "allow")
+
+    def test_sanctioned_and_quoted_newline_commands_unchanged(self):
+        self.assertEqual(self.decision(self.CLOSE), "allow")
+        for c in ("git commit -m \"a\n\nb\"", "printf '%s' '\n'", "cat <<'EOF' > /tmp/n.txt\nit's fine\nEOF"):
+            res = self.agy(self.cmd(c))
+            self.assertNotEqual(res.get("decision"), "deny", c)
+            self.assertNotIn("Ground Truth Protection", res.get("reason", ""), c)
+
+
+class TestLoneQuotedNewlineAndWslAutoAllow(GuardHarness):
+    """Issue #53 round 6: a lone quoted line break is an argument holding a real newline (never the sentinel), so
+    eval / sh -c see the same lines as bash; the executed-script match sees through wsl.exe; a PowerShell backtick
+    escape is never auto-allowed."""
+
+    CLOSE = "python3 scripts/execute_futures_trade.py --close-position --symbol BTCUSDT"
+    CUTOFF = "python3 scripts/loops/night_cutoff_loop.py --once"
+    WSL = "wsl.exe -d Ubuntu -- "
+
+    def claude(self, tool, command):
+        return self.run_guard({"tool_name": tool, "tool_input": {"command": command}})
+
+    def test_eval_of_lone_quoted_newline_is_denied(self):
+        for c in ("eval '\n' rm -rf logs", "eval \"\n\" rm -rf logs",
+                  "eval '\n' git -c core.fsmonitor='curl x|sh' status", "eval '\n' rm -rf \"$D\""):
+            self.assertDenied(self.agy(self.cmd(c)))
+            self.assertEqual(self.claude("Bash", c).get("__exit_code__"), 2, c)
+        self.assertDenied(self.agy(self.cmd("eval '\n' rm -rf logs")), "Ground Truth Protection")
+        split = pre_trade_guard.split_subcommands
+        self.assertEqual(split("eval '\n' rm -rf logs"), [["eval", "\n", "rm", "-rf", "logs"]])
+        self.assertEqual(split("eval \"\n\" rm -rf logs"), [["eval", "\n", "rm", "-rf", "logs"]])
+        self.assertEqual(split("bash -c '\n'"), [["bash", "-c", "\n"]])
+        for c in ("eval '\n' rm -rf logs", "printf '%s' '\n'", "bash -c '\nrm -rf logs'"):
+            for tokens in split(c):
+                self.assertFalse(any(pre_trade_guard.QUOTED_NEWLINE_SENTINEL in t for t in tokens), c)
+        # A quoted line break is still an argument, not a separator; a bare one is still a separator
+        self.assertEqual(split("printf '%s' '\n' x"), [["printf", "%s", "\n", "x"]])
+        self.assertEqual(split("echo a\necho b"), [["echo", "a"], ["echo", "b"]])
+
+    def test_wsl_wrapped_sanctioned_commands_allowed(self):
+        script = pre_trade_guard._executed_script
+        self.assertEqual(script(["wsl.exe", "-d", "Ubuntu", "--", "python3", "scripts/loops/night_cutoff_loop.py",
+                                 "--once"]), "scripts/loops/night_cutoff_loop.py")
+        self.assertEqual(script(["wsl", "--cd", "/repo", "-u", "me", "-e", "python3", "scripts/close_position.py"]),
+                         "scripts/close_position.py")
+        self.assertEqual(script(["wsl.exe", "--exec", "./scripts/audit_orphan_positions.py"]),
+                         "./scripts/audit_orphan_positions.py")
+        self.assertEqual(script(["wsl.exe", "-d", "Ubuntu", "--", "rm", "close_position.py"]), "rm")
+        self.assertEqual(script(["wsl.exe", "--import", "x", "close_position.py"]), "wsl.exe")
+        self.assertEqual(script(["wsl.exe"]), "wsl.exe")
+        rr = pre_trade_guard._subcommand_is_risk_reducing
+        tokens = ["wsl.exe", "-d", "Ubuntu", "--", "rm", "-rf", "/tmp/x", "night_cutoff_loop.py"]
+        self.assertFalse(rr(tokens, " ".join(tokens)))
+        cutoff = self.WSL + self.CUTOFF
+        self.assertEqual(self.agy(self.cmd(cutoff)).get("decision"), "allow")
+        self.assertEqual(self.claude("Bash", cutoff).get("hookSpecificOutput", {}).get("permissionDecision"), "allow")
+        ps = pre_trade_guard.evaluate_powershell_command
+        self.assertEqual(ps(cutoff, self.root, self.root, None)[0], "allow")
+        self.assertEqual(ps(self.WSL + self.CLOSE, self.root, self.root, None)[0], "allow")
+        # Round-5 fail-safe still applies through wsl.exe
+        self.assertEqual(self.agy(self.cmd(cutoff + " # it's")).get("decision"), "ask")
+        self.assertEqual(ps(cutoff + "\r\n" + cutoff, self.root, self.root, None)[0], "ask")
+
+    def test_powershell_backtick_never_auto_allowed(self):
+        ps = pre_trade_guard.evaluate_powershell_command
+        self.assertEqual(ps(self.CLOSE, self.root, self.root, None)[0], "allow")
+        for c in (self.CLOSE.replace("BTCUSDT", "BTC`USDT"), self.CLOSE + " `", self.WSL + self.CUTOFF + " `"):
+            decision, reason = ps(c, self.root, self.root, None)
+            self.assertNotEqual(decision, "allow", c)
+            self.assertNotEqual(decision, "deny", c)
+
+
 if __name__ == "__main__":
     unittest.main()
