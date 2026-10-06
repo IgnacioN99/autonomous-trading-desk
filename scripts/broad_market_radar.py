@@ -119,7 +119,7 @@ def analyze_single_symbol(symbol, interval=DEFAULT_INTERVAL):
     candle_open = opens[-1]
     candle_high = highs[-1]
     candle_low = lows[-1]
-    candle_vol = volumes[-1]
+    candle_vol = volumes[-2]  # closed wick candle: the forming candle's volume is partial (issue #83)
 
     total_range = candle_high - candle_low
     if total_range <= 0:
@@ -139,7 +139,7 @@ def analyze_single_symbol(symbol, interval=DEFAULT_INTERVAL):
     emas = calculate_ema(closes, period=20)
     ema20 = emas[-1] if emas else current_price
 
-    avg_vol = sum(volumes[-21:-1]) / 20 if len(volumes) >= 21 else candle_vol
+    avg_vol = sum(volumes[-22:-2]) / 20 if len(volumes) >= 22 else candle_vol
     vol_ratio = (candle_vol / avg_vol) if avg_vol > 0 else 1.0
 
     recent_high = max(highs[-40:])
@@ -312,13 +312,18 @@ def enrich_candidate_microstructure(cand):
     t_ratio = micro['taker_ratio']
     oi_pct = micro['oi_change_pct']
     funding_rate = micro['funding_rate_pct']
+    # Absorption is only scored when wick and taker data describe the wick candle (issue #83); a mismatch can
+    # only remove the bonus, never add score.
+    absorption_scored = not (micro.get('wick_candle_mismatch') or micro.get('taker_candle_matched') is False)
+    if not absorption_scored:
+        reasons.append("🔬 ORDER FLOW: absorption not scored (wick/taker candle mismatch)")
 
     if direction == 'SHORT':
         # Strongly penalize if market is in active Long Build-Up (aggressive buying + rising OI)
         if regime == 'LONG_BUILDUP':
             score -= 30
             reasons.append(f"⚠️ MACRO PENALTY: Active Long Build-up (Taker={t_ratio:.2f}, OI={oi_pct:+.2f}%)")
-        elif absorption == 'BEARISH_ABSORPTION':
+        elif absorption == 'BEARISH_ABSORPTION' and absorption_scored:
             score += 15
             reasons.append(f"🔬 ORDER FLOW: {micro['absorption_desc']}")
         elif regime == 'SHORT_SQUEEZE':
@@ -334,7 +339,7 @@ def enrich_candidate_microstructure(cand):
         if regime == 'SHORT_BUILDUP':
             score -= 30
             reasons.append(f"⚠️ MACRO PENALTY: Active Short Build-up (Taker={t_ratio:.2f}, OI={oi_pct:+.2f}%)")
-        elif absorption == 'BULLISH_ABSORPTION':
+        elif absorption == 'BULLISH_ABSORPTION' and absorption_scored:
             score += 15
             reasons.append(f"🔬 ORDER FLOW: {micro['absorption_desc']}")
         elif regime == 'LONG_BUILDUP':

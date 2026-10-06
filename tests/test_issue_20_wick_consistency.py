@@ -73,7 +73,8 @@ def next_open_candle(klines):
 def micro_routes(radar_klines, micro_klines):
     """Routes for one radar fetch (limit=55) plus a full microstructure fetch (taker / OI / premium / limit=30).
     Aggressive selling (taker ratio 0.7) with a flat OI and price -> BULLISH_ABSORPTION if the lower wick >= 40%."""
-    taker = [{"buySellRatio": "0.7", "buyVol": "70", "sellVol": "100"} for _ in range(30)]
+    # Binance publishes one taker row per CLOSED period, stamped with that kline's open time (issue #83)
+    taker = [{"buySellRatio": "0.7", "buyVol": "70", "sellVol": "100", "timestamp": k[0]} for k in micro_klines[:-1]]
     oi = [{"sumOpenInterest": "1000", "sumOpenInterestValue": "100000"} for _ in range(30)]
     return [("takerlongshortRatio", taker), ("openInterestHist", oi),
             ("premiumIndex", {"lastFundingRate": "0.0001"}),

@@ -12,6 +12,11 @@ import os
 import sys
 import argparse
 
+_SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+import microstructure_engine as me  # noqa: E402  (shared wick helper, issue #85)
+
 def get_top_crypto_pairs(limit=35):
     url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -132,20 +137,15 @@ def analyze_symbol(symbol, interval="15m"):
     candle_open = opens[-1]
     candle_high = highs[-1]
     candle_low = lows[-1]
-    candle_vol = volumes[-1]
+    candle_vol = volumes[-2]  # closed wick candle: the forming candle's volume is partial (issue #83)
 
     # Candle range and wicks
     total_range = candle_high - candle_low
     if total_range <= 0:
         return None
 
-    body_top = max(candle_open, current_price)
-    body_bottom = min(candle_open, current_price)
-    lower_wick = body_bottom - candle_low
-    upper_wick = candle_high - body_top
-
-    lower_wick_ratio = (lower_wick / total_range) * 100
-    upper_wick_ratio = (upper_wick / total_range) * 100
+    # Both wicks from the last CLOSED candle via the shared helper (klines[-1] is still forming; issue #85)
+    lower_wick_ratio, upper_wick_ratio = me.candle_wick_pcts(klines[-2])
 
     # RSI
     rsi_15m = calculate_rsi(closes, period=14)
@@ -155,7 +155,7 @@ def analyze_symbol(symbol, interval="15m"):
     ema20 = emas[-1] if emas else current_price
 
     # Relative volume vs 20-candle average
-    avg_vol = sum(volumes[-21:-1]) / 20 if len(volumes) >= 21 else candle_vol
+    avg_vol = sum(volumes[-22:-2]) / 20 if len(volumes) >= 22 else candle_vol
     vol_ratio = (candle_vol / avg_vol) if avg_vol > 0 else 1.0
 
     # Distance to EMA 20 in %
