@@ -25,6 +25,13 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    run_command calls that use trading primitives outside the sanctioned scripts (python -c, heredocs,
    piped interpreters, curl/wget writes to Binance, unsanctioned scripts importing the engine) are denied.
    Batch deploy scripts and auto-deploy loops are treated as trade openings.
+   Shell text is read through one bash-aware lexical pre-pass (_scan_shell, issue #98): '...', "...", $'...'
+   (decoded), `...`, $(...) / $((...)) bodies (also inside "..."), backslash escapes, backslash-newline continuations
+   (joined), comments (# at a word start outside quotes: removed) and heredoc operators outside quotes and comments
+   (<<W, <<-W, <<'W', <<"W", <<\\W, several per line; not <<<). Heredoc bodies are cut out of the command text and
+   tokenized on their own after their operator line, so a quote in a body or a comment never pairs with a later
+   quote; an unterminated quote is confined to the lines from where it opens (the complete lines before it are
+   judged as bash runs them). A scanner failure denies.
 4. STRUCTURED RISK-REDUCING ACTION PARSING:
    MCP: reduceOnly=true / closePosition=true / cancel*. Shell: per sub-command, the script it actually executes
    (the program, the script operand of python, also through wsl.exe) must be one of RISK_REDUCING_SCRIPTS by its
@@ -95,7 +102,12 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    an archive destination, git -C / --work-tree of a writing git sub-command, and a program known only at run time
    ($RM, $(which rm)) next to logs/, a protected file or another run-time value. $(pwd), `pwd`, $PWD and $(git
    rev-parse --show-toplevel) count as '.', $(cmd)/path is a run-time path ($X/logs counts as logs/), every other
-   $(cmd) / `cmd` is lifted and judged as its own line, and a quoted line break is an argument, not a separator.
+   $(cmd) / `cmd` is lifted (from the raw text, comments and heredoc bodies included) and judged as its own line,
+   and a quoted line break is an argument, not a separator. The line is read through the lexical pre-pass (see 3):
+   comments never hide a line, a heredoc body is judged as shell lines isolated from the text around it (scanned
+   as a shell would read it and, when that scan removed a comment or let a quote span lines, also line by line,
+   since the body may be data or another language where # is not a comment), and with an unterminated quote the
+   complete lines before the one where it opens are judged together, the rest line by line.
    Nested command lines get the same full, strict line analysis one level deeper, started once from every
    possible cwd of the enclosing line (beyond NESTED_DEPTH_LIMIT levels the command is denied): sh/bash -c, eval, cmd /c, powershell / pwsh -Command and -EncodedCommand in any prefix
    spelling (-e, -ec, -en, -enc, -enco ... -encodedcommand, with -, -- or /, or -enc:payload; base64 UTF-16LE,
@@ -118,7 +130,8 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    heredoc, inline code naming it, git checkout; an archive extraction or recursive copy may write any name), or
    when its path is a run-time value / relative to an unknown cwd; a missing file judges as nothing. A shell reading
    commands from stdin (... | bash, bash -s, sh -s, source /dev/stdin, bash <(curl ...)) is denied unless its input
-   is visible: a heredoc (its body is judged line by line), a here-string (judged), `< file` or a single `cat file` /
+   is visible: a heredoc (its body is judged line by line, isolated from the rest, also when the operator sits in
+   a "$(...)" string unless a plain `cat` reads it for a git / gh argument: a commit message), a here-string (judged), `< file` or a single `cat file` /
    `cat < file` producer (the file is judged). Only DESK_SHELL_SCRIPTS (scripts/report_issue.sh, resolved against
    the workspace root and pinned by the sha256 of the bytes the hook read) is judged without the run-time-value and
    unknown-cwd rules; every other rule (literal operands, xargs, stdin shells, nested lines) still applies, scripts
@@ -180,7 +193,9 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    File.delete, Dir.rmdir ...) or recursive deletes/moves next to an ancestor literal ('.', '..', the repo). Both
    are checked on the whole command line, so a `git commit -m "$(cat <<EOF ...)"` or `gh ... --body "$(...)"` text
    naming a protected file next to a write marker such as `.write(` is denied: use -F <file> / --body-file. Heredoc
-   bodies are only exempt from the line-by-line check when fed to python/node. Also: destructive find whose filters
+   bodies are only exempt from the line-by-line check when terminated and fed to python/node (python3 - <<EOF, cat <<EOF | node; a
+   << inside $((...)) / ((...)) is a shift, never such a heredoc) or read by a plain `cat` inside a "$(...)" argument of git / gh: a
+   message argument. Also: destructive find whose filters
    can match them or that is unfiltered/negated over a root that is or contains logs/ (., .., /, ~, the repo),
    recursive rm / rd / del / Remove-Item / mv / move of logs/ or an ancestor (globs and braces expanded: log*,
    {logs,build}), recursive / glob / --files-from copies into logs/ or an ancestor (incl. -t/--target-directory,
@@ -217,7 +232,15 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    ($XDG_CONFIG_HOME/git/config is denied as a run-time write, a config file pulled in by include.path from an
    arbitrary path is not recognised), file targets of a sed script's own w / W / s///w commands naming a git
    config path (sed 'w .git/config' x), run-time values and unknown cwd inside the pinned scripts/report_issue.sh,
-   and a missing pending_entries.json still reads as empty in the executor (tracked as follow-ups).
+   a missing pending_entries.json still reads as empty in the executor (tracked as follow-ups), and the lexical
+   pre-pass's own simplifications: a `case` command inside $(...) is denied outright, also a multi-line one (n=$(...
+   while read f; do case "$f" in *.py) ...;; esac; done)), since its pattern `)` would close the substitution early
+   (outside $(...) it is harmless; in a heredoc body that is data, not run by a shell, the body falls back to the
+   line-by-line check instead), a multi-line $((...)) / ((...)) holding << is denied too (a $( (subshell) )
+   heredoc or a shift), ${...} is
+   not a quoting context, a heredoc operator inside `...` is not recognised, a multi-line $(...) inside "..." stays
+   one argument (only its heredoc bodies are judged), and a heredoc body ends at the first line equal to its
+   delimiter (more lines are judged as commands than bash would run, the strict direction).
 9. CLAUDE CODE POWERSHELL TOOL (Windows) AND NOTEBOOKEDIT:
    NotebookEdit is a file tool (notebook_path). PowerShell commands are scanned for analysis only (Unicode quotes
    and dashes mapped to ASCII; quote-aware: '...' literal, backtick escapes in "..." and bare text; comments
@@ -419,6 +442,21 @@ SHELL_PUNCTUATION = "();<>|&\n"
 # Stands for a line break inside a '...' / "..." string (an argument, not a command separator)
 QUOTED_NEWLINE_SENTINEL = "__newline__"
 WORD_BOUNDARY_CHARS = " \t\r\n;&|()<>"
+# bash $'...' escapes with a fixed value (octal, \x, \u, \U and \c are decoded by _ansi_c_decode)
+ANSI_C_ESCAPES = {"a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n": "\n", "r": "\r", "t": "\t",
+                  "v": "\v", "\\": "\\", "'": "'", '"': '"', "?": "?"}
+# Heredocs inside heredoc bodies are tokenized recursively; deeper nesting, or more operators in one text (each
+# one's head is parsed again), is denied as too complex to audit (fail closed)
+HEREDOC_NESTING_LIMIT = 16
+HEREDOC_MAX_PER_SCAN = 64
+# Runs of characters with no lexical meaning for _scan_shell in a command context / inside "..."
+SCAN_PLAIN_CMD_RE = re.compile(r"[^\\'\"$`()#<\n]+")
+SCAN_PLAIN_DQ_RE = re.compile(r"[^\\\"$`\n]+")
+HEREDOC_OPERATOR_RE = re.compile(r"(?<!<)<<(?!<)")
+# Programs whose "$(cat <<'EOF' ... EOF)" argument is message text (commit / PR bodies), not judged as shell lines
+HEREDOC_MESSAGE_PROGRAMS = {"git", "gh"}
+# Besides SHELL_INTERPRETERS, programs that run a heredoc body as shell code (a scan failure there denies)
+HEREDOC_SHELL_READERS = {"eval", "source", ".", "wsl", "xargs", "su", "script", "busybox"}
 # bash operators, longest first: shlex returns punctuation runs (')>', ';>', '<>') as one token
 SHELL_OPERATORS = ("&>>", "<<<", "&&", "||", ";;", "|&", ">>", ">|", ">&", "&>", "<>", "<<", "<&",
                    "(", ")", ";", "|", "&", "\n", ">", "<")
@@ -807,7 +845,6 @@ FIND_OUTPUT_ACTIONS = {"-fprint", "-fprint0", "-fprintf", "-fls"}
 FIND_EXEC_ACTIONS = {"-exec", "-execdir", "-ok", "-okdir"}
 FIND_NAME_FILTERS = {"-name", "-iname"}
 FIND_PATH_FILTERS = {"-path", "-ipath", "-wholename", "-iwholename"}
-HEREDOC_RE = re.compile(r"(?<!<)<<(-?)\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
 # Heredoc bodies are dropped from the line-by-line check only when they feed python/node (judged by markers)
 CODE_INTERPRETER_PROGRAM_RE = re.compile(r"^(?:python[0-9.]*|node|nodejs)$", re.IGNORECASE)
 PIPE_TO_CODE_INTERPRETER_RE = re.compile(
@@ -1507,78 +1544,404 @@ def _shlex_tokens(text: str) -> List[str]:
     return [part for tok in lexer for part in _split_operators(tok)]
 
 
-def _protect_quoted_newlines(command_line: str) -> str:
-    """Replaces only the line breaks lying INSIDE a '...' / "..." string by QUOTED_NEWLINE_SENTINEL, tracking bash
-    quote state: inside '...' a backslash is literal; outside quotes and inside "..." it escapes the next character
-    (an unquoted backslash-newline is left to the tokenizer); a comment (# at word start, outside quotes) runs to
-    the end of its line and never opens a quote. A line break between a closing quote and the next line's opening
-    quote stays a command separator. When the scan ends inside an open quote (an apostrophe in a heredoc body or a
-    comment, unbalanced text) nothing is replaced: over-splitting is the fail-safe direction."""
-    if "\n" not in command_line:
-        return command_line
+class ShellScanError(ValueError):
+    """Unexpected input for the Bash lexical pre-pass (_scan_shell); never caught by the tokenizer, so the hook's
+    top-level handler denies (fail closed)."""
+
+
+def _dq_escape(text: str) -> str:
+    """Text placed inside a "..." string for shlex: backslashes and double quotes escaped, line breaks as
+    QUOTED_NEWLINE_SENTINEL (the token keeps the original characters)."""
+    return text.replace("\\", "\\\\").replace('"', '\\"').replace("\n", QUOTED_NEWLINE_SENTINEL)
+
+
+def _sq_unescape_dq(text: str) -> str:
+    """Inverse of the quoting part of _dq_escape (heads / tails of a heredoc operator inside "$(...)")."""
+    return re.sub(r'\\(["\\])', r"\1", text)
+
+
+def _ansi_c_decode(raw: str) -> str:
+    """Value of a bash $'...' string body: \\n \\t \\e ... \\nnn (octal), \\xHH, \\uHHHH, \\UHHHHHHHH, \\cX and \\' \\"
+    \\\\ decoded, an unknown escape kept with its backslash; NUL bytes are dropped (bash would cut the string there,
+    keeping more text is the strict direction)."""
     out: List[str] = []
-    quote = ""
-    word_start = True
-    i, n = 0, len(command_line)
+    i, n = 0, len(raw)
     while i < n:
-        c = command_line[i]
-        if quote:
-            if c == "\\" and quote == '"' and i + 1 < n:
-                nxt = command_line[i + 1]
-                out.append(c + (QUOTED_NEWLINE_SENTINEL if nxt == "\n" else nxt))
-                i += 2
-                continue
-            if c == quote:
-                quote = ""
-            out.append(QUOTED_NEWLINE_SENTINEL if c == "\n" else c)
+        c = raw[i]
+        if c != "\\" or i + 1 >= n:
+            out.append(c)
             i += 1
             continue
-        if c == "\\" and i + 1 < n:
-            out.append(command_line[i:i + 2])
-            word_start = False
+        d = raw[i + 1]
+        if d in ANSI_C_ESCAPES:
+            out.append(ANSI_C_ESCAPES[d])
             i += 2
-            continue
-        if c == "#" and word_start:
-            end = command_line.find("\n", i)
-            end = n if end < 0 else end
-            out.append(command_line[i:end])
-            i = end
-            continue
-        if c in "'\"":
-            quote = c
-        out.append(c)
-        word_start = c in WORD_BOUNDARY_CHARS
-        i += 1
-    return command_line if quote else "".join(out)
-
-
-def _has_unquoted_comment(command_line: str) -> bool:
-    """True when the text has a bash comment: '#' at the start of a word, outside '...' / "..." (same quote and
-    escape rules as _protect_quoted_newlines)."""
-    quote = ""
-    word_start = True
-    i, n = 0, len(command_line)
-    while i < n:
-        c = command_line[i]
-        if quote:
-            if c == "\\" and quote == '"':
+        elif d in "01234567":
+            m = re.match(r"[0-7]{1,3}", raw[i + 1:])
+            out.append(chr(int(m.group(0), 8) & 0xFF))
+            i += 1 + len(m.group(0))
+        elif d in "xuU":
+            m = re.match(r"[0-9A-Fa-f]{1,%d}" % {"x": 2, "u": 4, "U": 8}[d], raw[i + 2:])
+            if not m:
+                out.append(raw[i:i + 2])
                 i += 2
                 continue
-            if c == quote:
-                quote = ""
-            i += 1
+            try:
+                out.append(chr(int(m.group(0), 16)))
+            except (ValueError, OverflowError):
+                pass
+            i += 2 + len(m.group(0))
+        elif d == "c" and i + 2 < n:
+            out.append(chr(ord(raw[i + 2]) & 0x1F))
+            i += 3
+        else:
+            out.append(raw[i:i + 2])
+            i += 2
+    return "".join(out).replace("\x00", "")
+
+
+def _heredoc_word(text: str, i: int) -> Optional[Tuple[int, str, bool, bool]]:
+    """Parses the heredoc operator at text[i] ('<<' or '<<-', then optional blanks and a shell word: EOF, 'EOF',
+    "EOF", \\EOF, E"O"F, $'EOF', $"EOF"). Returns (index after the word, delimiter after quote removal, quoted, strip tabs) or None
+    when no word follows (a bash syntax error: the text is then scanned as ordinary command text)."""
+    n = len(text)
+    j = i + 2
+    strip = j < n and text[j] == "-"
+    j += 1 if strip else 0
+    while j < n and text[j] in " \t":
+        j += 1
+    start = j
+    delim: List[str] = []
+    quoted = False
+    while j < n and text[j] not in WORD_BOUNDARY_CHARS:
+        ch = text[j]
+        if ch == "$" and text.startswith("$'", j):
+            k = j + 2
+            while k < n and text[k] != "'":
+                k += 2 if text[k] == "\\" else 1
+            if k >= n:
+                return None
+            delim.append(_ansi_c_decode(text[j + 2:k]))
+            quoted, j = True, k + 1
+        elif ch == "$" and text.startswith('$"', j):
+            j += 1  # $"..." (locale string): the "..." branch reads it
+        elif ch == "'":
+            k = text.find("'", j + 1)
+            if k < 0:
+                return None
+            delim.append(text[j + 1:k])
+            quoted, j = True, k + 1
+        elif ch == '"':
+            k = j + 1
+            part: List[str] = []
+            while k < n and text[k] != '"':
+                if text[k] == "\\" and k + 1 < n and text[k + 1] in '"\\$`':
+                    k += 1
+                part.append(text[k])
+                k += 1
+            if k >= n:
+                return None
+            delim.append("".join(part))
+            quoted, j = True, k + 1
+        elif ch == "\\" and j + 1 < n:
+            delim.append(text[j + 1])
+            quoted, j = True, j + 2
+        else:
+            delim.append(ch)
+            j += 1
+    if j == start:
+        return None
+    return j, "".join(delim), quoted, strip
+
+
+def _scan_frame(kind: str, parent: Optional[Dict[str, Any]], start: int, closes: bool = False, paren: int = 0,
+                arith: bool = False, subst: bool = False) -> Dict[str, Any]:
+    """A lexical context of _scan_shell: "cmd" (the top level or a $(...) / ((...)) body), "sq" '...', "dq" "...",
+    "ansi" $'...', "bt" `...`. esc: some enclosing context is a "..." string, so the text is emitted escaped for
+    shlex (one argument, as bash passes it); start: index in the output buffer where it opened; subst: a $(...)
+    body; arith: a $((...)) / ((...)) body (<< is a shift there, never a heredoc)."""
+    esc = bool(parent) and (parent["esc"] or parent["kind"] == "dq")
+    return {"kind": kind, "esc": esc, "closes": closes, "paren": paren, "arith": arith, "subst": subst,
+            "shift": False, "start": start, "line_start": start, "raw": []}
+
+
+def _reject_case_in_subst(run: str, word_start: bool, before: str) -> None:
+    """Raises ShellScanError when the plain text run of a $(...) body holds `case` in a command position (start of
+    the body or after ; & | ( { ! newline, then, do, else, elif): its pattern `)` closes the substitution early for
+    _scan_shell. `case` as an argument (git log --grep case) or in quotes / heredoc bodies is not affected."""
+    for m in re.finditer(r"case(?=[ \t\r\n;&|()<>]|$)", run):
+        k = m.start()
+        if not ((k == 0 and word_start) or (k > 0 and run[k - 1] in WORD_BOUNDARY_CHARS)):
+            continue
+        prev = (before + run[:k]).rstrip(" \t")
+        if not prev or prev[-1] in ";&|(\n{!" or re.search(r"(?:^|[\s;&|(])(?:then|do|else|elif|time)$", prev):
+            raise ShellScanError("a case command inside $(...) cannot be audited")
+
+
+def _scan_shell(text: str) -> Dict[str, Any]:
+    """Bash-aware lexical pre-pass shared by the tokenizer and the auto-allow check (issue #98). Models '...',
+    "..." (backslash escapes), $'...' (backslash escapes; decoded), `...`, $(...) / $((...)) / ((...)) bodies (a
+    new command context, also inside "..."), unquoted backslash escapes, the backslash-newline line continuation
+    (removed; the word-start state before it is kept, so `ls \\<LF># x` is a comment), comments (# at a word start
+    outside quotes, to the end of the line: removed, the line break kept) and heredoc operators outside quotes and
+    comments (<<WORD, <<-WORD, <<'WORD', <<"WORD", <<\\WORD, several per line with their bodies in order; <<< is a
+    here-string). Returns:
+      pieces: [("code", text) | ("body", heredoc)] in order. Code is the command text outside the heredoc bodies
+        (the operator line stays, body and terminator line are cut out) with the line breaks inside quotes as
+        QUOTED_NEWLINE_SENTINEL and $'...' rewritten as $'<decoded value>' for shlex;
+      open_at: None, or the index in the last code piece of the start of the line where an unterminated quote
+        opens (bash runs the complete lines before it, then fails): from there the line breaks are real again;
+      deferred: heredocs inside a "...$(...)" string (their body stays inside that argument), judged as body
+        lines after the text unless a plain `cat` reads them for an argument of git / gh (a commit / PR message);
+      has_comment: a comment was removed.
+    A heredoc is {delim, quoted, strip (<<-, leading tabs removed from the body), terminated (unterminated: the
+    body runs to the end of the text, as in bash), body, head / tail (the operator line's command text before the
+    operator / after the word; inside $(...) a line starting with `EOF)` also ends it), interpreter (a terminated
+    body fed to python / node, _heredoc_feeds_interpreter)}. << inside $((...)) / ((...)) is a shift, never a
+    heredoc. Raise ShellScanError (deny): more than HEREDOC_MAX_PER_SCAN operators, a `case` command inside $(...)
+    (its pattern `)` would close the substitution early) and a multi-line arithmetic holding <<."""
+    pieces: List[Tuple[str, Any]] = []
+    deferred: List[Dict[str, Any]] = []
+    buf: List[str] = []
+    stack: List[Dict[str, Any]] = [_scan_frame("cmd", None, 0)]
+    pending: List[Dict[str, Any]] = []
+    has_comment = False
+    word_start = True
+    heredoc_count = 0
+    i, n = 0, len(text)
+
+    def emit(s: str, frame: Dict[str, Any]) -> None:
+        if frame["esc"]:
+            buf.append(_dq_escape(s))
+        elif frame["kind"] in ("sq", "dq"):
+            buf.append(s.replace("\n", QUOTED_NEWLINE_SENTINEL))
+        else:
+            buf.append(s)
+
+    def push(kind: str, opener: str, parent: Dict[str, Any], **kw: Any) -> None:
+        start = len(buf)
+        emit(opener, parent)
+        stack.append(_scan_frame(kind, parent, start, **kw))
+        stack[-1]["line_start"] = len(buf)
+
+    def read_bodies(pos: int, nl: int) -> int:
+        cur = stack[-1]
+        in_subst = any(fr["subst"] for fr in stack)
+        for h in pending:  # tails first: a flushed buffer would lose them
+            tail = "".join(buf[h["end"]:nl])
+            h["tail"] = _sq_unescape_dq(tail) if h["esc"] else tail
+        for h in pending:
+            start = pos
+            lines: List[str] = []
+            terminated = False
+            while pos < n:
+                e = text.find("\n", pos)
+                raw_line = text[pos:n if e < 0 else e]
+                line = raw_line.lstrip("\t") if h["strip"] else raw_line
+                if line.rstrip("\r") == h["delim"]:
+                    terminated, pos = True, (n if e < 0 else e + 1)
+                    break
+                if in_subst and line.startswith(h["delim"] + ")"):
+                    # bash ends a heredoc inside $(...) at `EOF)` too: scanning resumes at that `)`
+                    terminated = True
+                    pos += len(raw_line) - len(line) + len(h["delim"])
+                    break
+                pos = n if e < 0 else e + 1
+                lines.append(line)
+            h.update(body="\n".join(lines), terminated=terminated)
+            # an unterminated body fed to python / node is judged too (fail closed)
+            h["interpreter"] = terminated and _heredoc_feeds_interpreter(h["head"], h["tail"])
+            h["shell"] = _heredoc_feeds_shell(h["head"], h["tail"])
+            if cur["esc"]:
+                # "$(cat <<'EOF' ... EOF)": the body is part of the quoted argument (a commit message)
+                buf.append(_dq_escape(text[start:pos]))
+                if not h["interpreter"] and not _heredoc_is_message(h["head"], h["tail"], h["outer"]):
+                    h["shell"] = True  # its output feeds an outer command (eval "$(cat <<EOF ...)"): fail closed
+                    deferred.append(h)
+            else:
+                pieces.append(("code", "".join(buf)))
+                pieces.append(("body", h))
+                buf.clear()
+                for fr in stack:
+                    fr["line_start"] = 0
+        pending.clear()
+        return pos
+
+    while i < n:
+        f = stack[-1]
+        kind = f["kind"]
+        c = text[i]
+        if kind == "sq":
+            j = text.find("'", i)
+            if j < 0:
+                emit(text[i:], f)
+                i = n
+                continue
+            emit(text[i:j], f)
+            stack.pop()
+            emit("'", stack[-1])
+            word_start, i = False, j + 1
+            continue
+        if kind == "ansi":
+            if c == "\\" and i + 1 < n:
+                f["raw"].append(text[i:i + 2])
+                i += 2
+            elif c == "'":
+                stack.pop()
+                raw = "".join(f["raw"])
+                if f["esc"]:
+                    buf.append(_dq_escape("$'" + raw + "'"))
+                else:
+                    value = _ansi_c_decode(raw).replace("'", "'\"'\"'").replace("\n", QUOTED_NEWLINE_SENTINEL)
+                    buf.append("$'" + value + "'")
+                word_start, i = False, i + 1
+            else:
+                f["raw"].append(c)
+                i += 1
+            continue
+        if kind == "bt":
+            # bash finds the closing backquote textually (backslash escapes only): quotes inside cannot pair with
+            # quotes outside, so they are escaped for shlex
+            if c == "\\" and i + 1 < n:
+                buf.append(_dq_escape(text[i:i + 2]) if f["esc"] else text[i:i + 2])
+                i += 2
+            elif c == "`":
+                stack.pop()
+                emit("`", stack[-1])
+                word_start, i = False, i + 1
+            else:
+                buf.append(_dq_escape(c) if f["esc"] else ("\\" + c if c in "'\"" else c))
+                i += 1
+            continue
+        if kind == "dq":
+            plain = SCAN_PLAIN_DQ_RE.match(text, i)
+            if plain:
+                emit(plain.group(0), f)
+                i = plain.end()
+            elif c == "\\" and i + 1 < n:
+                if text[i + 1] != "\n":  # backslash-newline is a line continuation inside "..." too
+                    emit(text[i:i + 2], f)
+                i += 2
+            elif c == '"':
+                stack.pop()
+                emit('"', stack[-1])
+                word_start, i = False, i + 1
+            elif text.startswith("$((", i):
+                push("cmd", "$((", f, closes=True, paren=1, arith=True)
+                word_start, i = True, i + 3
+            elif text.startswith("$(", i):
+                push("cmd", "$(", f, closes=True, subst=True)
+                word_start, i = True, i + 2
+            elif c == "`":
+                push("bt", "`", f)
+                i += 1
+            else:
+                emit(c, f)
+                i += 1
+            continue
+        # command context (top level, $(...), ((...)))
+        plain = SCAN_PLAIN_CMD_RE.match(text, i)
+        if plain:
+            if f["subst"] and "case" in plain.group(0):
+                _reject_case_in_subst(plain.group(0), word_start, "".join(buf[f["line_start"]:]))
+            emit(plain.group(0), f)
+            word_start, i = plain.group(0)[-1] in WORD_BOUNDARY_CHARS, plain.end()
             continue
         if c == "\\":
-            word_start = False
-            i += 2
-            continue
-        if c == "#" and word_start:
-            return True
-        if c in "'\"":
-            quote = c
-        word_start = c in WORD_BOUNDARY_CHARS
-        i += 1
-    return False
+            if i + 1 < n and text[i + 1] == "\n":
+                i += 2  # line continuation: removed, word_start unchanged
+                continue
+            emit(text[i:i + 2], f)
+            word_start, i = False, i + 2
+        elif c in "'\"":
+            push("sq" if c == "'" else "dq", c, f)
+            word_start, i = False, i + 1
+        elif text.startswith("$'", i):
+            stack.append(_scan_frame("ansi", f, len(buf)))
+            word_start, i = False, i + 2
+        elif text.startswith("$((", i):
+            push("cmd", "$((", f, closes=True, paren=1, arith=True)
+            word_start, i = True, i + 3
+        elif text.startswith("$(", i):
+            push("cmd", "$(", f, closes=True, subst=True)
+            word_start, i = True, i + 2
+        elif c == "`":
+            push("bt", "`", f)
+            word_start, i = False, i + 1
+        elif c == "(" and word_start and text.startswith("((", i):
+            push("cmd", "((", f, closes=True, paren=1, arith=True)
+            stack[-1]["bare"] = True
+            word_start, i = True, i + 2
+        elif c == ")" and f["closes"] and f["paren"] == 0:
+            stack.pop()
+            emit(")", stack[-1])
+            # after a bare ((...)) command a new word starts (`((1))# x` is a comment); $(...) is part of a word
+            word_start, i = bool(f.get("bare")), i + 1
+        elif c in "()":
+            if f["closes"]:
+                f["paren"] += 1 if c == "(" else -1
+            emit(c, f)
+            word_start, i = True, i + 1
+        elif c == "#" and word_start:
+            j = text.find("\n", i)
+            has_comment, i = True, (n if j < 0 else j)
+        elif text.startswith("<<<", i):
+            emit("<<<", f)
+            word_start, i = True, i + 3
+        elif f["arith"] and text.startswith("<<", i):
+            f["shift"] = True  # a shift; see the line-break check below
+            emit("<<", f)
+            word_start, i = True, i + 2
+        elif text.startswith("<<", i) and _heredoc_word(text, i) is not None:
+            end, delim, quoted, strip = _heredoc_word(text, i)
+            heredoc_count += 1
+            if heredoc_count > HEREDOC_MAX_PER_SCAN:
+                raise ShellScanError(f"more than {HEREDOC_MAX_PER_SCAN} heredoc operators")
+            head = "".join(buf[f["line_start"]:])
+            # inside "...$(...)": the command line holding that string (git commit -m "$(cat <<EOF ...)")
+            first_dq = next((k for k, fr in enumerate(stack) if fr["kind"] == "dq"), None)
+            outer = "".join(buf[stack[first_dq - 1]["line_start"]:]) if first_dq else ""
+            emit(text[i:end], f)
+            pending.append({"delim": delim, "quoted": quoted, "strip": strip, "end": len(buf), "esc": f["esc"],
+                            "head": _sq_unescape_dq(head) if f["esc"] else head, "outer": outer,
+                            "tail": "", "body": "", "terminated": False, "interpreter": False})
+            word_start, i = False, end
+        elif c == "\n":
+            if f["arith"] and f["shift"]:
+                # `$((cat <<EOF` is a $( (subshell) ) whose heredoc bash reads; a multi-line arithmetic with << is
+                # too ambiguous to audit
+                raise ShellScanError("<< in a multi-line $((...)) / ((...))")
+            emit("\n", f)
+            nl = len(buf) - 1
+            f["line_start"] = len(buf)
+            word_start, i = True, i + 1
+            if pending:
+                i = read_bodies(i, nl)
+        else:
+            emit(c, f)
+            word_start, i = c in WORD_BOUNDARY_CHARS, i + 1
+
+    if stack[-1]["kind"] == "ansi":  # unterminated $'...': kept raw
+        raw = "$'" + "".join(stack[-1]["raw"])
+        buf.append(_dq_escape(raw) if stack[-1]["esc"] else raw)
+    code = "".join(buf)
+    open_at = None
+    opened = next((fr for fr in stack if fr["kind"] in ("sq", "dq", "ansi", "bt")), None)
+    if opened is not None:
+        start = len("".join(buf[:opened["start"]]))
+        open_at = code.rfind("\n", 0, start) + 1
+        code = code[:open_at] + code[open_at:].replace(QUOTED_NEWLINE_SENTINEL, "\n")
+    pieces.append(("code", code))
+    return {"pieces": pieces, "open_at": open_at, "deferred": deferred, "has_comment": has_comment}
+
+
+def _protect_quoted_newlines(command_line: str) -> str:
+    """The command text _scan_shell hands to shlex (heredoc bodies cut out, comments and line continuations
+    removed): line breaks INSIDE a '...' / "..." / $'...' string are QUOTED_NEWLINE_SENTINEL, a line break between
+    a closing quote and the next line's opening quote stays a command separator. From the line where an
+    unterminated quote opens (an apostrophe in a word, unbalanced text) the line breaks stay real: over-splitting is
+    the fail-safe direction."""
+    return "".join(value for kind, value in _scan_shell(command_line)["pieces"] if kind == "code")
 
 
 def _auto_allow_blocker(command_line: str) -> Optional[str]:
@@ -1591,32 +1954,94 @@ def _auto_allow_blocker(command_line: str) -> Optional[str]:
     for marker, label in AUTO_ALLOW_BLOCKERS:
         if marker in text:
             return f"it contains {label}"
-    if _has_unquoted_comment(text):
+    if _scan_shell(text)["has_comment"]:
         return "it contains a # comment"
     if any("\n" in t or "\r" in t or QUOTED_NEWLINE_SENTINEL in t for t in _tokenize(text)):
         return "an argument holds a line break"
     return None
 
 
-def _tokenize(command_line: str) -> List[str]:
-    """Quote-aware tokens (shell operators split off). When the whole text does not parse (an apostrophe in a
-    heredoc body or a comment), each line is tokenized on its own and only the lines that still fail fall back to a
-    whitespace / operator split with their quote characters stripped. Line breaks inside quotes are still
-    QUOTED_NEWLINE_SENTINEL here, so a quoted line break ('<LF>') is never taken for a "\\n" command separator:
-    split on SHELL_SEPARATORS first, then pass every kept token through _restore_quoted_newline."""
-    command_line = _protect_quoted_newlines(command_line)
+def _line_tokens(text: str) -> List[str]:
+    """Fallback tokens: each line on its own, and the lines that still do not parse split on whitespace / operators
+    with their quote characters stripped (never a denial on its own; nothing is hidden)."""
+    out: List[str] = []
+    for n, line in enumerate(text.split("\n")):
+        if n:
+            out.append("\n")
+        try:
+            out += _shlex_tokens(line)
+        except Exception:
+            out += [t.strip("'\"") for t in re.split(r"\s+|(?=[;&|<>])|(?<=[;&|<>])", line)]
+    return out
+
+
+def _code_tokens(code: str, open_at: Optional[int]) -> List[str]:
+    """shlex tokens of a code piece of _scan_shell. With an unterminated quote opening on the line at open_at, the
+    complete lines before it are tokenized together (their quotes are balanced) and the rest line by line, so the
+    open quote cannot swallow an earlier line (bash runs those before failing)."""
     try:
-        return _shlex_tokens(command_line)
+        return _shlex_tokens(code)
     except Exception:
-        out: List[str] = []
-        for n, line in enumerate(command_line.split("\n")):
-            if n:
-                out.append("\n")
-            try:
-                out += _shlex_tokens(line)
-            except Exception:
-                out += [t.strip("'\"") for t in re.split(r"\s+|(?=[;&|<>])|(?<=[;&|<>])", line)]
-        return out
+        if not open_at:
+            return _line_tokens(code)
+    try:
+        head = _shlex_tokens(code[:open_at])
+    except Exception:
+        head = _line_tokens(code[:open_at])
+    return head + _line_tokens(code[open_at:])
+
+
+def _heredoc_body_tokens(heredoc: Dict[str, Any], drop_interpreter_bodies: bool, depth: int) -> List[str]:
+    """Tokens of a heredoc body, isolated from the surrounding text (a quote in the body never pairs with one
+    outside it) and framed by line breaks. A body fed to python / node is dropped when drop_interpreter_bodies
+    (the ground-truth line check: its code is judged by the inline write markers on the raw text). Any other body
+    is judged as shell lines: scanned like a script (comments, quotes and nested heredocs as a shell reading it
+    would see them); when that scan removed a comment or let a quote span lines, every body line is also judged on
+    its own (a body that is data or another language: # is not a comment there and an apostrophe must not hide the
+    lines after it). When the scan fails (ShellScanError: a case command inside $(...), nesting) the denial
+    propagates for a body a shell runs (_heredoc_feeds_shell); any other body falls back to the line-by-line
+    tokens."""
+    if heredoc["interpreter"] and drop_interpreter_bodies:
+        return ["\n"]
+    body = heredoc["body"]
+    try:
+        tokens, scan = _tokenize_scan(body, drop_interpreter_bodies, depth + 1)
+    except ShellScanError:
+        if heredoc.get("shell", True):
+            raise  # a shell runs this body: fail closed
+        # data for another program (cat > f.sh, tee, perl ...): judged line by line instead, still strict
+        return ["\n"] + _line_tokens(body) + ["\n"]
+    out = ["\n"] + tokens
+    if scan["has_comment"] or scan["open_at"] is not None or any(QUOTED_NEWLINE_SENTINEL in t for t in tokens):
+        out += ["\n"] + _line_tokens(body)
+    return out + ["\n"]
+
+
+def _tokenize_scan(command_line: str, drop_interpreter_bodies: bool = False,
+                   depth: int = 0) -> Tuple[List[str], Dict[str, Any]]:
+    if depth > HEREDOC_NESTING_LIMIT:
+        raise ShellScanError(f"heredocs nested deeper than {HEREDOC_NESTING_LIMIT} levels")
+    scan = _scan_shell(command_line)
+    out: List[str] = []
+    last = len(scan["pieces"]) - 1
+    for k, (kind, value) in enumerate(scan["pieces"]):
+        if kind == "code":
+            out += _code_tokens(value, scan["open_at"] if k == last else None)
+        else:
+            out += _heredoc_body_tokens(value, drop_interpreter_bodies, depth)
+    for heredoc in scan["deferred"]:
+        out += _heredoc_body_tokens(heredoc, drop_interpreter_bodies, depth)
+    return out, scan
+
+
+def _tokenize(command_line: str, drop_interpreter_bodies: bool = False) -> List[str]:
+    """Quote-aware tokens (shell operators split off) of the text as bash reads it (_scan_shell): comments and line
+    continuations removed, each heredoc body tokenized on its own right after its operator line
+    (_heredoc_body_tokens), an unterminated quote confined to the lines from where it opens (_code_tokens). Line
+    breaks inside quotes are still QUOTED_NEWLINE_SENTINEL here, so a quoted line break ('<LF>') is never taken for
+    a "\\n" command separator: split on SHELL_SEPARATORS first, then pass every kept token through
+    _restore_quoted_newline. A scanner failure (ShellScanError) propagates: the hook denies."""
+    return _tokenize_scan(command_line, drop_interpreter_bodies)[0]
 
 
 def _restore_quoted_newline(tok: str) -> str:
@@ -3647,38 +4072,38 @@ def _ground_truth_writes(tokens: List[str], text: str, cwd: str = "", base_dir: 
     return _protected_hits(hits)
 
 
-def _heredoc_feeds_interpreter(line: str, m: "re.Match") -> bool:
-    """True when the heredoc operator m belongs to a python/node sub-command (python3 - <<EOF, node <<EOF) or to
-    `cat <<EOF | python3`; any other program (perl, bash, cat...) keeps its body in the line-by-line check."""
-    head = split_subcommands(line[:m.start()])
-    prog = re.sub(r"\.exe$", "", _program(head[-1])) if head else ""
+def _heredoc_program(head: str) -> str:
+    """Program of the last sub-command of a heredoc operator's head (the command text before it on its line)."""
+    subs = split_subcommands(head)
+    return re.sub(r"\.exe$", "", _program(subs[-1])) if subs else ""
+
+
+def _heredoc_feeds_interpreter(head: str, tail: str) -> bool:
+    """True when the heredoc operator belongs to a python/node sub-command (python3 - <<EOF, node <<EOF) or to
+    `cat <<EOF | python3` (head / tail: the operator line's command text before the operator / after its word);
+    any other program (perl, bash, cat...) keeps its body in the line-by-line check."""
+    prog = _heredoc_program(head)
     if CODE_INTERPRETER_PROGRAM_RE.match(prog):
         return True
-    return prog == "cat" and bool(PIPE_TO_CODE_INTERPRETER_RE.match(line[m.end():]))
+    return prog == "cat" and bool(PIPE_TO_CODE_INTERPRETER_RE.match(tail))
 
 
-def _strip_interpreter_heredocs(command_line: str) -> str:
-    """Drops heredoc bodies fed to python/node: their code is judged by INLINE_WRITE_MARKERS_RE on the whole
-    command line, not line by line as shell sub-commands."""
-    lines = command_line.split("\n")
-    out: List[str] = []
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        out.append(line)
-        i += 1
-        for m in HEREDOC_RE.finditer(line):
-            interpreter = _heredoc_feeds_interpreter(line, m)
-            delim, strip_tabs = m.group(3), m.group(1) == "-"
-            while i < len(lines) and (lines[i].lstrip("\t") if strip_tabs else lines[i]) != delim:
-                if not interpreter:
-                    out.append(lines[i])
-                i += 1
-            if i < len(lines):
-                if not interpreter:
-                    out.append(lines[i])
-                i += 1
-    return "\n".join(out)
+def _heredoc_feeds_shell(head: str, tail: str) -> bool:
+    """True when a shell (or eval / source / wsl / xargs / su / script) reads the heredoc: bash <<EOF, sh -s <<EOF,
+    cat <<EOF | sh. A scan failure of such a body denies; any other body is data for its program."""
+    if _heredoc_program(head) in SHELL_INTERPRETERS | HEREDOC_SHELL_READERS:
+        return True
+    return bool(re.search(r"\|&?\s*(?:\S*/)?(?:%s)(?:\.exe)?\b" % "|".join(
+        sorted(SHELL_INTERPRETERS | HEREDOC_SHELL_READERS - {"."}, key=len, reverse=True)), tail))
+
+
+def _heredoc_is_message(head: str, tail: str, outer: str) -> bool:
+    """A heredoc inside "$(...)" read by a plain `cat` (no redirect, pipe or background) whose string is an argument
+    of git / gh (outer: that command line up to the heredoc): `git commit -m "$(cat <<'EOF' ... EOF)"`. Its body is
+    message text inside the quoted argument, not judged as shell lines; any other consumer (eval "$(cat <<EOF ...)",
+    bash -c, echo ...) gets the body judged."""
+    return (_heredoc_program(head) == "cat" and not re.search(r"[|<>&;]", head.split("cat", 1)[-1] + tail)
+            and _heredoc_program(outer) in HEREDOC_MESSAGE_PROGRAMS)
 
 
 def _inline_logs_dir_writes(command_line: str, cwd: str = "", base_dir: str = "") -> List[str]:
@@ -3706,11 +4131,24 @@ def _lift_path_substitutions(command_line: str, runtime_prefix: bool = False) ->
     the run-time value $__subst__, whose `$__subst__/logs` _is_logs_dir treats as logs/), and any other one-line
     command substitution ($(cmd), `cmd`) by $__subst__; each lifted command is appended as a separate line. Unquoted, the tokenizer would split `$(pwd)/logs` into '$', '(', 'pwd', ')', '/logs' and the path
     would never reach the rm / ln operand checks."""
+    line, lifted = _lift_substitutions(command_line, runtime_prefix)
+    return line + "".join("\n" + c for c in lifted)
+
+
+def _lift_substitutions(command_line: str, runtime_prefix: bool = False) -> Tuple[str, List[str]]:
+    """(rewritten line, lifted commands) of _lift_path_substitutions. Applied to the raw text, so a substitution
+    in a comment or a heredoc body (bash expands it in an unquoted body) is lifted too: the strict direction."""
     line = HOME_VAR_RE.sub("~", CWD_SUBSTITUTION_RE.sub(".", command_line))
     lifted: List[str] = []
 
     def lift(m: "re.Match", replacement: str) -> str:
         inner = m.group(1) if m.group(1) is not None else m.group(2)
+        if HEREDOC_OPERATOR_RE.search(inner):
+            # $(cat <<EOF): its body follows on the next lines, so the operator stays in place for _scan_shell
+            # (removing it would leave the body as command text whose quotes pair with later ones)
+            if inner not in lifted:
+                lifted.append(inner)
+            return m.group(0)
         if inner.strip():
             lifted.append(inner)
         return replacement
@@ -3721,17 +4159,22 @@ def _lift_path_substitutions(command_line: str, runtime_prefix: bool = False) ->
         if lifted_line == line:
             break
         line = lifted_line
-    return line + "".join("\n" + c for c in lifted)
+    return line, lifted
 
 
 def _ground_truth_segments(command_line: str) -> List[Tuple[List[str], bool]]:
     """(sub-command tokens, fed by a pipe from the previous sub-command) for the ground-truth check: substitutions
-    lifted, interpreter heredoc bodies dropped and `find` predicates split off by escaped parentheses / `\\;`
+    lifted (each lifted command tokenized on its own, so neither an open quote nor an unterminated heredoc body can
+    swallow it), interpreter heredoc bodies dropped and `find` predicates split off by escaped parentheses / `\\;`
     re-attached to their find (find . \\( -type f \\) -delete)."""
     segments: List[Tuple[List[str], bool]] = []
     current: List[str] = []
     piped = False
-    for tok in _tokenize(_strip_interpreter_heredocs(_lift_path_substitutions(command_line, runtime_prefix=True))):
+    line, lifted = _lift_substitutions(command_line, runtime_prefix=True)
+    tokens = _tokenize(line, drop_interpreter_bodies=True)
+    for inner in lifted:
+        tokens += ["\n"] + _tokenize(inner, drop_interpreter_bodies=True)
+    for tok in tokens:
         if not tok:
             continue
         if tok in SHELL_SEPARATORS:
@@ -3993,7 +4436,7 @@ def _stdin_shell_hits(tokens: List[str], producers: List[List[str]], cwds: List[
 
     for j, t in enumerate(raw_args):
         if t in ("<<", "<<-"):
-            return []  # heredoc: the body is judged line by line with the rest of the command
+            return []  # heredoc: its body is judged as shell lines right after this one (_heredoc_body_tokens)
         if t == "<<<":
             if j + 1 >= len(raw_args):
                 return deny

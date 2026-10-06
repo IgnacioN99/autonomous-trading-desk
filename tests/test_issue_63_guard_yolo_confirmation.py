@@ -336,12 +336,17 @@ class TestShellWrappedConfirmation(t49.PowerShellHarness):
             self.assertBothShells(command, "deny", YOLO_GATE)
 
     def test_backslash_line_continuation_before_confirmed(self):
-        # The hook's shlex tokenizer does not join backslash-newline continuations: the newline splits the command,
-        # so --confirmed on the continuation line is not seen and the order is denied (fails closed).
+        # Issue #98: the hook's lexical pre-pass joins backslash-newline continuations as bash does, so --confirmed
+        # on the continuation line is the trade's own flag (never a confirmation denial); a multi-line command is
+        # still never auto-allowed: normal permission prompt.
         for command in (f"{self.TRADE} \\\n  --confirmed", f"bash -lc '{self.TRADE} \\\n  --confirmed'"):
             res = self.bash(command)
-            self.assertEqual(self.decision(res), "deny", res)
-            self.assertIn(YOLO_GATE, res["__stderr__"])
+            self.assertEqual(self.decision(res), "passthrough", res)
+            self.assertNotIn(YOLO_GATE, res["__stderr__"])
+        # Without the flag on the continuation line the order is still denied
+        res = self.bash(f"{self.TRADE} \\\n  --env prod")
+        self.assertEqual(self.decision(res), "deny", res)
+        self.assertIn(YOLO_GATE, res["__stderr__"])
         self.assertEqual(self.decision(self.bash(f"{self.TRADE} --confirmed")), "allow")
 
 

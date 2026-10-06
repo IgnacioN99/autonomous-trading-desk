@@ -897,9 +897,11 @@ class TestGroundTruthProtection(GuardHarness):
             res = self.agy(self.cmd(c))
             self.assertEqual(res.get("decision"), "ask", c)
             self.assertNotGroundTruth(res, c)
-        lines = pre_trade_guard._strip_interpreter_heredocs("perl <<'EOF' # python\nunlink x;\nEOF").split("\n")
-        self.assertIn("unlink x;", lines)
-        self.assertNotIn("x = 1", pre_trade_guard._strip_interpreter_heredocs("python3 - <<'EOF'\nx = 1\nEOF").split("\n"))
+        # Issue #98: _strip_interpreter_heredocs was replaced by the lexical pre-pass (_scan_shell); the ground-truth
+        # sub-commands keep a perl body (the comment does not make it python) and drop a python body
+        subs = pre_trade_guard._ground_truth_subcommands
+        self.assertIn(["unlink", "x"], subs("perl <<'EOF' # python\nunlink x;\nEOF"))
+        self.assertEqual(subs("python3 - <<'EOF'\nx = 1\nEOF"), [["python3", "-", "<<", "EOF"]])
 
     def test_unquoted_command_substitution_paths_denied(self):
         self.assertEqual(pre_trade_guard._lift_path_substitutions("rm -rf $(pwd)/logs"), "rm -rf ./logs")
@@ -1660,8 +1662,11 @@ class TestQuotedNewlineSplitting(GuardHarness):
         self.assertEqual(protect("echo \"a\\\"\nb\"\nls"), "echo \"a\\\"__newline__b\"\nls")  # \" stays inside
         self.assertEqual(protect("echo 'a\\'\nls"), "echo 'a\\'\nls")  # backslash is literal inside '...'
         self.assertEqual(protect("echo \\'\nls\necho \\'"), "echo \\'\nls\necho \\'")  # escaped quotes outside
-        self.assertEqual(protect("ls # it's\n'rm' -rf logs\necho 'x'"), "ls # it's\n'rm' -rf logs\necho 'x'")
+        # Issue #98: the helper now returns the scanner's command text: comments are removed (the line break kept)
+        # and the line breaks stay real from the line where an unterminated quote opens
+        self.assertEqual(protect("ls # it's\n'rm' -rf logs\necho 'x'"), "ls \n'rm' -rf logs\necho 'x'")
         self.assertEqual(protect("echo it's\nrm -rf logs"), "echo it's\nrm -rf logs")  # unbalanced: unchanged
+        self.assertEqual(protect("echo 'a\nb'\necho it's\nls"), "echo 'a__newline__b'\necho it's\nls")
         self.assertEqual(protect("echo a#'\nb'"), "echo a#'__newline__b'")  # '#' inside a word is not a comment
         self.assertAllGroundTruthDenied(["ls # it's\n'rm' -rf logs\necho 'x'", "echo it's\nrm -rf logs"])
 
@@ -1691,13 +1696,14 @@ class TestNestedNewlinesAndAutoAllowFailSafe(GuardHarness):
                          [["bash", "-c", "true\nrm -rf logs"]])
 
     def test_hidden_lines_never_auto_allowed(self):
+        # Issue #98: the lines a comment / ANSI-C string / quoted "<<EOF" used to hide are now seen, and denied
         for c in (self.CLOSE + " # it's\nrm -rf logs\necho \\'",
                   self.CLOSE + " $'\\''\nrm -rf logs\necho \\'",
                   "python3 scripts/loops/night_cutoff_loop.py \"<<EOF\"\nrm -rf logs close_position.py",
                   "rm -rf logs close_position.py"):
-            self.assertNotEqual(self.decision(c), "allow", c)
+            self.assertDenied(self.agy(self.cmd(c)), "Ground Truth Protection")
             res = self.run_guard({"tool_name": "Bash", "tool_input": {"command": c}})
-            self.assertNotEqual(res.get("hookSpecificOutput", {}).get("permissionDecision"), "allow", c)
+            self.assertEqual(res.get("__exit_code__"), 2, c)
 
     def test_flat_single_line_required_for_allow(self):
         # Each of these is risk-reducing for the analysis but carries text it cannot vouch for: ask, never deny
@@ -1716,8 +1722,11 @@ class TestNestedNewlinesAndAutoAllowFailSafe(GuardHarness):
         self.write_provenance_dossier("BTCUSDT", "LONG")
         opening = "python3 scripts/execute_futures_trade.py --symbol BTCUSDT --direction LONG --leverage 3 --env prod"
         self.assertEqual(self.agy(self.cmd(opening, conversationId=PARENT_CONV_ID)).get("decision"), "allow")
-        self.assertEqual(self.agy(self.cmd(opening + " # it's\nrm -rf logs\necho \\'",
+        self.assertEqual(self.agy(self.cmd(opening + "\nls -la",
                                            conversationId=PARENT_CONV_ID)).get("decision"), "ask")
+        # Issue #98: a comment no longer hides the next lines, so the destructive line is denied
+        self.assertDenied(self.agy(self.cmd(opening + " # it's\nrm -rf logs\necho \\'",
+                                            conversationId=PARENT_CONV_ID)), "Ground Truth Protection")
         # PowerShell: a multi-line command is not auto-allowed either
         ps = pre_trade_guard.evaluate_powershell_command
         self.assertEqual(ps("python scripts\\execute_futures_trade.py --close-position --symbol BTCUSDT",
@@ -1763,6 +1772,206 @@ class TestNestedNewlinesAndAutoAllowFailSafe(GuardHarness):
             res = self.agy(self.cmd(c))
             self.assertNotEqual(res.get("decision"), "deny", c)
             self.assertNotIn("Ground Truth Protection", res.get("reason", ""), c)
+
+
+class TestCommentAndHeredocLexicalScan(GuardHarness):
+    """Issue #98: comments and heredoc bodies with apostrophes must not hide later lines from Ground Truth Protection.
+    One bash-aware lexical pre-pass (_scan_shell) strips comments, joins line continuations, cuts heredoc bodies out
+    (tokenized on their own) and confines an unterminated quote to the lines from where it opens."""
+
+    CLOSE = "python3 scripts/execute_futures_trade.py --close-position --symbol BTCUSDT"
+    CUTOFF = "python3 scripts/loops/night_cutoff_loop.py --env prod"
+
+    def assertDeniedBothRuntimes(self, commands, fragment="Ground Truth Protection"):
+        for c in commands:
+            with self.subTest(command=c):
+                self.assertDenied(self.agy(self.cmd(c)), fragment)
+                res = self.run_guard({"tool_name": "Bash", "tool_input": {"command": c}})
+                self.assertEqual(res.get("__exit_code__"), 2, c)
+
+    def assertNotDenied(self, commands):
+        for c in commands:
+            with self.subTest(command=c):
+                res = self.agy(self.cmd(c))
+                self.assertNotEqual(res.get("decision"), "deny", c)
+                self.assertNotIn("Ground Truth Protection", res.get("reason", ""), c)
+
+    def test_issue_examples_denied(self):
+        self.assertDeniedBothRuntimes([
+            "ls # it's\nrm -rf logs\necho '",                                    # E1: comment apostrophe
+            "cat <<EOF\n'\nEOF\nrm -rf logs\necho '",                            # E2: heredoc body quote
+            "python3 scripts/loops/night_cutoff_loop.py \"<<EOF\"\nrm -rf logs",  # E3: quoted <<EOF
+            "ls \\\n# it's\nrm -rf logs\necho '",                                # E4: # after a continuation
+            "cat <<EOF\n'\nEOF\nrm -rf logs\necho ' # it's",                     # combined
+            self.CUTOFF + " # it's\nrm -rf logs\necho '",
+        ])
+
+    def test_quoted_heredoc_operator_with_interpreter_head_is_not_a_heredoc(self):
+        self.assertDeniedBothRuntimes([
+            "python3 - '<<EOF'\nrm -rf logs", "python3 - \"<<EOF\"\nrm -rf logs",
+            "node -e 'x' \"<<EOF\"\nrm -rf logs\nEOF", "python3 -c 'print(1)' '<<EOF'\nrm -rf logs\nEOF",
+        ])
+        self.assertEqual([k for k, _ in pre_trade_guard._scan_shell("python3 - '<<EOF'\nx")["pieces"]], ["code"])
+
+    def test_heredoc_variants(self):
+        self.assertDeniedBothRuntimes([
+            # several heredocs on one line, the second body holding a quote
+            "cat <<A <<B\na\nA\nit's\nB\nrm -rf logs\necho '",
+            "cat <<A; cat <<'B'\nx\nA\ny'\nB\nrm -rf logs\necho '",
+            # <<- strips the tabs of the body and of the terminator
+            "cat <<-EOF\n\tit's\n\tEOF\nrm -rf logs\necho '",
+            # quoted / escaped delimiter words
+            "cat <<\"EOF\"\n'\nEOF\nrm -rf logs\necho '", "cat <<\\EOF\n'\nEOF\nrm -rf logs\necho '",
+            "cat << 'E O'\n'\nE O\nrm -rf logs\necho '",
+            # a python body is isolated too: its quote cannot reach the shell lines after the terminator
+            "python3 - <<'EOF'\nx = \"it's\"\nEOF\nrm -rf logs\necho '",
+        ])
+        scan = pre_trade_guard._scan_shell("cat <<A <<-'B' > /tmp/x\na\nA\n\tb'\n\tB\nls")
+        bodies = [v for k, v in scan["pieces"] if k == "body"]
+        self.assertEqual([(h["delim"], h["quoted"], h["strip"], h["body"], h["terminated"]) for h in bodies],
+                         [("A", False, False, "a", True), ("B", True, True, "b'", True)])
+        self.assertEqual(scan["pieces"][-1], ("code", "ls"))
+        unterminated = pre_trade_guard._scan_shell("cat <<EOF\nx\nrm -rf logs")
+        self.assertEqual([v["body"] for k, v in unterminated["pieces"] if k == "body"], ["x\nrm -rf logs"])
+
+    def test_ansi_c_strings_comments_and_here_strings(self):
+        self.assertDeniedBothRuntimes([
+            "echo $'it\\'s'\nrm -rf logs\necho \\'",
+            "ls # <<EOF\nrm -rf logs\nEOF",                 # a comment never opens a heredoc
+            "cat <<< x\nrm -rf logs\nx",                    # a here-string is not a heredoc
+            "cat <<< \"it's\"\nrm -rf logs",
+            "bash -c $'echo hi\\nrm -rf l\\x6fgs'",          # $'...' escapes decoded (\\n, \\x6f)
+            "rm -rf $'\\154ogs'",                            # octal escape
+        ])
+        self.assertEqual(pre_trade_guard.split_subcommands("echo $'it\\'s'\nls"), [["echo", "$it's"], ["ls"]])
+        self.assertEqual([k for k, _ in pre_trade_guard._scan_shell("cat <<< x\nls\nx")["pieces"]], ["code"])
+        self.assertIn(["rm", "-rf", "logs"], pre_trade_guard.split_subcommands("ls # it's\nrm -rf logs\necho '"))
+        self.assertEqual(pre_trade_guard.split_subcommands("ls \\\n-la"), [["ls", "-la"]])
+
+    def test_heredoc_fed_to_a_shell_is_judged(self):
+        self.assertDeniedBothRuntimes([
+            "sh <<'EOF'\necho x > logs/guardian_state.json\nEOF",
+            "cat <<'EOF' | sh\nrm -rf logs\nEOF",
+            "bash -s <<'EOF'\n# it's\nrm -rf logs\n# that's\nEOF",
+            "echo \"$(bash <<'EOF'\nrm -rf logs\nEOF\n)\"",
+        ])
+        self.assertNotDenied(["bash <<'EOF'\nls # it's\nEOF", "sh <<'EOF'\necho ok\nEOF"])
+
+    def test_heredoc_inside_quoted_command_substitution(self):
+        # The body is part of the quoted argument (a commit message); its quote cannot pair with one outside
+        self.assertDeniedBothRuntimes([
+            "echo \"$(cat <<'EOF'\n\"\nEOF\n)\"\nrm -rf logs\necho \"",
+            "x=$(cat <<'EOF'\n'\nEOF\n)\nrm -rf logs\necho '",
+            # a one-line $(cat <<EOF) is lifted but its operator stays for the scanner (its body follows)
+            "echo \"$(cat <<EOF)\"\n'\nEOF\nrm -rf logs\necho '",
+            # bash expands $(...) in an unquoted body, also one fed to python
+            "python3 - <<EOF\nx = \"$(rm -rf logs)\"\nEOF",
+        ])
+        self.assertNotDenied([
+            "git commit -m \"$(cat <<'EOF'\nfix(guard): it's the \"scanner\", don't panic\n\nCo-Authored-By: x\nEOF\n)\"",
+        ])
+        tokens = pre_trade_guard.split_subcommands("git commit -m \"$(cat <<'EOF'\nit's \"x\"\nEOF\n)\"")
+        self.assertEqual(tokens, [["git", "commit", "-m", "$(cat <<'EOF'\nit's \"x\"\nEOF\n)"]])
+
+    def test_arithmetic_shift_is_never_an_interpreter_heredoc(self):
+        self.assertDeniedBothRuntimes([
+            "echo $((1<<2))\nrm -rf logs",
+            "python3 -c 'print(1)' $((1<<X))\nrm -rf logs\nX",
+            "(( python3 <<= 1 ))\nrm -rf logs\n=",
+        ])
+
+    def test_acceptance_negatives_unaffected(self):
+        self.assertNotDenied([
+            "git commit -m \"a\n\nb\"", "printf '%s' '\n'", "cat <<'EOF' > /tmp/n.txt\nit's fine\nEOF",
+            "git commit -F - <<'EOF'\nfix(guard): it's a lexer change, don't panic\n\nIt's tested.\nEOF",
+            "cat > /tmp/msg.txt <<'EOF'\nwe're done # it's\nEOF",
+        ])
+
+    def test_auto_allow_blocker_uses_the_scanner(self):
+        blocker = pre_trade_guard._auto_allow_blocker
+        self.assertIn("comment", blocker(self.CLOSE + " #x"))
+        self.assertIsNone(blocker(self.CLOSE + " --note 'a # b' --tag x#y"))
+        self.assertIsNotNone(blocker(self.CLOSE + " --note $'#'"))  # ANSI-C string (raw marker)
+        self.assertEqual(self.decision(self.CLOSE), "allow")
+        self.assertEqual(self.decision(self.CLOSE + " # it's fine"), "ask")
+
+    def decision(self, command_line):
+        return self.agy(self.cmd(command_line)).get("decision")
+
+    def test_round2_heredoc_closed_by_delimiter_paren_inside_substitution(self):
+        # bash ends a heredoc inside $(...) at `EOF)`: the lines after it are commands
+        self.assertDeniedBothRuntimes([
+            "git commit -m \"$(cat <<'EOF'\nmsg\nEOF)\"\nrm -rf logs\nEOF\n)\"",
+            "X=\"$(python3 - <<EOF\np\nEOF)\"\nrm -rf logs\necho '",
+            "X=$(python3 - <<EOF\np\nEOF)\nrm -rf logs",
+        ])
+
+    def test_round2_ansi_c_delimiter_and_unterminated_interpreter_body(self):
+        self.assertDeniedBothRuntimes([
+            "python3 - <<$'EOF'\nx\nEOF\nrm -rf logs\nEOF", "python3 - <<$\"EOF\"\nx\nEOF\nrm -rf logs\nEOF",
+            # an unterminated body fed to python is judged (fail closed)
+            "python3 - <<EOF\nx\nrm -rf logs", "cat <<'EOF' | node\nrm -rf logs",
+        ])
+        word = pre_trade_guard._heredoc_word
+        self.assertEqual(word("<<$'EOF'", 0), (8, "EOF", True, False))
+        self.assertEqual(word("<<$\"EOF\"", 0), (8, "EOF", True, False))
+        self.assertNotEqual(self.decision("python3 - <<'EOF'\nprint('ok')\nEOF"), "deny")
+
+    def test_round2_comment_after_bare_arithmetic_command(self):
+        self.assertDeniedBothRuntimes(["((1))# it's\nrm -rf logs\necho '", "(( x = 1 )) # it's\nrm -rf logs\necho '"])
+        self.assertFalse(pre_trade_guard._scan_shell("echo $((1))#x")["has_comment"])  # $((...)) is part of a word
+        self.assertTrue(pre_trade_guard._scan_shell("((1))#x")["has_comment"])
+
+    def test_round2_case_inside_substitution_fails_closed(self):
+        self.assertDeniedBothRuntimes(["X=\"$(case a in a) echo \"it's\";; esac)\"\nrm -rf logs\necho '",
+                                       "X=$(case a in a) echo ok;; esac)", "echo \"$(true; case a in *) ls;; esac)\""],
+                                      fragment="FAIL-CLOSED")
+        # `case` as an argument, in a heredoc message body or in quotes is not a case command
+        self.assertNotDenied([
+            "X=$(git log --grep case -1)", "git log --grep case $(git rev-parse HEAD)", "echo \"$(echo 'case x')\"",
+            "git commit -m \"$(cat <<'EOF'\nfix: handle the case where it's empty\ncase x in a) b;; esac\nEOF\n)\"",
+            "gh pr create --title x --body \"$(cat <<'EOF'\n## Summary\n- it's done (case 1)\nEOF\n)\"",
+            "case x in a) ls;; esac",
+        ])
+
+    def test_round3_case_in_a_data_heredoc_body_falls_back_to_line_checks(self):
+        # Data for cat / tee: the scan failure falls back to the strict line-by-line check, not a denial
+        self.assertNotDenied(["cat > /tmp/s.sh <<'EOF'\nx=$(case $1 in a) echo 1;; esac)\nEOF",
+                              "tee /tmp/s.sh <<'EOF' >/dev/null\nn=$(case a in a) ls;; esac)\nEOF"])
+        self.assertDeniedBothRuntimes(["cat > /tmp/s.sh <<'EOF'\nx=$(case $1 in a) echo 1;; esac)\nrm -rf logs\nEOF"])
+        # A shell runs the body: the scan failure still denies
+        self.assertDeniedBothRuntimes(["bash <<'EOF'\nx=$(case $1 in a) echo 1;; esac)\nEOF",
+                                       "cat <<'EOF' | sh\nx=$(case $1 in a) echo 1;; esac)\nEOF",
+                                       "eval \"$(cat <<'EOF'\nx=$(case a in a) ls;; esac)\nEOF\n)\""],
+                                      fragment="FAIL-CLOSED")
+        feeds = pre_trade_guard._heredoc_feeds_shell
+        self.assertTrue(feeds("bash -s ", ""))
+        self.assertTrue(feeds("cat ", " | /bin/sh"))
+        self.assertFalse(feeds("cat > /tmp/s.sh ", ""))
+        self.assertFalse(feeds("cat ", " | shasum"))
+
+    def test_round2_arithmetic_shift_and_eval_of_a_heredoc_message(self):
+        scan = pre_trade_guard._scan_shell("echo $((1<<2))\nls")
+        self.assertEqual(scan["pieces"], [("code", "echo $((1<<2))\nls")])
+        self.assertEqual(pre_trade_guard.split_subcommands("echo $((1<<2))\nls")[-1], ["ls"])
+        self.assertDeniedBothRuntimes(["echo $(( (1<<2) ))\nrm -rf logs"])
+        # `$((cat <<EOF` (a subshell whose heredoc bash reads) spanning lines: too ambiguous, denied
+        self.assertDeniedBothRuntimes(["echo $((cat <<EOF\n'\nEOF\n) )\nrm -rf logs\necho '"], fragment="FAIL-CLOSED")
+        # eval runs the "$(cat <<EOF ...)" text: its body is judged (only git / gh message arguments are not)
+        self.assertDeniedBothRuntimes(["eval \"$(cat <<'EOF'\nrm -rf logs\nEOF\n)\"",
+                                       "bash -c \"$(cat <<'EOF'\nrm -rf logs\nEOF\n)\""])
+
+    def test_scanner_failure_fails_closed(self):
+        with patch("pre_trade_guard._scan_shell", side_effect=pre_trade_guard.ShellScanError("boom")):
+            self.assertEqual(self.decision("ls"), "deny")
+            res = self.run_guard({"tool_name": "Bash", "tool_input": {"command": "ls"}})
+            self.assertEqual(res.get("__exit_code__"), 2)
+        limit = pre_trade_guard.HEREDOC_NESTING_LIMIT + 2
+        nested = "".join(f"bash <<E{k}\n" for k in range(limit)) + "ls\n" + "".join(
+            f"E{k}\n" for k in reversed(range(limit)))
+        self.assertEqual(self.decision(nested), "deny")
+        shallow = "bash <<E0\nbash <<E1\nls\nE1\nE0"
+        self.assertNotEqual(self.decision(shallow), "deny")
 
 
 class TestLoneQuotedNewlineAndWslAutoAllow(GuardHarness):
