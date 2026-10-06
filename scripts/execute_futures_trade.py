@@ -1496,8 +1496,8 @@ def enforce_evaluation_dossier(symbol, direction, target_env=None, bypass_eval_g
         return False, f"MECHANICAL HARD GATE REJECTION (Evaluation Gate, {label}): {reason}{hint}", None
 
     if is_prod and isinstance(cand, dict):
-        needs_confirmation = cand.get('requires_user_confirmation')
-        if (needs_confirmation is True or str(needs_confirmation).lower() == 'true') and not confirmed:
+        # Same truthiness as the PreToolUse hook (True / 'true' / '1' / 'yes'), issue #63
+        if _truthy(cand.get('requires_user_confirmation')) and not confirmed:
             return False, (
                 f"MECHANICAL HARD GATE REJECTION (Evaluation Gate, {label}): the evaluator approved {str(symbol).upper()} "
                 "pending explicit user confirmation. Re-run with confirmed=True / --confirmed after the user confirms."

@@ -83,14 +83,15 @@ class GuardHarness(unittest.TestCase):
                        "status": "APPROVED", "approved_symbols": [symbol],
                        "approved_candidates": [{"symbol": symbol, "direction": direction, "leverage": 3}]}, f)
 
-    def write_provenance_dossier(self, symbol="BTCUSDT", direction="LONG", parent=PARENT_CONV_ID):
-        """Fake evaluator subagent transcript + dossier recorded exactly like --from-subagent does."""
+    def write_provenance_dossier(self, symbol="BTCUSDT", direction="LONG", parent=PARENT_CONV_ID, extra=None):
+        """Fake evaluator subagent transcript + dossier recorded exactly like --from-subagent does.
+        `extra` overrides/adds candidate fields (tier, is_yolo, requires_user_confirmation, ...)."""
         conv_dir = os.path.join(self.brain, EVALUATOR_CONV_ID, ".system_generated", "logs")
         os.makedirs(conv_dir, exist_ok=True)
         created = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        block = json.dumps({"status": "APPROVED", "summary": "test",
-                            "approved_candidates": [{"symbol": symbol, "direction": direction, "tier": "Tier S",
-                                                     "leverage": 3}]})
+        cand = {"symbol": symbol, "direction": direction, "tier": "Tier S", "leverage": 3}
+        cand.update(extra or {})
+        block = json.dumps({"status": "APPROVED", "summary": "test", "approved_candidates": [cand]})
         steps = [
             {"source": "SYSTEM", "type": "USER_INPUT", "content": f"Subagent invoked sender={parent}", "step_index": 0},
             {"source": "MODEL", "type": "PLANNER_RESPONSE", "step_index": 1, "created_at": created,

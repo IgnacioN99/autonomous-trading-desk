@@ -447,10 +447,11 @@ class TestGuardWithClaudeDossier(tgb.GuardHarness):
         self.projects = os.path.join(self.root, "claude_projects")
         os.environ[dp.CLAUDE_PROJECTS_ENV] = self.projects  # restored by GuardHarness' patch.dict
 
-    def write_claude_dossier(self, symbol="BTCUSDT", direction="LONG", agent_type=dp.EVALUATOR_NAME):
+    def write_claude_dossier(self, symbol="BTCUSDT", direction="LONG", agent_type=dp.EVALUATOR_NAME, extra=None):
+        cand = {"symbol": symbol, "direction": direction, "tier": "S", "leverage": 3}
+        cand.update(extra or {})  # optional candidate overrides (is_yolo, tier, requires_user_confirmation, ...)
         block = json.dumps({"status": "APPROVED", "target_env": "PROD", "summary": "test",
-                            "approved_candidates": [{"symbol": symbol, "direction": direction, "tier": "S",
-                                                     "leverage": 3}]})
+                            "approved_candidates": [cand]})
         path = write_claude_transcript(Path(self.projects), EVALUATOR_AGENT_ID,
                                        f"Master Dossier\n<dossier_json>\n{block}\n</dossier_json>", agent_type)
         record = dp.build_record_from_extraction(dp.extract_dossier_from_claude_transcript(str(path)))
