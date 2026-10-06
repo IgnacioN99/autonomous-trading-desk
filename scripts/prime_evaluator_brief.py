@@ -343,7 +343,7 @@ def format_markdown_brief(brief: dict) -> str:
         lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- |")
         for o in opps:
             trig = o.get('trigger_price')
-            lines.append(f"| **{o.get('symbol')}** | {o.get('direction')} | {(o.get('tier') or '').split(' ')[0]} | {o.get('confidence')}% | {o.get('current_price')} | {trig if trig is not None else '-'} | {o.get('sl_price')} | {o.get('tp1_price')} / {o.get('tp2_price')} | {o.get('rr_ratio')}R | ${o.get('target_dollar_risk', default_risk)} | {'; '.join(o.get('reasons', [])[:2])} |")
+            lines.append(f"| **{o.get('symbol')}** | {o.get('direction')} | {o.get('tier_code') if o.get('tier_code') in ('S', 'A+', 'A', 'B+') else next((c for c in ('S', 'A+', 'A', 'B+') if (o.get('tier') or '').split(' ')[:2] == ['Tier', c]), '?')} | {o.get('confidence')}% | {o.get('current_price')} | {trig if trig is not None else '-'} | {o.get('sl_price')} | {o.get('tp1_price')} / {o.get('tp2_price')} | {o.get('rr_ratio')}R | ${o.get('target_dollar_risk', default_risk)} | {'; '.join(o.get('reasons', [])[:2])} |")
     else:
         lines.append("*(No intraday setups passing institutional microstructure filter)*")
     lines.append("")

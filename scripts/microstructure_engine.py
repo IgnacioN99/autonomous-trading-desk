@@ -59,6 +59,17 @@ def select_wick_kline(klines, wick_candle_open_time=None):
         return klines[-2], True
     return klines[-2], False
 
+def select_taker_index(taker_data, candle_open_time):
+    """Index of the takerlongshortRatio row for the candle opening at `candle_open_time` (ms): Binance stamps
+    each closed period with its kline open time. None when no row matches (missing/malformed timestamp, lag)."""
+    for i in range(len(taker_data) - 1, -1, -1):
+        try:
+            if int(taker_data[i].get("timestamp")) == int(candle_open_time):
+                return i
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return None
+
 def get_symbol_microstructure(symbol, period="15m", history_limit=30, wick_candle_open_time=None):
     """
     Queries quantitative order flow metrics over a 30-period rolling window:
@@ -71,6 +82,12 @@ def get_symbol_microstructure(symbol, period="15m", history_limit=30, wick_candl
     opening at `wick_candle_open_time` (ms) when given (callers pass the candle they scored, so a candle boundary
     between their fetch and this one does not shift it), else the last closed candle. If the requested candle is
     not in this fetch, the last closed candle is used and `wick_candle_mismatch` is True.
+
+    Taker ratio, buy/sell volume, OIB and `cvd_current_delta` come from the taker row whose `timestamp` equals that
+    wick candle's open time (Binance stamps each closed period with its kline open time), so the absorption flag
+    and its text describe one candle (issue #83). No matching row -> `taker_candle_matched` False, the latest row
+    is reported for information only and `absorption` is "NONE". The absorption flag needs both the taker
+    condition and a >= 40% wick on that candle; `price_change_pct` (latest period) feeds only regime and cascade.
     """
     try:
         # 1. Taker Buy/Sell Volume Ratio (30-candle window)
@@ -92,16 +109,26 @@ def get_symbol_microstructure(symbol, period="15m", history_limit=30, wick_candl
         if not taker_data or not oi_data or not klines or len(klines) < 5:
             return None
 
+        # Absorption Wicks: both sides from one candle (the caller's candle, else the last closed one)
+        wick_kline, wick_candle_mismatch = select_wick_kline(klines, wick_candle_open_time)
+        wick_open_time = int(wick_kline[0])
+        lower_wick_pct, upper_wick_pct = candle_wick_pcts(wick_kline)
+
         # --- CUMULATIVE VOLUME DELTA (CVD) ANALYSIS ---
         deltas = np.array([float(t.get("buyVol", 0)) - float(t.get("sellVol", 0)) for t in taker_data])
         cvd_cumulative = np.cumsum(deltas)
-        cvd_current_delta = float(deltas[-1])
         cvd_window_net = float(cvd_cumulative[-1] - cvd_cumulative[0])
 
-        latest_taker = taker_data[-1]
-        t_ratio = float(latest_taker.get("buySellRatio", 1.0))
-        buy_vol = float(latest_taker.get("buyVol", 0))
-        sell_vol = float(latest_taker.get("sellVol", 0))
+        # Taker row of the wick candle (matched by open time), else the latest row for information only
+        taker_idx = select_taker_index(taker_data, wick_open_time)
+        taker_candle_matched = taker_idx is not None
+        if not taker_candle_matched:
+            taker_idx = len(taker_data) - 1
+        cvd_current_delta = float(deltas[taker_idx])
+        wick_taker = taker_data[taker_idx]
+        t_ratio = float(wick_taker.get("buySellRatio", 1.0))
+        buy_vol = float(wick_taker.get("buyVol", 0))
+        sell_vol = float(wick_taker.get("sellVol", 0))
 
         # --- OPEN INTEREST (OI) STATISTICAL ANALYSIS ---
         oi_series = np.array([float(x.get("sumOpenInterest", 0)) for x in oi_data])
@@ -130,10 +157,6 @@ def get_symbol_microstructure(symbol, period="15m", history_limit=30, wick_candl
         c_close = float(klines[-1][4])
         p_change_pct = ((c_close - c_open) / c_open) * 100
 
-        # Absorption Wicks: both sides from one candle (the caller's candle, else the last closed one)
-        wick_kline, wick_candle_mismatch = select_wick_kline(klines, wick_candle_open_time)
-        lower_wick_pct, upper_wick_pct = candle_wick_pcts(wick_kline)
-
         # --- QUANTITATIVE REGIME CLASSIFICATION (OI Z-Score >= 1.25σ or Significant Delta) ---
         # Robust filter: Requires statistically anomalous OI change (|Z| >= 1.25 or |ΔOI| >= 0.40%)
         is_oi_inflow = (oi_z_score >= 1.25 or oi_change_pct >= 0.40)
@@ -159,21 +182,26 @@ def get_symbol_microstructure(symbol, period="15m", history_limit=30, wick_candl
         absorption = "NONE"
         absorption_desc = "No anomalous absorption detected"
 
+        candle_utc = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(wick_open_time / 1000))
+
+        # Only scored on one candle: the wick candle and its own taker row. Unmatched taker data -> "NONE".
         # BULLISH ABSORPTION:
-        # Aggressive taker selling (Taker Ratio <= 0.85 or negative candle CVD),
-        # but price fails to drop or displays strong lower wick (lower wick >= 40% or p_change >= -0.15%).
+        # Aggressive taker selling (Taker Ratio <= 0.85 or negative candle CVD) AND a strong lower wick (>= 40%).
         # Conclusion: Passive limit bid walls absorbing all sell flow at support.
-        if (t_ratio <= 0.85 or cvd_current_delta < 0) and (lower_wick_pct >= 40.0 or p_change_pct >= -0.15):
+        if not taker_candle_matched:
+            absorption_desc = "Absorption not evaluated (no taker data for the wick candle)"
+        elif (t_ratio <= 0.85 or cvd_current_delta < 0) and lower_wick_pct >= 40.0:
             absorption = "BULLISH_ABSORPTION"
-            absorption_desc = f"Active Bullish Absorption (Taker Ratio {t_ratio:.2f} absorbed by bid wall, lower wick {lower_wick_pct:.0f}%)"
+            absorption_desc = (f"Active Bullish Absorption on the {candle_utc} candle (Taker Ratio {t_ratio:.2f}, "
+                               f"CVD delta {cvd_current_delta:+,.0f} absorbed by bid wall, lower wick {lower_wick_pct:.0f}%)")
 
         # BEARISH ABSORPTION:
-        # Aggressive taker buying (Taker Ratio >= 1.25 or positive candle CVD),
-        # but price fails to rise or displays strong upper wick (upper wick >= 40% or p_change <= 0.15%).
+        # Aggressive taker buying (Taker Ratio >= 1.25 or positive candle CVD) AND a strong upper wick (>= 40%).
         # Conclusion: Institutional passive ask blocks unloading into retail flow.
-        elif (t_ratio >= 1.25 or cvd_current_delta > 0) and (upper_wick_pct >= 40.0 or p_change_pct <= 0.15):
+        elif (t_ratio >= 1.25 or cvd_current_delta > 0) and upper_wick_pct >= 40.0:
             absorption = "BEARISH_ABSORPTION"
-            absorption_desc = f"Active Bearish Absorption (Taker Ratio {t_ratio:.2f} absorbed by ask wall, upper wick {upper_wick_pct:.0f}%)"
+            absorption_desc = (f"Active Bearish Absorption on the {candle_utc} candle (Taker Ratio {t_ratio:.2f}, "
+                               f"CVD delta {cvd_current_delta:+,.0f} absorbed by ask wall, upper wick {upper_wick_pct:.0f}%)")
 
         # --- ORDER FLOW IMBALANCE (OIB) & VWAP DEVIATION ---
         total_taker_vol = buy_vol + sell_vol
@@ -208,8 +236,9 @@ def get_symbol_microstructure(symbol, period="15m", history_limit=30, wick_candl
             "vwap_deviation_pct": round(vwap_deviation_pct, 2),
             "lower_wick_pct": round(lower_wick_pct, 1),
             "upper_wick_pct": round(upper_wick_pct, 1),
-            "wick_candle_open_time": int(wick_kline[0]),
+            "wick_candle_open_time": wick_open_time,
             "wick_candle_mismatch": wick_candle_mismatch,
+            "taker_candle_matched": taker_candle_matched,
             "regime": regime,
             "regime_desc": regime_desc,
             "absorption": absorption,

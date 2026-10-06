@@ -188,7 +188,7 @@ def run_watcher(interval_seconds: int = 180, once: bool = False, auto_deploy: bo
                         "direction": c.direction,
                         "tier": "Tier S",
                         "leverage": leverage,
-                        "thesis": f"Institutional volume climax {c.vol_ratio:.1f}x with {wick:.1f}% absorption wick. Portfolio delta: {portfolio_delta}."
+                        "thesis": f"Institutional closed-candle volume climax {c.vol_ratio:.1f}x with {wick:.1f}% absorption wick. Portfolio delta: {portfolio_delta}."
                     })
                 
                 if target_env == "prod":
