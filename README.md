@@ -34,8 +34,8 @@ graph TD
         SYNC["scripts/sync_session_state.py<br/>• Direct Binance Ledger Sync (~600ms)<br/>• Cache: session_state.json (PROD gates re-read the exchange)"]
     end
 
-    subgraph L2 ["Layer 2: Mechanical Hard Gates (PreToolUse Hook)"]
-        GATE["scripts/hooks/pre_trade_guard.py<br/>• Delta-Neutral Gate (Block Longs on LONG_HEAVY)<br/>• Dynamic Equity Risk Gate (0.5% Account Risk + Buffer)<br/>• Financial Friction Floor (TP1 >= 0.35%)"]
+    subgraph L2 ["Layer 2: PreToolUse Hook + Mechanical Hard Gates"]
+        GATE["scripts/hooks/pre_trade_guard.py (PreToolUse)<br/>• Choke point, dossier provenance, cache pre-check of session_state.json<br/>scripts/execute_futures_trade.py (authoritative, live exchange)<br/>• Delta-Neutral Gate (positions + resting orders + new order)<br/>• Dynamic Equity Risk Gate (0.5% of min(balance, balance + uPnL) + Buffer)<br/>• Financial Friction Floor (TP1 >= 0.35%)"]
     end
 
     subgraph L3 ["Layer 3: Deterministic Context Primer"]
@@ -69,8 +69,8 @@ graph TD
 Natural language instructions are not a reliable safety barrier in live financial trading. ATD rejects the antipattern of relying on the LLM's stochastic memory to enforce risk boundaries. Instead, runtime **PreToolUse hooks physically intercept every order execution attempt at the OS level**:
 - **Single Choke Point Enforcement:** Direct calls to exchange order tools are mechanically blocked. All orders must pass through `scripts/execute_futures_trade.py`; there is no MCP wrapper (calls to the retired `crypto_radar` MCP server are denied).
 - **Mandatory Clean-Room Evaluation:** Orders require a non-expired (<20m) dossier in `logs/evaluations/latest_dossier.json`, recorded from the evaluator subagent transcript with `record_evaluation.py --from-subagent` and re-verified (sha256 provenance), approving the symbol and direction. Hand-written dossiers are rejected in PROD.
-- **Delta-Neutral Gate:** If the portfolio marks `LONG_HEAVY`, attempts to execute a `LONG` order are rejected with `hard_gate_rejection: True` before any network packet reaches the exchange API. If `SHORT_HEAVY`, additional `SHORT` orders are blocked.
-- **Dynamic Equity Risk Gate:** Maximum monetary loss is capped to the user's calibrated equity risk profile (default 0.5% of Account Equity + 1.25x buffer, e.g. ~$50 on $10k, $5 on $1k, $0.50 on $100), dynamically verified against live balance.
+- **Delta-Neutral Gate:** The hook pre-checks the cached `logs/session_state.json`; the executor's authoritative gate re-reads the exchange (filled positions plus resting opening orders). If the portfolio marks `LONG_HEAVY`, a `LONG` order is rejected with `hard_gate_rejection: True` before any order is sent; if `SHORT_HEAVY`, additional `SHORT` orders are blocked. On a non-empty book, an order whose own notional would tip it heavy in its direction is rejected too.
+- **Dynamic Equity Risk Gate:** Maximum monetary loss is capped to the user's calibrated equity risk profile (default 0.5% of equity + 1.25x buffer, e.g. ~$62.50 on $10k), where equity is min(live wallet balance, balance + unrealized PnL of the open positions): open losses lower the cap, open gains never raise it. Position sizing still uses the wallet balance, so with large open losses a full-size standard order is rejected rather than sized down.
 - **Financial Friction Floor:** Orders where distance to TP1 is less than 0.35% are physically blocked, ensuring taker fees and bid-ask spread never consume the statistical edge.
 - **Leverage Ceiling Gate:** Absolute desk ceiling of 15x; standard positions use the profile's `leverage_standard`, YOLO moonshots `leverage_yolo` (Binance agentic sub-accounts are capped at 5x and the executor clamps automatically).
 

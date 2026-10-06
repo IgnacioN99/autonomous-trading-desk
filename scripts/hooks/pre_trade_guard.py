@@ -65,8 +65,11 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    and //wsl$/<distro>/x are the Linux path /x (case-sensitive) when <distro> is WSL_DISTRO_NAME (case-insensitive;
    another or an unknown distro names another filesystem). With a native Linux cwd (/mnt/c/..., /home/...) or none,
    /c/x and //wsl.../x are Linux paths: not sanctioned (ask) (issue #110).
-5. FAIL-CLOSED SESSION STATE & STALENESS CHECK:
-   logs/session_state.json must exist, be valid (is_valid=True) and NOT stale (<= 300s).
+5. FAIL-CLOSED SESSION STATE & STALENESS CHECK (cache-based pre-check, defense in depth):
+   logs/session_state.json must exist, be valid (is_valid=True) and NOT stale (<= 300s); its position count and
+   delta_bias are checked too. The hook makes no network call, so this reads only the cache: the executor's
+   live-anchored PROD gates (positionRisk, resting opening orders and the new order; issues #101 / #119) are
+   authoritative and reject what a forged fresh file lets through here.
 6. EVALUATION DOSSIER PROVENANCE (scripts/utils/dossier_provenance.py):
    PROD requires a schema v2 dossier whose provenance hash is re-verified against the
    isolated_market_evaluator subagent transcript (agy brain or Claude Code subagents/ with
@@ -680,8 +683,12 @@ EVALUATION_TRAIL_CMD_RE = re.compile(
 TRANSCRIPT_ROOT_OVERRIDE_RE = re.compile(
     r"\b(?:AGY_BRAIN_DIRS|CLAUDE_PROJECTS_DIRS)\b(?:['\"]\]?)?\s*=|\b(?:AGY_BRAIN_DIRS|CLAUDE_PROJECTS_DIRS)['\"]\s*[,:]"
 )
-# Ground-truth runtime state: each file gates PROD orders and has exactly one sanctioned writer, a desk script
-# that writes it from Python (atomic_write_json), never through a shell command or a file tool.
+# Ground-truth runtime state: each file feeds the PROD order checks and has exactly one sanctioned writer, a desk
+# script that writes it from Python (atomic_write_json), never through a shell command or a file tool.
+# session_state.json is a cache for the hook's pre-check (defense in depth): the executor's live-anchored gates are
+# authoritative. guardian_state.json is read directly by the executor (guardian liveness for resting entries).
+# pending_entries.json is cross-checked against the exchange's resting orders and supplies total_qty for MCP algo
+# entries listed without a quantity (Gate 1, issue #119).
 GROUND_TRUTH_FILES = {
     "logs/session_state.json": "`python3 scripts/sync_session_state.py`",
     "logs/guardian_state.json": "`python3 scripts/loops/position_guardian_loop.py`",
@@ -5547,7 +5554,8 @@ def evaluate_trade_opening(cmd: str, args: dict, mcp_args: dict, base_dir: str,
                 "👉 Ask the user to confirm in chat and re-run with the '--confirmed' flag."
             )
 
-    # GATE 2: DELTA-NEUTRAL & SESSION STATE AUDIT
+    # GATE 2: DELTA-NEUTRAL & SESSION STATE AUDIT (cache-based pre-check, docstring 5: no network in the hook; the
+    # executor re-reads the exchange and its live-anchored gates are authoritative)
     if not has_bypass_delta:
         state_file = os.path.join(base_dir, "logs", "session_state.json")
         if not os.path.exists(state_file):
