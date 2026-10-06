@@ -160,6 +160,13 @@ class TestSharedGateLimits(unittest.TestCase):
 # =============================================================================
 # 2. Executor GATE 2 (YOLO) / GATE 3 use the shared constants, behaviour unchanged
 # =============================================================================
+def _flat_exchange_reads_only(method, endpoint, params=None, target_env=None, retry_count=0):
+    if method == "GET" and not params and endpoint in ("/fapi/v2/positionRisk", "/fapi/v1/openAlgoOrders",
+                                                       "/fapi/v1/openOrders"):
+        return []
+    raise AssertionError(f"gate check must not send other requests ({method} {endpoint})")
+
+
 class TestExecutorGatesUseSharedLimits(unittest.TestCase):
 
     def setUp(self):
@@ -175,8 +182,8 @@ class TestExecutorGatesUseSharedLimits(unittest.TestCase):
             patch.object(eft, "__file__", os.path.join(ws, "scripts", "execute_futures_trade.py")),
             patch("user_profile.load_user_profile", return_value=dict(PROFILE)),
             patch("quant_risk_engine.get_account_equity", return_value=1000.0),
-            patch("execute_futures_trade.send_signed_request",
-                  side_effect=AssertionError("gate check must not send requests")),
+            # the gate check only reads the live PROD snapshot (issue #101): a flat exchange, as in session_state
+            patch("execute_futures_trade.send_signed_request", side_effect=_flat_exchange_reads_only),
         ]
         for p in patches:
             p.start()

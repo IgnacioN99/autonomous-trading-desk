@@ -69,7 +69,8 @@ Action record (also one JSON line in logs/guardian_actions.jsonl):
   {"timestamp": int, "env": str, "symbol": str, "dry_run": bool, "success": bool,
    "type": "orphan_heal" | "orphan_close" | "trail_stop" | "dead_alpha_close" | "pending_protect_sl" |
            "pending_tp_placed" | "pending_abort" | "pending_timeout_cancel" | "pending_dropped" |
-           "pending_sl_crossed_close" | "unknown_resting_entry" (report only, success false), "detail": {...}}
+           "pending_sl_crossed_close" | "pending_record_mismatch" | "unknown_resting_entry" (report only, success
+           false), "detail": {...}}
 
 Scheduling (generic examples; run from the repository root):
   cron, every 5 minutes, one cycle per run:
