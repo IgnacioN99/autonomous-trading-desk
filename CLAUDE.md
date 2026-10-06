@@ -14,7 +14,7 @@ agy mechanics to Claude Code.
 |---|---|---|
 | Rules | `AGENTS.md`, `.agents/rules/*.md` | this file (imports them) |
 | Subagents | `.agents/agents/<name>/agent.md` | `.claude/agents/<name>.md` (generated) |
-| Skills | `.agents/skills/{market-radar,trade-execution-planner,pr-review}/SKILL.md` | `.claude/skills/<skill>/SKILL.md` (generated) |
+| Skills | `.agents/skills/{market-radar,trade-execution-planner,pr-review,issue-orchestrator}/SKILL.md` | `.claude/skills/<skill>/SKILL.md` (generated) |
 | Hooks | `.agents/hooks.json` | `.claude/settings.json` (+ `.claude/settings.local.json` on Windows) |
 | MCP servers | `.agents/mcp_config.json` | `.mcp.json` |
 
@@ -52,6 +52,16 @@ agy mechanics to Claude Code.
 the `pr-review` skill: triage, launch every required `<id>_reviewer` with the Agent tool in ONE message,
 `python3 scripts/ci/assemble_review.py --pr <n> --from-claude-subagent <id>=<agentId> ...` (it verifies each
 transcript's agentType), `verify_review.py`, then `gh pr comment <n> --body-file logs/pr_review/report.md`.
+
+## Issue workflow
+
+"Work issue N" runs the `issue-orchestrator` skill in the main session: `scripts/dev/issue_workspace.py init`
+(worktree + branch), `issue_locator` (read-only), your `design.md`, `issue_fixer` (edits and tests; its edits and
+Bash go through `scripts/hooks/issue_fixer_guard.py`: confined to the issue worktree, never the main checkout, and
+an allowlist with no git writes, gh, network or desk scripts),
+`issue_workspace.py review-context` + `issue_auditor` (read-only, up to 3 rounds), your own full-suite run, PR,
+`pr-review`, merge on green CI, follow-up issues and `issue_workspace.py cleanup`. The three agents run on opus
+and never use the internet; on Windows run the flow from WSL (the fixer's guard fails closed without `python3`).
 
 ## Windows
 
