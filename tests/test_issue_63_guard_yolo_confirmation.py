@@ -116,6 +116,26 @@ class TestYoloConfirmationProd(YoloGuardHarness):
         self.assertFalse(ok(f"bash -lc '{SCRIPT} --symbol X' --confirmed"))
         self.assertFalse(ok(f"bash -lc 'cd /mnt/c/repo && {SCRIPT} --symbol X # --confirmed'"))
         self.assertFalse(ok(f"bash -c '{SCRIPT} --symbol X --confirmed; {SCRIPT} --symbol Y'"))
+        # Option values and long --command forms (main's _shell_args): $0 is never read as an executor flag
+        self.assertFalse(ok(f"bash -eo pipefail -c '{SCRIPT} --symbol X' --confirmed"))
+        self.assertFalse(ok(f"fish --command '{SCRIPT} --symbol X' --confirmed"))
+        self.assertFalse(ok(f"bash --command='{SCRIPT} --symbol X' --confirmed"))
+        self.assertTrue(ok(f"bash -eo pipefail -c '{SCRIPT} --symbol X --confirmed'"))
+        self.assertTrue(ok(f"bash -c -- '{SCRIPT} --symbol X --confirmed'"))
+        self.assertTrue(ok(f"fish --command '{SCRIPT} --symbol X --confirmed'"))
+        # Indirection through $0/$1: words after the -c string are never executor flags
+        self.assertFalse(ok(f"bash -c '$0 $1 --symbol PEPEUSDT --direction LONG --env prod' {SCRIPT} --confirmed"))
+
+    def test_shell_c_indirection_is_not_a_confirmation(self):
+        self.dossier(is_yolo=True, tier="Tier S", requires_user_confirmation=False)
+        command = f"bash -c '$0 $1 --symbol PEPEUSDT --direction LONG --env prod' {SCRIPT} --confirmed"
+        # Through the hook the inline-code choke point denies it first ...
+        self.assertDenied(self.agy(self.cmd(command, conversationId=tgb.PARENT_CONV_ID)), "Choke Point Enforcement")
+        # ... and the trade-opening gates alone deny it as an unconfirmed YOLO entry.
+        decision, reason = pre_trade_guard.evaluate_trade_opening(command, {"CommandLine": command}, {}, self.root,
+                                                                  tgb.PARENT_CONV_ID)
+        self.assertEqual(decision, "deny")
+        self.assertIn(YOLO_GATE, reason)
 
     def test_yolo_candidate_executor_truthiness_denied(self):
         # The executor's _truthy treats '1' / 'yes' as YOLO; the hook must not be laxer.

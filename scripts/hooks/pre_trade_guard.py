@@ -1683,31 +1683,14 @@ def _flags(tokens: List[str]) -> set:
     return {tok.split("=", 1)[0].lower() for tok in tokens if tok.startswith("-")}
 
 
-def _shell_c_operand_index(args: List[str]) -> Optional[int]:
-    """Index in `args` (the arguments of sh/bash/...) of the command string run with -c (-c, -lc, -ec...), if any."""
-    has_c = skip = False
-    for i, a in enumerate(args):
-        if skip:
-            skip = False
-        elif a in SHELL_VALUE_OPTIONS:
-            skip = True
-        elif a == "--":
-            continue
-        elif a.startswith(("-", "+")) and len(a) > 1:
-            has_c = has_c or (not a.startswith("--") and "c" in a[1:])
-        else:
-            return i if has_c else None  # without -c the first operand is a script file
-    return None
-
-
 def executor_confirmed(cmd: str, tokens: Optional[List[str]] = None, depth: int = 0) -> bool:
     """
     True only if the executor itself would receive --confirmed / --user-confirmed (exact tokens; abbreviations and
     =value forms are not recognised, which fails closed). Flags are read from the tokens after the
     execute_futures_trade script path (not env assignments or wrappers before it) and up to a shell comment.
-    When the script sits inside the -c string of sh/bash/... (e.g. wsl.exe -- bash -lc '...'), that string is
-    re-tokenised and every segment running the executor must be confirmed; arguments after the -c string are
-    the shell's $0/$1..., never the executor's.
+    When the script sits inside the -c / --command string of sh/bash/... (parsed by _shell_args, e.g.
+    wsl.exe -- bash -lc '...', bash -eo pipefail -c '...'), that string is re-tokenised and every segment running
+    the executor must be confirmed; arguments after it are the shell's $0/$1..., never the executor's.
     """
     if depth > NESTED_DEPTH_LIMIT:
         return False
@@ -1723,9 +1706,11 @@ def executor_confirmed(cmd: str, tokens: Optional[List[str]] = None, depth: int 
             prog = prog[:-4]
         if prog not in SHELL_INTERPRETERS:
             continue
-        rel = _shell_c_operand_index(tokens[p + 1:])
-        if rel is not None and p + 1 + rel == idx:
-            segments = [seg for seg in split_subcommands(tokens[idx]) if TRADE_ENGINE_RE.search(" ".join(seg))]
+        inner = _shell_args(tokens[p + 1:])["command"]
+        if inner is not None:  # executor flags live only inside the -c/--command string; later words are $0/$1...
+            segments = [seg for seg in split_subcommands(inner) if TRADE_ENGINE_RE.search(" ".join(seg))]
+            # The string decides on its own: no executor segment inside (e.g. bash -c '$0 $1 ...' script --confirmed)
+            # means the executor's own arguments cannot be verified -> not confirmed (fails closed).
             return bool(segments) and all(executor_confirmed("", seg, depth + 1) for seg in segments)
     for tok in tokens[idx + 1:]:
         if tok.startswith("#"):
