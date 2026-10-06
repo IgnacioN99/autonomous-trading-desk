@@ -286,7 +286,7 @@ class TestRunCommandBypasses(GuardHarness):
 
     def test_chained_risk_flag_does_not_whitelist_trade(self):
         c = ("python3 scripts/execute_futures_trade.py --symbol SOLUSDT --direction LONG && "
-             "python3 scripts/trading_doctor.py --auto-heal")
+             "python3 scripts/trading_doctor.py --heal")
         self.assertDenied(self.agy(self.cmd(c)), "Clean-Room Evaluator Required")
 
     def test_chained_protect_pending_does_not_whitelist_trade(self):
@@ -353,7 +353,7 @@ class TestRunCommandBypasses(GuardHarness):
 
     def test_harmless_command_is_ask_and_risk_reducing_is_allow(self):
         self.assertEqual(self.agy(self.cmd("ls -la")).get("decision"), "ask")
-        self.assertEqual(self.agy(self.cmd("rm -rf build && python3 scripts/trading_doctor.py --auto-heal")).get("decision"),
+        self.assertEqual(self.agy(self.cmd("rm -rf build && python3 scripts/trading_doctor.py --heal")).get("decision"),
                          "ask")
         res = self.agy(self.cmd("python3 scripts/execute_futures_trade.py --symbol BTCUSDT --close-position --env prod"))
         self.assertEqual(res.get("decision"), "allow")
@@ -731,8 +731,11 @@ class TestGroundTruthProtection(GuardHarness):
             res = self.agy(self.cmd(c))
             self.assertEqual(res.get("decision"), "ask", c)
             self.assertNotGroundTruth(res, c)
-        self.assertEqual(self.agy(self.cmd("python3 scripts/loops/position_guardian_loop.py --once >> logs/guardian.log 2>&1"))
-                         .get("decision"), "allow")
+        # Issue #100: a risk-reducing call carrying a redirect (a token with '>' / '&') is no longer auto-allowed
+        # (normal permission policy), and never a ground-truth denial
+        res = self.agy(self.cmd("python3 scripts/loops/position_guardian_loop.py --once >> logs/guardian.log 2>&1"))
+        self.assertEqual(res.get("decision"), "ask")
+        self.assertNotGroundTruth(res)
         self.assertEqual(self.agy(self.cmd("python3 scripts/execute_futures_trade.py --protect-pending --env prod "
                                            "2>&1 | tee -a logs/guardian.log")).get("decision"), "ask")
 
@@ -1673,7 +1676,7 @@ class TestNestedNewlinesAndAutoAllowFailSafe(GuardHarness):
     command; risk-reducing scripts count only when they are the script actually executed."""
 
     CLOSE = "python3 scripts/execute_futures_trade.py --close-position --symbol BTCUSDT"
-    CUTOFF = "python3 scripts/loops/night_cutoff_loop.py --once"
+    CUTOFF = "python3 scripts/loops/night_cutoff_loop.py --env prod"
 
     def decision(self, command_line):
         return self.agy(self.cmd(command_line)).get("decision")
@@ -1733,14 +1736,25 @@ class TestNestedNewlinesAndAutoAllowFailSafe(GuardHarness):
         self.assertEqual(script(["python3", "-c", "x", "close_position.py"]), "")
         self.assertEqual(script(["python3", "-m", "close_position.py"]), "")
         self.assertEqual(script(["rm", "-rf", "logs", "close_position.py"]), "rm")
-        rr = pre_trade_guard._subcommand_is_risk_reducing
+
+        def rr(tokens):
+            return pre_trade_guard._subcommand_is_risk_reducing(tokens, " ".join(tokens), self.root, self.root)
+
         for tokens in (["rm", "-rf", "logs", "close_position.py"], ["echo", "night_cutoff_loop.py"],
-                       ["python3", "evil_close_position.py"], ["python3", "-c", "x", "close_position.py"]):
-            self.assertFalse(rr(tokens, " ".join(tokens)), tokens)
-        for tokens in (["python3", "scripts/loops/night_cutoff_loop.py", "--once"],
-                       ["python3", "scripts/close_position_market.py"], ["./scripts/audit_orphan_positions.py"]):
-            self.assertTrue(rr(tokens, " ".join(tokens)), tokens)
+                       ["python3", "evil_close_position.py"], ["python3", "-c", "x", "close_position.py"],
+                       # Issue #100: the retired ghost names are not sanctioned (an agent-made file would be)
+                       ["python3", "scripts/close_position.py"], ["python3", "scripts/close_position_market.py"],
+                       ["./scripts/audit_orphan_positions.py"],
+                       # a night_cutoff_loop.py flag that does not exist
+                       ["python3", "scripts/loops/night_cutoff_loop.py", "--once"]):
+            self.assertFalse(rr(tokens), tokens)
+        for tokens in (["python3", "scripts/loops/night_cutoff_loop.py"],
+                       ["python3", "scripts/loops/night_cutoff_loop.py", "--env", "prod", "--auto-ratchet"],
+                       ["python3", "scripts/loops/night_cutoff_loop.py", "--overnight-mode=CLOSE_ALL_AT_MARKET"],
+                       ["./scripts/loops/night_cutoff_loop.py", "--env", "prod"]):
+            self.assertTrue(rr(tokens), tokens)
         self.assertNotEqual(self.decision("echo night_cutoff_loop.py"), "allow")
+        self.assertNotEqual(self.decision("python3 scripts/close_position.py"), "allow")
         self.assertEqual(self.decision(self.CUTOFF), "allow")
 
     def test_sanctioned_and_quoted_newline_commands_unchanged(self):
@@ -1757,7 +1771,7 @@ class TestLoneQuotedNewlineAndWslAutoAllow(GuardHarness):
     escape is never auto-allowed."""
 
     CLOSE = "python3 scripts/execute_futures_trade.py --close-position --symbol BTCUSDT"
-    CUTOFF = "python3 scripts/loops/night_cutoff_loop.py --once"
+    CUTOFF = "python3 scripts/loops/night_cutoff_loop.py --env prod"
     WSL = "wsl.exe -d Ubuntu -- "
 
     def claude(self, tool, command):
@@ -1783,17 +1797,52 @@ class TestLoneQuotedNewlineAndWslAutoAllow(GuardHarness):
     def test_wsl_wrapped_sanctioned_commands_allowed(self):
         script = pre_trade_guard._executed_script
         self.assertEqual(script(["wsl.exe", "-d", "Ubuntu", "--", "python3", "scripts/loops/night_cutoff_loop.py",
-                                 "--once"]), "scripts/loops/night_cutoff_loop.py")
-        self.assertEqual(script(["wsl", "--cd", "/repo", "-u", "me", "-e", "python3", "scripts/close_position.py"]),
-                         "scripts/close_position.py")
-        self.assertEqual(script(["wsl.exe", "--exec", "./scripts/audit_orphan_positions.py"]),
-                         "./scripts/audit_orphan_positions.py")
+                                 "--env", "prod"]), "scripts/loops/night_cutoff_loop.py")
+        self.assertEqual(script(["wsl", "--cd", "/repo", "-u", "me", "-e", "python3", "scripts/trading_doctor.py"]),
+                         "scripts/trading_doctor.py")
+        self.assertEqual(script(["wsl.exe", "--exec", "./scripts/loops/night_cutoff_loop.py"]),
+                         "./scripts/loops/night_cutoff_loop.py")
         self.assertEqual(script(["wsl.exe", "-d", "Ubuntu", "--", "rm", "close_position.py"]), "rm")
         self.assertEqual(script(["wsl.exe", "--import", "x", "close_position.py"]), "wsl.exe")
         self.assertEqual(script(["wsl.exe"]), "wsl.exe")
-        rr = pre_trade_guard._subcommand_is_risk_reducing
-        tokens = ["wsl.exe", "-d", "Ubuntu", "--", "rm", "-rf", "/tmp/x", "night_cutoff_loop.py"]
-        self.assertFalse(rr(tokens, " ".join(tokens)))
+
+        def rr(tokens):
+            return pre_trade_guard._subcommand_is_risk_reducing(tokens, " ".join(tokens), self.root, self.root)
+
+        for tokens in (["wsl.exe", "-d", "Ubuntu", "--", "rm", "-rf", "/tmp/x", "night_cutoff_loop.py"],
+                       # Issue #100: ghost names are not sanctioned, through wsl.exe either
+                       ["wsl", "-e", "python3", "scripts/close_position.py"],
+                       ["wsl.exe", "--exec", "./scripts/audit_orphan_positions.py"],
+                       # a Windows spelling inside wsl is another file for Linux; an absolute path elsewhere too
+                       ["wsl.exe", "--", "python3", "scripts\\loops\\night_cutoff_loop.py"],
+                       ["wsl.exe", "--", "python3", "/tmp/scripts/loops/night_cutoff_loop.py"]):
+            self.assertFalse(rr(tokens), tokens)
+        for tokens in (["wsl.exe", "--exec", "./scripts/loops/night_cutoff_loop.py"],
+                       ["wsl.exe", "-d", "Ubuntu", "--", "python3", self.root + "/scripts/loops/night_cutoff_loop.py"]):
+            self.assertTrue(rr(tokens), tokens)
+        # A Windows workspace root maps to the /mnt/<drive> Linux path (lexically; drive paths case-insensitive)
+        sanctioned = pre_trade_guard._sanctioned_script
+        self.assertEqual(sanctioned("/mnt/c/Repo/scripts/trading_doctor.py", "", "C:\\Repo", True),
+                         "scripts/trading_doctor.py")
+        self.assertEqual(sanctioned("C:\\Repo\\scripts\\trading_doctor.py", "", "/mnt/c/Repo", False),
+                         "scripts/trading_doctor.py")
+        self.assertEqual(sanctioned("scripts/trading_doctor.py", "C:\\Repo", "/mnt/c/Repo", False),
+                         "scripts/trading_doctor.py")
+        self.assertEqual(sanctioned("/mnt/c/repo/SCRIPTS/trading_doctor.py", "", "C:\\Repo", True),
+                         "scripts/trading_doctor.py")
+        self.assertEqual(sanctioned("scripts/trading_doctor.py", "/c/Repo", "/mnt/c/Repo", False),
+                         "scripts/trading_doctor.py")
+        self.assertEqual(sanctioned("/c/repo/scripts/trading_doctor.py", "", "/mnt/c/Repo", False),
+                         "scripts/trading_doctor.py")
+        self.assertEqual(sanctioned("scripts/trading_doctor.py", "\\\\wsl.localhost\\Ubuntu\\home\\u\\r", "/home/u/r",
+                                    False), "scripts/trading_doctor.py")
+        self.assertEqual(sanctioned("scripts/trading_doctor.py", "\\\\wsl$\\Ubuntu\\home\\u\\r", "/home/u/r",
+                                    False), "scripts/trading_doctor.py")
+        self.assertIsNone(sanctioned("/c/Repo/scripts/trading_doctor.py", "", "/mnt/c/Repo", True))  # Linux /c
+        self.assertIsNone(sanctioned("/home/u/R/scripts/trading_doctor.py", "", "/home/u/r", False))  # Linux case
+        self.assertIsNone(sanctioned("C:\\Repo\\scripts\\trading_doctor.py", "", "/mnt/c/Repo", True))
+        self.assertIsNone(sanctioned("scripts/trading_doctor.py", "/tmp", "/mnt/c/Repo", False))
+        self.assertIsNone(sanctioned("../Repo/scripts/x.py", "", "/mnt/c/Repo", False))
         cutoff = self.WSL + self.CUTOFF
         self.assertEqual(self.agy(self.cmd(cutoff)).get("decision"), "allow")
         self.assertEqual(self.claude("Bash", cutoff).get("hookSpecificOutput", {}).get("permissionDecision"), "allow")
@@ -1811,6 +1860,237 @@ class TestLoneQuotedNewlineAndWslAutoAllow(GuardHarness):
             decision, reason = ps(c, self.root, self.root, None)
             self.assertNotEqual(decision, "allow", c)
             self.assertNotEqual(decision, "deny", c)
+
+
+class TestRiskReducingIdentityAndWslReparse(GuardHarness):
+    """Issues #100 / #97: the risk-reducing auto-allow trusts only the exact sanctioned script (repo path, exclusive
+    flag set) run as one flat command; wsl.exe arguments are judged again as the Linux shell re-parses them, from
+    the Bash tool as well as from PowerShell."""
+
+    E = "scripts/execute_futures_trade.py"
+    WSL = "wsl.exe -d Ubuntu -- "
+
+    def claude(self, tool, command):
+        return self.run_guard({"tool_name": tool, "tool_input": {"command": command}})
+
+    def decisions(self, command_line):
+        """(agy, Claude Code Bash) decisions; Claude Code "ask" has no JSON output (passthrough)."""
+        claude = self.claude("Bash", command_line)
+        return (self.agy(self.cmd(command_line)).get("decision"),
+                claude.get("hookSpecificOutput", {}).get("permissionDecision", "deny" if claude.get("__exit_code__")
+                                                         == 2 else "ask"))
+
+    def ps(self, command_line):
+        return pre_trade_guard.evaluate_powershell_command(command_line, self.root, self.root, None)[0]
+
+    def assertNotAllowed(self, command_line, powershell=True):
+        for label, decision in zip(("agy", "claude"), self.decisions(command_line)):
+            self.assertNotEqual(decision, "allow", f"{label}: {command_line!r}")
+        if powershell:
+            self.assertNotEqual(self.ps(command_line), "allow", f"powershell: {command_line!r}")
+
+    def assertAllowed(self, command_line, powershell=True):
+        self.assertEqual(self.decisions(command_line), ("allow", "allow"), command_line)
+        if powershell:
+            self.assertEqual(self.ps(command_line), "allow", f"powershell: {command_line!r}")
+
+    def test_script_names_anywhere_in_the_text_not_auto_allowed(self):
+        for c in ("touch /tmp/x position_guardian_loop.py --once", "touch x trading_doctor.py --heal",
+                  "rm x trading_doctor.py --heal", "touch x execute_futures_trade.py --close-position",
+                  "touch x scripts/loops/night_cutoff_loop.py", "echo scripts/trading_doctor.py --heal"):
+            self.assertNotAllowed(c)
+
+    def test_ghost_and_foreign_paths_not_auto_allowed(self):
+        for c in ("python3 scripts/close_position.py", "python3 scripts/close_position_market.py",
+                  "python3 scripts/audit_orphan_positions.py", "./scripts/close_position.py",
+                  f"python3 /tmp/{self.E} --close-position --symbol BTCUSDT",
+                  f"python3 /tmp/x/../{self.E} --close-position --symbol BTCUSDT",
+                  "python3 /tmp/scripts/loops/position_guardian_loop.py --once",
+                  self.WSL + f"python3 /tmp/{self.E} --close-position --symbol BTCUSDT"):
+            self.assertNotAllowed(c)
+        # The same script by its absolute workspace path is sanctioned
+        self.assertAllowed(f"python3 {self.root}/{self.E} --close-position --symbol BTCUSDT", powershell=False)
+
+    def test_mixed_close_and_open_flags_not_auto_allowed(self):
+        for flags in ("--close-position --symbol BTCUSDT --direction LONG --leverage 15",
+                      "--close-position --symbol BTCUSDT --dir LONG", "--auto-heal --is-yolo",
+                      "--audit-orphans --confirmed", "--protect-pending --order-type LIMIT --limit-price 1",
+                      "--close-position --symbol BTCUSDT --bypass-eval-gate --env testnet"):
+            c = f"python3 {self.E} {flags}"
+            self.assertNotAllowed(c)
+            # an opening flag sends the sub-command to the trade gates (no dossier here: denied)
+            self.assertEqual(self.agy(self.cmd(c)).get("decision"), "deny", c)
+        # Unknown flags, stray operands, abbreviations and switch values: not the sanctioned one-liner (ask)
+        for args in ("--close-position --symbol BTCUSDT --note x", "--close-position --symbol BTCUSDT extra",
+                     "--close-position --symbol BTCUSDT -- x", "--close-pos --symbol BTCUSDT",
+                     "--close-position=1 --symbol BTCUSDT", "--close-position --symbol --env prod",
+                     "--positions", "--help --interval 5"):
+            c = f"python3 {self.E} {args}"
+            self.assertEqual(self.agy(self.cmd(c)).get("decision"), "ask", c)
+
+    def test_exclusive_flag_sets_of_the_other_scripts(self):
+        for c in ("python3 scripts/loops/position_guardian_loop.py --interval 60",
+                  "python3 scripts/loops/position_guardian_loop.py --dry-run",
+                  "python3 scripts/loops/position_guardian_loop.py --once --interval 60",
+                  "python3 scripts/trading_doctor.py", "python3 scripts/trading_doctor.py --auto-heal",
+                  "python3 scripts/trading_doctor.py --heal --verbose",
+                  "python3 scripts/loops/night_cutoff_loop.py --once",
+                  "python3 scripts/loops/climax_watcher_loop.py --once",
+                  "python3 scripts/user_profile.py --show"):
+            self.assertNotAllowed(c, powershell=False)
+        for c in ("python3 scripts/loops/position_guardian_loop.py --once --env prod --dry-run --close-dead-alpha --json",
+                  "python3 scripts/trading_doctor.py --heal --env prod",
+                  "python3 scripts/loops/night_cutoff_loop.py --env prod --auto-ratchet --overnight-mode CLOSE_ALL_AT_MARKET",
+                  "python3 scripts/loops/climax_watcher_loop.py --help", "python3 scripts/user_profile.py -h"):
+            self.assertAllowed(c, powershell=False)
+
+    def test_directory_change_disqualifies_auto_allow(self):
+        for c in (f"cd /tmp && python3 {self.E} --close-position --symbol BTCUSDT",
+                  f"cd {self.root} && python3 {self.E} --close-position --symbol BTCUSDT",
+                  f"pushd /tmp; python3 {self.E} --auto-heal", f"env -C /tmp python3 {self.E} --auto-heal",
+                  f"wsl.exe --cd /tmp -- python3 {self.E} --auto-heal"):
+            self.assertNotAllowed(c)
+            self.assertNotEqual(self.agy(self.cmd(c)).get("decision"), "deny", c)
+
+    def test_risk_reducing_with_unsafe_sub_command_not_allowed(self):
+        for c in (f"python3 {self.E} --close-position --symbol BTCUSDT && touch /tmp/x",
+                  f"python3 scripts/loops/position_guardian_loop.py --once; python3 scripts/other.py",
+                  f"python3 {self.E} --auto-heal | tee /tmp/out"):
+            self.assertNotAllowed(c)
+        # benign neighbours still allow (true / sleep / date)
+        self.assertAllowed(f"sleep 1 && python3 {self.E} --auto-heal", powershell=False)
+
+    def test_metacharacter_in_a_token_not_auto_allowed(self):
+        for c in (f"python3 {self.E} --close-position --symbol 'BTCUSDT;x'",
+                  f"python3 {self.E} --close-position --symbol 'BTC|USDT'",
+                  f"python3 {self.E} --close-position --symbol 'BTC&USDT'",
+                  f"python3 {self.E} --close-position --symbol 'BTC>USDT'",
+                  f"python3 {self.E} --close-position --symbol '$X'",
+                  f"python3 scripts/loops/position_guardian_loop.py --once > /tmp/g.log"):
+            self.assertNotAllowed(c)
+            self.assertNotEqual(self.agy(self.cmd(c)).get("decision"), "deny", c)
+
+    def test_wsl_shell_injection_not_allowed_from_bash_and_powershell(self):
+        inject = self.WSL.replace(" -d Ubuntu", "") + \
+            f"python3 {self.E} --close-position --symbol 'BTCUSDT;touch${{IFS}}/tmp/x'"
+        self.assertNotAllowed(inject)
+        # Without a run-time value the re-parse alone exposes the second command
+        for c in (f"wsl.exe -- python3 {self.E} --close-position --symbol 'BTCUSDT;touch /tmp/x'",
+                  f"wsl.exe -- python3 {self.E} --close-position --symbol 'BTCUSDT&&rm -rf logs'"):
+            self.assertNotAllowed(c)
+        self.assertEqual(self.agy(self.cmd(f"wsl.exe -- python3 {self.E} --close-position --symbol "
+                                           "'BTCUSDT;rm -rf logs'")).get("decision"), "deny")
+        lines = pre_trade_guard._bash_wsl_shell_commands(
+            f"X=1 wsl.exe -d Ubuntu -- python3 {self.E} --symbol 'B;touch y' && wsl.exe -e ls 'a;b'")
+        self.assertEqual(lines, [f"python3 {self.E} --symbol B;touch y"])
+        self.assertEqual(pre_trade_guard._bash_wsl_shell_commands("wsl.exe --cd /tmp -- ls"), ["cd /tmp && ls"])
+
+    def test_wsl_reparse_bounded_for_nested_wsl(self):
+        nested = "wsl.exe -- " * (pre_trade_guard.NESTED_DEPTH_LIMIT + 3) + f"python3 {self.E} --auto-heal"
+        self.assertEqual(self.agy(self.cmd(nested)).get("decision"), "deny")
+        self.assertAllowed("wsl.exe -- wsl.exe -- " + f"python3 {self.E} --auto-heal", powershell=False)
+
+    def test_sanctioned_one_liners_stay_allowed(self):
+        for c in (f"python3 {self.E} --move-breakeven --symbol BTCUSDT",
+                  self.WSL + f"python3 {self.E} --move-breakeven --symbol BTCUSDT",
+                  f"python3 {self.E} --close-position --symbol BTCUSDT",
+                  self.WSL + f"python3 {self.E} --close-position --symbol BTCUSDT --env prod --json",
+                  f"python3 {self.E} --auto-heal", f"python3 {self.E} --audit-orphans --env prod",
+                  f"python3 {self.E} --protect-pending", f"python3 {self.E} --move-breakeven --symbol=BTCUSDT --force",
+                  "python3 scripts/loops/position_guardian_loop.py --once",
+                  self.WSL + "python3 scripts/loops/night_cutoff_loop.py --env prod",
+                  "python3 scripts/trading_doctor.py --heal",
+                  "BINANCE_API_ENV=prod python3 scripts/trading_doctor.py --heal"):
+            self.assertAllowed(c)
+        self.assertEqual(self.ps(f"python scripts\\execute_futures_trade.py --close-position --symbol BTCUSDT"),
+                         "allow")
+        self.assertEqual(self.ps("python .\\scripts\\loops\\position_guardian_loop.py --once"), "allow")
+
+    def test_audit_budget_small_for_sanctioned_one_liners(self):
+        for c in (f"python3 {self.E} --close-position --symbol BTCUSDT",
+                  self.WSL + f"python3 {self.E} --close-position --symbol BTCUSDT"):
+            self.assertEqual(self.agy(self.cmd(c)).get("decision"), "allow", c)
+            self.assertLessEqual(pre_trade_guard._AUDIT["count"], 4, c)
+
+
+class TestRiskReducingPrefixesAndWindowsCwd(GuardHarness):
+    """Issue #100 round 2: every level the executed-script walk crosses (wsl -e, env, sudo, python) is checked for
+    directory changes, env assignments and interpreter options; Windows / Git Bash session cwds map onto the WSL
+    workspace root; --is-yolo is allowed next to --move-breakeven only."""
+
+    E = "scripts/execute_futures_trade.py"
+    DOCTOR = "python3 scripts/trading_doctor.py --heal"
+
+    def claude(self, command, tool="Bash", cwd=None):
+        payload = {"tool_name": tool, "tool_input": {"command": command}}
+        if cwd is not None:
+            payload["cwd"] = cwd
+        res = self.run_guard(payload)
+        return res.get("hookSpecificOutput", {}).get("permissionDecision",
+                                                     "deny" if res.get("__exit_code__") == 2 else "ask")
+
+    def ps(self, command_line):
+        return pre_trade_guard.evaluate_powershell_command(command_line, self.root, self.root, None)[0]
+
+    def test_directory_change_inside_wsl_exec_levels_not_auto_allowed(self):
+        for c in (f"wsl.exe -e env -C /tmp {self.DOCTOR}", f"wsl.exe -e sudo -D /tmp {self.DOCTOR}",
+                  f"wsl.exe -e wsl.exe --cd /tmp -- {self.DOCTOR}", f"wsl.exe -- env -C /tmp {self.DOCTOR}",
+                  f"wsl.exe -e env --chdir=/tmp python3 {self.E} --auto-heal"):
+            for label, decision in (("agy", self.agy(self.cmd(c)).get("decision")), ("bash", self.claude(c)),
+                                    ("powershell", self.ps(c))):
+                self.assertNotEqual(decision, "allow", f"{label}: {c}")
+                self.assertNotEqual(decision, "deny", f"{label}: {c}")
+        self.assertEqual(self.agy(self.cmd(f"wsl.exe -e env {self.DOCTOR}")).get("decision"), "allow")
+
+    def test_env_assignments_and_python_options_need_the_allowlist(self):
+        for c in (f"PYTHONPATH=/tmp/x {self.DOCTOR}", f"env PYTHONPATH=/tmp/x {self.DOCTOR}",
+                  f"PYTHONSTARTUP=/tmp/x.py {self.DOCTOR}", f"wsl.exe -e env PYTHONPATH=/tmp/x {self.DOCTOR}",
+                  f"wsl.exe -d Ubuntu -- LD_PRELOAD=/tmp/x.so {self.DOCTOR}",
+                  "python3 -i scripts/trading_doctor.py --heal", "python3 -I scripts/trading_doctor.py --heal",
+                  "python3 -X importtime scripts/trading_doctor.py --heal",
+                  f"python3 -W error {self.E} --auto-heal", f"xargs python3 {self.E} --auto-heal"):
+            self.assertNotEqual(self.agy(self.cmd(c)).get("decision"), "allow", c)
+            self.assertNotEqual(self.claude(c), "allow", c)
+        for c in (f"BINANCE_API_ENV=testnet {self.DOCTOR}", f"BINANCE_AUTH_MODE=KEYS BINANCE_API_ENV=prod {self.DOCTOR}",
+                  f"env PYTHONUNBUFFERED=1 PYTHONIOENCODING=utf-8 {self.DOCTOR}",
+                  f"PYTHONDONTWRITEBYTECODE=1 python3 -u -B -X utf8 {self.E} --auto-heal",
+                  f"python3 -Xutf8 {self.E} --close-position --symbol BTCUSDT",
+                  f"MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu -- BINANCE_API_ENV=prod python3 -u {self.E} --auto-heal",
+                  f"timeout 60 python3 {self.E} --auto-heal"):
+            self.assertEqual(self.agy(self.cmd(c)).get("decision"), "allow", c)
+            self.assertEqual(self.claude(c), "allow", c)
+
+    def test_is_yolo_only_next_to_move_breakeven(self):
+        for flags in ("--move-breakeven --symbol PEPEUSDT --is-yolo", "--move-breakeven --symbol PEPEUSDT --is_yolo",
+                      "--move-breakeven --is-yolo --symbol PEPEUSDT --env prod --json"):
+            c = f"python3 {self.E} {flags}"
+            self.assertEqual(self.agy(self.cmd(c)).get("decision"), "allow", c)
+            self.assertEqual(self.ps(c), "allow", c)
+        for flags in ("--close-position --symbol PEPEUSDT --is-yolo", "--auto-heal --is-yolo",
+                      "--symbol PEPEUSDT --is-yolo"):
+            c = f"python3 {self.E} {flags}"
+            self.assertEqual(self.agy(self.cmd(c)).get("decision"), "deny", c)  # trade gates, no dossier
+
+    def test_windows_and_git_bash_session_cwd_map_to_the_wsl_root(self):
+        os.environ[pre_trade_guard.HEARTBEAT_ENV_OVERRIDE] = os.path.join(self.root, "heartbeat.json")
+        real_root, self.root = self.root, "/mnt/c/Desk/Trading"
+        try:
+            for cwd in ("C:\\Desk\\Trading", "/c/Desk/Trading", "c:\\desk\\trading", "/mnt/c/Desk/Trading",
+                        "C:\\Desk\\Trading\\scripts\\..", "C:/Desk/Trading/"):
+                for c in (f"python3 {self.E} --close-position --symbol BTCUSDT", self.DOCTOR,
+                          f"wsl.exe -d Ubuntu -- python3 {self.E} --move-breakeven --symbol BTCUSDT",
+                          "python3 /c/Desk/Trading/scripts/trading_doctor.py --heal",
+                          "python3 C:\\\\Desk\\\\Trading\\\\scripts\\\\trading_doctor.py --heal"):
+                    self.assertEqual(self.claude(c, cwd=cwd), "allow", f"{cwd}: {c}")
+                self.assertEqual(self.claude("python scripts\\execute_futures_trade.py --auto-heal", "PowerShell",
+                                             cwd), "allow", cwd)
+            for cwd in ("C:\\Other", "/c/Desk", "D:\\Desk\\Trading"):
+                self.assertNotEqual(self.claude(self.DOCTOR, cwd=cwd), "allow", cwd)
+            # Inside wsl a /c/... path is a Linux directory, not the C: drive
+            self.assertNotEqual(self.claude("wsl.exe -- python3 /c/Desk/Trading/scripts/trading_doctor.py --heal",
+                                            cwd="C:\\Desk\\Trading"), "allow")
+        finally:
+            self.root = real_root
 
 
 if __name__ == "__main__":

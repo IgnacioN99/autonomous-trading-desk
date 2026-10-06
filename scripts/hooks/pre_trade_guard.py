@@ -26,10 +26,26 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    piped interpreters, curl/wget writes to Binance, unsanctioned scripts importing the engine) are denied.
    Batch deploy scripts and auto-deploy loops are treated as trade openings.
 4. STRUCTURED RISK-REDUCING ACTION PARSING:
-   Requires exact structured flags (--close-position, --auto-heal, --audit-orphans, --protect-pending,
-   --move-breakeven with exactly one --symbol, reduceOnly=true), evaluated per shell sub-command. Never matches generic substrings
-   like 'close'. `execute_futures_trade.py --positions` is read-only (ask). The position guardian loop never
-   opens positions: bounded runs (--once / --dry-run) are allowed, long-running ones require confirmation.
+   MCP: reduceOnly=true / closePosition=true / cancel*. Shell: per sub-command, the script it actually executes
+   (the program, the script operand of python, also through wsl.exe) must be one of RISK_REDUCING_SCRIPTS by its
+   exact repo path, resolved lexically against the cwd (else the workspace root; inside wsl a relative or
+   /mnt/<drive>/... path mapping to the root), never a name anywhere in the text, with an exclusive flag set:
+   scripts/execute_futures_trade.py needs --close-position / --move-breakeven (exactly one --symbol) /
+   --audit-orphans / --auto-heal / --protect-pending (or --help) and only {those, --positions, --symbol, --json,
+   --force, --env, --help, -h, and --is-yolo next to --move-breakeven only}; scripts/loops/position_guardian_loop.py needs --once (never --interval) with
+   {--env, --dry-run, --close-dead-alpha, --json}; scripts/loops/night_cutoff_loop.py {--env, --auto-ratchet,
+   --overnight-mode}; scripts/trading_doctor.py needs --heal with {--env}; record_evaluation.py,
+   loops/climax_watcher_loop.py and user_profile.py only --help / -h. An unknown flag, an abbreviation, a stray
+   operand or another path is not risk-reducing (ask); an executor opening flag (--direction, --leverage, --margin,
+   prices, --order-type, --is-yolo, --confirmed, --bypass-*, also abbreviated) sends the sub-command to the trade
+   gates. `execute_futures_trade.py --positions` alone is read-only (ask). The auto-allow also needs every other
+   sub-command to be benign, no directory change in the line (cd / pushd / popd, and env -C / sudo -D / wsl --cd
+   at any wrapper or wsl -e level), only RISK_ENV_ASSIGNMENTS (BINANCE_API_ENV, BINANCE_AUTH_MODE, PYTHONUNBUFFERED,
+   PYTHONDONTWRITEBYTECODE, PYTHONIOENCODING, MSYS_NO_PATHCONV) and RISK_PYTHON_OPTIONS (-u, -B, -X utf8) before the
+   script, no xargs / env -S / time -o, and no token of the risk-reducing sub-command holding ; | & $ < > ` or a
+   line break (redirects included): otherwise "ask", never a denial. Paths compare lexically (_lexical_host_path,
+   backslashes read as '/'): C:/x, c:/x, Git Bash /c/x (outside wsl) and /mnt/c/x are one case-insensitive drive
+   path; //wsl.localhost/<distro>/x and //wsl$/<distro>/x are the Linux path /x (case-sensitive).
 5. FAIL-CLOSED SESSION STATE & STALENESS CHECK:
    logs/session_state.json must exist, be valid (is_valid=True) and NOT stale (<= 300s).
 6. EVALUATION DOSSIER PROVENANCE (scripts/utils/dossier_provenance.py):
@@ -161,6 +177,11 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    unresolvable: an unknown cwd / ancestor of logs/. PowerShell statements are judged
    per sub-command with these rules minus the Bash-only ones (cd / variable / xargs / stdin-shell tracking, run-time
    values, scripts by path; see 9). Reads by allowlisted programs keep the normal permission policy (ask).
+   wsl.exe without -e / --exec (Bash and PowerShell alike): its default Linux shell parses the arguments again, so
+   their plain space-joined text (after `cd DIR &&` for --cd DIR) is judged once more as a Bash line by the whole
+   decision engine (nested wsl calls up to NESTED_DEPTH_LIMIT levels, deeper is denied); the most restrictive
+   result wins. The join drops the quoting Git Bash / PowerShell may add around arguments with spaces, so it can
+   split more than Linux does: it only ever makes a decision stricter.
    Not covered (residual, defense in depth; the executor-side fail-closed checks are the primary control): Python /
    Node / other non-shell script files (run by their interpreter or by path with their shebang), interpreters
    reading code from a file we do not open (PYTHONPATH / sitecustomize, NODE_OPTIONS --require, PERL5OPT), command
@@ -179,7 +200,7 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    restrictive result wins and a command with bodies is never auto-allowed. Statements are judged exactly like Bash
    (trading primitives, deploy batches, raw Binance HTTP, evaluation trail, harness, ground truth; read-only cmdlets
    such as Get-Content / Select-String may name ground-truth files; wsl.exe [options] -- <cmd> is judged as the
-   Linux command). A backstop then denies a command naming a ground-truth file (literally, through a
+   Linux command and its joined arguments once more as a Bash line, as in 8). A backstop then denies a command naming a ground-truth file (literally, through a
    logs/ glob or an 8.3 short name), the evaluation trail or the logs/ directory unless every statement starts with
    a read-only / navigation cmdlet and nothing in it can write or run code (write cmdlets and aliases anywhere,
    redirection other than to $null, .NET static / method calls, ${provider:path} variables, iex / Invoke-Command /
@@ -189,7 +210,8 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    (unbalanced quotes) are always denied. Not covered: names assembled at runtime (string concatenation, variables).
 10. PASS-THROUGH:
    Tool calls unrelated to trading return "ask" so the runtime's normal permission policy applies.
-   "allow" is reserved for calls that passed every trading gate or are purely risk-reducing.
+   "allow" is reserved for calls that passed every trading gate or are purely risk-reducing (4), written as one
+   flat single-line command; anything the analysis cannot vouch for is downgraded to "ask".
 11. HEARTBEAT:
    Every invocation refreshes logs/hook_heartbeat.json (best effort, never alters the decision).
 
@@ -456,24 +478,59 @@ TRADE_ENGINE_RE = re.compile(r"\bexecute_futures_trade(?:\.py)?\b")
 # Executor modes that never open a position (dispatched by the engine before the trade path)
 EXECUTOR_MOVE_BREAKEVEN_FLAGS = {"--move-breakeven", "--move_breakeven"}
 EXECUTOR_READ_ONLY_FLAGS = {"--positions"}
-# Background position guardian (trailing stops, dead alpha, orphan audit): risk-reducing only
-GUARDIAN_LOOP_RE = re.compile(r"\bposition_guardian_loop(?:\.py)?\b")
-GUARDIAN_BOUNDED_FLAGS = {"--once", "--dry-run", "--dry_run", "--help", "-h"}
 DEPLOY_BATCH_RE = re.compile(r"\bdeploy_[A-Za-z0-9_]+\.py\b")
 AUTO_DEPLOY_LOOP_RE = re.compile(r"\bclimax_watcher_loop(?:\.py)?\b")
 RECORD_EVALUATION_RE = re.compile(r"\brecord_evaluation(?:\.py)?\b")
 USER_PROFILE_SET_RE = re.compile(r"\buser_profile(?:\.py)?\b.*\s--(?:set|setup)\b", re.IGNORECASE)
 
-# Scripts whose CLI implements the risk-reducing flags / --help with argparse
-RISK_FLAG_SCRIPTS_RE = re.compile(
-    r"\b(?:execute_futures_trade|trading_doctor|night_cutoff_loop|record_evaluation|climax_watcher_loop|user_profile)(?:\.py)?\b"
+# Risk-reducing auto-allow (_subcommand_is_risk_reducing). Identity = the script a sub-command actually executes
+# (_executed_script, also through python / wsl.exe), resolved lexically against the cwd (else the workspace root) and
+# equal to one of these repo-relative paths: never a word anywhere in the text. Each entry: (flags of which at least
+# one is required, {allowed flag: takes a value}); any other flag, an =value on a switch or a stray positional means
+# "not risk-reducing" (exact spellings from each script's argparse; abbreviations are not recognised: fails closed).
+HELP_FLAGS = {"--help": False, "-h": False}
+EXECUTOR_RISK_FLAGS = {"--close-position", "--close_position", "--move-breakeven", "--move_breakeven",
+                       "--audit-orphans", "--audit_orphans", "--auto-heal", "--auto_heal",
+                       "--protect-pending", "--protect_pending"}
+# --is-yolo is an opening flag, except next to --move-breakeven (stricter YOLO break-even rules, never opens)
+EXECUTOR_BREAKEVEN_YOLO_FLAGS = {"--is-yolo": False, "--is_yolo": False}
+# What may precede a risk-reducing script for an auto-allow: these env assignments (VAR=v, env VAR=v) and python
+# options only (PYTHONPATH / PYTHONSTARTUP / -i / -m ... can make the interpreter run other code)
+RISK_ENV_ASSIGNMENTS = {"BINANCE_API_ENV", "BINANCE_AUTH_MODE", "PYTHONUNBUFFERED", "PYTHONDONTWRITEBYTECODE",
+                        "PYTHONIOENCODING", "MSYS_NO_PATHCONV"}
+RISK_PYTHON_OPTIONS = {"-u", "-B", "-Xutf8"}
+RISK_REDUCING_SCRIPTS: Dict[str, Tuple[set, Dict[str, bool]]] = {
+    # --positions is allowed next to a risk flag but is not one itself (alone: read-only listing, normal policy)
+    "scripts/execute_futures_trade.py": (
+        EXECUTOR_RISK_FLAGS | set(HELP_FLAGS),
+        {**{f: False for f in EXECUTOR_RISK_FLAGS}, "--positions": False, "--symbol": True, "--json": False,
+         "--force": False, "--env": True, **EXECUTOR_BREAKEVEN_YOLO_FLAGS, **HELP_FLAGS}),
+    # The guardian never opens positions: only a bounded single cycle (--once), never --interval
+    "scripts/loops/position_guardian_loop.py": (
+        {"--once"} | set(HELP_FLAGS),
+        {"--once": False, "--env": True, "--dry-run": False, "--close-dead-alpha": False, "--json": False,
+         **HELP_FLAGS}),
+    "scripts/loops/night_cutoff_loop.py": (
+        set(), {"--env": True, "--auto-ratchet": False, "--overnight-mode": True, **HELP_FLAGS}),
+    "scripts/trading_doctor.py": ({"--heal"} | set(HELP_FLAGS), {"--env": True, "--heal": False, **HELP_FLAGS}),
+    # Only their --help is risk-free
+    "scripts/record_evaluation.py": (set(HELP_FLAGS), dict(HELP_FLAGS)),
+    "scripts/loops/climax_watcher_loop.py": (set(HELP_FLAGS), dict(HELP_FLAGS)),
+    "scripts/user_profile.py": (set(HELP_FLAGS), dict(HELP_FLAGS)),
+}
+# Executor options that open (or shape the opening of) a position, matched with argparse's unique-prefix
+# abbreviations (--dir, --lev): an engine sub-command naming one is judged as a trade opening, never as an exit
+EXECUTOR_OPENING_OPTIONS = (
+    "--direction", "--leverage", "--margin", "--trigger-price", "--trigger_price", "--sl-price", "--sl_price",
+    "--tp1-price", "--tp1_price", "--tp2-price", "--tp2_price", "--order-type", "--order_type", "--limit-price",
+    "--limit_price", "--bypass-eval-gate", "--bypass_eval_gate", "--bypass-delta-gate", "--bypass_delta_gate",
+    "--is-yolo", "--is_yolo", "--confirmed", "--user-confirmed",
 )
-RISK_REDUCING_FLAGS = {"--close-position", "--close_position", "--auto-heal", "--auto_heal",
-                       "--audit-orphans", "--audit_orphans", "--heal", "--protect-pending", "--protect_pending"}
-# Matched against the base name of the script a sub-command executes (_executed_script), never a word anywhere
-RISK_REDUCING_SCRIPTS_RE = re.compile(
-    r"\b(?:night_cutoff_loop|audit_orphan_positions|close_position_market|close_position)\.py\b"
-)
+# Characters a risk-reducing sub-command may not carry in any token to be auto-allowed: a shell that parses the
+# arguments again (wsl.exe without -e) may run them as commands; redirects (>, >>, 2>&1) write files
+RISK_AUTO_ALLOW_METACHARS = (";", "|", "&", "$", "<", ">", "`", "\n", "\r")
+# Programs / cmdlets that change the working directory of the rest of the line
+CHDIR_PROGRAMS = {"cd", "pushd", "popd", "chdir", "set-location", "sl", "push-location", "pop-location"}
 PYTHON_PROGRAM_RE = re.compile(r"^python[0-9.]*(?:\.exe)?$")
 PYTHON_LONG_VALUE_OPTIONS = {"--check-hash-based-pycs"}
 # Text an auto-allow cannot vouch for: the analysis may not see every command it runs (a comment or an
@@ -1028,16 +1085,17 @@ def normalize_tool_call(payload: dict) -> Dict[str, Any]:
 # =============================================================================
 # Argument extraction helpers
 # =============================================================================
-def is_risk_reducing_action(cmd_or_name: str, args_dict: dict = None) -> bool:
+def is_risk_reducing_action(cmd_or_name: str, args_dict: dict = None, cwd: str = "", base_dir: str = "") -> bool:
     """
     Verifies whether an action reduces or eliminates risk (NEVER blocked).
     Structured arguments ONLY:
     - MCP: reduceOnly=true, closePosition=true, or cancel / delete operations
-    - CLI: exact --close-position / --auto-heal / --audit-orphans / --protect-pending / --heal / --help tokens on scripts whose CLI
-      implements them, `execute_futures_trade.py --move-breakeven` with exactly one --symbol, bounded position
-      guardian runs (--once / --dry-run), or dedicated risk-reduction scripts. Batch deploy scripts are never
+    - CLI (one sub-command): the executed script is one of RISK_REDUCING_SCRIPTS by its exact repo path (resolved
+      against cwd, else base_dir / the workspace root) with only that script's exclusive flag set (docstring 4):
+      e.g. `execute_futures_trade.py --close-position --symbol X`, `--move-breakeven` with exactly one --symbol,
+      `position_guardian_loop.py --once`, `trading_doctor.py --heal`. Batch deploy scripts are never
       risk-reducing.
-    Never relies on generic substring 'close' across the command line.
+    Never relies on generic substring 'close' or a script name anywhere in the command line.
     """
     if args_dict:
         mcp_args = parse_mcp_arguments(args_dict)
@@ -1051,7 +1109,7 @@ def is_risk_reducing_action(cmd_or_name: str, args_dict: dict = None) -> bool:
             return True
 
     if cmd_or_name:
-        return _subcommand_is_risk_reducing(_tokenize_subcommand(cmd_or_name), cmd_or_name)
+        return _subcommand_is_risk_reducing(_tokenize_subcommand(cmd_or_name), cmd_or_name, cwd, base_dir)
     return False
 
 
@@ -1724,29 +1782,30 @@ def _symbol_count(text: str) -> int:
     return len({m.group(2).upper() for m in re.finditer(r"--symbol(?:\s+|=)(['\"]?)([A-Za-z0-9_]+)\1", text)})
 
 
-def _executed_script(tokens: List[str]) -> str:
-    """Script operand actually run by a sub-command: the program itself (./close_position.py) or the first operand
-    of a python interpreter (python3 -u scripts/x.py), also through wsl.exe [-d X] [--cd X] [-u X] [--|-e] cmd...;
-    "" for python -c / -m / stdin."""
+def _executed_script_at(tokens: List[str], in_wsl: bool = False) -> Tuple[List[str], int, bool]:
+    """(tokens, index of the script operand in them, run inside wsl) for the script a sub-command actually runs: the
+    program itself (./scripts/x.py) or the first operand of a python interpreter (python3 -u scripts/x.py), also
+    through wsl.exe [-d X] [--cd X] [-u X] [--|-e] cmd... (the tokens are then the Linux command). Index -1 for
+    python -c / -m / stdin."""
     idx = _program_index(tokens)
     n = len(tokens)
     if idx >= n:
-        return ""
+        return tokens, -1, in_wsl
     program = os.path.basename(tokens[idx]).lower()
     if re.sub(r"\.exe$", "", program) == "wsl":
         linux_command = _wsl_command(tokens[idx + 1:])
-        return _executed_script(linux_command) if linux_command else tokens[idx]
+        return _executed_script_at(linux_command, True) if linux_command else (tokens, idx, in_wsl)
     if not PYTHON_PROGRAM_RE.match(program):
-        return tokens[idx]
+        return tokens, idx, in_wsl
     i = idx + 1
     while i < n:
         tok = tokens[i]
         if tok == "--":
-            return tokens[i + 1] if i + 1 < n else ""
+            return tokens, (i + 1 if i + 1 < n else -1), in_wsl
         if tok == "-":
-            return ""
+            return tokens, -1, in_wsl
         if not tok.startswith("-"):
-            return tok
+            return tokens, i, in_wsl
         i += 1
         if tok.startswith("--"):
             if tok in PYTHON_LONG_VALUE_OPTIONS:
@@ -1755,32 +1814,111 @@ def _executed_script(tokens: List[str]) -> str:
         letters = tok[1:]
         for k, ch in enumerate(letters):
             if ch in "cm":
-                return ""
+                return tokens, -1, in_wsl
             if ch in "WX":
                 if k == len(letters) - 1:
                     i += 1
                 break
-    return ""
+    return tokens, -1, in_wsl
 
 
-def _subcommand_is_risk_reducing(tokens: List[str], text: str) -> bool:
-    if not tokens:
+def _executed_script(tokens: List[str]) -> str:
+    """Script operand actually run by a sub-command (see _executed_script_at); "" for python -c / -m / stdin."""
+    toks, i, _ = _executed_script_at(tokens)
+    return toks[i] if i >= 0 else ""
+
+
+def _lexical_host_path(path: str, git_bash: bool = True) -> str:
+    """Absolute POSIX spelling of a path for the lexical identity check, "" for a relative one: '\\' -> '/';
+    C:/x, /mnt/C/x and (git_bash, a Windows-side spelling) Git Bash /c/x -> /mnt/c/x, lower-cased as a whole like
+    _canon_path (drive paths live on case-insensitive NTFS); \\\\wsl.localhost\\<distro>\\x and \\\\wsl$\\<distro>\\x
+    -> /x (case kept: a Linux filesystem may hold an agent-made Scripts/ next to scripts/); normalised. Inside
+    wsl.exe pass git_bash=False: /c/x is then a Linux directory."""
+    p = (path or "").replace("\\", "/")
+    m = re.match(r"^//(?:wsl\.localhost|wsl\$)/[^/]+(?=/|$)", p, re.IGNORECASE)
+    if m:
+        return posixpath.normpath("/" + p[m.end():].lstrip("/"))
+    m = (re.match(r"^([A-Za-z]):(?=/|$)", p) or re.match(r"^/mnt/([A-Za-z])(?=/|$)", p)
+         or (re.match(r"^/([A-Za-z])(?=/|$)", p) if git_bash else None))
+    if m:
+        return posixpath.normpath("/mnt/" + m.group(1).lower() + p[m.end():]).lower()
+    return posixpath.normpath(p) if p.startswith("/") else ""
+
+
+def _sanctioned_script(script: str, cwd: str, base_dir: str, in_wsl: bool) -> Optional[str]:
+    """RISK_REDUCING_SCRIPTS key of a script operand, compared lexically (no filesystem check) with the sanctioned
+    repo paths under base_dir. A relative operand is joined with the cwd (else base_dir). Inside wsl.exe the Linux
+    path must be relative or absolute POSIX (/mnt/<drive>/... mapping to base_dir, or base_dir itself when the hook
+    runs inside WSL); a Windows spelling or a backslash there names another file for Linux: None."""
+    if not script or not base_dir:
+        return None
+    if in_wsl and ("\\" in script or re.match(r"^[A-Za-z]:", script)):
+        return None
+    root = _lexical_host_path(base_dir)
+    if not root:
+        return None
+    if script.replace("\\", "/").startswith("/") or re.match(r"^[A-Za-z]:", script):
+        full = _lexical_host_path(script, git_bash=not in_wsl)
+    else:
+        # The cwd is the Windows-side session cwd (wsl.exe inherits it): Git Bash /c/x spellings map
+        start = (_lexical_host_path(cwd) if cwd else "") or root
+        full = _lexical_host_path(posixpath.join(start, script.replace("\\", "/")), git_bash=False)
+    for key in RISK_REDUCING_SCRIPTS:
+        if full == _lexical_host_path(posixpath.join(root, key), git_bash=False):
+            return key
+    return None
+
+
+def _risk_flags_allowed(key: str, args: List[str]) -> bool:
+    """True when the arguments of a sanctioned script use only its allowlisted flags (RISK_REDUCING_SCRIPTS), carry
+    one of its required flags (when it has any) and no positional operand; a value-taking flag needs a value that is
+    not itself an option."""
+    required, allowed = RISK_REDUCING_SCRIPTS[key]
+    seen = set()
+    i = 0
+    while i < len(args):
+        name, eq, _ = args[i].partition("=")
+        if not name.startswith("-") or name in ("-", "--") or name not in allowed:
+            return False
+        if allowed[name]:
+            if not eq:
+                if i + 1 >= len(args) or args[i + 1].startswith("-"):
+                    return False
+                i += 1
+        elif eq:
+            return False  # argparse rejects a value on a switch
+        seen.add(name)
+        i += 1
+    if required and not seen & required:
         return False
-    if DEPLOY_BATCH_RE.search(text):
-        return False
-    if RISK_REDUCING_SCRIPTS_RE.fullmatch(_executed_script(tokens).replace("\\", "/").rsplit("/", 1)[-1]):
-        return True
-    flags = _flags(tokens)
-    if GUARDIAN_LOOP_RE.search(text) and not TRADE_ENGINE_RE.search(text):
-        # The guardian never opens positions; only bounded runs are auto-allowed.
-        return bool(flags & GUARDIAN_BOUNDED_FLAGS)
-    if not RISK_FLAG_SCRIPTS_RE.search(text):
-        return False
-    if flags & RISK_REDUCING_FLAGS or flags & {"--help", "-h"}:
-        return True
-    if TRADE_ENGINE_RE.search(text) and flags & EXECUTOR_MOVE_BREAKEVEN_FLAGS and _symbol_count(text) == 1:
-        return True
+    if key == "scripts/execute_futures_trade.py" and seen & EXECUTOR_MOVE_BREAKEVEN_FLAGS and \
+            sum(1 for a in args if a.partition("=")[0] == "--symbol") != 1:
+        return False  # --move-breakeven acts on exactly one --symbol
+    if seen & set(EXECUTOR_BREAKEVEN_YOLO_FLAGS) and not seen & EXECUTOR_MOVE_BREAKEVEN_FLAGS:
+        return False  # --is-yolo outside --move-breakeven shapes an opening
+    return True
+
+
+def _executor_opening_named(text: str) -> bool:
+    """True when the text names an executor opening option (EXECUTOR_OPENING_OPTIONS, also as an argparse unique
+    prefix such as --dir / --lev) anywhere, also inside a nested -c string."""
+    for word in re.findall(r"--[A-Za-z0-9_-]+", text or ""):
+        if len(word) > 3 and any(opt.startswith(word) for opt in EXECUTOR_OPENING_OPTIONS):
+            return True
     return False
+
+
+def _subcommand_is_risk_reducing(tokens: List[str], text: str, cwd: str = "", base_dir: str = "") -> bool:
+    """True when a sub-command runs one of RISK_REDUCING_SCRIPTS by its exact repo path (the script it executes,
+    resolved against cwd, else base_dir, which defaults to the workspace root) with only that script's allowlisted
+    flags. Batch deploy scripts are never risk-reducing."""
+    if not tokens or DEPLOY_BATCH_RE.search(text):
+        return False
+    toks, i, in_wsl = _executed_script_at(tokens)
+    if i < 0:
+        return False
+    key = _sanctioned_script(toks[i], cwd, base_dir or find_workspace_root(), in_wsl)
+    return bool(key) and _risk_flags_allowed(key, _plain_args(toks[i + 1:]))
 
 
 def _is_redirect(tok: str) -> bool:
@@ -4004,8 +4142,9 @@ def _powershell_write_construct(command_line: str, tokens: List[str]) -> Optiona
 
 def _wsl_invocation(args: List[str]) -> Optional[Tuple[List[str], bool]]:
     """(Linux command, through the default shell) run by `wsl.exe [-d X] [-u X] [--cd X] [--|-e] cmd...` ([] when
-    none). Without -e/--exec wsl joins the arguments and its default shell parses them again. None for any other
-    wsl option (--import, --mount, --export...), which is judged like an unknown program."""
+    none). Without -e/--exec wsl joins the arguments and its default shell parses them again: both the Bash and the
+    PowerShell paths judge that joined line once more (_wsl_shell_line). None for any other wsl option (--import,
+    --mount, --export...), which is judged like an unknown program."""
     i = 0
     while i < len(args):
         a = args[i]
@@ -4026,9 +4165,46 @@ def _wsl_command(args: List[str]) -> Optional[List[str]]:
     return invocation[0] if invocation is not None else None
 
 
+def _wsl_cd(args: List[str]) -> Optional[str]:
+    """Value of the last `--cd DIR` among the wsl.exe options (before the Linux command); None without one."""
+    cd = None
+    i = 0
+    while i < len(args) and args[i] in WSL_VALUE_OPTIONS:
+        if args[i] == "--cd" and i + 1 < len(args):
+            cd = args[i + 1]
+        i += 2
+    return cd
+
+
+def _wsl_shell_line(seg: List[str], idx: int) -> Optional[str]:
+    """Command line that the wsl.exe call at seg[idx] hands to the Linux default shell (no -e/--exec), None when it
+    is not one: the arguments joined with spaces (the conservative model of what the shell parses again, wsl --
+    cat x '>logs/session_state.json' redirects), after `cd DIR &&` for --cd DIR so the cwd is tracked. Shared by
+    the Bash (_bash_wsl_shell_commands) and PowerShell (_powershell_wsl_shell_commands) paths."""
+    if idx >= len(seg) or re.sub(r"\.exe$", "", os.path.basename(seg[idx]).lower()) != "wsl":
+        return None
+    args = _plain_args(seg[idx + 1:])
+    invocation = _wsl_invocation(args)
+    if invocation is None or not invocation[1] or not invocation[0]:
+        return None
+    line = " ".join(invocation[0])
+    cd = _wsl_cd(args)
+    return f"cd {shlex.quote(cd)} && {line}" if cd is not None else line
+
+
+def _bash_wsl_shell_commands(command_line: str) -> List[str]:
+    """Command lines that the wsl.exe calls of a Bash line hand to the Linux default shell (see _wsl_shell_line):
+    Git Bash passes an argument without spaces bare (--symbol 'X;touch${IFS}y'), and the Linux shell runs it."""
+    lines: List[str] = []
+    for seg in split_subcommands(command_line):
+        line = _wsl_shell_line(seg, _program_index(seg))
+        if line is not None:
+            lines.append(line)
+    return lines
+
+
 def _powershell_wsl_shell_commands(command_line: str) -> List[str]:
-    """Command lines that wsl.exe hands to the Linux default shell (no -e/--exec): the arguments joined with spaces,
-    re-parsed by that shell (wsl -- cat x '>logs/session_state.json' redirects)."""
+    """Command lines that wsl.exe hands to the Linux default shell (no -e/--exec), see _wsl_shell_line."""
     lines: List[str] = []
     segments: List[List[str]] = [[]]
     for tok in _powershell_tokens(command_line):
@@ -4037,10 +4213,9 @@ def _powershell_wsl_shell_commands(command_line: str) -> List[str]:
         else:
             segments[-1].append(tok)
     for seg in segments:
-        if seg and re.sub(r"\.exe$", "", os.path.basename(seg[0]).lower()) == "wsl":
-            invocation = _wsl_invocation(_plain_args(seg[1:]))
-            if invocation is not None and invocation[1] and invocation[0]:
-                lines.append(" ".join(invocation[0]))
+        line = _wsl_shell_line(seg, 0)
+        if line is not None:
+            lines.append(line)
     return lines
 
 
@@ -4113,8 +4288,8 @@ def analyze_run_command(command_line: str, cwd: str, base_dir: str, shell: str =
     Classifies a shell command (shell="powershell": a command already normalised by
     normalize_powershell_command, whose read-only cmdlets may name ground-truth files). Returns
     {deny: reason|None, force_ask: reason|None, trading: [subcommand text], trading_tokens: [its tokens],
-     risk_reducing: bool,
-     neutral_only: bool, record_eval: {...}|None}
+     risk_reducing: bool, risk_blocker: why a risk-reducing sub-command may not be auto-allowed|None,
+     all_safe: bool, record_eval: {...}|None}
     Runs inside the evaluation's audit scope; exceeding the work budget denies (fail closed).
     """
     with _audit_scope():
@@ -4122,13 +4297,66 @@ def analyze_run_command(command_line: str, cwd: str, base_dir: str, shell: str =
             return _analyze_run_command(command_line, cwd, base_dir, shell)
         except AuditBudgetExceeded:
             return {"deny": AUDIT_BUDGET_REASON, "force_ask": None, "trading": [], "batch": [],
-                    "risk_reducing": False, "all_safe": False, "record_eval": None}
+                    "risk_reducing": False, "risk_blocker": None, "all_safe": False, "record_eval": None}
+
+
+def _risk_auto_allow_blocker(tokens: List[str]) -> Optional[str]:
+    """Why a risk-reducing sub-command may not be auto-allowed on its own: a token holding a shell metacharacter
+    (RISK_AUTO_ALLOW_METACHARS: wsl.exe hands its arguments to a shell that parses them again; redirects write
+    files) or a prefix the hook cannot vouch for (_risk_prefix_blocker). None when it may."""
+    for tok in tokens:
+        for ch in RISK_AUTO_ALLOW_METACHARS:
+            if ch in tok:
+                return f"an argument holds the shell metacharacter {ch!r}"
+    return _risk_prefix_blocker(tokens)
+
+
+def _risk_prefix_blocker(tokens: List[str]) -> Optional[str]:
+    """Walks every level _executed_script_at crosses (assignments, wrappers such as env / sudo / timeout, wsl.exe,
+    python) and returns why the call is not auto-allowed: a directory change at any level (env -C, sudo -D,
+    wsl.exe --cd, also inside wsl -e), an env assignment outside RISK_ENV_ASSIGNMENTS (PYTHONPATH=..., env
+    LD_...=...), a wrapper fed by stdin or a string (xargs, env -S) or writing a file (time -o), or a python option
+    outside RISK_PYTHON_OPTIONS (-i, -m, -c, -W...). None when the prefix is clean."""
+    for _ in range(NESTED_DEPTH_LIMIT + 2):
+        idx, info = _command_start(tokens)
+        if info["chdirs"]:
+            return "it changes the working directory"
+        if info["xargs"] or info["nested"] or info["outputs"]:
+            return "it runs through a wrapper that takes arguments, a command string or an output file"
+        for var, _value in info["assigns"]:
+            if var not in RISK_ENV_ASSIGNMENTS:
+                return f"it sets the environment variable {var}"
+        if idx >= len(tokens):
+            return None
+        prog = re.sub(r"\.exe$", "", os.path.basename(tokens[idx]).lower())
+        if prog == "wsl":
+            if _wsl_cd(tokens[idx + 1:]) is not None:
+                return "it changes the working directory"
+            linux = _wsl_command(tokens[idx + 1:])
+            if not linux:
+                return None
+            tokens = linux
+            continue
+        if PYTHON_PROGRAM_RE.match(prog):
+            _toks, script_at, _ = _executed_script_at(tokens)
+            options = tokens[idx + 1:script_at] if script_at > idx else tokens[idx + 1:]
+            i = 0
+            while i < len(options):
+                opt = options[i]
+                if opt == "-X" and i + 1 < len(options) and options[i + 1] == "utf8":
+                    i += 2
+                    continue
+                if opt not in RISK_PYTHON_OPTIONS and opt != "--":
+                    return f"it passes the interpreter option {opt}"
+                i += 1
+        return None
+    return "it nests wsl.exe calls too deeply"
 
 
 def _analyze_run_command(command_line: str, cwd: str, base_dir: str, shell: str = "bash") -> Dict[str, Any]:
     result: Dict[str, Any] = {
         "deny": None, "force_ask": None, "trading": [], "trading_tokens": [], "batch": [], "risk_reducing": False,
-        "all_safe": True, "record_eval": None,
+        "risk_blocker": None, "all_safe": True, "record_eval": None,
     }
     if not command_line.strip():
         return result
@@ -4202,6 +4430,10 @@ def _analyze_run_command(command_line: str, cwd: str, base_dir: str, shell: str 
     for tokens in subcommands:
         text = " ".join(tokens)
         prog = _program(tokens)
+        if prog in CHDIR_PROGRAMS:
+            # The sanctioned scripts are matched against the hook's cwd: a line that changes directory never
+            # auto-allows a risk-reducing call (one flat command per call)
+            result["risk_blocker"] = result["risk_blocker"] or "it changes the working directory"
 
         # 5. Harness files require explicit confirmation
         if HARNESS_PATH_CMD_RE.search(text) and _subcommand_writes_path(tokens, text, HARNESS_PATH_CMD_RE, inline):
@@ -4238,25 +4470,32 @@ def _analyze_run_command(command_line: str, cwd: str, base_dir: str, shell: str 
         if is_batch:
             result["batch"].append(text)
             continue
+        if _subcommand_is_risk_reducing(tokens, text, cwd, base_dir):
+            # A sanctioned script with only its allowlisted flags is safe on its own (judged here, not skipped:
+            # metacharacters, directory changes and redirects keep it from an auto-allow); every other sub-command
+            # of the line still has to be safe below
+            result["risk_reducing"] = True
+            result["risk_blocker"] = result["risk_blocker"] or _risk_auto_allow_blocker(tokens)
+            if _redirect_targets(tokens):
+                result["all_safe"] = False
+            continue
         if TRADE_ENGINE_RE.search(text):
             flags = _flags(tokens)
-            if _subcommand_is_risk_reducing(tokens, text):
-                result["risk_reducing"] = True
-            elif flags & EXECUTOR_MOVE_BREAKEVEN_FLAGS:
+            if flags & EXECUTOR_MOVE_BREAKEVEN_FLAGS and _symbol_count(text) != 1:
                 result["deny"] = (
                     "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Structured Risk Parsing): `execute_futures_trade.py "
                     "--move-breakeven` requires exactly one --symbol (e.g. --move-breakeven --symbol BTCUSDT)."
                 )
                 return result
-            elif flags & EXECUTOR_READ_ONLY_FLAGS:
-                result["all_safe"] = False  # read-only position listing: normal permission policy (ask)
+            non_opening = EXECUTOR_READ_ONLY_FLAGS | EXECUTOR_RISK_FLAGS | set(HELP_FLAGS)
+            if not _executor_opening_named(text) and any(
+                    f in non_opening or (len(f) > 3 and any(o.startswith(f) for o in non_opening)) for f in flags):
+                # Read-only listing, or an exit / help that is not the exact sanctioned one-liner (another path, an
+                # unknown flag, a nested shell): normal permission policy (ask), never auto-allowed
+                result["all_safe"] = False
             else:
                 result["trading"].append(text)
                 result["trading_tokens"].append(tokens)
-            continue
-
-        if _subcommand_is_risk_reducing(tokens, text):
-            result["risk_reducing"] = True
             continue
 
         if prog not in BENIGN_PROGRAMS or _redirect_targets(tokens):
@@ -4642,16 +4881,29 @@ def evaluate_trade_opening(cmd: str, args: dict, mcp_args: dict, base_dir: str,
 # Decision engine
 # =============================================================================
 def evaluate_shell_command(command_line: str, cwd: str, base_dir: str, conversation_id: Optional[str],
-                           shell: str = "bash") -> Tuple[str, str]:
+                           shell: str = "bash", wsl_depth: int = 0) -> Tuple[str, str]:
     """(decision, reason) for a shell command line (Bash, or PowerShell text normalised by scan_powershell). An
     "allow" (risk-reducing exit or gated trade opening) needs a flat single-line command (_auto_allow_blocker);
-    otherwise it is downgraded to "ask"."""
+    otherwise it is downgraded to "ask". Bash: the joined arguments of each wsl.exe call without -e/--exec are
+    judged once more as the Linux default shell re-parses them (_bash_wsl_shell_commands, nested wsl calls up to
+    NESTED_DEPTH_LIMIT levels); the most restrictive result wins."""
+    if wsl_depth > NESTED_DEPTH_LIMIT:
+        return "deny", (f"🚨 FAIL-CLOSED: wsl.exe calls nested deeper than {NESTED_DEPTH_LIMIT} levels cannot be "
+                        "audited.")
     decision, reason = _evaluate_shell_command(command_line, cwd, base_dir, conversation_id, shell)
     if decision == "allow":
         blocker = _auto_allow_blocker(command_line)
         if blocker:
-            return "ask", (reason + f" Not auto-allowed because {blocker}; user confirmation required.").strip()
-    return decision, reason
+            decision, reason = "ask", (reason + f" Not auto-allowed because {blocker}; user confirmation "
+                                                "required.").strip()
+    if shell != "bash" or decision == "deny":
+        return decision, reason
+    results = [(decision, reason)]
+    for line in _bash_wsl_shell_commands(command_line):
+        results.append(evaluate_shell_command(line, cwd, base_dir, conversation_id, "bash", wsl_depth + 1))
+        if results[-1][0] == "deny":
+            return results[-1]
+    return max(results, key=lambda r: PS_DECISION_RANK.get(r[0], PS_DECISION_RANK["deny"]))
 
 
 def _evaluate_shell_command(command_line: str, cwd: str, base_dir: str, conversation_id: Optional[str],
@@ -4705,6 +4957,9 @@ def _evaluate_shell_command(command_line: str, cwd: str, base_dir: str, conversa
     if analysis["force_ask"]:
         return "force_ask", analysis["force_ask"]
     if analysis["risk_reducing"] and analysis["all_safe"]:
+        if analysis["risk_blocker"]:
+            return "ask", (f"Risk-reducing action / exit, not auto-allowed because {analysis['risk_blocker']}: run "
+                           "the sanctioned command as one flat call; user confirmation required.")
         return "allow", "Risk-reducing action / exit authorized."
     return "ask", ""
 

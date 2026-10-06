@@ -323,12 +323,12 @@ class TestPreTradeGuardHardening(unittest.TestCase):
         self.assertEqual(res.get("decision"), "allow")
 
     def test_structured_cli_auto_heal_flag_allowed(self):
-        """CLI command with --auto-heal flag is recognized as risk-reducing and allowed."""
+        """trading_doctor.py --heal (its real auto-heal flag) is recognized as risk-reducing and allowed."""
         payload = {
             "toolCall": {
                 "name": "run_command",
                 "args": {
-                    "CommandLine": "python3 scripts/trading_doctor.py --auto-heal"
+                    "CommandLine": "python3 scripts/trading_doctor.py --heal"
                 }
             }
         }
@@ -403,13 +403,16 @@ class TestPreTradeGuardHardening(unittest.TestCase):
             self.assertEqual(res.get("__exit_code__"), 0)
 
     def test_position_guardian_loop_classification(self):
-        """The guardian never opens positions: bounded runs are allowed, long-running ones ask."""
+        """The guardian never opens positions: single cycles (--once) are allowed, long-running ones ask."""
         for cmd in ("python3 scripts/loops/position_guardian_loop.py --once",
                     "python3 scripts/loops/position_guardian_loop.py --once --env prod --json",
-                    "python3 scripts/loops/position_guardian_loop.py --dry-run --interval 60",
+                    "python3 scripts/loops/position_guardian_loop.py --once --dry-run --close-dead-alpha",
                     "python3 scripts/loops/position_guardian_loop.py --help"):
             self.assertEqual(self._cmd(cmd).get("decision"), "allow", cmd)
+        # Issue #100: the auto-allow needs --once; --interval (even with --dry-run) is a long-running loop
         for cmd in ("python3 scripts/loops/position_guardian_loop.py",
+                    "python3 scripts/loops/position_guardian_loop.py --dry-run --interval 60",
+                    "python3 scripts/loops/position_guardian_loop.py --once --interval 60",
                     "python3 scripts/loops/position_guardian_loop.py --interval 300 --env prod",
                     "nohup python3 scripts/loops/position_guardian_loop.py --interval 300 &"):
             self.assertEqual(self._cmd(cmd).get("decision"), "ask", cmd)
