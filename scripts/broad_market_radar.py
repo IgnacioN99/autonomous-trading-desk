@@ -125,30 +125,15 @@ def analyze_single_symbol(symbol, interval=DEFAULT_INTERVAL):
     if total_range <= 0:
         return None
 
-    body_top = max(candle_open, current_price)
-    body_bottom = min(candle_open, current_price)
-    lower_wick = body_bottom - candle_low
-    upper_wick = candle_high - body_top
-
-    lower_wick_ratio = (lower_wick / total_range) * 100
-    upper_wick_ratio = (upper_wick / total_range) * 100
-
-    # Previous candle to confirm recent absorption wicks
-    prev_open = opens[-2]
-    prev_close = closes[-2]
-    prev_high = highs[-2]
-    prev_low = lows[-2]
-    prev_range = prev_high - prev_low
-    prev_lower_wick_ratio = 0
-    prev_upper_wick_ratio = 0
-    if prev_range > 0:
-        prev_body_top = max(prev_open, prev_close)
-        prev_body_bottom = min(prev_open, prev_close)
-        prev_lower_wick_ratio = ((prev_body_bottom - prev_low) / prev_range) * 100
-        prev_upper_wick_ratio = ((prev_high - prev_body_top) / prev_range) * 100
-
-    effective_lower_wick = max(lower_wick_ratio, prev_lower_wick_ratio)
-    effective_upper_wick = max(upper_wick_ratio, prev_upper_wick_ratio)
+    # Absorption wicks: BOTH sides from the same, last CLOSED candle (klines[-1] is still forming, so its wicks
+    # are not final). Never mix sides across candles: lower + upper must stay <= 100% of one range (issue #20).
+    wick_kline = klines[-2]
+    wick_candle_open_time = int(wick_kline[0])
+    effective_lower_wick, effective_upper_wick = me.candle_wick_pcts(wick_kline)
+    # The stop must sit beyond the wick that justifies the trade, not inside it: anchor on the more extreme of
+    # the forming candle and the wick candle (issue #20).
+    wick_high = float(wick_kline[2])
+    wick_low = float(wick_kline[3])
 
     rsi_15m = calculate_rsi(closes, period=14)
     emas = calculate_ema(closes, period=20)
@@ -237,7 +222,7 @@ def analyze_single_symbol(symbol, interval=DEFAULT_INTERVAL):
         reasons = long_reasons
         entry = current_price
         trigger = candle_high * 1.0005
-        sl = candle_low - (1.3 * atr)
+        sl = min(candle_low, wick_low) - (1.3 * atr)
         risk_pct = ((entry - sl) / entry) * 100
         if risk_pct < 1.4:
             sl = entry * 0.985
@@ -251,7 +236,7 @@ def analyze_single_symbol(symbol, interval=DEFAULT_INTERVAL):
         reasons = short_reasons
         entry = current_price
         trigger = candle_low * 0.9995
-        sl = candle_high + (1.3 * atr)
+        sl = max(candle_high, wick_high) + (1.3 * atr)
         risk_pct = ((sl - entry) / entry) * 100
         if risk_pct < 1.4:
             sl = entry * 1.015
@@ -306,12 +291,15 @@ def analyze_single_symbol(symbol, interval=DEFAULT_INTERVAL):
         "vol_ratio": round(vol_ratio, 1),
         "lower_wick": round(effective_lower_wick, 1),
         "upper_wick": round(effective_upper_wick, 1),
+        "wick_candle_open_time": wick_candle_open_time,  # open time (ms) of the closed candle both wicks come from
         "reasons": reasons
     }
 
 def enrich_candidate_microstructure(cand):
     sym = cand['symbol']
-    micro = me.get_symbol_microstructure(sym, period=cand.get('interval', DEFAULT_INTERVAL))
+    # Same wick candle as the scan, so the ORDER FLOW text and the wick fields describe one candle (issue #20)
+    micro = me.get_symbol_microstructure(sym, period=cand.get('interval', DEFAULT_INTERVAL),
+                                         wick_candle_open_time=cand.get('wick_candle_open_time'))
     if not micro:
         return cand
     cand['micro'] = micro

@@ -102,14 +102,18 @@ def fake_urlopen(routes, log=None):
 
 
 def radar_long_klines(n=55):
-    """Steady decline then a climax-volume candle with a ~94% lower absorption wick (Tier S LONG)."""
+    """Steady decline, a climax-volume candle with a ~94% lower absorption wick, then the still-open candle on
+    climax volume (Tier S LONG). The wick candle is the last CLOSED one (klines[-2]): since issue #20 the radar
+    reads both wicks from it, never from the forming candle."""
     ks, price = [], 100.0
-    for i in range(n - 1):
+    for i in range(n - 2):
         o, c = price, price * 0.995
         ks.append([i, str(o), str(o * 1.001), str(c * 0.999), str(c), "100"])
         price = c
     o = price
-    ks.append([n, str(o), str(o * 1.004), str(o * 0.94), str(o * 1.002), "400"])
+    ks.append([n - 2, str(o), str(o * 1.004), str(o * 0.94), str(o * 1.002), "400"])
+    o = o * 1.002
+    ks.append([n - 1, str(o), str(o * 1.001), str(o * 0.999), str(o * 1.0005), "400"])
     return ks
 
 
@@ -131,7 +135,7 @@ def flat_klines(n=40):
     return [[i, "1", "1", "1", "1", "100"] for i in range(n)]
 
 
-def micro_snapshot(symbol, period="15m"):
+def micro_snapshot(symbol, period="15m", **kwargs):  # kwargs: wick_candle_open_time (issue #20)
     return {
         "symbol": symbol, "taker_ratio": 1.0, "oib_ratio": 0.0, "cvd_window_net": 0.0,
         "oi_change_pct": 0.1, "oi_z_score": 0.2, "funding_rate_pct": 0.01,
@@ -180,7 +184,7 @@ class TestBroadMarketRadarCli(_NoOrders):
     def test_json_schema_interval_and_pure_stdout(self):
         log = []
 
-        def noisy_micro(symbol, period="15m"):
+        def noisy_micro(symbol, period="15m", **kwargs):
             print("library noise that must not reach stdout")
             return micro_snapshot(symbol, period)
 
@@ -202,7 +206,7 @@ class TestBroadMarketRadarCli(_NoOrders):
         cand = data["candidates"][0]
         for key in ("symbol", "direction", "confidence", "tier", "tier_code", "interval", "price", "trigger",
                     "sl", "tp1", "tp2", "rr", "risk_pct", "rsi", "vol_ratio", "lower_wick", "upper_wick",
-                    "reasons", "micro", "roe_est_pct"):
+                    "wick_candle_open_time", "reasons", "micro", "roe_est_pct"):
             self.assertIn(key, cand)
         self.assertEqual(cand["direction"], "LONG")
         self.assertEqual(cand["tier_code"], "S")
