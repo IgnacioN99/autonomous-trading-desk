@@ -33,13 +33,21 @@ HEALTHY = {"status": "HEALTHY_MOMENTUM", "range_pct": 1.2, "recommendation": "HO
 STALLED = {"status": "DEAD_ALPHA_STALLED", "range_pct": 0.2, "recommendation": "CLOSE_OR_PROTECT", "message": "stalled"}
 
 
+# Shared holding-time verdict (utils/position_timing, issue #92): the guardian only reports/closes DEAD_ALPHA_STALLED
+# when the 15m stall AND this verdict agree. Real-path coverage lives in tests/test_issue_92_holding_time.py.
+OVERDUE_STAGNANT = {"verdict": "DEAD_ALPHA", "is_dead_alpha": True, "elapsed_hours": 5.0, "entry_time_source": "userTrades"}
+
+
 @contextlib.contextmanager
-def guardian_env(fake, structural_result=None, dead_alpha=HEALTHY):
+def guardian_env(fake, structural_result=None, dead_alpha=HEALTHY, holding=None):
     log_dir = tempfile.mkdtemp()
-    with offline(fake), \
-         patch.object(pgl, "DEFAULT_LOG_DIR", log_dir), \
-         patch("dynamic_exit_manager.calculate_structural_stop", return_value=structural_result), \
-         patch("dynamic_exit_manager.check_dead_alpha_timeout", return_value=dict(dead_alpha)):
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(offline(fake))
+        stack.enter_context(patch.object(pgl, "DEFAULT_LOG_DIR", log_dir))
+        stack.enter_context(patch("dynamic_exit_manager.calculate_structural_stop", return_value=structural_result))
+        stack.enter_context(patch("dynamic_exit_manager.check_dead_alpha_timeout", return_value=dict(dead_alpha)))
+        if holding is not None:
+            stack.enter_context(patch.object(pgl, "holding_verdict", return_value=dict(holding)))
         yield log_dir
 
 
@@ -68,7 +76,7 @@ class TestGuardianDryRun(unittest.TestCase):
     def test_once_dry_run_sends_no_writes(self):
         positions = [long_position("BTCUSDT"), long_position("ETHUSDT")]
         fake = FakeExchange(positions, algos=[stop(501, 95.0, symbol="BTCUSDT")])  # ETHUSDT is an orphan
-        with guardian_env(fake, structural_result=structural(102.0), dead_alpha=STALLED) as log_dir, \
+        with guardian_env(fake, structural_result=structural(102.0), dead_alpha=STALLED, holding=OVERDUE_STAGNANT) as log_dir, \
              patch("execute_futures_trade.close_position_market") as mock_close, \
              patch("execute_futures_trade.emergency_abort_market_close") as mock_abort:
             code, out = run_main(["--once", "--dry-run", "--env", "testnet", "--json", "--close-dead-alpha"])
@@ -143,7 +151,7 @@ class TestGuardianLive(unittest.TestCase):
 
     def test_dead_alpha_reported_only_by_default(self):
         fake = FakeExchange([long_position("BTCUSDT")], algos=[stop(501, 104.0)])
-        with guardian_env(fake, structural_result=structural(102.0), dead_alpha=STALLED) as log_dir, \
+        with guardian_env(fake, structural_result=structural(102.0), dead_alpha=STALLED, holding=OVERDUE_STAGNANT) as log_dir, \
              patch("execute_futures_trade.close_position_market") as mock_close:
             code, _ = run_main(["--once", "--env", "testnet"])
         mock_close.assert_not_called()
@@ -153,7 +161,7 @@ class TestGuardianLive(unittest.TestCase):
 
     def test_dead_alpha_closed_with_flag(self):
         fake = FakeExchange([long_position("BTCUSDT")], algos=[stop(501, 104.0)])
-        with guardian_env(fake, structural_result=structural(102.0), dead_alpha=STALLED) as log_dir, \
+        with guardian_env(fake, structural_result=structural(102.0), dead_alpha=STALLED, holding=OVERDUE_STAGNANT) as log_dir, \
              patch("execute_futures_trade.close_position_market", return_value={"success": True}) as mock_close:
             run_main(["--once", "--env", "testnet", "--close-dead-alpha"])
         mock_close.assert_called_once_with("BTCUSDT", target_env="testnet")
