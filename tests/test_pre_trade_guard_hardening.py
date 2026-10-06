@@ -373,11 +373,15 @@ class TestPreTradeGuardHardening(unittest.TestCase):
     def test_cli_move_breakeven_with_symbol_allowed(self):
         """--move-breakeven with exactly one --symbol is risk-reducing (no dossier / session state needed)."""
         for cmd in ("python3 scripts/execute_futures_trade.py --move-breakeven --symbol BTCUSDT",
-                    "python3 scripts/execute_futures_trade.py --move-breakeven --symbol=BTCUSDT --force --env prod",
+                    "python3 scripts/execute_futures_trade.py --move-breakeven --symbol=BTCUSDT --env prod",
                     "python3 scripts/execute_futures_trade.py --move_breakeven --symbol BTCUSDT --env testnet"):
             res = self._cmd(cmd)
             self.assertEqual(res.get("decision"), "allow", cmd)
             self.assertIn("Risk-reducing", res.get("reason", ""))
+        # Issue #111: --force overrides anti-truncation / YOLO BE-after-TP1: user confirmation, never a denial
+        res = self._cmd("python3 scripts/execute_futures_trade.py --move-breakeven --symbol=BTCUSDT --force --env prod")
+        self.assertEqual(res.get("decision"), "ask")
+        self.assertIn("Forced break-even", res.get("reason", ""))
 
     def test_cli_move_breakeven_without_single_symbol_denied(self):
         """--move-breakeven needs exactly one --symbol; it never falls through to the trade-opening path."""

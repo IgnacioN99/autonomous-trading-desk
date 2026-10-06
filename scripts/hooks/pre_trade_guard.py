@@ -39,20 +39,32 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    /mnt/<drive>/... path mapping to the root), never a name anywhere in the text, with an exclusive flag set:
    scripts/execute_futures_trade.py needs --close-position / --move-breakeven (exactly one --symbol) /
    --audit-orphans / --auto-heal / --protect-pending (or --help) and only {those, --positions, --symbol, --json,
-   --force, --env, --help, -h, and --is-yolo next to --move-breakeven only}; scripts/loops/position_guardian_loop.py needs --once (never --interval) with
-   {--env, --dry-run, --close-dead-alpha, --json}; scripts/loops/night_cutoff_loop.py {--env, --auto-ratchet,
-   --overnight-mode}; scripts/trading_doctor.py needs --heal with {--env}; record_evaluation.py,
+   --force, --env, --help, -h, and --is-yolo next to --move-breakeven only}, but --move-breakeven --force (it
+   overrides the anti-truncation and YOLO break-even-after-TP1 rules) is never auto-allowed: a forced break-even
+   asks the user, never a denial (issue #111); scripts/loops/position_guardian_loop.py needs --once (never
+   --interval) with {--env, --dry-run, --close-dead-alpha, --json}; scripts/loops/night_cutoff_loop.py {--env,
+   --auto-ratchet, --overnight-mode}; scripts/trading_doctor.py needs --heal with {--env}; record_evaluation.py,
    loops/climax_watcher_loop.py and user_profile.py only --help / -h. An unknown flag, an abbreviation, a stray
    operand or another path is not risk-reducing (ask); an executor opening flag (--direction, --leverage, --margin,
    prices, --order-type, --is-yolo, --confirmed, --bypass-*, also abbreviated) sends the sub-command to the trade
-   gates. `execute_futures_trade.py --positions` alone is read-only (ask). The auto-allow also needs every other
+   gates, except --is-yolo next to --move-breakeven (a break-even call off the sanctioned path asks, never denied).
+   `execute_futures_trade.py --positions` alone is read-only (ask). The auto-allow also needs every other
    sub-command to be benign, no directory change in the line (cd / pushd / popd, and env -C / sudo -D / wsl --cd
-   at any wrapper or wsl -e level), only RISK_ENV_ASSIGNMENTS (BINANCE_API_ENV, BINANCE_AUTH_MODE, PYTHONUNBUFFERED,
-   PYTHONDONTWRITEBYTECODE, PYTHONIOENCODING, MSYS_NO_PATHCONV) and RISK_PYTHON_OPTIONS (-u, -B, -X utf8) before the
-   script, no xargs / env -S / time -o, and no token of the risk-reducing sub-command holding ; | & $ < > ` or a
-   line break (redirects included): otherwise "ask", never a denial. Paths compare lexically (_lexical_host_path,
-   backslashes read as '/'): C:/x, c:/x, Git Bash /c/x (outside wsl) and /mnt/c/x are one case-insensitive drive
-   path; //wsl.localhost/<distro>/x and //wsl$/<distro>/x are the Linux path /x (case-sensitive).
+   at any wrapper or wsl -e level), only RISK_WRAPPERS (env, timeout, nice, nohup, stdbuf) at every wrapper or
+   wsl -e level (sudo in any form, doas, chroot, setsid, flock, time, ionice, taskset, exec, command, xargs, uv run
+   ... change the user, root, shell or process context: issue #110), no wsl.exe -u / --user, no wsl.exe
+   --shell-type login (it sources ~/.profile; standard / none are fine) and no wsl.exe -d /
+   --distribution other than WSL_DISTRO_NAME (case-insensitive; unset: any -d asks), only RISK_ENV_ASSIGNMENTS
+   (BINANCE_API_ENV, BINANCE_AUTH_MODE, PYTHONUNBUFFERED, PYTHONDONTWRITEBYTECODE, PYTHONIOENCODING,
+   MSYS_NO_PATHCONV) and RISK_PYTHON_OPTIONS (-u, -B, -X utf8) before the script, no env -S, and no token of the
+   risk-reducing sub-command holding ; | & $ < > ` or a line break (redirects included): otherwise "ask", never a
+   denial. A gated trade opening on the same line as a risk-reducing sub-command that may not be auto-allowed asks.
+   Paths compare lexically (_lexical_host_path, backslashes read as '/'): C:/x, c:/x and /mnt/c/x are one
+   case-insensitive drive path; outside wsl and only when the session cwd is a Windows-side spelling (C:\\x, c:/x, a
+   backslash, /c/x: a call made from Windows) Git Bash /c/x is that drive path too and //wsl.localhost/<distro>/x
+   and //wsl$/<distro>/x are the Linux path /x (case-sensitive) when <distro> is WSL_DISTRO_NAME (case-insensitive;
+   another or an unknown distro names another filesystem). With a native Linux cwd (/mnt/c/..., /home/...) or none,
+   /c/x and //wsl.../x are Linux paths: not sanctioned (ask) (issue #110).
 5. FAIL-CLOSED SESSION STATE & STALENESS CHECK:
    logs/session_state.json must exist, be valid (is_valid=True) and NOT stale (<= 300s).
 6. EVALUATION DOSSIER PROVENANCE (scripts/utils/dossier_provenance.py):
@@ -568,8 +580,18 @@ EXECUTOR_BREAKEVEN_YOLO_FLAGS = {"--is-yolo": False, "--is_yolo": False}
 RISK_ENV_ASSIGNMENTS = {"BINANCE_API_ENV", "BINANCE_AUTH_MODE", "PYTHONUNBUFFERED", "PYTHONDONTWRITEBYTECODE",
                         "PYTHONIOENCODING", "MSYS_NO_PATHCONV"}
 RISK_PYTHON_OPTIONS = {"-u", "-B", "-Xutf8"}
+# Wrappers that may precede a risk-reducing script at any level for an auto-allow (issue #110): they neither change
+# the user, root, shell or working directory nor feed the command from elsewhere. Any other wrapper (sudo in any
+# form, doas, chroot, setsid, flock, time, ionice, taskset, exec, command, xargs, uv run ...) means "ask"
+RISK_WRAPPERS = {"env", "timeout", "nice", "nohup", "stdbuf"}
+# Executor --force (only acts with --move-breakeven) overrides the anti-truncation (+2.0x ATR_15m) and YOLO
+# break-even-after-TP1 rules: still risk-reducing in shape (never sent to the trade gates, never denied), but a
+# forced break-even always asks the user (issue #111)
+FORCED_BREAKEVEN_BLOCKER = ("--force overrides the break-even rules (anti-truncation +2.0x ATR_15m, YOLO break-even "
+                            "only after TP1)")
 RISK_REDUCING_SCRIPTS: Dict[str, Tuple[set, Dict[str, bool]]] = {
     # --positions is allowed next to a risk flag but is not one itself (alone: read-only listing, normal policy)
+    # --force is recognised but never auto-allowed (FORCED_BREAKEVEN_BLOCKER, issue #111)
     "scripts/execute_futures_trade.py": (
         EXECUTOR_RISK_FLAGS | set(HELP_FLAGS),
         {**{f: False for f in EXECUTOR_RISK_FLAGS}, "--positions": False, "--symbol": True, "--json": False,
@@ -2211,6 +2233,7 @@ def _command_start_uncached(tokens: List[str]) -> Tuple[int, Dict[str, Any]]:
             continue
         base = os.path.basename(tok).lower()
         if base == "uv" and i + 1 < n and tokens[i + 1] == "run":
+            info["wrappers"].append("uv")
             i += 2
         elif base == "xargs":
             info["wrappers"].append("xargs")
@@ -2328,13 +2351,19 @@ def _executed_script(tokens: List[str]) -> str:
 def _lexical_host_path(path: str, git_bash: bool = True) -> str:
     """Absolute POSIX spelling of a path for the lexical identity check, "" for a relative one: '\\' -> '/';
     C:/x, /mnt/C/x and (git_bash, a Windows-side spelling) Git Bash /c/x -> /mnt/c/x, lower-cased as a whole like
-    _canon_path (drive paths live on case-insensitive NTFS); \\\\wsl.localhost\\<distro>\\x and \\\\wsl$\\<distro>\\x
-    -> /x (case kept: a Linux filesystem may hold an agent-made Scripts/ next to scripts/); normalised. Inside
-    wsl.exe pass git_bash=False: /c/x is then a Linux directory."""
+    _canon_path (drive paths live on case-insensitive NTFS); (git_bash too) \\\\wsl.localhost\\<distro>\\x and
+    \\\\wsl$\\<distro>\\x -> /x only when <distro> is this WSL distribution (WSL_DISTRO_NAME, case-insensitive;
+    issue #110): another or an unknown distro keeps its //wsl.../<distro>/x spelling, which never equals a workspace path (case kept: a Linux
+    filesystem may hold an agent-made Scripts/ next to scripts/); normalised. Pass git_bash=False inside wsl.exe and
+    whenever the session cwd is not a Windows-side spelling (_windows_side_cwd): /c/x is then a Linux directory and
+    //wsl.localhost/... a Linux path (POSIX // root), never mapped."""
     p = (path or "").replace("\\", "/")
-    m = re.match(r"^//(?:wsl\.localhost|wsl\$)/[^/]+(?=/|$)", p, re.IGNORECASE)
+    m = re.match(r"^//(?:wsl\.localhost|wsl\$)/([^/]+)(?=/|$)", p, re.IGNORECASE) if git_bash else None
     if m:
-        return posixpath.normpath("/" + p[m.end():].lstrip("/"))
+        own = os.environ.get("WSL_DISTRO_NAME", "")
+        if own and m.group(1).lower() == own.lower():
+            return posixpath.normpath("/" + p[m.end():].lstrip("/"))
+        return posixpath.normpath(p)
     m = (re.match(r"^([A-Za-z]):(?=/|$)", p) or re.match(r"^/mnt/([A-Za-z])(?=/|$)", p)
          or (re.match(r"^/([A-Za-z])(?=/|$)", p) if git_bash else None))
     if m:
@@ -2342,23 +2371,35 @@ def _lexical_host_path(path: str, git_bash: bool = True) -> str:
     return posixpath.normpath(p) if p.startswith("/") else ""
 
 
-def _sanctioned_script(script: str, cwd: str, base_dir: str, in_wsl: bool) -> Optional[str]:
+def _windows_side_cwd(cwd: str) -> bool:
+    """True when the session cwd is a Windows-side spelling (C:\\x, c:/x, any backslash, Git Bash /c/x), i.e. the hook
+    judges a call made from Windows, where a Git Bash /c/... path is the C: drive (issue #110). A native Linux cwd
+    (/mnt/c/..., /home/...) or no cwd: /c/... is a Linux directory."""
+    cwd = cwd or ""
+    return bool(re.match(r"^[A-Za-z]:", cwd) or "\\" in cwd or re.match(r"^/[A-Za-z](?=/|$)", cwd))
+
+
+def _sanctioned_script(script: str, cwd: str, base_dir: str, in_wsl: bool,
+                       windows_cwd: Optional[bool] = None) -> Optional[str]:
     """RISK_REDUCING_SCRIPTS key of a script operand, compared lexically (no filesystem check) with the sanctioned
     repo paths under base_dir. A relative operand is joined with the cwd (else base_dir). Inside wsl.exe the Linux
     path must be relative or absolute POSIX (/mnt/<drive>/... mapping to base_dir, or base_dir itself when the hook
-    runs inside WSL); a Windows spelling or a backslash there names another file for Linux: None."""
+    runs inside WSL); a Windows spelling or a backslash there names another file for Linux: None. windows_cwd (default
+    _windows_side_cwd(cwd)): Git Bash /c/x spellings (script or cwd) are the C: drive only for a Windows-side cwd."""
     if not script or not base_dir:
         return None
     if in_wsl and ("\\" in script or re.match(r"^[A-Za-z]:", script)):
         return None
+    if windows_cwd is None:
+        windows_cwd = _windows_side_cwd(cwd)
     root = _lexical_host_path(base_dir)
     if not root:
         return None
     if script.replace("\\", "/").startswith("/") or re.match(r"^[A-Za-z]:", script):
-        full = _lexical_host_path(script, git_bash=not in_wsl)
+        full = _lexical_host_path(script, git_bash=windows_cwd and not in_wsl)
     else:
-        # The cwd is the Windows-side session cwd (wsl.exe inherits it): Git Bash /c/x spellings map
-        start = (_lexical_host_path(cwd) if cwd else "") or root
+        # The cwd is the session cwd (wsl.exe inherits it): Git Bash /c/x spellings map only from Windows
+        start = (_lexical_host_path(cwd, git_bash=windows_cwd) if cwd else "") or root
         full = _lexical_host_path(posixpath.join(start, script.replace("\\", "/")), git_bash=False)
     for key in RISK_REDUCING_SCRIPTS:
         if full == _lexical_host_path(posixpath.join(root, key), git_bash=False):
@@ -2396,6 +2437,12 @@ def _risk_flags_allowed(key: str, args: List[str]) -> bool:
     return True
 
 
+def _is_breakeven_yolo_spelling(token: str) -> bool:
+    """True for --is-yolo / --is_yolo or an argparse unique-prefix abbreviation of them (--is-y), switch form only."""
+    name, eq, _ = token.partition("=")
+    return not eq and len(name) > 3 and any(f.startswith(name) for f in EXECUTOR_BREAKEVEN_YOLO_FLAGS)
+
+
 def _executor_opening_named(text: str) -> bool:
     """True when the text names an executor opening option (EXECUTOR_OPENING_OPTIONS, also as an argparse unique
     prefix such as --dir / --lev) anywhere, also inside a nested -c string."""
@@ -2414,7 +2461,7 @@ def _subcommand_is_risk_reducing(tokens: List[str], text: str, cwd: str = "", ba
     toks, i, in_wsl = _executed_script_at(tokens)
     if i < 0:
         return False
-    key = _sanctioned_script(toks[i], cwd, base_dir or find_workspace_root(), in_wsl)
+    key = _sanctioned_script(toks[i], cwd, base_dir or find_workspace_root(), in_wsl, _windows_side_cwd(cwd))
     return bool(key) and _risk_flags_allowed(key, _plain_args(toks[i + 1:]))
 
 
@@ -4788,14 +4835,22 @@ def _wsl_command(args: List[str]) -> Optional[List[str]]:
     return invocation[0] if invocation is not None else None
 
 
+def _wsl_leading_options(args: List[str]) -> List[Tuple[str, str]]:
+    """(option, value) pairs of the value-taking wsl.exe options before the Linux command (-d X, -u X, --cd X ...)."""
+    out: List[Tuple[str, str]] = []
+    i = 0
+    while i < len(args) and args[i] in WSL_VALUE_OPTIONS:
+        out.append((args[i], args[i + 1] if i + 1 < len(args) else ""))
+        i += 2
+    return out
+
+
 def _wsl_cd(args: List[str]) -> Optional[str]:
     """Value of the last `--cd DIR` among the wsl.exe options (before the Linux command); None without one."""
     cd = None
-    i = 0
-    while i < len(args) and args[i] in WSL_VALUE_OPTIONS:
-        if args[i] == "--cd" and i + 1 < len(args):
-            cd = args[i + 1]
-        i += 2
+    for opt, value in _wsl_leading_options(args):
+        if opt == "--cd" and value:
+            cd = value
     return cd
 
 
@@ -4929,11 +4984,16 @@ def analyze_run_command(command_line: str, cwd: str, base_dir: str, shell: str =
 def _risk_auto_allow_blocker(tokens: List[str]) -> Optional[str]:
     """Why a risk-reducing sub-command may not be auto-allowed on its own: a token holding a shell metacharacter
     (RISK_AUTO_ALLOW_METACHARS: wsl.exe hands its arguments to a shell that parses them again; redirects write
-    files) or a prefix the hook cannot vouch for (_risk_prefix_blocker). None when it may."""
+    files), --move-breakeven --force (FORCED_BREAKEVEN_BLOCKER, issue #111) or a prefix the hook cannot vouch
+    for (_risk_prefix_blocker). None when it may."""
     for tok in tokens:
         for ch in RISK_AUTO_ALLOW_METACHARS:
             if ch in tok:
                 return f"an argument holds the shell metacharacter {ch!r}"
+    toks, i, _ = _executed_script_at(tokens)
+    names = {a.partition("=")[0] for a in _plain_args(toks[i + 1:])} if i >= 0 else set()
+    if "--force" in names and names & EXECUTOR_MOVE_BREAKEVEN_FLAGS:
+        return FORCED_BREAKEVEN_BLOCKER
     return _risk_prefix_blocker(tokens)
 
 
@@ -4941,7 +5001,9 @@ def _risk_prefix_blocker(tokens: List[str]) -> Optional[str]:
     """Walks every level _executed_script_at crosses (assignments, wrappers such as env / sudo / timeout, wsl.exe,
     python) and returns why the call is not auto-allowed: a directory change at any level (env -C, sudo -D,
     wsl.exe --cd, also inside wsl -e), an env assignment outside RISK_ENV_ASSIGNMENTS (PYTHONPATH=..., env
-    LD_...=...), a wrapper fed by stdin or a string (xargs, env -S) or writing a file (time -o), or a python option
+    LD_...=...), a wrapper outside RISK_WRAPPERS (sudo, doas, chroot, setsid, flock, time, uv run ...: issue #110),
+    wsl.exe -u / --user or -d / --distribution other than WSL_DISTRO_NAME,
+    a wrapper fed by stdin or a string (xargs, env -S), or a python option
     outside RISK_PYTHON_OPTIONS (-i, -m, -c, -W...). None when the prefix is clean."""
     for _ in range(NESTED_DEPTH_LIMIT + 2):
         idx, info = _command_start(tokens)
@@ -4949,6 +5011,9 @@ def _risk_prefix_blocker(tokens: List[str]) -> Optional[str]:
             return "it changes the working directory"
         if info["xargs"] or info["nested"] or info["outputs"]:
             return "it runs through a wrapper that takes arguments, a command string or an output file"
+        for wrapper in info["wrappers"]:
+            if wrapper not in RISK_WRAPPERS:
+                return f"it runs through the wrapper {wrapper} (another user, root, shell or process context)"
         for var, _value in info["assigns"]:
             if var not in RISK_ENV_ASSIGNMENTS:
                 return f"it sets the environment variable {var}"
@@ -4958,6 +5023,18 @@ def _risk_prefix_blocker(tokens: List[str]) -> Optional[str]:
         if prog == "wsl":
             if _wsl_cd(tokens[idx + 1:]) is not None:
                 return "it changes the working directory"
+            own = os.environ.get("WSL_DISTRO_NAME", "").lower()
+            pairs = _wsl_leading_options(tokens[idx + 1:])
+            rest = tokens[idx + 1 + 2 * len(pairs):]
+            if rest and rest[0].startswith("--shell-type="):
+                pairs = pairs + [("--shell-type", rest[0].split("=", 1)[1])]
+            for opt, value in pairs:
+                if opt == "--shell-type" and value.lower() == "login":
+                    return "it runs a wsl.exe login shell (--shell-type login sources the profile)"
+                if opt in ("-u", "--user"):
+                    return "it runs wsl.exe as another user (-u / --user)"
+                if opt in ("-d", "--distribution") and (not own or value.lower() != own):
+                    return "it runs in another WSL distribution (-d / --distribution other than WSL_DISTRO_NAME)"
             linux = _wsl_command(tokens[idx + 1:])
             if not linux:
                 return None
@@ -5117,7 +5194,12 @@ def _analyze_run_command(command_line: str, cwd: str, base_dir: str, shell: str 
                 )
                 return result
             non_opening = EXECUTOR_READ_ONLY_FLAGS | EXECUTOR_RISK_FLAGS | set(HELP_FLAGS)
-            if not _executor_opening_named(text) and any(
+            opening_text = text
+            if flags & EXECUTOR_MOVE_BREAKEVEN_FLAGS:
+                # --is-yolo (also abbreviated) next to --move-breakeven never opens: a break-even call that is not
+                # the exact sanctioned one-liner (another path, an unknown flag) asks, it is never sent to the gates
+                opening_text = " ".join(t for t in tokens if not _is_breakeven_yolo_spelling(t))
+            if not _executor_opening_named(opening_text) and any(
                     f in non_opening or (len(f) > 3 and any(o.startswith(f) for o in non_opening)) for f in flags):
                 # Read-only listing, or an exit / help that is not the exact sanctioned one-liner (another path, an
                 # unknown flag, a nested shell): normal permission policy (ask), never auto-allowed
@@ -5597,7 +5679,10 @@ def _evaluate_shell_command(command_line: str, cwd: str, base_dir: str, conversa
         sub_tokens = analysis["trading_tokens"][0] if analysis["trading_tokens"] else None
         decision, reason = evaluate_trade_opening(sub, {"CommandLine": sub}, {}, base_dir, conversation_id,
                                                   env_hint_cmd=command_line, tokens=sub_tokens)
-        if decision == "allow" and not analysis["all_safe"]:
+        # A risk-reducing sub-command that may not be auto-allowed on its own never rides on a gated opening (a
+        # line without one keeps the trade gates' decision: `cd repo && <opening>` is judged as before)
+        if decision == "allow" and (not analysis["all_safe"]
+                                    or analysis["risk_reducing"] and analysis["risk_blocker"]):
             decision = "force_ask" if analysis["force_ask"] else "ask"
             reason = reason + " Compound command contains other sub-commands; user confirmation required."
         return decision, reason
@@ -5605,6 +5690,8 @@ def _evaluate_shell_command(command_line: str, cwd: str, base_dir: str, conversa
     if analysis["force_ask"]:
         return "force_ask", analysis["force_ask"]
     if analysis["risk_reducing"] and analysis["all_safe"]:
+        if analysis["risk_blocker"] == FORCED_BREAKEVEN_BLOCKER:
+            return "ask", f"Forced break-even, not auto-allowed: {FORCED_BREAKEVEN_BLOCKER}; user confirmation required."
         if analysis["risk_blocker"]:
             return "ask", (f"Risk-reducing action / exit, not auto-allowed because {analysis['risk_blocker']}: run "
                            "the sanctioned command as one flat call; user confirmation required.")
