@@ -343,6 +343,8 @@ class TestRestingLimitOrders(unittest.TestCase):
             "stepSize": 0.001, "minQty": 0.001, "tickSize": 0.1,
             "precision_qty": 3, "precision_price": 1, "minNotional": 5.0
         }
+        placed_stops = []   # the issue #36 pre-armed stop, echoed on GET openAlgoOrders
+
         def fake_send(method, endpoint, params=None, target_env=None):
             if endpoint in ['/fapi/v2/balance', '/fapi/v3/balance']:
                 return [{'asset': 'USDT', 'balance': '10000.0'}]
@@ -350,6 +352,13 @@ class TestRestingLimitOrders(unittest.TestCase):
                 return {'price': '100.0'}
             if endpoint == '/fapi/v1/order' and method == 'POST':
                 return {'orderId': 70001, 'status': 'NEW'}
+            if endpoint == '/fapi/v1/' + 'algoOrder' and method == 'POST':
+                placed_stops.append({'algoId': 70002, 'symbol': params['symbol'], 'side': params['side'],
+                                     'orderType': params['type'], 'triggerPrice': str(params['triggerPrice']),
+                                     'closePosition': params.get('closePosition') == 'true', 'reduceOnly': False})
+                return {'algoId': 70002}
+            if endpoint == '/fapi/v1/openAlgoOrders':
+                return [dict(s) for s in placed_stops]
             return {}
 
         mock_send.side_effect = fake_send
@@ -379,6 +388,10 @@ class TestRestingLimitOrders(unittest.TestCase):
         posted = [c for c in mock_send.call_args_list if c.args[0] == 'POST' and c.args[1] == '/fapi/v1/order']
         self.assertEqual(len(posted), 1)
         self.assertNotIn('reduceOnly', posted[0].args[2])
+        # Issue #36: the only algo order is the pre-armed closePosition Stop Loss (never a TP)
+        self.assertEqual(res["prearm_status"], "placed")
+        self.assertEqual([(s['side'], s['triggerPrice'], s['closePosition']) for s in placed_stops],
+                         [('SELL', '95.0', True)])
 
 
 class TestCLIEntryPoint(unittest.TestCase):

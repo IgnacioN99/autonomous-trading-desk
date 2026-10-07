@@ -156,6 +156,14 @@ class ExecutorHarness(unittest.TestCase):
             failing = self.positions_error is True or (self.positions_error == "symbol" and params.get("symbol"))
             return {"error": "timeout"} if failing else [dict(p) for p in self.positions]
         if endpoint == ALGO_ENDPOINT and method == "POST":
+            if params.get("closePosition") == "true" or params.get("reduceOnly") == "true":
+                # A protective stop (issue #36 pre-arm): echoed on GET openAlgoOrders so its verification passes.
+                # Entries are not echoed (a later execute() would see them as unregistered resting entries).
+                self.open_algos.append({"algoId": 9, "symbol": params["symbol"], "side": params["side"],
+                                        "orderType": params["type"], "triggerPrice": str(params["triggerPrice"]),
+                                        "closePosition": params.get("closePosition") == "true",
+                                        "reduceOnly": params.get("reduceOnly") == "true"})
+                return {"algoId": 9}
             return {"algoId": 8}
         if endpoint == ALGO_ENDPOINT and method == "DELETE":
             return {"algoId": params.get("algoId"), "code": "200", "msg": "success"}
@@ -169,7 +177,7 @@ class ExecutorHarness(unittest.TestCase):
     def writes(self):
         return [c for c in self.calls if c[0] in ("POST", "DELETE")]
 
-    def execute(self, env="testnet", send=None, **kwargs):
+    def execute(self, env="testnet", send=None, mcp=False, **kwargs):
         args = dict(symbol="SOLUSDT", direction="LONG", leverage=3, margin_usdt=10.0,
                     sl_price=97.0, tp1_price=110.0, tp2_price=120.0, target_env=env)
         if env == "testnet":
@@ -177,13 +185,15 @@ class ExecutorHarness(unittest.TestCase):
         args.update(kwargs)
         if not os.path.exists(os.path.join(self.ws, "logs", "session_state.json")):
             write_session_state(self.ws, self.positions)  # PROD Gate 0A requires the cache (issue #101), as live
+        # place_algo_stop_loss is not mocked: the issue #36 pre-arm reaches self.fake as an algo POST (id 9, echoed).
         with patch("execute_futures_trade.send_signed_request", side_effect=send or self.fake), \
              patch("execute_futures_trade._workspace_dir", return_value=self.ws), \
              patch("execute_futures_trade.load_env", return_value={"LIVE_TRADING_ARMED": "true"}), \
              patch("execute_futures_trade.enforce_evaluation_dossier", return_value=(True, "ok", None)), \
              patch("execute_futures_trade.check_mechanical_gates", return_value=(True, None)), \
              patch("execute_futures_trade.get_symbol_filters", return_value=dict(EX_FILTERS)), \
-             patch("execute_futures_trade.place_algo_stop_loss", return_value={"algoId": 9}), \
+             patch("execute_futures_trade.uses_mcp_gateway", return_value=mcp), \
+             patch("execute_futures_trade.subprocess.run", side_effect=FileNotFoundError("binance-cli")), \
              patch("execute_futures_trade.verify_algo_stop_loss", return_value=(True, {"algoId": 9})), \
              patch("quant_risk_engine.get_account_equity", return_value=10000.0), \
              patch("user_profile.load_user_profile", return_value=dict(EX_PROFILE)):
@@ -200,11 +210,13 @@ class TestConditionalEntryRouting(ExecutorHarness):
         self.assertEqual([c for c in self.calls if c[0] == "POST" and c[1] == ORDER_ENDPOINT], [],
                          "conditional entries must never be sent to /fapi/v1/order (-4120)")
         algo = [c[2] for c in self.calls if c[0] == "POST" and c[1] == ALGO_ENDPOINT]
-        self.assertEqual(len(algo), 1)
+        self.assertEqual(len(algo), 2, "the entry, then the issue #36 pre-armed stop (KEYS)")
         self.assertEqual(algo[0], {"algoType": "CONDITIONAL", "symbol": "SOLUSDT", "side": "BUY", "type": "STOP_MARKET",
                                    "triggerPrice": 102.34, "quantity": 0.293, "closePosition": "false",
                                    "workingType": "CONTRACT_PRICE"})
         self.assertNotIn("reduceOnly", algo[0])
+        self.assertEqual(algo[1], {"algoType": "CONDITIONAL", "symbol": "SOLUSDT", "side": "SELL", "type": "STOP_MARKET",
+                                   "triggerPrice": 97.0, "closePosition": "true"})
         self.assertIn("--protect-pending", res["message"])
         self.assertNotIn("deferred to fill.", res["message"])
 
@@ -241,7 +253,9 @@ class TestConditionalEntryRouting(ExecutorHarness):
         self.assertTrue(res["entry_cancelled"])
         self.assertIn("disk full", res["error"])
         cancels = [c[2] for c in self.calls if c[0] == "DELETE" and c[1] == ALGO_ENDPOINT]
-        self.assertEqual(cancels, [{"symbol": "SOLUSDT", "algoId": 8}])
+        # the entry, then its issue #36 pre-armed stop (by algo id; no position)
+        self.assertEqual(cancels, [{"symbol": "SOLUSDT", "algoId": 8}, {"symbol": "SOLUSDT", "algoId": 9}])
+        self.assertTrue(res["prearm_cancelled"])
 
     def test_registry_failure_cancels_limit_entry(self):
         with patch("execute_futures_trade.update_pending_entries", side_effect=IOError("disk full")):
@@ -267,9 +281,10 @@ class TestConditionalEntryRouting(ExecutorHarness):
                 return self.fake(method, endpoint, params, target_env)
             return gateway(method, endpoint, params=params)  # MCP_OAUTH_ACTIVE path of send_signed_request
 
-        res = self.execute(order_type="STOP_MARKET", trigger_price=102.347, send=route)
+        res = self.execute(order_type="STOP_MARKET", trigger_price=102.347, send=route, mcp=True)
         self.assertTrue(res["success"], res.get("error"))
         self.assertEqual(res["orderId"], 4242)
+        self.assertEqual(res["prearm_status"], "skipped:mcp", "no pre-arm through the MCP gateway (issue #36)")
         mock_mcp.assert_called_once_with("tool_execute", {
             "toolName": "futures_usds.newAlgoOrder",
             "arguments": {"symbol": "SOLUSDT", "side": "BUY", "type": "STOP_MARKET", "algoType": "CONDITIONAL",
@@ -744,11 +759,11 @@ class TestFindUnregisteredRestingEntries(unittest.TestCase):
 # ---------------------------------------------------------------------------------------------
 class TestProtectPendingEntries(unittest.TestCase):
 
-    def run_protect(self, fake, *records, dry_run=False, env="testnet"):
+    def run_protect(self, fake, *records, dry_run=False, env="testnet", mcp=False):
         ws = tempfile.mkdtemp()
         if records:
             write_registry(ws, *records)
-        with offline(fake, workspace=ws):
+        with offline(fake, workspace=ws), patch("execute_futures_trade.uses_mcp_gateway", return_value=mcp):
             res = eft.protect_pending_entries(target_env=env, dry_run=dry_run)
         return res, ws
 
@@ -831,9 +846,10 @@ class TestProtectPendingEntries(unittest.TestCase):
         heal = dict(stop(601, 98.4, close_position=False), reduceOnly=True, quantity="4")
         fake = FakeExchange([long_position(amt="4", entry="101.0")], algos=[heal], open_orders=[limit])
         ws = tempfile.mkdtemp()
-        # no sl_qty: coverage unknown (total_qty matches the resting LIMIT's origQty, issue #101 cross-check)
+        # no sl_qty: coverage unknown (total_qty matches the resting LIMIT's origQty, issue #101 cross-check).
+        # MCP: its listing carries no quantity (on KEYS the listed quantity 4 covers the 4-unit fill, issue #118).
         write_registry(ws, make_record(kind="LIMIT", entry_id="8001", sl=95.0, total_qty=10.0))
-        with offline(fake, workspace=ws):
+        with offline(fake, workspace=ws), patch("execute_futures_trade.uses_mcp_gateway", return_value=True):
             res1 = eft.protect_pending_entries(target_env="testnet")
             self.assertTrue(res1["ok"], res1["errors"])
             self.assertEqual(res1["actions"][0]["detail"]["mode"], "resize")
@@ -936,7 +952,8 @@ class TestProtectPendingEntries(unittest.TestCase):
     def test_unverified_resize_keeps_existing_stop_no_auto_destruct(self):
         fake = FakeExchange([long_position(amt="10", entry="101.0")], algos=[stop(701, 95.0)], index_new_stops=False)
         with patch("execute_futures_trade.emergency_abort_market_close") as mock_abort:
-            res, ws = self.run_protect(fake, make_record(sl=95.0, sl_qty=4.0))
+            # MCP: a closePosition stop on KEYS covers any size and is never resized (issue #39)
+            res, ws = self.run_protect(fake, make_record(sl=95.0, sl_qty=4.0), mcp=True)
         mock_abort.assert_not_called()
         self.assertFalse(res["ok"])
         self.assertEqual(res["actions"][0]["detail"]["mode"], "resize")
@@ -962,7 +979,9 @@ class TestProtectPendingEntries(unittest.TestCase):
         fake = FakeExchange([long_position(amt="4", entry="101.0")], open_orders=[limit])
         ws = tempfile.mkdtemp()
         write_registry(ws, make_record(kind="LIMIT", entry_id="8001"))
-        with offline(fake, workspace=ws):
+        # MCP: the gateway sizes the closePosition stop reduce-only for the partial fill, so growth is resized (on
+        # KEYS the closePosition stop covers any size: TestKeysCoveringStopNotResized, issue #39)
+        with offline(fake, workspace=ws), patch("execute_futures_trade.uses_mcp_gateway", return_value=True):
             res1 = eft.protect_pending_entries(target_env="testnet")
             rec = read_registry(ws)["testnet:BTCUSDT:8001"]
             self.assertTrue(res1["ok"], res1["errors"])
