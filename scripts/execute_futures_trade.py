@@ -67,7 +67,8 @@ JSON schemas (stable; extra keys may be added, existing keys are never renamed):
   --close-position (exit 0 iff success; stops are cancelled only once positionRisk shows the position flat):
       success: {"success": true, "closed": {...last close response...}, "attempts": int, "cleanup_errors": [str]}
       failure: {"success": false, "error": str, "attempts"?: int, "position_amt"?: float,
-                "stop_protected"?: bool, "stop_source"?: "kept" | "healed" | "none", "closed"?: {...}, "heal"?: {...}}
+                "stop_protected"?: bool | null, "stop_source"?: "kept" | "healed" | "none" | "unknown",
+                "stop_note"?: str, "closed"?: {...}, "heal"?: {...}}  (null/"unknown": every stop read failed)
                 (no position / unreadable positionRisk ("position state unknown") return only "error")
   --audit-orphans / --auto-heal: {"total_active": int, "orphans_count": int, "all_protected": bool,
       "positions": [{"symbol", "direction", "amount", "entry_price", "mark_price", "leverage", "unpnl",
@@ -109,7 +110,7 @@ import urllib.parse
 import urllib.request
 import json
 import logging
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 
 logger = logging.getLogger("execute_futures_trade")
 
@@ -612,6 +613,15 @@ def round_step(val, step, prec):
     rounded = (d_val // d_step) * d_step
     return float(f"{rounded:.{prec}f}")
 
+def format_order_qty(value):
+    """Order quantity as a plain decimal string ("0.00001", never "1e-05" or "-0"). Accepts the raw positionAmt
+    string or a number; the sign is dropped (the order side carries the direction). No exchangeInfo call."""
+    try:
+        d = Decimal(str(value)).copy_abs().normalize()
+    except (InvalidOperation, TypeError, ValueError):
+        d = Decimal(repr(abs(_to_float(value)))).normalize()
+    return format(d, "f")
+
 def round_price(val, step, prec):
     d_val = Decimal(str(val))
     d_step = Decimal(str(step))
@@ -1044,12 +1054,14 @@ def get_atr_15m(symbol):
         return None
 
 
-def heal_orphan_position(position, target_env=None, close_on_failure=False):
+def heal_orphan_position(position, target_env=None, close_on_failure=False, *, planned_sl=None):
     """
     Places a verified emergency stop on a position that has none. The stop sits ORPHAN_HEAL_SL_DISTANCE away
-    from the worse of entry/mark so it can never trigger on placement. If it cannot be verified and
-    close_on_failure=True, the position is closed with a reduce-only market order (fail-safe auto-destruct).
-    Never opens or increases exposure.
+    from the worse of entry/mark so it can never trigger on placement. planned_sl (the trade's planned SL, passed
+    only by close_position_market) replaces that anchor when it is tighter and not crossed (below mark for LONG,
+    above for SHORT); it never loosens the stop. A rejected or unverified planned-SL stop is retried once at the
+    anchor (sl_source "anchor_after_planned_rejected"). If it cannot be verified and close_on_failure=True, the position
+    is closed with a reduce-only market order (fail-safe auto-destruct). Never opens or increases exposure.
     """
     target_env = resolve_env(target_env)
     sym = position['symbol']
@@ -1066,21 +1078,35 @@ def heal_orphan_position(position, target_env=None, close_on_failure=False):
     else:
         anchor = min(entry_p, mark_p) if is_long else max(entry_p, mark_p)
         raw_sl = anchor * (1 - ORPHAN_HEAL_SL_DISTANCE) if is_long else anchor * (1 + ORPHAN_HEAL_SL_DISTANCE)
-        heal_sl = round_price(raw_sl, filters['tickSize'], filters['precision_price'])
-        out["healed_sl_price"] = heal_sl
-        try:
-            out["placement"] = place_algo_stop_loss(sym, exit_side, heal_sl, target_env=target_env)
-        except Exception as e:
-            out["placement"] = {"error": str(e)}
-        placed_id = _order_id(out["placement"]) if isinstance(out["placement"], dict) else None
-        verified, info = wait_for_stop_confirmation(sym, exit_side, heal_sl, algo_id=placed_id,
-                                                    tick_size=filters.get('tickSize'), target_env=target_env)
-        out["verified"] = verified
-        out["new_stop"] = stop_summary(info) if verified else None
-        if verified:
-            out["success"] = True
-            out["reason"] = "healed"
-            return out
+        anchor_sl = round_price(raw_sl, filters['tickSize'], filters['precision_price'])
+        attempts = [(anchor_sl, None)]
+        planned = _to_float(planned_sl)
+        if planned > 0 and is_tighter_stop(planned, raw_sl, is_long):
+            planned = round_price(planned, filters['tickSize'], filters['precision_price'])
+            if planned > 0 and ((planned < mark_p) if is_long else (planned > mark_p)) \
+                    and is_tighter_stop(planned, anchor_sl, is_long):
+                # Planned SL first; if it is rejected or unverified (e.g. -2021 against a stale mark), retry once at
+                # the anchor. Never looser than the anchor.
+                attempts = [(planned, "planned_sl"), (anchor_sl, "anchor_after_planned_rejected")]
+        for heal_sl, sl_source in attempts:
+            if sl_source == "anchor_after_planned_rejected":
+                out["planned_attempt"] = {"sl_price": out["healed_sl_price"], "placement": out.get("placement")}
+            if sl_source:
+                out["sl_source"] = sl_source
+            out["healed_sl_price"] = heal_sl
+            try:
+                out["placement"] = place_algo_stop_loss(sym, exit_side, heal_sl, target_env=target_env)
+            except Exception as e:
+                out["placement"] = {"error": str(e)}
+            placed_id = _order_id(out["placement"]) if isinstance(out["placement"], dict) else None
+            verified, info = wait_for_stop_confirmation(sym, exit_side, heal_sl, algo_id=placed_id,
+                                                        tick_size=filters.get('tickSize'), target_env=target_env)
+            out["verified"] = verified
+            out["new_stop"] = stop_summary(info) if verified else None
+            if verified:
+                out["success"] = True
+                out["reason"] = "healed"
+                return out
         out["reason"] = "heal_stop_unverified"
 
     if close_on_failure:
@@ -1143,7 +1169,7 @@ def emergency_abort_market_close(symbol, exit_side, total_qty, target_env=None):
         'symbol': symbol,
         'side': exit_side,
         'type': 'MARKET',
-        'quantity': total_qty,
+        'quantity': format_order_qty(total_qty),
         'reduceOnly': 'true'
     }
 
@@ -2537,7 +2563,8 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out):
             return act("pending_sl_crossed_close", False, **detail)
         try:
             close = send_signed_request('POST', '/fapi/v1/order', {'symbol': sym, 'side': exit_side, 'type': 'MARKET',
-                                                                  'quantity': qty, 'reduceOnly': 'true'}, target_env=target_env)
+                                                                  'quantity': format_order_qty(qty), 'reduceOnly': 'true'},
+                                        target_env=target_env)
         except Exception as e:
             close = {"error": str(e)}
         flat = _market_order_accepted(close) and _wait_until_flat(sym, is_long, target_env)
@@ -3556,16 +3583,45 @@ def _read_open_position(symbol, target_env=None, is_long=None):
     return None, None
 
 
+def _planned_sl_for_position(symbol, row, target_env=None):
+    """sl_price of the latest trades_audit entry record that matches the live position (direction, env, entry within
+    tolerance, total_qty >= |positionAmt|), else None. Never raises."""
+    try:
+        from utils import position_timing as pt
+        direction = 'LONG' if _to_float(row.get('positionAmt')) > 0 else 'SHORT'
+        audit_path = os.path.join(_workspace_dir(), 'logs', 'trades_audit.jsonl')
+        rec = pt.latest_audit_entry_record(audit_path, symbol, direction, target_env)
+        if rec and pt.audit_record_matches_position(rec, row.get('entryPrice'), row.get('positionAmt')):
+            return rec.get('sl_price')
+    except Exception:
+        pass
+    return None
+
+
+def _is_existing_close_position_stop_rejection(placement):
+    """True when a closePosition stop placement was rejected with Binance -4130 (a closePosition stop in that
+    direction already exists)."""
+    if not isinstance(placement, dict):
+        return False
+    if str(placement.get('code')) == '-4130':
+        return True
+    return '-4130' in str(placement.get('error') or placement.get('msg') or '')
+
+
 def _report_close_failure(symbol, target_env, error, stop_source):
-    """CRITICAL/P0 issue for a close that was not confirmed flat. Never raises (the close path must not break)."""
+    """CRITICAL/P0 issue for a close that was not confirmed flat. Never raises (the close path must not break).
+    error_detail (hashed into the dedup fingerprint) is stable per symbol + stop source; the full error (attempts,
+    raw responses, read errors) goes into context."""
     try:
         import report_agent_issue
         report_agent_issue.report_issue(
             title=f"close_position_market: reduce-only close of {symbol} not confirmed flat",
-            error_detail=error, category="risk_gate", severity="CRITICAL", priority="P0",
+            error_detail=f"{symbol} close not confirmed flat; stop {stop_source}",
+            category="risk_gate", severity="CRITICAL", priority="P0",
             agent_name="execute_futures_trade.close_position_market",
             affected_files="scripts/execute_futures_trade.py:close_position_market",
-            context=f"env={target_env}; symbol={symbol}; stop_source={stop_source}; no order was cancelled",
+            context=(f"env={target_env}; symbol={symbol}; stop_source={stop_source}; no order was cancelled; "
+                     f"error: {error}"),
             remediation="Check the position on Binance; keep it protected and retry --close-position.")
     except Exception as e:
         logger.error(f"close failure report for {symbol} could not be filed: {e}")
@@ -3579,7 +3635,16 @@ def close_position_market(symbol, target_env=None):
       2. send the reduce-only MARKET close, up to 3 attempts (CLOSE_RETRY_DELAYS backoff), re-reading the size
          before each retry (partial fills retry the residual; already flat = done),
       3. flat: cancel leftover orders/stops (_cancel_symbol_orders); cleanup errors are returned, not fatal,
-      4. not flat: cancel nothing, verify a stop on openAlgoOrders (heal one if none) and report CRITICAL/P0.
+      4. not flat: cancel nothing, read the stops on openAlgoOrders (retried with STOP_VERIFY_RETRY_DELAYS), heal
+         one when none is seen (also when every read failed: a naked position must not stay naked; the heal stop
+         uses the planned SL of the matching trades_audit record when tighter and not crossed) and report CRITICAL/P0.
+    The quantity is sent as a plain decimal string (format_order_qty, never scientific notation).
+    Not-flat result: {success: False, error, attempts, position_amt, closed, heal?, stop_source, stop_protected}:
+      stop_source "kept"    -> a protective stop was read (or inferred from a -4130 heal rejection after every read
+                               failed), stop_protected True;
+                  "healed"  -> an emergency stop was placed and verified, stop_protected True;
+                  "none"    -> a successful read showed no stop and the heal failed, stop_protected False;
+                  "unknown" -> every read failed and the heal failed for another reason, stop_protected None.
     """
     target_env = resolve_env(target_env)
     symbol = str(symbol).upper()  # every read/write (and _wait_until_flat's match) uses the exchange's symbol case
@@ -3591,7 +3656,7 @@ def close_position_market(symbol, target_env=None):
 
     is_long = _to_float(row.get('positionAmt')) > 0
     exit_side = 'SELL' if is_long else 'BUY'
-    qty = abs(_to_float(row.get('positionAmt')))
+    qty = format_order_qty(row.get('positionAmt'))
     res, attempts, flat, state_unknown = None, 0, False, None
 
     for attempts, delay in enumerate(CLOSE_RETRY_DELAYS, start=1):
@@ -3611,7 +3676,7 @@ def close_position_market(symbol, target_env=None):
             break
         if fresh is not None:
             # Partial fill: the next attempt closes the residual (an unreadable state keeps the last known size).
-            row, qty = fresh, abs(_to_float(fresh.get('positionAmt')))
+            row, qty = fresh, format_order_qty(fresh.get('positionAmt'))
 
     if flat:
         cleanup_errors = _cancel_symbol_orders(symbol, target_env)
@@ -3620,26 +3685,45 @@ def close_position_market(symbol, target_env=None):
         return {"success": True, "closed": res, "attempts": attempts, "cleanup_errors": cleanup_errors}
 
     # Not confirmed flat: nothing is cancelled; make sure the (residual) position keeps a verified stop.
-    stops, stop_err = get_open_stop_orders(symbol, exit_side, target_env=target_env)
-    heal = None
+    stops, stop_err = [], None
+    for delay in (0.0,) + tuple(STOP_VERIFY_RETRY_DELAYS):
+        if delay:
+            time.sleep(delay)
+        stops, stop_err = get_open_stop_orders(symbol, exit_side, target_env=target_env)
+        if stop_err is None:
+            break
+    heal, note = None, None
     if stops:
         stop_source = "kept"
     else:
         try:
-            heal = heal_orphan_position(row, target_env=target_env, close_on_failure=False)
+            heal = heal_orphan_position(row, target_env=target_env, close_on_failure=False,
+                                        planned_sl=_planned_sl_for_position(symbol, row, target_env))
         except Exception as e:
             heal = {"verified": False, "reason": f"heal failed: {e}"}
-        stop_source = "healed" if heal.get("verified") else "none"
+        if heal.get("verified"):
+            stop_source = "healed"
+        elif stop_err is None:
+            stop_source = "none"
+        elif _is_existing_close_position_stop_rejection(heal.get("placement")):
+            stop_source, note = "kept", "stop inferred from -4130"
+        else:
+            stop_source = "unknown"
     error = (f"Reduce-only MARKET close of {symbol} not confirmed flat after {attempts} attempt(s) "
              f"(last response: {res}); nothing cancelled; stop {stop_source}")
+    if note:
+        error += f" ({note})"
     if state_unknown is not None:
         error += f"; position state unknown on the last read: {state_unknown}"
     if stop_err and not stops:
         error += f"; stop check: {stop_err}"
     logger.error(error)
     _report_close_failure(symbol, target_env, error, stop_source)
+    stop_protected = {"kept": True, "healed": True, "none": False}.get(stop_source)
     out = {"success": False, "error": error, "attempts": attempts, "position_amt": _to_float(row.get('positionAmt')),
-           "stop_protected": stop_source != "none", "stop_source": stop_source, "closed": res}
+           "stop_protected": stop_protected, "stop_source": stop_source, "closed": res}
+    if note:
+        out["stop_note"] = note
     if heal is not None:
         out["heal"] = heal
     return out
