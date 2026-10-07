@@ -79,12 +79,16 @@ JSON schemas (stable; extra keys may be added, existing keys are never renamed):
                            "pending_dropped" | "pending_sl_crossed_close" | "pending_record_mismatch", "key", "symbol",
                 "success": bool,
                 "dry_run": bool, "detail": {...}}],
-      "errors": [{"key", "symbol", "stage", "error"}]}
+      "errors": [{"key", "symbol", "stage", "error"}],
+      "warnings"?: [{"key", "symbol", "stage": "loss_cap_check", "warning"}]}   # issue #118 check deferred
   trade deployment: {"success": bool, "symbol", "direction", "leverage", "entry_price", "total_qty",
       "sl_price", "tp1_price", "tp2_price", ..., "error"?: str, "hard_gate_rejection"?: bool}
       Resting entries (untriggered STOP_MARKET via the algo order API, resting LIMIT) return
       "conditional_entry" / "pending_limit_entry": true and "pending_entry_key"; they are recorded in
       logs/pending_entries.json, require a live position guardian in PROD and count against max_open_positions.
+      Issue #36: on KEYS their planned SL is pre-armed as a closePosition stop when not crossed ("prearm_status":
+      "placed" | "rejected:<code-or-text>" | "skipped:mcp" | "skipped:crossed", "prearm_algo_id"); the guardian
+      verifies it at fill and is the fallback; it is cancelled (by algo id) when the entry ends without a position.
       In PROD every new entry is rejected while an opening order rests on the exchange without a registry record
       (find_unregistered_resting_entries; the position guardian reports them as unknown_resting_entry).
       PROD gates are anchored to the exchange (issue #101): logs/session_state.json and logs/pending_entries.json
@@ -1334,6 +1338,40 @@ def check_liquidation_gate(direction, entry_price, sl_price, leverage, maint_mar
     return True, None, details
 
 
+def monetary_loss_cap(account_equity, prof, *, is_testnet, is_yolo, ref, total_qty, leverage, unrealized=0.0):
+    """Gate 2 loss cap (pure; shared by check_mechanical_gates and the protect-pending record check, issue #118).
+    TESTNET: max(equity x risk x 1.25, 50); PROD YOLO: max(YOLO_MIN_LOSS_CAP_USDT, margin x
+    YOLO_MAX_LOSS_MARGIN_FRACTION) with margin = ref x total_qty / leverage; PROD standard: min(wallet balance,
+    balance + unrealized PnL) x risk x 1.25 (issue #119). Returns (max_allowed_loss, risk_fraction, equity_used,
+    equity_note)."""
+    # Load risk percentage from user profile (default 0.005 = 0.5%)
+    try:
+        raw_risk = float((prof or {}).get("risk_pct_equity", 0.005))
+    except Exception:
+        raw_risk = 0.005
+
+    # Normalize risk fraction: e.g. 0.005 -> 0.005; 0.5 -> 0.005; 1.0 -> 0.01
+    risk_fraction = raw_risk if raw_risk <= 0.05 else (raw_risk / 100.0)
+
+    equity_note = ""
+    # Dynamic risk ceiling = account_equity * (risk_pct_equity / 100) * 1.25 buffer
+    if is_testnet:
+        max_allowed_loss = max(account_equity * risk_fraction * 1.25, 50.0)
+    elif is_yolo:
+        # Barbell YOLO Moonshot: strict software loss cap (35% of margin, min $3.75 USDT; utils/gate_limits.py)
+        margin_est = (ref * total_qty / max(leverage, 1))
+        max_allowed_loss = max(YOLO_MIN_LOSS_CAP_USDT, margin_est * YOLO_MAX_LOSS_MARGIN_FRACTION)
+    else:
+        # Issue #119: the cap is sized on min(wallet balance, balance + unrealized PnL), so open losses lower it and
+        # open gains never raise it. /fapi/v2/balance has no marginBalance and its crossUnPnl excludes isolated
+        # positions (the desk mandates isolated margin), so the caller passes the positionRisk uPnL.
+        wallet_balance = account_equity
+        account_equity = min(wallet_balance, wallet_balance + unrealized)
+        equity_note = f" = min(wallet balance ${wallet_balance:.2f}, balance + unrealized PnL ${unrealized:+.2f})"
+        max_allowed_loss = account_equity * risk_fraction * 1.25
+    return max_allowed_loss, risk_fraction, account_equity, equity_note
+
+
 def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty, leverage, bypass_delta_gate=False, target_env=None, bypass_all_gates=False, is_yolo=False,
                            maint_margin_ratio=None, maint_amount=0.0, mmr_source=None, liq_entry_price=None, entry_price=None,
                            live_snapshot=None):
@@ -1510,7 +1548,6 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
 
     # --- GATE 2: Dynamic Equity Risk Gate (Finding 13) ---
     potential_dollar_loss = abs(ref - sl_price) * total_qty
-    equity_note = ""
     try:
         import quant_risk_engine as qre
         account_equity = qre.get_account_equity(target_env)
@@ -1520,37 +1557,19 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
         else:
             return False, f"MECHANICAL HARD GATE REJECTION: FAIL-CLOSED — Cannot verify account equity for PROD ({e}). Order blocked."
 
-    # Load risk percentage from user profile (default 0.005 = 0.5%)
-    try:
-        raw_risk = float(prof.get("risk_pct_equity", 0.005))
-    except Exception:
-        raw_risk = 0.005
-
-    # Normalize risk fraction: e.g. 0.005 -> 0.005; 0.5 -> 0.005; 1.0 -> 0.01
-    risk_fraction = raw_risk if raw_risk <= 0.05 else (raw_risk / 100.0)
-
-    # Dynamic risk ceiling = account_equity * (risk_pct_equity / 100) * 1.25 buffer
-    if is_testnet:
-        max_allowed_loss = max(account_equity * risk_fraction * 1.25, 50.0)
-    elif is_yolo:
-        # Barbell YOLO Moonshot: strict software loss cap (35% of margin, min $3.75 USDT; utils/gate_limits.py)
-        margin_est = (ref * total_qty / max(leverage, 1))
-        max_allowed_loss = max(YOLO_MIN_LOSS_CAP_USDT, margin_est * YOLO_MAX_LOSS_MARGIN_FRACTION)
-    else:
-        # Issue #119: the cap is sized on min(wallet balance, balance + unrealized PnL), so open losses lower it and
-        # open gains never raise it. /fapi/v2/balance has no marginBalance and its crossUnPnl excludes isolated
-        # positions (the desk mandates isolated margin), so the uPnL comes from the live snapshot's positionRisk rows
-        # (KEYS /fapi/v2/positionRisk, MCP positionInformationV2: unRealizedProfit); no extra request. A missing or
-        # unparseable unRealizedProfit on an open position rejects (fail closed).
-        wallet_balance = account_equity
+    unrealized = 0.0
+    if not is_testnet and not is_yolo:
+        # Issue #119: the uPnL comes from the live snapshot's positionRisk rows (KEYS /fapi/v2/positionRisk, MCP
+        # positionInformationV2: unRealizedProfit); no extra request. A missing or unparseable unRealizedProfit on an
+        # open position rejects (fail closed).
         try:
             unrealized = unrealized_pnl_total(live_snapshot["exposure"])
         except (ValueError, KeyError, TypeError) as e:
             return False, (f"MECHANICAL HARD GATE REJECTION: FAIL-CLOSED — cannot read the unrealized PnL of the "
                            f"open positions for the monetary risk cap ({e}). Order blocked.")
-        account_equity = min(wallet_balance, wallet_balance + unrealized)
-        equity_note = f" = min(wallet balance ${wallet_balance:.2f}, balance + unrealized PnL ${unrealized:+.2f})"
-        max_allowed_loss = account_equity * risk_fraction * 1.25
+    max_allowed_loss, risk_fraction, account_equity, equity_note = monetary_loss_cap(
+        account_equity, prof, is_testnet=is_testnet, is_yolo=is_yolo, ref=ref, total_qty=total_qty,
+        leverage=leverage, unrealized=unrealized)
 
     if potential_dollar_loss > max_allowed_loss:
         return False, f"MECHANICAL HARD GATE REJECTION: Monetary risk exceeds allowed cap (${potential_dollar_loss:.2f} > ${max_allowed_loss:.2f} USDT, entry ref {ref}, equity: ${account_equity:.2f}{equity_note}, risk fraction: {risk_fraction*100:.2f}% + buffer). Adjust margin or position size."
@@ -1702,11 +1721,17 @@ def append_trade_audit_record(record, margin_usdt):
 # Binance cannot attach a Stop Loss to a conditional/resting order, so each one is recorded in
 # logs/pending_entries.json and protect_pending_entries() (--protect-pending, run by the position
 # guardian at the start of every cycle) places the planned SL/TPs once it fills.
+# Issue #36: on KEYS (HMAC) the planned SL is also pre-armed at placement as a closePosition STOP_MARKET when it is
+# not crossed (prearm_resting_entry_stop); the guardian then verifies it at fill and stays the fallback.
+# Schema v2 record fields: prearm_status ("placed" | "rejected:<code-or-text>" | "skipped:mcp" |
+# "skipped:crossed"), prearm_algo_id / prearm_price (an algo id was returned), sl_close_position: true and
+# sl_qty: null (verified pre-arm, covers any size). v1 records have none of them: not pre-armed.
 # -----------------------------------------------------------------------------
 PENDING_ENTRY_TIMEOUT_SECONDS = 5400    # desk order timeout (60-90 min) for unfilled resting entries
 GUARDIAN_MAX_INTERVAL_FOR_RESTING = 120 # resting entries require a guardian LOOP (--interval <= 120s) for the env
 PENDING_MISSING_GRACE_SECONDS = 60      # "entry gone, no position" must persist this long before a record is dropped
-PENDING_ENTRIES_SCHEMA_VERSION = 1
+PENDING_ENTRIES_SCHEMA_VERSION = 2
+FILL_MIN_RR_TP2 = 3.0                   # issue #39: audit flag "rr_below_3" for a fill whose real R:R to TP2 is lower
 
 
 def pending_entries_path(base_dir=None):
@@ -1757,8 +1782,9 @@ def update_pending_entries(mutate, base_dir=None):
 
 
 def register_resting_entry(kind, entry_id, symbol, direction, entry_side, exit_side, target_env, price, total_qty,
-                           sl_price, tp1_price, tp2_price, leverage, is_yolo, margin_usdt):
-    """Records a resting entry in logs/pending_entries.json. Returns (key, record); raises on failure."""
+                           sl_price, tp1_price, tp2_price, leverage, is_yolo, margin_usdt, prearm=None):
+    """Records a resting entry in logs/pending_entries.json (schema v2; `prearm`: the prearm_resting_entry_stop
+    fields). Returns (key, record); raises on failure."""
     now = int(time.time())
     key = pending_entry_key(target_env, symbol, entry_id)
     record = {
@@ -1780,8 +1806,185 @@ def register_resting_entry(kind, entry_id, symbol, direction, entry_side, exit_s
         'placed_at_ts': now,
         'expires_at_ts': now + PENDING_ENTRY_TIMEOUT_SECONDS,
     }
+    record.update(prearm or {})
     update_pending_entries(lambda entries: entries.__setitem__(key, record))
     return key, record
+
+
+def _rejection_text(res):
+    """Short reason of a rejected order response: the Binance code when present, else the message (<= 120 chars)."""
+    if isinstance(res, dict):
+        code = res.get('code')
+        if code is not None and str(code).lstrip('-').isdigit() and int(code) < 0:
+            return str(code)
+        text = res.get('msg') or res.get('error') or res.get('message') or res
+    else:
+        text = res
+    return str(text)[:120] or "unknown"
+
+
+def prearm_resting_entry_stop(symbol, exit_side, sl_price, ref_price, target_env=None, tick_size=None):
+    """
+    Issue #36: pre-arms the planned Stop Loss of a resting entry right after the entry is placed, as a closePosition
+    STOP_MARKET on the exit side (place_algo_stop_loss with quantity=None). A closePosition order can never open a
+    position. Binance does not document whether such a stop is accepted with no position or what it does if it
+    triggers before the fill; either way the guardian verifies it at fill (_ensure_entry_stop) and places the planned
+    stop when it is gone. Pre-armed only when:
+      - the orders do not route through the MCP gateway (it rejects a bare closePosition with no position);
+      - sl_price is on the protective side of ref_price (the current last price; the stop has no workingType, i.e.
+        CONTRACT_PRICE): below it for a SELL stop (LONG), above it for a BUY stop (SHORT).
+    Never blocks the entry. Returns the v2 registry fields: {"prearm_status": "placed" | "rejected:<code-or-text>" |
+    "skipped:mcp" | "skipped:crossed"}, plus prearm_algo_id / prearm_price when an algo id was returned (cancelled
+    with the entry) and sl_close_position: True / sl_qty: None once verified on /fapi/v1/openAlgoOrders. Never
+    raises: an unexpected error is "rejected:<error>" (the entry must still be registered).
+    """
+    try:
+        return _prearm_resting_entry_stop(symbol, exit_side, sl_price, ref_price, target_env, tick_size)
+    except Exception as e:
+        return {'prearm_status': f"rejected:{type(e).__name__}: {e}"[:130]}
+
+
+def _prearm_resting_entry_stop(symbol, exit_side, sl_price, ref_price, target_env, tick_size):
+    if uses_mcp_gateway(target_env):
+        return {'prearm_status': 'skipped:mcp'}
+    sl_price, ref_price = _to_float(sl_price), _to_float(ref_price)
+    is_long_exit = str(exit_side).upper() == 'SELL'
+    if sl_price <= 0 or ref_price <= 0 or ((sl_price >= ref_price) if is_long_exit else (sl_price <= ref_price)):
+        return {'prearm_status': 'skipped:crossed'}
+    try:
+        placement = place_algo_stop_loss(symbol, exit_side, sl_price, target_env=target_env)
+    except Exception as e:
+        placement = {"error": f"placement exception: {e}"}
+    placed_id = _order_id(placement) if isinstance(placement, dict) and not _is_api_error(placement) else None
+    if placed_id is None:
+        return {'prearm_status': f"rejected:{_rejection_text(placement)}"}
+    fields = {'prearm_algo_id': placed_id, 'prearm_price': sl_price}
+    verified, _info = wait_for_stop_confirmation(symbol, exit_side, sl_price, algo_id=placed_id, tick_size=tick_size,
+                                                 target_env=target_env)
+    if not verified:
+        return dict(fields, prearm_status='rejected:unverified')
+    return dict(fields, prearm_status='placed', sl_close_position=True, sl_qty=None)
+
+
+def _prearm_note(prearm, sl_price):
+    if prearm.get('prearm_status') == 'placed':
+        return f"Stop Loss pre-armed at {sl_price} (closePosition, algo {prearm.get('prearm_algo_id')}). "
+    return f"Stop Loss not pre-armed ({prearm.get('prearm_status')}). "
+
+
+def cancel_prearmed_stop(symbol, exit_side, algo_id, target_env=None):
+    """
+    Cancels the pre-armed stop of a resting entry that ended without a position (issue #36), by its algo id only:
+    never a sweep of the symbol's stops. It is cancelled only when /fapi/v1/openAlgoOrders lists it for symbol as a
+    protective stop on exit_side (a forged id cannot cancel another symbol's stop); not listed = already gone (ok).
+    A leftover stop must not stay: verify_algo_stop_loss accepts any protective stop within 3% of the price, so it
+    could falsely confirm the stop of a later MARKET entry on the symbol. Returns (ok, detail); a failed read or
+    cancel returns ok False (callers keep the record and retry on the next cycle; never blocking).
+    """
+    if algo_id is None:
+        return True, None
+    stops, err = get_open_stop_orders(symbol, exit_side, target_env=target_env)
+    if err:
+        return False, err
+    if not any(str(_order_id(s)) == str(algo_id) for s in stops):
+        return True, "not_listed"
+    try:
+        res = send_signed_request('DELETE', '/fapi/v1/algoOrder', {'symbol': symbol, 'algoId': algo_id}, target_env=target_env)
+    except Exception as e:
+        res = {"error": str(e)}
+    if _is_api_error(res):
+        return False, res
+    return True, res
+
+
+def _ensure_entry_stop(symbol, exit_side, sl_price, prearm_algo_id=None, quantity=None, tick_size=None,
+                       target_env=None):
+    """
+    One stop rule for a pending or just-filled entry (issue #36), shared by the inline PARTIALLY_FILLED path and
+    _protect_pending_entry at fill:
+      1. a pre-armed stop (prearm_algo_id) verified on /fapi/v1/openAlgoOrders (by algo id, then by price within one
+         tick; one read) is kept: no placement;
+      2. otherwise (no pre-arm, or it was consumed, e.g. triggered before the fill) the planned stop is placed as
+         before (quantity=None: closePosition) and verified with progressive retries;
+      3. a -4130 on that placement means a closePosition stop already exists: re-verified by listing, "kept".
+    Returns {"verified", "source": "prearm" | "placed" | "kept" | None, "placement", "info"}.
+    """
+    if prearm_algo_id is not None:
+        verified, info = wait_for_stop_confirmation(symbol, exit_side, sl_price, algo_id=prearm_algo_id,
+                                                    tick_size=tick_size, target_env=target_env, retry_delays=())
+        if verified:
+            return {"verified": True, "source": "prearm", "placement": None, "info": info}
+    try:
+        placement = place_algo_stop_loss(symbol, exit_side, sl_price, target_env=target_env, quantity=quantity)
+    except Exception as e:
+        placement = {"error": f"placement exception: {e}"}
+    if _is_existing_close_position_stop_rejection(placement):
+        verified, info = wait_for_stop_confirmation(symbol, exit_side, sl_price, algo_id=prearm_algo_id,
+                                                    tick_size=tick_size, target_env=target_env)
+        return {"verified": verified, "source": "kept" if verified else None, "placement": placement, "info": info}
+    placed_id = _order_id(placement) if isinstance(placement, dict) else None
+    verified, info = wait_for_stop_confirmation(symbol, exit_side, sl_price, algo_id=placed_id, tick_size=tick_size,
+                                                target_env=target_env)
+    return {"verified": verified, "source": "placed" if verified else None, "placement": placement, "info": info}
+
+
+def _stop_covers_position(order, qty, rec=None):
+    """KEYS listing (issue #39/#118): a protective stop covers a position of `qty` when it is closePosition, when
+    it is the verified pre-arm of `rec` (sl_close_position), or when its quantity is >= qty. An unreadable quantity
+    does not cover (the caller resizes, the safe direction). Never used on MCP (its listing folds reduceOnly into
+    closePosition and drops the quantity)."""
+    if not isinstance(order, dict):
+        return False
+    if _truthy(order.get('closePosition')):
+        return True
+    if rec and _truthy(rec.get('sl_close_position')) and rec.get('prearm_algo_id') is not None \
+            and str(_order_id(order)) == str(rec.get('prearm_algo_id')):
+        return True
+    stop_qty = _to_float(order.get('quantity') or order.get('origQty'))
+    return stop_qty > 0 and stop_qty >= abs(_to_float(qty)) * (1 - 1e-9)
+
+
+def fill_quality_fields(is_long, entry_px, stop_px, tp1_px, tp2_px):
+    """Issue #39 (log only, no gate): fill quality of a filled resting entry for its audit record, from the real
+    entry price and the stop in force. realized_rr_tp2 = reward to TP2 / risk to the stop (None when the stop is at
+    or beyond the entry, e.g. break-even); tp1_distance_pct = signed TP1 distance from the entry in percent.
+    fill_quality_flags: "rr_below_3" (realized_rr_tp2 < FILL_MIN_RR_TP2) and/or "tp1_below_friction" (TP1 closer
+    than MIN_TP1_DISTANCE, or on the wrong side)."""
+    entry_px, stop_px = _to_float(entry_px), _to_float(stop_px)
+    tp1_px, tp2_px = _to_float(tp1_px), _to_float(tp2_px)
+    sign = 1.0 if is_long else -1.0
+    risk = (entry_px - stop_px) * sign
+    rr = round((tp2_px - entry_px) * sign / risk, 4) if entry_px > 0 and stop_px > 0 and tp2_px > 0 and risk > 0 else None
+    tp1_frac = (tp1_px - entry_px) * sign / entry_px if entry_px > 0 and tp1_px > 0 else None
+    flags = []
+    if rr is not None and rr < FILL_MIN_RR_TP2:
+        flags.append("rr_below_3")
+    if tp1_frac is not None and tp1_frac < MIN_TP1_DISTANCE:
+        flags.append("tp1_below_friction")
+    return {"realized_rr_tp2": rr,
+            "tp1_distance_pct": round(tp1_frac * 100, 4) if tp1_frac is not None else None,
+            "fill_quality_flags": flags}
+
+
+def record_loss_cap_problem(rec, ref_price, equity, prof, unrealized=0.0, leverage=None):
+    """Issue #118 (PROD, pure): the loss at the record's SL, abs(ref_price - sl_price) x total_qty, must not exceed
+    the Gate 2 cap (monetary_loss_cap): standard min(wallet, wallet + uPnL) x risk_pct_equity x 1.25; YOLO the margin
+    cap, with `leverage` (the live position's when filled, else the record's). Returns a problem string or None."""
+    ref = _to_float(ref_price)
+    sl = _to_float(rec.get('sl_price'))
+    total_qty = _to_float(rec.get('total_qty'))
+    is_yolo = _truthy(rec.get('is_yolo'))
+    lev = _to_float(leverage) or _to_float(rec.get('leverage')) or 1.0
+    cap, risk_fraction, equity_used, _note = monetary_loss_cap(
+        _to_float(equity), prof, is_testnet=False, is_yolo=is_yolo, ref=ref, total_qty=total_qty, leverage=lev,
+        unrealized=_to_float(unrealized))
+    loss = abs(ref - sl) * total_qty
+    if loss > cap:
+        basis = (f"YOLO margin cap at {lev:g}x" if is_yolo else
+                 f"equity ${equity_used:.2f} x {risk_fraction * 100:.2f}% x 1.25")
+        return (f"loss at sl_price {sl} ({loss:.2f} USDT for {total_qty} from {ref}) exceeds the Gate 2 loss cap "
+                f"{cap:.2f} USDT ({basis})")
+    return None
 
 
 def cancel_resting_entry(symbol, kind, entry_id, target_env=None):
@@ -2152,7 +2355,8 @@ def check_max_open_positions(prof, target_env, base_dir=None, live=None):
 def check_resting_entry_gates(symbol, target_env):
     """
     PROD gates for entries that rest on the book (untriggered STOP_MARKET, LIMIT), evaluated before any write.
-    Their SL/TPs are only placed on fill by protect_pending_entries, so:
+    Their TPs (and their SL when it cannot be pre-armed: MCP, crossed or rejected, issue #36) are only placed on fill
+    by protect_pending_entries, which also verifies a pre-armed SL, so:
       1. a guardian loop must be alive for this env (fail closed, see check_guardian_alive);
       2. the symbol must have no open position (keeps fill detection unambiguous).
     (No pending entry on the symbol is enforced for every entry by check_pending_entry_conflict.)
@@ -2163,7 +2367,8 @@ def check_resting_entry_gates(symbol, target_env):
     if not alive:
         return False, (
             f"CONDITIONAL ENTRY REJECTED: FAIL-CLOSED — the position guardian is not alive ({why}). A resting entry "
-            "only gets its Stop Loss on fill; start the guardian first: "
+            "gets its TPs (and its Stop Loss unless pre-armed) on fill and its stop verified by the guardian; start "
+            "the guardian first: "
             f"`python3 scripts/loops/position_guardian_loop.py --interval 60 --env {target_env}`."
         )
     try:
@@ -2254,28 +2459,41 @@ def protect_pending_entries(target_env=None, dry_run=False, keys=None):
     Strictly risk-reducing follow-up of logs/pending_entries.json (never opens or increases a position).
     For every record of target_env (only `keys` when given):
       - filled (position in the entry direction): ensure a verified protective stop, NEVER loosening one:
-          * no stop at all -> place the planned SL (closePosition); if it cannot be verified, cancel the entry and
+          * no stop at all -> _ensure_entry_stop: a still-verified pre-armed stop (issue #36) is kept, else the planned
+            SL is placed (closePosition; -4130 re-verified as kept); if it cannot be verified, cancel the entry and
             close the position reduce-only (auto-destruct);
           * every existing stop looser than the plan (e.g. the 2.5% orphan heal) -> replace with the planned SL,
             place-then-cancel;
-          * an existing stop at or tighter than the plan (trailing, break-even) -> kept; when a partial LIMIT fill
-            grew beyond the quantity covered (or once when the coverage is unknown, i.e. no sl_qty yet), it is
-            resized place-then-cancel at that tighter price for the full current size.
+          * an existing stop at or tighter than the plan (trailing, break-even, the pre-arm) -> kept. KEYS: resized
+            place-then-cancel at that tighter price for the full current size only when it does not cover the
+            position (not closePosition and its listed quantity < |positionAmt|; issues #39 / #118). MCP (no
+            readable coverage): resized when a partial LIMIT fill grew beyond sl_qty, or once when no sl_qty yet.
           A replace/resize that cannot be verified keeps the existing stop(s) (no auto-destruct) and is retried.
-          If the planned SL is already crossed (mark beyond it, or -2021 on placement), the position is closed
-          reduce-only at MARKET without cancelling existing stops first; leftovers are cancelled only once flat.
+          If the planned SL is already crossed (mark beyond it, or -2021 on placement), a resting entry remainder is
+          cancelled first, the position re-read and its live size closed reduce-only at MARKET without cancelling
+          existing stops; leftovers are cancelled only once flat. A failed close with no stop at all gets an
+          orphan-heal stop (issue #39).
         Once the entry order is gone, TP1/TP2 are placed reduce-only from the ACTUAL position size (idempotent:
-        placed TP ids are saved first and only a missing TP is retried), an audit record is appended and the record
-        dropped. A partially filled LIMIT keeps its record (remainder cancelled at expiry, TPs on a later run).
+        placed TP ids are saved first and only a missing TP is retried), an audit record is appended (with
+        realized_rr_tp2, tp1_distance_pct and fill_quality_flags, issue #39, log only) and the record dropped.
+        A partially filled LIMIT keeps its record (remainder cancelled at expiry, TPs on a later run).
       - not filled and still open: cancelled once expires_at_ts is reached, else kept.
       - not filled and no longer open: marked missing_since_ts and dropped only if still so on a run at least
         PENDING_MISSING_GRACE_SECONDS later (positionRisk can lag behind a trigger).
+      - every path that ends the entry without a position (timeout, drop, untrusted cancel) also cancels the
+        record's pre-armed stop by prearm_algo_id only (cancel_prearmed_stop, after a positionRisk re-read); a failed
+        cancel keeps the record for the next run.
       - record not trusted (issue #101, pending_record_mismatch + an error): while the entry rests, its side, quantity
         (within stepSize) and trigger/limit price (within tickSize) must match the record, and the record must be
         consistent (qty > 0, SL on the loss side, TP1/TP2 on the profit side of its entry price); otherwise the
         entry is cancelled and the record dropped (a partial position is protected as an orphan). Filled with an
         invalid SL: the record's SL is never used; with no protective stop, heal_orphan_position(close_on_failure)
-        and drop. Filled with invalid TPs only: the SL is handled, no TP is placed, record dropped.
+        and drop; a kept stop must cover the position (KEYS: closePosition or quantity >= |positionAmt|; MCP: always
+        replaced) or it is replaced place-then-cancel at its price (issue #118). Filled with invalid TPs only: the
+        SL is handled, no TP is placed, record dropped.
+        PROD (issue #118): the record's SL is also invalid when abs(trigger_or_limit_price - sl_price) x total_qty
+        exceeds the Gate 2 loss cap (record_loss_cap_problem; YOLO leverage from the live position when filled); a
+        failed equity read only adds a "warnings" entry and defers the check. TESTNET skips it.
     Any query error keeps the record (fail closed). dry_run reports the decisions without any write. A missing
     registry reads as empty (never blocks this risk-reducing path).
     Returns {"ok", "env", "dry_run", "actions": [{"type", "key", "symbol", "success", "dry_run", "detail"}],
@@ -2296,6 +2514,7 @@ def protect_pending_entries(target_env=None, dry_run=False, keys=None):
         out["errors"].append({"key": None, "symbol": None, "stage": "registry", "error": err})
         return out
     now = int(time.time())
+    run_ctx = {}   # per-run cache of the PROD equity read (issue #118 loss cap check)
     for key in sorted(entries):
         rec = entries[key]
         if keys is not None and key not in keys:
@@ -2303,7 +2522,7 @@ def protect_pending_entries(target_env=None, dry_run=False, keys=None):
         if not isinstance(rec, dict) or rec.get('target_env') != target_env:
             continue
         try:
-            _protect_pending_entry(key, rec, target_env, dry_run, now, out)
+            _protect_pending_entry(key, rec, target_env, dry_run, now, out, run_ctx)
         except Exception as e:
             out["errors"].append({"key": key, "symbol": rec.get('symbol'), "stage": "exception",
                                   "error": f"{type(e).__name__}: {e}"})
@@ -2370,7 +2589,38 @@ def pending_entry_order_mismatches(rec, kind, order, is_long, filters=None):
     return out
 
 
-def _protect_pending_entry(key, rec, target_env, dry_run, now, out):
+def _pending_loss_cap_problem(rec, position, target_env, run_ctx):
+    """Issue #118 (PROD): record_loss_cap_problem with live inputs. The reference is the record's
+    trigger_or_limit_price (the check is about the record, not the fill's slippage). Standard records read the wallet
+    balance (quant_risk_engine.get_account_equity) and the all-symbol positionRisk uPnL once per protect-pending run
+    (run_ctx); YOLO records need no read (margin cap; leverage from the live position when filled, else the record).
+    Returns (problem_or_None, warning_or_None): a failed read is a warning and defers the check (never blocks)."""
+    try:
+        import user_profile as up
+        prof = up.load_user_profile()
+    except Exception:
+        prof = {}
+    equity, unrealized = 0.0, 0.0
+    if not _truthy(rec.get('is_yolo')):
+        if 'equity' not in run_ctx:
+            try:
+                import quant_risk_engine as qre
+                wallet = float(qre.get_account_equity(target_env))
+                rows = send_signed_request('GET', '/fapi/v2/positionRisk', target_env=target_env)
+                if not isinstance(rows, list):
+                    raise ValueError(f"/fapi/v2/positionRisk query failed: {rows}")
+                run_ctx['equity'] = (wallet, unrealized_pnl_total(compute_exposure(rows)))
+            except Exception as e:
+                run_ctx['equity'] = f"{type(e).__name__}: {e}"
+        if isinstance(run_ctx['equity'], str):
+            return None, (f"SL distance vs loss cap check deferred to the next run: equity read failed "
+                          f"({run_ctx['equity']})")
+        equity, unrealized = run_ctx['equity']
+    leverage = position.get('leverage') if position is not None else None
+    return record_loss_cap_problem(rec, rec.get('trigger_or_limit_price'), equity, prof, unrealized, leverage), None
+
+
+def _protect_pending_entry(key, rec, target_env, dry_run, now, out, run_ctx=None):
     sym = str(rec['symbol']).upper()
     kind = 'STOP_MARKET' if str(rec.get('kind', '')).upper() == 'STOP_MARKET' else 'LIMIT'
     entry_id = str(rec['entry_id'])
@@ -2431,6 +2681,39 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out):
 
     # --- Record vs exchange cross-check (issue #101): never act on a forged / corrupted record ---------------
     problems = pending_record_problems(rec, is_long)
+    if (str(target_env).lower() != 'testnet' and (entry_open or position is not None)
+            and not problems["sl"] and not problems["entry"]):
+        # Issue #118 (PROD): an SL pushed further away (still on the loss side) must not exceed the Gate 2 loss cap.
+        # A breach makes the record untrusted: the entry is cancelled while it rests; a filled position without a
+        # stop gets the orphan heal, whose 2.5% anchor may be looser than the record SL (accepted: the record is not
+        # trusted at that point).
+        cap_problem, cap_warning = _pending_loss_cap_problem(rec, position, target_env,
+                                                             run_ctx if run_ctx is not None else {})
+        if cap_problem:
+            problems["sl"].append(cap_problem)
+        if cap_warning:
+            logger.warning(f"{sym} {key}: {cap_warning}")
+            out.setdefault("warnings", []).append({"key": key, "symbol": sym, "stage": "loss_cap_check",
+                                                   "warning": cap_warning})
+
+    def cancel_prearm_if_flat():
+        """Issue #36: cancels the record's pre-armed stop (by algo id only) once the entry ended without a position.
+        positionRisk is re-read first: a position (e.g. a fill racing the entry cancel) keeps the stop. Returns
+        (ok, detail); not ok keeps the record so the next run retries (never blocking)."""
+        pa_id = rec.get('prearm_algo_id')
+        if pa_id is None:
+            return True, None
+        if dry_run:
+            return True, f"planned cancel of pre-armed stop {pa_id}"
+        row, err = _read_open_position(sym, target_env=target_env, is_long=is_long)
+        if err:
+            return False, f"position re-read failed ({err}); pre-armed stop {pa_id} kept"
+        if row is not None:
+            return False, f"a position appeared ({row.get('positionAmt')}); pre-armed stop {pa_id} kept"
+        ok, res = cancel_prearmed_stop(sym, exit_side, pa_id, target_env=target_env)
+        if not ok:
+            logger.warning(f"{sym} {key}: cancel of pre-armed stop {pa_id} failed ({res}); retried next run")
+        return ok, res
 
     def untrusted_record(reason, mismatches):
         """Cancels the resting entry (when open), protects any position WITHOUT the record (orphan heal only when no
@@ -2472,10 +2755,38 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out):
                                                      "record kept for the next run.")
             if stops:
                 detail.update(kept_stops=[stop_summary(s) for s in stops])
+                # Issue #118: the kept stop must cover the whole position. KEYS reads the coverage from the listing
+                # (closePosition, or quantity >= |positionAmt|; the untrusted record is not used); MCP cannot read
+                # it, so a covering stop is always placed. Place-then-cancel at the tightest stop's price; if the
+                # replacement is unverified the existing stops stay (the record is dropped anyway: it is untrusted).
+                tight = tightest_stop(stops, is_long)
+                pos_qty = abs(_to_float(cur_pos.get('positionAmt')))
+                if uses_mcp_gateway(target_env) or not _stop_covers_position(tight, pos_qty):
+                    cov_filters = get_symbol_filters(sym, target_env=target_env)
+                    rep = replace_protective_stop(sym, exit_side, _trigger_price(tight),
+                                                  format_order_qty(cur_pos.get('positionAmt')), stops,
+                                                  target_env=target_env,
+                                                  tick_size=(cov_filters or {}).get('tickSize'))
+                    detail.update(coverage_replace=rep)
+                    for ce in rep.get('cancel_errors', []):
+                        fail("record_mismatch_cancel_old", ce)
+                    if not rep.get('success'):
+                        fail("record_mismatch_coverage", f"{sym} record {key} not trusted; the kept stop may not cover "
+                                                         f"{pos_qty} and its covering replacement was not verified; "
+                                                         "existing stop(s) kept.")
             else:
                 heal = heal_orphan_position(cur_pos, target_env=target_env, close_on_failure=True)
                 detail.update(heal=heal)
                 success = bool(heal.get('success') or heal.get('closed'))
+        elif rec.get('prearm_algo_id') is not None:
+            # Issue #36: entry cancelled, no position: cancel the pre-armed stop (by algo id); retried next run.
+            pa_ok, pa_res = cancel_prearmed_stop(sym, exit_side, rec.get('prearm_algo_id'), target_env=target_env)
+            detail.update(prearm_cancelled=pa_ok, prearm_cancel_result=pa_res)
+            if not pa_ok:
+                success = False
+                fail("record_mismatch_prearm_cancel", f"{sym} record {key}: entry cancelled but the pre-armed stop "
+                                                      f"{rec.get('prearm_algo_id')} could not be cancelled ({pa_res}); "
+                                                      "record kept for the next run.")
         act("pending_record_mismatch", success, **detail)
         fail("record_mismatch", f"{sym} pending entry record {key} does not match the exchange / is inconsistent "
                                 f"({'; '.join(mismatches)}); "
@@ -2511,18 +2822,34 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out):
                 return None
             if now - _to_float(since) < PENDING_MISSING_GRACE_SECONDS:
                 return None
-            act("pending_dropped", True, reason="entry_not_open_no_position", kind=kind, entry_id=entry_id,
+            pa_ok, pa_res = cancel_prearm_if_flat()
+            prearm_detail = ({"prearm_cancelled": pa_ok, "prearm_cancel_result": pa_res}
+                             if rec.get('prearm_algo_id') is not None else {})
+            act("pending_dropped", pa_ok, reason="entry_not_open_no_position", kind=kind, entry_id=entry_id,
                 missing_since_ts=since,
-                message="Entry no longer open and no position: cancelled or expired outside the desk.")
+                message="Entry no longer open and no position: cancelled or expired outside the desk.", **prearm_detail)
+            if not pa_ok:
+                return fail("prearm_cancel", f"Entry {entry_id} gone without a position but its pre-armed stop "
+                                             f"{rec.get('prearm_algo_id')} was not cancelled ({pa_res}); record kept.")
             return drop()
         if now < expires:
             return None
         if dry_run:
             return act("pending_timeout_cancel", False, kind=kind, entry_id=entry_id, expires_at_ts=expires)
         ok, res = cancel_resting_entry(sym, kind, entry_id, target_env=target_env)
-        act("pending_timeout_cancel", ok, kind=kind, entry_id=entry_id, expires_at_ts=expires, result=res)
+        prearm_detail = {}
+        if ok and rec.get('prearm_algo_id') is not None:
+            pa_ok, pa_res = cancel_prearm_if_flat()
+            prearm_detail = {"prearm_cancelled": pa_ok, "prearm_cancel_result": pa_res}
+        act("pending_timeout_cancel", ok, kind=kind, entry_id=entry_id, expires_at_ts=expires, result=res,
+            **prearm_detail)
         if not ok:
             return fail("timeout_cancel", f"Cancel of expired entry {entry_id} failed: {res}")
+        if prearm_detail and not prearm_detail["prearm_cancelled"]:
+            # The entry is cancelled: the next run sees it gone and retries the pre-arm cancel (pending_dropped path).
+            return fail("prearm_cancel", f"Expired entry {entry_id} cancelled but its pre-armed stop "
+                                         f"{rec.get('prearm_algo_id')} was not ({prearm_detail['prearm_cancel_result']}); "
+                                         "record kept.")
         return drop()
 
     # --- Filled (fully or partially): planned Stop Loss first ----------------
@@ -2540,12 +2867,21 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out):
     tightest = tightest_stop(stops, is_long)
     ex_p = _trigger_price(tightest) if tightest else None
     covered = _to_float(rec.get('sl_qty'))
+    looser = bool(stops) and abs(ex_p - sl_p) > tol and is_tighter_stop(sl_p, ex_p, is_long)
+    mcp = uses_mcp_gateway(target_env) if stops and not looser else None
     if not stops:
         mode, target_p, old_stops = 'place', sl_p, []
-    elif abs(ex_p - sl_p) > tol and is_tighter_stop(sl_p, ex_p, is_long):
+    elif looser:
         mode, target_p, old_stops = 'replace', sl_p, stops   # every stop looser than plan (e.g. 2.5% orphan heal)
+    elif not mcp:
+        # KEYS (issues #39 / #118): the listing is reliable, so the kept (tighter) stop is resized place-then-cancel at
+        # ITS price only when it does not cover the position: a closePosition stop (e.g. the issue #36 pre-arm)
+        # already covers any size and is never downgraded to a fixed-quantity one.
+        covers = _stop_covers_position(tightest, qty, rec)
+        mode, target_p, old_stops = (None, ex_p, []) if covers else ('resize', ex_p, stops)
     elif not covered or qty > covered * 1.000001:
-        # Kept (tighter) stop, resized place-then-cancel at ITS price for the full current size when the partial fill
+        # MCP (its listing folds reduceOnly into closePosition and drops the quantity, and detection errors land here):
+        # kept (tighter) stop, resized place-then-cancel at ITS price for the full current size when the partial fill
         # grew, or once when its coverage is unknown (a stop not placed here, e.g. an MCP orphan heal sized
         # reduce-only for a partial fill); sl_qty is then the baseline.
         mode, target_p, old_stops = 'resize', ex_p, stops
@@ -2553,27 +2889,51 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out):
         mode, target_p, old_stops = None, ex_p, []           # existing stop at or tighter than plan: keep it
     sl_stop = stop_summary(tightest) if tightest else None
     mark_p = _to_float(position.get('markPrice'))
+    if (mode is None and rec.get('prearm_algo_id') is not None and tightest is not None
+            and str(_order_id(tightest)) == str(rec.get('prearm_algo_id'))
+            and str(rec.get('sl_algo_id')) != str(rec.get('prearm_algo_id'))):
+        save(sl_algo_id=rec.get('prearm_algo_id'))   # issue #36: the verified pre-arm is the stop in force
 
     def crossed_close(reason, placement=None):
-        """The planned SL is already crossed: close reduce-only at MARKET for the actual size WITHOUT cancelling the
-        existing stops first; only once flat are leftover stops/TPs and the entry remainder cancelled."""
+        """The planned SL is already crossed. Issue #39: the resting entry remainder is cancelled FIRST (it cannot keep
+        filling), then the position is re-read and its live size closed reduce-only at MARKET WITHOUT cancelling the
+        existing stops; only once flat are leftover stops/TPs cancelled. A failed close that leaves a position with
+        no stop at all (place mode) gets an orphan-heal stop (heal_orphan_position, never looser than its anchor)."""
         detail = dict(reason=reason, planned_sl_price=sl_p, mark_price=mark_p or None, quantity=qty,
                       kept_stops=[stop_summary(s) for s in stops], placement=placement)
         if dry_run:
             return act("pending_sl_crossed_close", False, **detail)
-        try:
-            close = send_signed_request('POST', '/fapi/v1/order', {'symbol': sym, 'side': exit_side, 'type': 'MARKET',
-                                                                  'quantity': format_order_qty(qty), 'reduceOnly': 'true'},
-                                        target_env=target_env)
-        except Exception as e:
-            close = {"error": str(e)}
-        flat = _market_order_accepted(close) and _wait_until_flat(sym, is_long, target_env)
-        if not flat:
-            act("pending_sl_crossed_close", False, close=close, flat=False, **detail)
-            return fail("sl_crossed_close", f"Planned SL {sl_p} crossed for {sym} but the reduce-only close was not "
-                                            f"confirmed flat ({close}); existing stop(s) and record kept.")
         entry_cancel_ok, entry_cancel_res = (cancel_resting_entry(sym, kind, entry_id, target_env=target_env)
                                              if entry_open else (True, None))
+        live_row, live_err = _read_open_position(sym, target_env=target_env, is_long=is_long)
+        if live_row is None and live_err is None:
+            close = {"skipped": "position already flat on re-read"}
+            flat = _wait_until_flat(sym, is_long, target_env)
+        else:
+            close_qty = format_order_qty(live_row.get('positionAmt') if live_row is not None else qty)
+            detail.update(quantity=close_qty)
+            try:
+                close = send_signed_request('POST', '/fapi/v1/order', {'symbol': sym, 'side': exit_side, 'type': 'MARKET',
+                                                                      'quantity': close_qty, 'reduceOnly': 'true'},
+                                            target_env=target_env)
+            except Exception as e:
+                close = {"error": str(e)}
+            flat = _market_order_accepted(close) and _wait_until_flat(sym, is_long, target_env)
+        if not flat:
+            heal = None
+            if not stops:
+                heal_row, heal_err = _read_open_position(sym, target_env=target_env, is_long=is_long)
+                if heal_row is not None:
+                    heal = heal_orphan_position(heal_row, target_env=target_env, planned_sl=sl_p)
+                elif heal_err:
+                    heal = {"success": False, "reason": f"position re-read failed ({heal_err})"}
+            act("pending_sl_crossed_close", False, close=close, flat=False,
+                entry_cancelled=entry_cancel_ok if entry_open else None, heal=heal, **detail)
+            return fail("sl_crossed_close", f"Planned SL {sl_p} crossed for {sym} but the reduce-only close was not "
+                                            f"confirmed flat ({close}); "
+                                            + (f"orphan-heal stop verified={bool((heal or {}).get('success'))}; "
+                                               if not stops else "existing stop(s) kept; ")
+                                            + "record kept.")
         cleanup_errors = _cancel_symbol_orders(sym, target_env)
         act("pending_sl_crossed_close", True, close=close, flat=True, entry_cancelled=entry_cancel_ok if entry_open else None,
             cleanup_errors=cleanup_errors, **detail)
@@ -2592,15 +2952,13 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out):
             old_stops=[stop_summary(s) for s in stops])
     elif mode:
         cancelled_old = []
+        stop_source = None
         if mode == 'place':
-            try:
-                placement = place_algo_stop_loss(sym, exit_side, target_p, target_env=target_env)
-            except Exception as e:
-                placement = {"error": f"placement exception: {e}"}
-            placed_id = _order_id(placement) if isinstance(placement, dict) else None
-            verified, info = wait_for_stop_confirmation(sym, exit_side, target_p, algo_id=placed_id, tick_size=tick,
-                                                        target_env=target_env)
-            new_stop = stop_summary(info) if verified else None
+            # Issue #36: a pre-armed stop that is still verified is kept; otherwise (consumed) the planned SL is placed.
+            ensured = _ensure_entry_stop(sym, exit_side, target_p, prearm_algo_id=rec.get('prearm_algo_id'),
+                                         tick_size=tick, target_env=target_env)
+            placement, verified, stop_source = ensured["placement"], ensured["verified"], ensured["source"]
+            new_stop = stop_summary(ensured["info"]) if verified else None
         else:
             rep = replace_protective_stop(sym, exit_side, target_p, qty_str, old_stops, target_env=target_env, tick_size=tick)
             placement, verified, new_stop = rep.get('placement'), bool(rep.get('success')), rep.get('new_stop')
@@ -2609,7 +2967,7 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out):
                 fail("protect_sl_cancel_old", ce)
         act("pending_protect_sl", verified, mode=mode, sl_price=target_p, planned_sl_price=sl_p, quantity=qty,
             verified=verified, new_stop=new_stop, cancelled_old_stop_ids=cancelled_old, placement=placement,
-            coverage_unknown=(mode == 'resize' and not covered))
+            coverage_unknown=(mode == 'resize' and bool(mcp) and not covered), stop_source=stop_source)
         if not verified and mode in ('place', 'replace') and _is_immediate_trigger(placement):
             return crossed_close("sl_rejected_would_immediately_trigger", placement)
         if not verified and mode != 'place':
@@ -2712,6 +3070,7 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out):
             'target_env': target_env,
             'pending_entry_key': key,
         }
+        record.update(fill_quality_fields(is_long, entry_px, target_p, tp1_p, tp2_p))
         try:
             append_trade_audit_record(record, rec.get('margin_usdt'))
         except Exception as e:
@@ -2845,8 +3204,9 @@ def execute_complete_trade(
                                             "Execution aborted (fail-closed).")}
 
     # 1b. Pending resting entries (Issue #33, PROD): no new entry of any type on a symbol with a pending resting
-    # entry (or an unreadable registry). An untriggered STOP_MARKET or a LIMIT entry rests on the book and only gets
-    # its SL/TPs on fill (--protect-pending / position guardian loop). Checked before any write.
+    # entry (or an unreadable registry). An untriggered STOP_MARKET or a LIMIT entry rests on the book and gets its TPs
+    # (and its SL unless pre-armed, issue #36) on fill (--protect-pending / position guardian loop). Checked before
+    # any write.
     if is_prod:
         pend_ok, pend_err = check_pending_entry_conflict(symbol, target_env)
         if not pend_ok:
@@ -2938,17 +3298,18 @@ def execute_complete_trade(
     # and prevent premature profit truncation. The TP1 leg is a LIMIT at tp1_p, so its minNotional is checked there.
     tp1_qty, tp2_qty = split_take_profit_quantities(total_qty, filters, tp1_p)
 
-    def register_or_cancel(kind, entry_id, price):
-        """Records the resting entry for post-fill protection; if that fails the entry is cancelled (fail closed)."""
+    def register_or_cancel(kind, entry_id, price, prearm=None):
+        """Records the resting entry for post-fill protection; if that fails the entry and its pre-armed stop are
+        cancelled (fail closed)."""
         try:
             key, rec = register_resting_entry(
                 kind, entry_id, symbol, direction, entry_side, exit_side, target_env, price, total_qty,
-                sl_p, tp1_p, tp2_p, effective_leverage, is_yolo, margin_usdt)
+                sl_p, tp1_p, tp2_p, effective_leverage, is_yolo, margin_usdt, prearm=prearm)
             return key, rec, None
         except Exception as e:
             cancelled, cancel_res = cancel_resting_entry(symbol, kind, entry_id, target_env=target_env)
             state = "the entry was cancelled" if cancelled else "CANCEL ALSO FAILED: cancel it manually now"
-            return None, None, {
+            failure = {
                 "success": False,
                 "pending_registry_failure": True,
                 "orderId": entry_id,
@@ -2957,6 +3318,19 @@ def execute_complete_trade(
                 "error": (f"FAIL-CLOSED: {kind} entry {entry_id} for {symbol} was placed but could not be registered "
                           f"for post-fill protection in logs/pending_entries.json ({e}); {state}."),
             }
+            prearm_id = (prearm or {}).get('prearm_algo_id')
+            if prearm_id is not None:
+                # Only once the entry is cancelled and no position exists: otherwise the pre-arm protects a fill.
+                pos_row, pos_err = _read_open_position(symbol, target_env=target_env, is_long=is_long)
+                if cancelled and pos_row is None and pos_err is None:
+                    pa_ok, pa_res = cancel_prearmed_stop(symbol, exit_side, prearm_id, target_env=target_env)
+                else:
+                    pa_ok, pa_res = False, ("kept: the entry is not cancelled or a position may exist "
+                                            f"(position read: {pos_err or (pos_row or {}).get('positionAmt')})")
+                failure.update(prearm_cancelled=pa_ok, prearm_cancel_result=pa_res)
+                if not pa_ok:
+                    failure["error"] += f" The pre-armed stop {prearm_id} was not cancelled ({pa_res})."
+            return None, None, failure
 
     # 7. Technical Trigger Validation (Confirmation breakout)
     # (trigger_p / trigger_breached were computed with the effective entry, before sizing and gates)
@@ -2978,7 +3352,10 @@ def execute_complete_trade(
                 cond_order = send_signed_request('POST', '/fapi/v1/algoOrder', entry_params, target_env=target_env)
                 order_id = _order_id(cond_order) if isinstance(cond_order, dict) and not _is_api_error(cond_order) else None
                 if order_id:
-                    key, rec, failure = register_or_cancel('STOP_MARKET', order_id, trigger_p)
+                    # Issue #36: pre-arm the planned SL after the entry (the entry stays the first algo order sent).
+                    prearm = prearm_resting_entry_stop(symbol, exit_side, sl_p, cur_price, target_env=target_env,
+                                                       tick_size=filters.get('tickSize'))
+                    key, rec, failure = register_or_cancel('STOP_MARKET', order_id, trigger_p, prearm)
                     if failure:
                         return failure
                     return {
@@ -2992,9 +3369,14 @@ def execute_complete_trade(
                         "quantity": total_qty,
                         "pending_entry_key": key,
                         "expires_at_ts": rec['expires_at_ts'],
+                        "prearm_status": prearm['prearm_status'],
+                        "prearm_algo_id": prearm.get('prearm_algo_id'),
                         "message": (f"Conditional STOP_MARKET entry placed at {trigger_p} (algo order {order_id}). "
-                                    "Its SL/TPs are placed on fill by `execute_futures_trade.py --protect-pending` / the "
-                                    f"position guardian loop; unfilled after {PENDING_ENTRY_TIMEOUT_SECONDS // 60} min it is cancelled.")
+                                    + _prearm_note(prearm, sl_p) +
+                                    "Its TPs (and the SL when not pre-armed) are placed on fill by "
+                                    "`execute_futures_trade.py --protect-pending` / the position guardian loop, which also "
+                                    "verifies the stop; unfilled after "
+                                    f"{PENDING_ENTRY_TIMEOUT_SECONDS // 60} min it is cancelled.")
                     }
                 else:
                     return {"success": False, "error": f"Failed to place conditional order: {cond_order}"}
@@ -3031,7 +3413,12 @@ def execute_complete_trade(
     # still rests too: it is registered and its partial position gets the planned SL right away (TPs once filled).
     entry_status = str(entry_order.get('status', '')).upper()
     if order_type.upper() == 'LIMIT' and entry_status in ('NEW', 'PARTIALLY_FILLED'):
-        key, rec, failure = register_or_cancel('LIMIT', entry_order.get('orderId'), lim_p)
+        # Issue #36: a resting (NEW) LIMIT gets its SL pre-armed after the entry; a PARTIALLY_FILLED one is protected
+        # below from executedQty (_ensure_entry_stop).
+        prearm = (prearm_resting_entry_stop(symbol, exit_side, sl_p, cur_price, target_env=target_env,
+                                            tick_size=filters.get('tickSize'))
+                  if entry_status == 'NEW' else None)
+        key, rec, failure = register_or_cancel('LIMIT', entry_order.get('orderId'), lim_p, prearm)
         if failure:
             return failure
         result = {
@@ -3045,10 +3432,15 @@ def execute_complete_trade(
             "status": entry_status,
             "pending_entry_key": key,
             "expires_at_ts": rec['expires_at_ts'],
-            "message": (f"LIMIT order placed at {lim_p} (order ID: {entry_order.get('orderId')}). SL/TP orders deferred until fill "
+            "message": (f"LIMIT order placed at {lim_p} (order ID: {entry_order.get('orderId')}). "
+                        + (_prearm_note(prearm, sl_p) if prearm else "") +
+                        "TP orders (and the SL when not pre-armed) deferred until fill "
                         "(prevents -2022) and placed on fill by `execute_futures_trade.py --protect-pending` / the position "
-                        f"guardian loop; unfilled after {PENDING_ENTRY_TIMEOUT_SECONDS // 60} min it is cancelled.")
+                        f"guardian loop, which also verifies the stop; unfilled after {PENDING_ENTRY_TIMEOUT_SECONDS // 60} "
+                        "min it is cancelled.")
         }
+        if prearm:
+            result.update(prearm_status=prearm['prearm_status'], prearm_algo_id=prearm.get('prearm_algo_id'))
         if entry_status == 'PARTIALLY_FILLED':
             entry_id = entry_order.get('orderId')
             head = f"LIMIT order PARTIALLY_FILLED at {lim_p} (order ID: {entry_id}). "
@@ -3056,22 +3448,23 @@ def execute_complete_trade(
             if exec_qty > 0:
                 # Protect the filled part NOW from the entry response (no dependency on positionRisk visibility):
                 # closePosition with HMAC keys; quantity-based reduce-only via the MCP gateway (which needs a quantity).
-                try:
-                    sl_order = place_algo_stop_loss(symbol, exit_side, sl_p, target_env=target_env,
-                                                    quantity=exec_qty if uses_mcp_gateway(target_env) else None)
-                except Exception as e:
-                    sl_order = {"error": f"placement exception: {e}"}
-                placed_id = _order_id(sl_order) if isinstance(sl_order, dict) else None
-                sl_ok, sl_info = wait_for_stop_confirmation(symbol, exit_side, sl_p, algo_id=placed_id,
-                                                            tick_size=filters.get('tickSize'), target_env=target_env)
+                ensured = _ensure_entry_stop(symbol, exit_side, sl_p,
+                                             quantity=exec_qty if uses_mcp_gateway(target_env) else None,
+                                             tick_size=filters.get('tickSize'), target_env=target_env)
+                sl_order, sl_ok, sl_info = ensured["placement"], ensured["verified"], ensured["info"]
                 result["partial_fill_protection"] = {"executed_qty": exec_qty, "sl_order": sl_order, "verified": sl_ok,
+                                                     "stop_source": ensured["source"],
                                                      "new_stop": stop_summary(sl_info) if sl_ok else None}
                 result["partial_fill_protected"] = sl_ok
                 if not sl_ok:
-                    # Fail-safe auto-destruct: cancel the resting remainder, then close the filled part.
+                    # Fail-safe auto-destruct: cancel the resting remainder, then close the LIVE size (issue #39: units
+                    # filled between the entry response and the cancel are included); executedQty if the re-read fails.
                     entry_cancel_ok, entry_cancel_res = cancel_resting_entry(symbol, 'LIMIT', entry_id, target_env=target_env)
-                    abort_exit = emergency_abort_market_close(symbol, exit_side, exec_qty, target_env=target_env)
-                    log_emergency_abort(symbol, direction, exec_qty, sl_p, sl_order, abort_exit, target_env)
+                    live_row, live_err = _read_open_position(symbol, target_env=target_env, is_long=is_long)
+                    close_qty = (format_order_qty(live_row.get('positionAmt'))
+                                 if live_row is not None and live_err is None else exec_qty)
+                    abort_exit = emergency_abort_market_close(symbol, exit_side, close_qty, target_env=target_env)
+                    log_emergency_abort(symbol, direction, close_qty, sl_p, sl_order, abort_exit, target_env)
                     if abort_exit.get("confirmed") and entry_cancel_ok:
                         try:
                             update_pending_entries(lambda entries: entries.pop(key, None))

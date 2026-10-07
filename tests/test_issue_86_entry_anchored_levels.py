@@ -205,9 +205,18 @@ class TestExecutorRoundsBeforeGates(unittest.TestCase):
 
     def _execute(self, **kwargs):
         calls = []
+        placed_stops = []   # echoed on GET openAlgoOrders so the issue #36 pre-arm verifies
+
+        def place_stop(symbol, exit_side, sl_price, target_env=None, quantity=None):
+            placed_stops.append({"algoId": 9, "symbol": symbol, "side": exit_side, "orderType": "STOP_MARKET",
+                                 "triggerPrice": str(sl_price), "closePosition": quantity is None,
+                                 "reduceOnly": quantity is not None})
+            return {"algoId": 9}
 
         def fake(method, endpoint, params=None, target_env=None):
             calls.append((method, endpoint, dict(params or {})))
+            if endpoint == "/fapi/v1/openAlgoOrders":
+                return [dict(s) for s in placed_stops]
             if endpoint == "/fapi/v1/marginType":
                 return {"code": 200, "msg": "success"}
             if endpoint == "/fapi/v1/leverage":
@@ -231,7 +240,7 @@ class TestExecutorRoundsBeforeGates(unittest.TestCase):
              patch("execute_futures_trade._workspace_dir", return_value=ws), \
              patch("execute_futures_trade.check_mechanical_gates", gates), \
              patch("execute_futures_trade.get_symbol_filters", return_value=FILTERS), \
-             patch("execute_futures_trade.place_algo_stop_loss", return_value={"algoId": 9}), \
+             patch("execute_futures_trade.place_algo_stop_loss", side_effect=place_stop), \
              patch("execute_futures_trade.verify_algo_stop_loss", return_value=(True, {"algoId": 9})), \
              patch("quant_risk_engine.get_account_equity", return_value=10000.0), \
              patch("user_profile.load_user_profile", return_value=dict(PROFILE)), \

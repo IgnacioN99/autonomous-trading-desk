@@ -7,9 +7,10 @@ audit_and_trail_all_positions, check_dead_alpha and audit_orphan_positions.
 
 Per cycle:
   0. Pending entries (execute_futures_trade.protect_pending_entries, same as --protect-pending): a filled
-     resting entry from logs/pending_entries.json gets its planned SL (verified, else reduce-only close) and,
-     once the entry order is gone, its TPs sized from the actual position; expired unfilled entries are
-     cancelled. Runs first, so a fresh fill gets the planned stop instead of the orphan emergency stop.
+     resting entry from logs/pending_entries.json gets its planned SL (its pre-armed stop when still verified,
+     issue #36; else placed and verified, else reduce-only close) and, once the entry order is gone, its TPs sized
+     from the actual position; expired unfilled entries are cancelled with their pre-armed stop. Runs first, so a
+     fresh fill gets the planned stop instead of the orphan emergency stop.
   1. Sync open positions (GET /fapi/v2/positionRisk).
   2. Orphan audit: a position without a verified protective stop is auto-healed with a verified
      emergency stop (execute_futures_trade.heal_orphan_position); if the stop cannot be verified,
