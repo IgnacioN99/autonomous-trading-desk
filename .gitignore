@@ -24,6 +24,7 @@ config/user_context.json
 # =================================================================
 logs/*.json
 logs/*.jsonl
+logs/*.lock
 logs/*.md
 logs/evaluations/*
 logs/pr_review/

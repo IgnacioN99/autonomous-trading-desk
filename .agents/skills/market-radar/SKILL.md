@@ -81,13 +81,21 @@ sorted by confidence. `--top 0` (default) returns all of them.
 
 `python3 scripts/broad_yolo_scanner.py --json [--top N] [--interval 15m|5m|1h] [--env ENV]`
 
-Hardened Barbell filters: climax volume ≥ 2.0x OR absorption wick ≥ 50% (never below 1.0x volume), long RSI ≤ 65, short
-RSI ≥ 45, score ≥ 50. Margin comes from the profile (`yolo_margin_fixed`, else `yolo_equity_pct`
+Universe (one `/fapi/v1/exchangeInfo` request): `TRADING` USDT `PERPETUAL` contracts with `underlyingType`
+`COIN` (TradFi equity, ETF and commodity perps are excluded) whose `underlyingSubType` contains `Meme`, or whose
+base asset, without a `1000` / `1000000` / `1M` prefix, is exactly one of PEPE, WIF, BONK, DOGE, NEIRO, PENGU,
+BOME, MOODENG, SHIB, FLOKI. No 24h movers and no substring matches. If exchangeInfo fails (not a rate limit) the
+universe is that allowlist only (`universe_from_live_ticker: false`).
+
+Hardened Barbell filters on the last CLOSED candle (wicks and volume ratio vs the 20 candles before it): climax
+volume ≥ 2.0x OR absorption wick ≥ 50% (never below 1.0x volume), long RSI ≤ 65, short RSI ≥ 45, score ≥ 50.
+A symbol that passes both LONG and SHORT is dropped from both lists and listed in `ambiguous_symbols` (never a
+slot candidate). Margin comes from the profile (`yolo_margin_fixed`, else `yolo_equity_pct`
 × equity of `env`, clamped to 10-15 USDT); leverage is `leverage_yolo` capped at `leverage_ceiling`.
 
 ```json
-{"status": "ok", "command": "yolo", "env": "prod", "interval": "15m", "universe_size": 96,
- "universe_from_live_ticker": true, "scanned": 94, "max_used_weight_1m": 312,
+{"status": "ok", "command": "yolo", "env": "prod", "interval": "15m", "universe_size": 61,
+ "universe_from_live_ticker": true, "scanned": 61, "max_used_weight_1m": 312, "ambiguous_symbols": ["DOGEUSDT"],
  "filters": {"min_vol_ratio": 2.0, "min_wick_pct": 50.0, "min_vol_floor": 1.0, "long_max_rsi": 65.0, "short_min_rsi": 45.0, "min_score": 50.0,
    "min_tp1_distance": 0.0035, "max_loss_margin_fraction": 0.35, "min_r_tp1": 1.8, "min_rr_tp2": 3.0, "rounding_margin": 0.0005},
  "sizing": {"margin_usdt": 12.0, "leverage": 10, "leverage_ceiling": 15, "margin_mode": "ISOLATED", "yolo_slot_enabled": true},
@@ -97,34 +105,41 @@ RSI ≥ 45, score ≥ 50. Margin comes from the profile (`yolo_margin_fixed`, el
    "leverage": 10, "margin_usdt": 12.0, "notional_usdt": 120.0, "qty": 59.08, "max_loss_usdt": 3.48,
    "gain_tp1_usdt": 7.66, "gain_tp2_usdt": 15.66, "rsi": 41.2, "vol_ratio": 3.4, "lower_wick": 61.0,
    "upper_wick": 4.0, "atr_pct": 1.8, "trigger_buffer_pct": 0.18, "spread_pct": 0.0497,
-   "gate_ok": true, "gate_failures": []},
+   "tick_size": 0.0001, "gate_ok": true, "gate_failures": []},
  "longs": ["<same shape as recommendation>"], "shorts": ["<same shape, direction SHORT>"],
  "volume_surges": [{"symbol": "WIFUSDT", "vol_ratio": 3.4, "rsi": 41.2, "atr_pct": 1.8, "price": 2.01}]}
 ```
 
 - `slot_status`: `EMPTY` (no long passes the filters and the executor gates — keep the slot empty, never force a
   trade), `CANDIDATE`, or `CANDIDATE_SLOT_DISABLED` (profile `yolo_slot_enabled` is false: report only).
-- Every long and short row carries `gate_ok` and `gate_failures` (`coherence`, `friction`, `loss_cap`, `rr_tp1`,
-  `rr_tp2`), mirroring the PROD executor gates it would face when entered at `trigger` (on TESTNET the executor
-  skips the GATE 2 YOLO cap and the GATE 3 friction floor; the flags stay at the PROD limits) — coherent levels (LONG SL below the
-  current price and `sl < trigger < tp1 <= tp2`, SHORT mirrored), TP1 ≥ 0.35% from the trigger (GATE 3), SL
-  distance × leverage ≤ 0.35 of the isolated margin (GATE 2 YOLO cap) and TP1 ≥ 1.8R / TP2 ≥ 3:1. They run on prices
-  rounded to 6 significant digits with an adverse 0.05% margin (SL farther, TPs closer). The gates run on every
-  qualified row before the `--top` cut: `longs` / `shorts` list gate-passing rows first (score order within each
-  group), then failing rows only when fewer than `--top` pass. Failing rows are never recommended: a
-  `gate_ok: false` row is not a trade.
+- If `gate_ok` is false, NEVER propose, recommend or forward that row.
+- Every long and short row carries `gate_ok` and `gate_failures`, checked as if entered at `trigger` at the PROD
+  limits (on TESTNET the executor skips GATE 2 YOLO and GATE 3; the flags do not):
+  - `coherence`: LONG SL below the current price and `sl < trigger < tp1 <= tp2` (SHORT mirrored).
+  - `friction` (executor GATE 3): TP1 ≥ 0.35% from the trigger.
+  - `loss_cap` (executor GATE 2 YOLO): loss at SL ≤ 35% of the isolated margin (SL distance × leverage ≤ 0.35;
+    a fractional leverage is rounded up). The scanner skips the executor's 3.75 USDT minimum cap (stricter).
+  - `rr_tp1` / `rr_tp2`: TP1 ≥ 1.8R and TP2 ≥ 3:1. These are desk floors, not executor gates.
+  - `wide_spread`: `spread_pct` above 0.5% (the buffer cap; the trigger sits less than one spread past the
+    candle extreme, illiquid book).
+- The checks use prices rounded to 6 significant digits with an adverse margin of max(0.05%, `tick_size` / price)
+  (SL farther, TPs closer; `tick_size` is the exchangeInfo `tickSize`, `null` on the fallback universe). On a
+  tight stop this margin inflates the measured risk (about +50% on a ~0.1% stop), so a borderline row may be
+  flagged although the executor would accept it (conservative). Gates run on every qualified row before the
+  `--top` cut: `longs` / `shorts` list gate-passing rows first (score order within each group), then failing rows
+  only when fewer than `--top` pass.
 - `recommendation` is the top long with `gate_ok: true` (or `null`); shorts are hedges only.
 - Levels are measured from `trigger` (the breakout entry): `risk_pct`, TP1 = +2.2R, TP2 = +4.5R, ROE, `qty`
   and `max_loss_usdt`.
-- Trigger buffer (spread- and ATR-aware): LONG `trigger` = candle high × (1 + buffer), SHORT = candle low ×
-  (1 − buffer), with buffer = min(0.5%, max(0.08%, 1.0 × spread, 0.1 × ATR%)). `spread_pct` is (ask − bid) / mid
-  from one bookTicker request (`null` when unavailable: the buffer then uses ATR and the floor);
-  `trigger_buffer_pct` is the buffer applied.
-- Request weight per run: 24hr ticker 40 + bookTicker 5 + ~1 per symbol of klines, with 8 concurrent kline
-  workers. `max_used_weight_1m` is the highest `X-MBX-USED-WEIGHT-1M` header seen (`null` if none); a stderr
-  warning is printed at 1800 of the 2400/minute IP limit. On HTTP 429/418 the scan stops issuing requests and
-  fails (exit 1, no fallback universe); inside `screening_pipeline.py` the slot becomes
-  `UNAVAILABLE: YOLO scan rate-limited by Binance. YOLO slot kept empty.`
+- Trigger buffer (spread- and ATR-aware): LONG `trigger` = high × (1 + buffer), SHORT = low × (1 − buffer), the
+  high/low spanning the signal candle and the forming one, with buffer = min(0.5%, max(0.08%, 1.0 × spread,
+  0.1 × ATR%)). `spread_pct` is a percentage, (ask − bid) / mid × 100, from one bookTicker request (`null` when
+  unavailable: the buffer then uses ATR and the floor); `trigger_buffer_pct` is the buffer applied.
+- Rate limits: on HTTP 429/418 every scan stops and reports UNAVAILABLE, never a fallback universe. The ban
+  (Retry-After, else 60 s / 120 s) is kept in `logs/market_data_rate_limit.json`; until it expires every scan CLI
+  exits 1 without calling Binance and prints `market_data_status` = `UNAVAILABLE: Binance rate limit (HTTP <status>),
+  retry after <UTC time>`. `screening_pipeline.py` then exits 0 with that `market_data_status` and no candidates
+  (YOLO slot `UNAVAILABLE: YOLO scan rate-limited by Binance. YOLO slot kept empty.`).
 - Every pipeline run that requests the YOLO scan records its final slot status in `logs/yolo_scan_health.json`;
   `trading_doctor.py` warns (`[YOLO_SCAN]`, never critical) after 3 consecutive `UNAVAILABLE` runs.
 - Do not move a YOLO stop to break-even before TP1 fills.

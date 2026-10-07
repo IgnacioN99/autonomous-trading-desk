@@ -11,6 +11,7 @@ Implements the 'Lean Evaluator' Pattern:
 import os
 import sys
 import json
+import math
 import time
 import threading
 from typing import List, Literal, Optional, Tuple
@@ -30,6 +31,7 @@ import broad_yolo_scanner as bys
 from utils.env_resolver import resolve_env
 from utils.gate_limits import MIN_TP1_DISTANCE, YOLO_MAX_LOSS_MARGIN_FRACTION
 from utils import yolo_scan_health
+from utils import rate_limit_guard
 
 # Barbell YOLO slot (issue #52): the memecoin scanner runs concurrently under a hard time budget so it can
 # never block or break the standard scan (prime_evaluator_brief.py gives the whole pipeline 60 s).
@@ -40,14 +42,15 @@ YOLO_MAX_CANDIDATES = 2  # token budget of the primed brief
 YOLO_FILTER_TEXT = (f"climax volume >= {bys.MIN_VOL_RATIO}x or buyer absorption wick >= {bys.MIN_WICK_PCT:.0f}% "
                     f"(volume >= {bys.MIN_VOL_FLOOR}x)")
 YOLO_INACTIVE_STATUS = f"INACTIVE: Preserving capital. No memecoin exceeds {YOLO_FILTER_TEXT}."
-YOLO_DISABLED_STATUS = "DISABLED: yolo_slot_enabled is false in the user profile."
+YOLO_DISABLED_STATUS = yolo_scan_health.YOLO_DISABLED_STATUS  # shared with prime_evaluator_brief.py
 YOLO_RATE_LIMITED_REASON = "YOLO scan rate-limited by Binance"
 _UNAVAILABLE_PREFIX = "UNAVAILABLE: "
 _UNAVAILABLE_SUFFIX = ". YOLO slot kept empty."
 # The evaluator never sees a YOLO entry that the executor would reject when entered at the trigger. The gate checks
 # live in broad_yolo_scanner.yolo_gate_failures (shared with the standalone scanner) and use the executor's own
 # limits from utils/gate_limits.py: friction floor (execute_futures_trade.py GATE 3, TP1 >= 0.35% from the entry)
-# and the Barbell YOLO loss cap (GATE 2, loss at SL <= 35% of the isolated margin: SL distance x leverage <= 0.35).
+# and the Barbell YOLO loss cap (GATE 2, loss at SL <= 35% of the isolated margin: SL distance x leverage <= 0.35),
+# plus the scanner row flags that travel with the row: the tick-size rounding margin (`tick_size`) and `wide_spread`.
 # The names below are aliases kept for callers and tests.
 YOLO_MIN_TP1_DISTANCE = MIN_TP1_DISTANCE
 # Desk R:R floors measured from the trigger entry: TP1 must reach +1.8R (fees + free trade) and TP2 >= 3:1.
@@ -165,6 +168,10 @@ class MarketScreeningPayload(BaseModel):
     yolo_slot: Optional[YoloSlot] = None
     news_catalysts_summary: List[str]
     untrusted_external_content: bool = True
+    # None = market data OK. Fixed "UNAVAILABLE: Binance rate limit (HTTP <status>), retry after <UTC>" text when a
+    # 429/418 ban is active (issue #91.1): the payload then carries no candidates.
+    market_data_status: Optional[str] = None
+    run_id: Optional[str] = None  # DESK_SCAN_RUN_ID echoed back to prime_evaluator_brief.py (issue #91.6)
 
 # ==========================================
 # 2. DETERMINISTIC EXECUTION PIPELINE
@@ -198,6 +205,8 @@ def fetch_macro_btc() -> MacroContext:
             allows_alt_shorts=allows_shorts,
             macro_warning=warning
         )
+    except rate_limit_guard.RateLimitedError:
+        raise  # the whole run reports market data UNAVAILABLE
     except Exception as e:
         return MacroContext(
             btc_price=0.0,
@@ -374,12 +383,15 @@ def _unavailable_reason(yolo_status: str) -> str:
         text = text[:-len(_UNAVAILABLE_SUFFIX)]
     return text
 
-def _record_yolo_health(yolo_status: str, yolo_slot: YoloSlot) -> None:
+def _record_yolo_health(yolo_status: str, yolo_slot: YoloSlot, run_id: Optional[str] = None) -> None:
     """Persists the run's final YOLO slot status (logs/yolo_scan_health.json, read by trading_doctor.py).
     Main thread only, after the bounded wait; fail-open."""
     try:
         reason = _unavailable_reason(yolo_status) if yolo_slot.status == "UNAVAILABLE" else None
-        yolo_scan_health.record_scan(yolo_slot.status, reason)
+        if run_id:
+            yolo_scan_health.record_scan(yolo_slot.status, reason, run_id=run_id)
+        else:
+            yolo_scan_health.record_scan(yolo_slot.status, reason)
     except Exception as e:
         print(f"YOLO scan health not recorded ({type(e).__name__})", file=sys.stderr)
 
@@ -394,7 +406,7 @@ def _to_yolo_candidate(raw: dict) -> Optional[YoloCandidate]:
             return None
         symbol, price, trigger, sl = str(raw["symbol"]), float(raw["price"]), float(raw["trigger"]), float(raw["sl"])
         tp1, tp2 = float(raw["tp1"]), float(raw["tp2"])
-        leverage, margin = int(raw["leverage"]), float(raw["margin_usdt"])
+        leverage, margin = math.ceil(float(raw["leverage"])), float(raw["margin_usdt"])
         rsi = float(raw["rsi"])
         vol_ratio, lower_wick = float(raw["vol_ratio"]), float(raw["lower_wick"])
     except Exception:
@@ -450,18 +462,35 @@ def build_yolo_slot(scan: dict) -> Tuple[str, YoloSlot]:
     return (f"ACTIVE: {len(candidates)} memecoin(s) pass {YOLO_FILTER_TEXT}.",
             YoloSlot(status="ACTIVE", interval=interval, candidates=candidates))
 
+def _rate_limited_macro(text: str) -> MacroContext:
+    """Placeholder macro block of a run without market data (fixed text; alt shorts not allowed)."""
+    return MacroContext(btc_price=0.0, btc_regime="UNKNOWN", btc_regime_desc=text, btc_absorption="NONE",
+                        btc_taker_ratio=1.0, btc_cvd_30v=0.0, btc_oi_z_score=0.0, btc_tape_bias="UNKNOWN",
+                        btc_tape_imbalance=0.0, allows_alt_shorts=False, macro_warning=text)
+
 def execute_screening_pipeline(top_pairs_count: int = 80, target_env: Optional[str] = None,
                                include_yolo: bool = True) -> MarketScreeningPayload:
     """
     Executes the full screening pipeline concurrently in Python without any intermediary LLM.
     Returns a validated, structured MarketScreeningPayload object.
     include_yolo=False skips the Barbell YOLO memecoin scan (for callers that only use top_candidates).
+
+    Market-data rate limits (issue #91.1): the process-wide guard (utils/rate_limit_guard.py) is enabled for the
+    run. While a 429/418 ban is active (persisted by an earlier run, or tripped during this one) the payload carries
+    `market_data_status` = "UNAVAILABLE: Binance rate limit (HTTP <status>), retry after <UTC>" and no candidates;
+    it is still a normal payload (the CLI exits 0). The ban is persisted at the end of the run (main thread).
     """
+    with rate_limit_guard.scan_session():
+        return _run_screening_pipeline(top_pairs_count, target_env, include_yolo)
+
+def _run_screening_pipeline(top_pairs_count: int, target_env: Optional[str],
+                            include_yolo: bool) -> MarketScreeningPayload:
     global _last_yolo_future
     _last_yolo_future = None
     t0 = time.time()
 
     target_env = resolve_env(target_env)
+    run_id = os.environ.get(yolo_scan_health.RUN_ID_ENV) or None
 
     # Barbell YOLO slot: gated by the profile and started first so it overlaps the standard scan.
     f_yolo: Optional[Future] = None
@@ -483,7 +512,9 @@ def execute_screening_pipeline(top_pairs_count: int = 80, target_env: Optional[s
 
     # If a non-YOLO task raises after the scan started, stop the scan from issuing further requests.
     standard_scan_done = False
+    rate_limited = False
     try:
+        rate_limit_guard.raise_if_banned()  # a ban persisted by an earlier run: no Binance call in this run
         with ThreadPoolExecutor(max_workers=5) as executor:
             f_macro = executor.submit(fetch_macro_btc)
             f_radar = executor.submit(bmr.scan_all_liquid_pairs, top_pairs_count)
@@ -568,11 +599,16 @@ def execute_screening_pipeline(top_pairs_count: int = 80, target_env: Optional[s
             except Exception:
                 pass
         standard_scan_done = True
+    except rate_limit_guard.RateLimitedError:
+        rate_limited = True  # the payload below reports market data UNAVAILABLE
     finally:
         if not standard_scan_done and f_yolo is not None:
             cancel_event = getattr(f_yolo, "yolo_cancel_event", None)
             if cancel_event is not None:
                 cancel_event.set()
+    if rate_limited:
+        macro_data = _rate_limited_macro(rate_limit_guard.unavailable_text())
+        portfolio_ctx, top_candidates, stat_arb_list, raw_funding, news_data = None, [], [], None, []
 
     # Barbell YOLO Slot Status (bounded wait; any failure or timeout leaves the slot empty)
     if f_yolo is not None:
@@ -588,8 +624,17 @@ def execute_screening_pipeline(top_pairs_count: int = 80, target_env: Optional[s
         except Exception as e:
             yolo_result = _yolo_unavailable(f"YOLO scan failed ({type(e).__name__})", detail=str(e))
     yolo_status, yolo_slot = yolo_result
+    # Fail closed on a 429/418 anywhere in the run (fetches that swallow errors still trip the guard): the market
+    # data may be partial, so no setup is forwarded.
+    market_data_status = None
+    if rate_limited or rate_limit_guard.is_banned():
+        market_data_status = rate_limit_guard.unavailable_text()
+        top_candidates, stat_arb_list, raw_funding = [], [], None
+        if yolo_slot.status in ("ACTIVE", "INACTIVE"):  # no YOLO candidate either; DISABLED is kept as is
+            yolo_status, yolo_slot = _yolo_unavailable(YOLO_RATE_LIMITED_REASON)
     if include_yolo:
-        _record_yolo_health(yolo_status, yolo_slot)
+        _record_yolo_health(yolo_status, yolo_slot, run_id)
+    rate_limit_guard.persist()
 
     t1 = time.time()
     latency_ms = int((t1 - t0) * 1000)
@@ -605,7 +650,9 @@ def execute_screening_pipeline(top_pairs_count: int = 80, target_env: Optional[s
         yolo_slot_status=yolo_status,
         yolo_slot=yolo_slot,
         news_catalysts_summary=news_data,
-        untrusted_external_content=True
+        untrusted_external_content=True,
+        market_data_status=market_data_status,
+        run_id=run_id,
     )
 
 def _exit_without_waiting_for_yolo(code: int) -> None:
@@ -661,6 +708,8 @@ def main(argv: Optional[list] = None) -> int:
         real_stdout.write(payload.model_dump_json(indent=2) + "\n")
     else:
         print(f"⚡ PIPELINE COMPLETED IN {payload.pipeline_latency_ms} ms ({payload.timestamp_utc})")
+        if payload.market_data_status:
+            print(f"• Market data: {payload.market_data_status}")
         print(f"• Macro BTC: {payload.macro.btc_regime} | Price: ${payload.macro.btc_price:,.1f} | Allows Shorts: {payload.macro.allows_alt_shorts}")
         print(f"• Top Qualified Setups: {len(payload.top_candidates)}")
         for c in payload.top_candidates:

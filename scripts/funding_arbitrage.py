@@ -7,14 +7,24 @@ Calculates exact return, payment intervals, collateral, and basis spread for Bin
 import argparse
 import os
 import sys
+import urllib.error
 import urllib.request
 import json
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from utils import rate_limit_guard
+
 def fetch_json(url):
+    """Public market-data GET through the process-wide rate-limit guard (utils/rate_limit_guard.py)."""
+    rate_limit_guard.raise_if_banned()
     req = urllib.request.Request(url, headers={'User-Agent': 'BinanceAgentic/1.0'})
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        return json.loads(resp.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        rate_limit_guard.on_http_error(e)
+        raise
 
 def scan_top_funding_opportunities(min_volume_usdt=20_000_000, top_n=6):
     """Screens top contracts for Cash-and-Carry (Positive and Negative)."""
@@ -140,15 +150,23 @@ def main(argv=None):
         sys.stderr.write(f"error: {e}\n")
         return 2
 
-    try:
-        top = scan_top_funding_opportunities(min_volume_usdt=args.min_volume, top_n=args.top)
-        sim = simulate_funding_trade(args.simulate.upper(), args.capital) if args.simulate else None
-    except Exception as e:
-        err = f"{type(e).__name__}: {e}"
-        if args.json:
-            sys.stdout.write(json.dumps({"status": "error", "command": "funding", "env": env, "error": err}, indent=2) + "\n")
+    failure = None
+    with rate_limit_guard.scan_session():  # a persisted 429/418 ban skips the scan without calling Binance
+        if rate_limit_guard.is_banned():
+            failure = rate_limit_guard.error_payload("funding", env)
         else:
-            sys.stderr.write(f"Funding scan failed: {err}\n")
+            try:
+                top = scan_top_funding_opportunities(min_volume_usdt=args.min_volume, top_n=args.top)
+                sim = simulate_funding_trade(args.simulate.upper(), args.capital) if args.simulate else None
+            except Exception as e:
+                failure = {"status": "error", "command": "funding", "env": env, "error": f"{type(e).__name__}: {e}"}
+                if isinstance(e, rate_limit_guard.RateLimitedError):
+                    failure["market_data_status"] = rate_limit_guard.unavailable_text()
+    if failure is not None:
+        if args.json:
+            sys.stdout.write(json.dumps(failure, indent=2) + "\n")
+        else:
+            sys.stderr.write(f"Funding scan failed: {failure.get('market_data_status') or failure['error']}\n")
         return 1
 
     if args.json:

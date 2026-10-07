@@ -143,7 +143,8 @@ def check_yolo_scan_health(profile: dict) -> tuple:
         reason = str(health.get("last_unavailable_reason") or "unspecified")[:200]
         return "warn", (f"YOLO scan UNAVAILABLE in {count} consecutive runs (last reason: {reason}). "
                         "If it persists, open a MEDIUM issue: ./scripts/report_issue.sh --category tool_error "
-                        "--severity MEDIUM.")
+                        "--severity MEDIUM --title \"YOLO scan UNAVAILABLE\" --repro \"<command> (exit <code>)\" "
+                        "--output-file <file with the raw output>.")
     return "ok", f"YOLO scan healthy (last status {health.get('last_status', 'UNKNOWN')}, {count} consecutive UNAVAILABLE)."
 
 
