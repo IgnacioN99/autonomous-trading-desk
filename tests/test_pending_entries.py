@@ -418,7 +418,7 @@ class TestPartiallyFilledLimitAtPlacement(unittest.TestCase):
         self.assertTrue(res["emergency_abort"])
         closes = [c[2] for c in fx.calls if c[0] == "POST" and c[1] == ORDER_ENDPOINT and c[2].get("type") == "MARKET"]
         self.assertTrue(closes)
-        self.assertTrue(all(c["reduceOnly"] == "true" and c["quantity"] == 0.1 for c in closes))
+        self.assertTrue(all(c["reduceOnly"] == "true" and c["quantity"] == "0.1" for c in closes))
         self.assertEqual(fx.open_orders, [], "the resting remainder was cancelled")
         self.assertEqual(read_registry(ws), {})
 
@@ -888,7 +888,7 @@ class TestProtectPendingEntries(unittest.TestCase):
         self.assertEqual(self.types(res), ["pending_sl_crossed_close"])
         writes = fake.writes()
         self.assertEqual((writes[0][1], writes[0][2]["type"], writes[0][2]["reduceOnly"], writes[0][2]["quantity"]),
-                         (ORDER_ENDPOINT, "MARKET", "true", 10.0), "the close comes first, stops still in place")
+                         (ORDER_ENDPOINT, "MARKET", "true", "10"), "the close comes first, stops still in place")
         self.assertEqual(posts(fake, ALGO_ENDPOINT), [], "no stop placement at a crossed price")
         self.assertEqual(fake.algos, [], "leftover stop cancelled only once flat")
         self.assertEqual(read_registry(ws), {})
@@ -952,7 +952,7 @@ class TestProtectPendingEntries(unittest.TestCase):
         closes = posts(fake, ORDER_ENDPOINT)
         self.assertTrue(closes)
         for c in closes:
-            self.assertEqual((c["type"], c["side"], c["reduceOnly"], c["quantity"]), ("MARKET", "SELL", "true", 10.0))
+            self.assertEqual((c["type"], c["side"], c["reduceOnly"], c["quantity"]), ("MARKET", "SELL", "true", "10"))
         self.assertEqual(read_jsonl(ws, "emergency_aborts.jsonl")[0]["event"], "CRITICAL_FAILSAFE_ABORT")
         self.assertEqual(read_registry(ws), {})
 

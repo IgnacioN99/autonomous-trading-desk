@@ -160,7 +160,7 @@ class TestKeysClose(unittest.TestCase):
         self.assertEqual((res["attempts"], res["cleanup_errors"], res["closed"]), (1, [], FILLED))
         writes = fake.writes()
         self.assertEqual((writes[0][0], writes[0][1], writes[0][2]["type"], writes[0][2]["reduceOnly"],
-                          writes[0][2]["quantity"]), ("POST", ORDER_ENDPOINT, "MARKET", "true", 10.0),
+                          writes[0][2]["quantity"]), ("POST", ORDER_ENDPOINT, "MARKET", "true", "10"),
                          "the reduce-only close is the first write")
         first_delete = fake.calls.index(fake.deletes()[0])
         flat_reads = [i for i, c in enumerate(fake.calls) if c[1] == "/fapi/v2/positionRisk" and i < first_delete]
@@ -214,7 +214,7 @@ class TestKeysClose(unittest.TestCase):
         with keys_env(fake) as mock_report:
             res = eft.close_position_market("BTCUSDT", target_env="prod")
         self.assertFalse(res["success"])
-        self.assertEqual(fake.close_qtys, [10.0, 4.0, 4.0], "retries close the residual, never a zero quantity")
+        self.assertEqual(fake.close_qtys, ["10", "4", "4"], "retries close the residual, never a zero quantity")
         self.assertEqual(fake.deletes(), [])
         self.assertEqual((res["position_amt"], res["stop_source"]), (4.0, "kept"))
         self.assertEqual([a["algoId"] for a in fake.algos], [501])
@@ -257,7 +257,7 @@ class TestKeysClose(unittest.TestCase):
         with keys_env(fake) as mock_report:
             res = eft.close_position_market("btcusdt", target_env="prod")
         self.assertFalse(res["success"], "a partial fill must not count as flat")
-        self.assertEqual(fake.close_qtys, [10.0, 4.0, 4.0])
+        self.assertEqual(fake.close_qtys, ["10", "4", "4"])
         self.assertTrue(all(c[2].get("symbol") == "BTCUSDT" for c in fake.calls if c[2].get("symbol")),
                         "every request uses the upper-case symbol")
         self.assertEqual(fake.deletes(), [])
@@ -276,7 +276,7 @@ class TestKeysClose(unittest.TestCase):
         with keys_env(fake):
             res = eft.close_position_market("BTCUSDT", target_env="testnet")
         self.assertTrue(res["success"], res)
-        self.assertEqual((fake.writes()[0][2]["side"], fake.writes()[0][2]["quantity"]), ("BUY", 3.0))
+        self.assertEqual((fake.writes()[0][2]["side"], fake.writes()[0][2]["quantity"]), ("BUY", "3"))
 
     def test_position_risk_error_is_unknown_state_and_sends_nothing(self):
         for err in ({"code": -1003, "msg": "Too many requests"}, RuntimeError("network down"), "<html>502</html>"):
