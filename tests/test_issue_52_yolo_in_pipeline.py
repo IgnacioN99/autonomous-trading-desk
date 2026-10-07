@@ -43,13 +43,24 @@ def _no_network(*args, **kwargs):
 
 
 def setUpModule():
-    global _net_patch
+    global _net_patch, _ban_dir, _ban_patch
     _net_patch = patch("urllib.request.urlopen", side_effect=_no_network)
     _net_patch.start()
+    # Issue #91: module-wide temp ban file (a stale real ban in logs/ never flips a test).
+    from utils import rate_limit_guard
+    _ban_dir = tempfile.TemporaryDirectory()
+    _ban_patch = patch.object(rate_limit_guard, "STATE_FILE",
+                              os.path.join(_ban_dir.name, "market_data_rate_limit.json"))
+    _ban_patch.start()
+    rate_limit_guard.reset_for_tests()
 
 
 def tearDownModule():
+    from utils import rate_limit_guard
     _net_patch.stop()
+    _ban_patch.stop()
+    _ban_dir.cleanup()
+    rate_limit_guard.reset_for_tests()
 
 
 def _audit_row(symbol, vol_ratio, lower_wick, price=0.0123):
@@ -104,6 +115,12 @@ class _PipelineFakes(unittest.TestCase):
         health_dir = tempfile.TemporaryDirectory()
         self.addCleanup(health_dir.cleanup)
         patches.append(patch("utils.yolo_scan_health.HEALTH_FILE", os.path.join(health_dir.name, "yolo_scan_health.json")))
+        # Issue #91: the pipeline enables the process-wide rate-limit guard; its ban file stays out of logs/ too.
+        patches.append(patch("utils.rate_limit_guard.STATE_FILE",
+                             os.path.join(health_dir.name, "market_data_rate_limit.json")))
+        from utils import rate_limit_guard
+        rate_limit_guard.reset_for_tests()
+        self.addCleanup(rate_limit_guard.reset_for_tests)
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
@@ -252,8 +269,9 @@ class TestPipelineYoloSlot(_PipelineFakes):
 
 
 def _wick_klines(side, last_vol, n=40):
-    """Drift then a last candle with a ~98% lower (side='LONG') or upper (side='SHORT') wick and volume last_vol
-    (the previous bars trade 100). LONG drifts down (RSI < 50), SHORT drifts up (RSI > 50)."""
+    """Drift, a signal candle with a ~98% lower (side='LONG') or upper (side='SHORT') wick and volume last_vol
+    (the previous bars trade 100), then a neutral forming candle inside its range: the signal candle is the last
+    CLOSED one, klines[-2] (issue #85). LONG drifts down (RSI < 50), SHORT drifts up (RSI > 50)."""
     ks, price = [], 1.0
     up, down = (0.997, 1.002) if side == "LONG" else (1.003, 0.998)
     for i in range(n - 1):
@@ -266,6 +284,8 @@ def _wick_klines(side, last_vol, n=40):
         ks.append([n, str(o), str(o * 1.001), str(o * 0.95), str(o * 1.0005), str(last_vol)])
     else:
         ks.append([n, str(o), str(o * 1.05), str(o * 0.999), str(o * 0.9995), str(last_vol)])
+    f = float(ks[-1][4])
+    ks.append([n + 1, str(f), str(f * 1.0002), str(f * 0.9998), str(f), "100"])
     return ks
 
 
@@ -464,6 +484,7 @@ class TestCliExitsDespiteHungYoloScan(_PipelineFakes):
             patch("funding_arbitrage.scan_top_funding_opportunities", return_value=[]).start()
             patch("sync_session_state.sync_session_state", return_value={{}}).start()
             patch("utils.yolo_scan_health.HEALTH_FILE", sys.argv[1]).start()  # issue #66: keep logs/ clean
+            patch("utils.rate_limit_guard.STATE_FILE", sys.argv[1] + ".ban.json").start()  # issue #91 ban file
             sp._run_cli(["--json", "--env", "prod"])
         """)
         with tempfile.TemporaryDirectory() as tmp:
@@ -546,10 +567,11 @@ class TestBriefYoloSlot(unittest.TestCase):
         legacy = self._assemble({"yolo_slot_status": "INACTIVE: Preserving capital. legacy"})
         self.assertEqual(legacy["yolo_slot"], {"status": "INACTIVE",
                                                "summary": "INACTIVE: Preserving capital. legacy", "candidates": []})
+        # Failed pipeline ({}) with the slot disabled in the profile: the DISABLED text (issue #91.8c).
         empty = self._assemble({})
-        self.assertEqual(empty["yolo_slot"], {"status": "INACTIVE", "summary": "INACTIVE: Preserving capital.",
+        self.assertEqual(empty["yolo_slot"], {"status": "DISABLED", "summary": sp.YOLO_DISABLED_STATUS,
                                               "candidates": []})
-        self.assertIn("**YOLO Slot:** INACTIVE: Preserving capital.", peb.format_markdown_brief(empty))
+        self.assertIn(f"**YOLO Slot:** {sp.YOLO_DISABLED_STATUS}", peb.format_markdown_brief(empty))
 
     def test_non_active_slot_never_forwards_candidates(self):
         screening = self._structured_screening()

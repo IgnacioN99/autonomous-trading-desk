@@ -8,14 +8,24 @@ and overall liquidity to recommend optimal quantitative strategies in real time.
 import argparse
 import os
 import sys
+import urllib.error
 import urllib.request
 import json
 import math
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from utils import rate_limit_guard
+
 def fetch_json(url):
+    """Public market-data GET through the process-wide rate-limit guard (utils/rate_limit_guard.py)."""
+    rate_limit_guard.raise_if_banned()
     req = urllib.request.Request(url, headers={'User-Agent': 'BinanceAgentic/1.0'})
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        return json.loads(resp.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        rate_limit_guard.on_http_error(e)
+        raise
 
 def get_btc_macro_state():
     """Analyzes Bitcoin trend across 1h and 15m timeframes."""
@@ -148,8 +158,20 @@ def main(argv=None):
         sys.stderr.write(f"error: {e}\n")
         return 2
 
-    report = classify_regime()
-    failed = "error" in report["btc_state"] and "error" in report["funding_climate"]
+    with rate_limit_guard.scan_session():  # a persisted 429/418 ban skips the scan without calling Binance
+        if rate_limit_guard.is_banned():
+            err = rate_limit_guard.error_payload("regime", env)
+            if args.json:
+                sys.stdout.write(json.dumps(err, indent=2) + "\n")
+            else:
+                sys.stderr.write(f"Regime scan skipped: {err['market_data_status']}\n")
+            return 1
+        report = classify_regime()
+        banned = rate_limit_guard.is_banned()
+    if banned:
+        # A 429/418 during the run (swallowed per fetch): the regime is unreliable, report it as unavailable.
+        report["market_data_status"] = rate_limit_guard.unavailable_text()
+    failed = banned or ("error" in report["btc_state"] and "error" in report["funding_climate"])
     if args.json:
         payload = {"status": "error" if failed else "ok", "command": "regime", "env": env}
         payload.update(report)

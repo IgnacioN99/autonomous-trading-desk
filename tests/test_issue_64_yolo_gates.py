@@ -31,6 +31,7 @@ import broad_yolo_scanner as bys
 import execute_futures_trade as eft
 import screening_pipeline as sp
 from utils import gate_limits as gl
+from utils import rate_limit_guard as rlg
 
 PROFILE = {
     "profile_completed": True, "risk_pct_equity": 0.005, "max_margin_ratio": 0.30, "yolo_slot_enabled": True,
@@ -44,23 +45,32 @@ def _no_network(*args, **kwargs):
 
 
 def setUpModule():
-    global _net_patch
+    global _net_patch, _ban_dir, _ban_patch
     _net_patch = patch("urllib.request.urlopen", side_effect=_no_network)
     _net_patch.start()
+    # Issue #91: the market-data rate-limit ban file lives in a temp dir (a stale real ban never flips a test).
+    _ban_dir = tempfile.TemporaryDirectory()
+    _ban_patch = patch.object(rlg, "STATE_FILE", os.path.join(_ban_dir.name, "market_data_rate_limit.json"))
+    _ban_patch.start()
+    rlg.reset_for_tests()
 
 
 def tearDownModule():
     _net_patch.stop()
+    _ban_patch.stop()
+    _ban_dir.cleanup()
+    rlg.reset_for_tests()
 
 
 # =============================================================================
 # Fixtures
 # =============================================================================
-def _klines(side, high, low, close, vol, n=40):
-    """Choppy drift (down for 'LONG', up for 'SHORT') then a signal candle (high/low/close relative to its open)
-    with volume `vol` (previous bars trade 100)."""
+def _klines(side, high, low, close, vol, n=40, steps=None):
+    """Choppy drift (down for 'LONG', up for 'SHORT', or `steps` = (up, down)), a signal candle (high/low/close
+    relative to its open) with volume `vol` (previous bars trade 100), then a neutral forming candle inside its range:
+    the signal candle is the last CLOSED one, klines[-2] (issue #85)."""
     ks, price = [], 1.0
-    up, down = (1.002, 0.997) if side == "LONG" else (1.003, 0.998)
+    up, down = steps or ((1.002, 0.997) if side == "LONG" else (1.003, 0.998))
     for i in range(n - 1):
         o = price
         c = price * (up if i % 2 == 0 else down)
@@ -68,6 +78,8 @@ def _klines(side, high, low, close, vol, n=40):
         price = c
     o = price
     ks.append([n, str(o), str(o * high), str(o * low), str(o * close), str(vol)])
+    f = o * close
+    ks.append([n + 1, str(f), str(f * 1.0005), str(f * 0.9995), str(f), "100"])
     return ks
 
 
@@ -75,9 +87,11 @@ def _klines(side, high, low, close, vol, n=40):
 LONG_OK = _klines("LONG", 1.005, 0.975, 1.001, 300)          # ~3.8% stop x7 = 0.27: passes every gate
 LONG_OVER_CAP = _klines("LONG", 1.005, 0.95, 1.001, 500)     # 5.5% stop x7 = 0.385 > 0.35: loss_cap (higher score)
 LONG_SL_ABOVE = _klines("LONG", 1.08, 0.99, 1.0, 600)        # 8% upper wick: SL above the current price
-# SHORT rows:
-SHORT_OK = _klines("SHORT", 1.025, 0.995, 0.999, 300)        # ~3.9% stop: passes
-SHORT_SL_BELOW = _klines("SHORT", 1.01, 0.92, 1.0, 600)      # 8% lower wick: SL below the current price
+# SHORT rows. Issue #80: a symbol qualifying both sides is dropped from both, so every SHORT fixture fails the LONG
+# filters: wick path on 1.5-1.8x volume (no climax volume, small lower wick) or RSI above LONG_MAX_RSI.
+SHORT_OK = _klines("SHORT", 1.025, 0.995, 0.999, 150)        # ~3.9% stop: passes
+SHORT_OVER_CAP = _klines("SHORT", 1.05, 0.995, 0.999, 180)   # 5.5% stop x7 = 0.385 > 0.35: loss_cap (higher score)
+SHORT_SL_BELOW = _klines("SHORT", 1.01, 0.92, 1.0, 600, steps=(1.005, 0.998))  # 8% lower wick, RSI > 65: SL below price
 
 class _Resp:
     def __init__(self, payload):
@@ -94,13 +108,16 @@ class _Resp:
 
 
 def _urlopen(klines_by_symbol):
-    """24h ticker = the given (meme-keyword) symbols; klines routed by symbol."""
-    tickers = [{"symbol": s, "priceChangePercent": "1.0", "quoteVolume": "1000"} for s in klines_by_symbol]
+    """exchangeInfo = the given symbols as Binance-tagged memecoin perpetuals (fine tick); klines routed by symbol."""
+    info = {"symbols": [{"symbol": s, "contractType": "PERPETUAL", "status": "TRADING", "baseAsset": s[:-4],
+                         "quoteAsset": "USDT", "underlyingType": "COIN", "underlyingSubType": ["Meme", "Crypto"],
+                         "filters": [{"filterType": "PRICE_FILTER", "tickSize": "0.0000001"}]}
+                        for s in klines_by_symbol]}
 
     def _open(req, timeout=None):
         url = getattr(req, "full_url", req)
-        if "ticker/24hr" in url:
-            return _Resp(tickers)
+        if "/fapi/v1/exchangeInfo" in url:
+            return _Resp(info)
         if "ticker/bookTicker" in url:
             return _Resp([])  # issue #66: no book data -> spread unknown, trigger buffer from ATR / floor
         for sym, ks in klines_by_symbol.items():
@@ -295,17 +312,20 @@ class TestScannerFlagsGateFailures(unittest.TestCase):
 
     def test_gate_passing_rows_listed_first_in_score_order(self):
         """Round 2: passing rows first, failing rows after; score order kept within each group (stable sort)."""
-        data = _scan({"1000PEPEUSDT": LONG_OVER_CAP, "DOGEUSDT": LONG_SL_ABOVE, "WIFUSDT": LONG_OK})
+        data = _scan({"1000PEPEUSDT": LONG_OVER_CAP, "DOGEUSDT": LONG_SL_ABOVE, "WIFUSDT": LONG_OK,
+                      "1000BONKUSDT": SHORT_OVER_CAP, "1000FLOKIUSDT": SHORT_OK})
         rows = data["longs"]
         self.assertEqual([c["symbol"] for c in rows], ["WIFUSDT", "1000PEPEUSDT", "DOGEUSDT"])
         self.assertEqual([c["gate_ok"] for c in rows], [True, False, False])
         failing = [c for c in rows if not c["gate_ok"]]
         self.assertGreater(failing[0]["score"], failing[1]["score"])   # 1000PEPE (score ~135) before DOGE (~119)
         self.assertGreater(failing[0]["score"], rows[0]["score"])      # the passing row outranks a higher score
-        # Shorts too: 1000PEPE's SHORT fails the cap with the higher score, WIF's SHORT passes and comes first.
+        # Shorts too: 1000BONK's SHORT fails the cap with the higher score, 1000FLOKI's SHORT passes and comes first.
         self.assertEqual([(c["symbol"], c["gate_ok"]) for c in data["shorts"]],
-                         [("WIFUSDT", True), ("1000PEPEUSDT", False)])
+                         [("1000FLOKIUSDT", True), ("1000BONKUSDT", False)])
+        self.assertEqual(data["shorts"][1]["gate_failures"], ["loss_cap"])
         self.assertGreater(data["shorts"][1]["score"], data["shorts"][0]["score"])
+        self.assertEqual(data["ambiguous_symbols"], [])
 
     def test_gate_passing_long_below_top_cut_is_recommended(self):
         """Round 2: top=1 and only the rank-2 long (by score) passes: it is the recommendation and the listed row."""

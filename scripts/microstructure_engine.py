@@ -13,15 +13,25 @@ import sys
 import json
 import time
 import math
+import urllib.error
 import urllib.request
 import numpy as np
+
+from utils import rate_limit_guard  # scripts/ is on sys.path (run as a script or imported by a desk script)
 
 BASE_FAPI = "https://fapi.binance.com"
 
 def fetch_json(url, timeout=6):
+    """Public market-data GET. With the process-wide rate-limit guard enabled (scan entry points only), an active
+    ban raises RateLimitedError before the request and HTTP 429/418 trip it (utils/rate_limit_guard.py)."""
+    rate_limit_guard.raise_if_banned()
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        rate_limit_guard.on_http_error(e)
+        raise
 
 WICK_SUM_EPSILON = 1e-6
 

@@ -45,6 +45,7 @@ import prime_evaluator_brief as peb
 import screening_pipeline as sp
 import trading_doctor
 from utils import atomic_writer
+from utils import rate_limit_guard as rlg
 from utils import yolo_scan_health as ysh
 
 PROFILE = {
@@ -60,20 +61,29 @@ def _no_network(*args, **kwargs):
 
 
 def setUpModule():
-    global _net_patch
+    global _net_patch, _ban_dir, _ban_patch
     _net_patch = patch("urllib.request.urlopen", side_effect=_no_network)
     _net_patch.start()
+    # The pipeline enables the process-wide rate-limit guard: its ban file lives in a temp dir (never logs/).
+    _ban_dir = tempfile.TemporaryDirectory()
+    _ban_patch = patch.object(rlg, "STATE_FILE", os.path.join(_ban_dir.name, "market_data_rate_limit.json"))
+    _ban_patch.start()
+    rlg.reset_for_tests()
 
 
 def tearDownModule():
     _net_patch.stop()
+    _ban_patch.stop()
+    _ban_dir.cleanup()
+    rlg.reset_for_tests()
 
 
 # =============================================================================
 # Fixtures
 # =============================================================================
 def _klines(side="LONG", high=1.005, low=0.975, close=1.001, vol=300, n=40):
-    """Choppy drift then a signal candle. Defaults: LONG with a ~3.8% stop that passes every gate at 7x."""
+    """Choppy drift, a signal candle (the last CLOSED one, klines[-2]) and a neutral forming candle inside its range
+    (issue #85). Defaults: LONG with a ~3.8% stop that passes every gate at 7x."""
     ks, price = [], 1.0
     up, down = (1.002, 0.997) if side == "LONG" else (1.003, 0.998)
     for i in range(n - 1):
@@ -83,7 +93,17 @@ def _klines(side="LONG", high=1.005, low=0.975, close=1.001, vol=300, n=40):
         price = c
     o = price
     ks.append([n, str(o), str(o * high), str(o * low), str(o * close), str(vol)])
+    f = o * close
+    ks.append([n + 1, str(f), str(f * 1.0005), str(f * 0.9995), str(f), "100"])
     return ks
+
+
+def _exchange_info(symbols, subtype=("Meme", "Crypto"), tick="0.0000001"):
+    """exchangeInfo rows (shape of logs/issue_work/exchange_info_sample.json) tagged as Binance memecoins."""
+    return {"symbols": [{"symbol": s, "pair": s, "contractType": "PERPETUAL", "status": "TRADING",
+                         "baseAsset": s[:-4], "quoteAsset": "USDT", "underlyingType": "COIN",
+                         "underlyingSubType": list(subtype),
+                         "filters": [{"filterType": "PRICE_FILTER", "tickSize": tick}]} for s in symbols]}
 
 
 class _Resp:
@@ -132,17 +152,13 @@ class _Router:
             return sum(1 for req, _, _ in self.calls if key in getattr(req, "full_url", req))
 
 
-def _tickers(symbols):
-    return [{"symbol": s, "priceChangePercent": "1.0", "quoteVolume": "1000"} for s in symbols]
-
-
 def _book(symbols, bid=0.999, ask=1.001):
     return [{"symbol": s, "bidPrice": str(bid), "bidQty": "1", "askPrice": str(ask), "askQty": "1", "time": 1}
             for s in symbols]
 
 
-def _routes(symbols=("WIFUSDT",), klines=None, book=None, ticker=None):
-    return [("ticker/24hr", _tickers(symbols) if ticker is None else ticker),
+def _routes(symbols=("WIFUSDT",), klines=None, book=None, info=None):
+    return [("/fapi/v1/exchangeInfo", _exchange_info(symbols) if info is None else info),
             ("ticker/bookTicker", _book(symbols) if book is None else book),
             ("/fapi/v1/klines", (lambda url: _klines()) if klines is None else klines)]
 
@@ -171,6 +187,8 @@ class _HealthFileTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
+        rlg.reset_for_tests()
+        self.addCleanup(rlg.reset_for_tests)
         self.tmp = tmp.name
         self.health_file = os.path.join(self.tmp, "logs", "yolo_scan_health.json")
         p = patch.object(ysh, "HEALTH_FILE", self.health_file)
@@ -188,7 +206,7 @@ class _HealthFileTest(unittest.TestCase):
 # Read-only endpoints scan_yolo may touch: market data, plus the account reads behind the YOLO margin
 # (get_yolo_margin -> get_account_equity: KEYS = GET /fapi/v1/time + signed GET /fapi/v2/balance; MCP = one
 # read-only tools/call on the Agentic gateway).
-FAPI_READ_PATHS = {"/fapi/v1/ticker/24hr", "/fapi/v1/ticker/bookTicker", "/fapi/v1/klines", "/fapi/v1/time",
+FAPI_READ_PATHS = {"/fapi/v1/exchangeInfo", "/fapi/v1/ticker/bookTicker", "/fapi/v1/klines", "/fapi/v1/time",
                    "/fapi/v2/balance"}
 MCP_READ_TOOLS = {"futures_usds.futuresAccountBalanceV3"}
 
@@ -236,7 +254,7 @@ class TestScanSideEffectContract(unittest.TestCase):
 
     def _market_routes(self, symbols=("WIFUSDT", "1000PEPEUSDT", "DOGEUSDT")):
         headers = {"X-MBX-USED-WEIGHT-1M": "120"}
-        return [("ticker/24hr", _Resp(_tickers(symbols), headers)),
+        return [("/fapi/v1/exchangeInfo", _Resp(_exchange_info(symbols), headers)),
                 ("ticker/bookTicker", _Resp(_book(symbols), headers)),
                 ("/fapi/v1/klines", lambda url: _Resp(_klines(), headers))]
 
@@ -538,9 +556,8 @@ class TestBriefMarksPipelineFailure(_HealthFileTest):
 
     def test_no_double_count_when_the_pipeline_already_recorded(self):
         def _pipeline_records_then_fails(*args, **kwargs):
-            # The subprocess got this far; its record is strictly after the brief started (explicit timestamp, so a
-            # coarse clock cannot make it tie with started_ts).
-            ysh.record_scan("UNAVAILABLE", "YOLO scan failed (RuntimeError)", now=time.time() + 1.0)
+            # The subprocess got this far and recorded this run (its DESK_SCAN_RUN_ID) as UNAVAILABLE (issue #91.6).
+            ysh.record_scan("UNAVAILABLE", "YOLO scan failed (RuntimeError)", run_id=kwargs["env"][ysh.RUN_ID_ENV])
             return subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="crash after the YOLO wait")
 
         brief = self._assemble({"yolo_slot_enabled": True}, run_side_effect=_pipeline_records_then_fails)
@@ -557,17 +574,22 @@ class TestBriefMarksPipelineFailure(_HealthFileTest):
         self.assertEqual(h["consecutive_unavailable"], 2)
         self.assertEqual(h["last_unavailable_reason"], "screening pipeline failed")
 
-    def test_failed_pipeline_with_slot_disabled_stays_inactive(self):
+    def test_failed_pipeline_with_slot_disabled_shows_disabled(self):
+        """Issue #91.8c: the DISABLED text, not "INACTIVE: Preserving capital."."""
         failed = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="boom")
         brief = self._assemble({"yolo_slot_enabled": False}, run_result=failed)
-        self.assertEqual(brief["yolo_slot"]["status"], "INACTIVE")
-        self.assertEqual(brief["yolo_slot"]["summary"], "INACTIVE: Preserving capital.")
+        self.assertEqual(brief["yolo_slot"], {"status": "DISABLED", "summary": sp.YOLO_DISABLED_STATUS,
+                                              "candidates": []})
+        self.assertEqual(sp.YOLO_DISABLED_STATUS, "DISABLED: yolo_slot_enabled is false in the user profile.")
         self.assertFalse(os.path.exists(self.health_file))
 
     def test_usable_payload_is_not_overridden_or_recorded(self):
-        payload = {"yolo_slot_status": "INACTIVE: Preserving capital. x", "yolo_slot": {"status": "INACTIVE"}}
-        ok = subprocess.CompletedProcess(args=[], returncode=0, stdout=json.dumps(payload))
-        brief = self._assemble({"yolo_slot_enabled": True}, run_result=ok)
+        def _ok(*args, **kwargs):
+            payload = {"yolo_slot_status": "INACTIVE: Preserving capital. x", "yolo_slot": {"status": "INACTIVE"},
+                       "run_id": kwargs["env"][ysh.RUN_ID_ENV]}  # the pipeline echoes this run's id
+            return subprocess.CompletedProcess(args=[], returncode=0, stdout=json.dumps(payload))
+
+        brief = self._assemble({"yolo_slot_enabled": True}, run_side_effect=_ok)
         self.assertEqual(brief["yolo_slot"]["status"], "INACTIVE")
         self.assertFalse(os.path.exists(self.health_file))
 
@@ -645,22 +667,26 @@ class TestDoctorYoloScanCheck(_HealthFileTest):
 # =============================================================================
 class TestRateLimit(unittest.TestCase):
 
+    def setUp(self):
+        rlg.reset_for_tests()
+        self.addCleanup(rlg.reset_for_tests)
+
     def test_universe_fetch_raises_on_429_and_418_without_core_memes_fallback(self):
         for code in (429, 418):
             with self.subTest(code=code):
-                router = _Router([("ticker/24hr", _http_error(code))])
+                router = _Router([("/fapi/v1/exchangeInfo", _http_error(code))])
                 with patch("urllib.request.urlopen", side_effect=router), \
                      self.assertRaises(bys.RateLimitedError) as ctx:
                     bys.get_yolo_universe()
                 self.assertIn(f"HTTP {code}", str(ctx.exception))
                 self.assertIsInstance(ctx.exception, RuntimeError)
-        # Other errors keep the CORE_MEMES fallback.
-        router = _Router([("ticker/24hr", _http_error(500))])
+        # Other errors keep the CORE_MEMES (allowlist) fallback, without tick sizes.
+        router = _Router([("/fapi/v1/exchangeInfo", _http_error(500))])
         with patch("urllib.request.urlopen", side_effect=router), patch("sys.stderr", io.StringIO()):
-            self.assertEqual(bys.get_yolo_universe(), (list(bys.CORE_MEMES), False))
+            self.assertEqual(bys.get_yolo_universe(), (list(bys.CORE_MEMES), False, {}))
 
     def test_universe_429_aborts_scan_before_any_other_request(self):
-        router = _Router([("ticker/24hr", _http_error(429))] + _routes()[1:])
+        router = _Router([("/fapi/v1/exchangeInfo", _http_error(429))] + _routes()[1:])
         with _scanner_env(router), self.assertRaises(bys.RateLimitedError):
             bys.scan_yolo("prod")
         self.assertEqual(len(router.calls), 1)
@@ -785,7 +811,7 @@ class TestWeightHeader(unittest.TestCase):
             return _Resp(payload, {"X-MBX-USED-WEIGHT-1M": str(w)} if w is not None else {})
 
         symbols = ["WIFUSDT", "DOGEUSDT"]
-        routes = [("ticker/24hr", lambda url: resp(_tickers(symbols))),
+        routes = [("/fapi/v1/exchangeInfo", lambda url: resp(_exchange_info(symbols))),
                   ("ticker/bookTicker", lambda url: resp(_book(symbols))),
                   ("/fapi/v1/klines", lambda url: resp(_klines()))]
         err = io.StringIO()

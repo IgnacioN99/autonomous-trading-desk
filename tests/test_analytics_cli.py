@@ -42,6 +42,24 @@ import market_regime as mr
 import funding_arbitrage as fa
 import microstructure_engine as me
 import intraday_radar as ir
+from utils import rate_limit_guard
+
+
+def setUpModule():
+    # Issue #91: the scan CLIs enable the process-wide rate-limit guard; its ban file never touches logs/.
+    global _ban_dir, _ban_patch
+    import tempfile
+    _ban_dir = tempfile.TemporaryDirectory()
+    _ban_patch = patch.object(rate_limit_guard, "STATE_FILE",
+                              os.path.join(_ban_dir.name, "market_data_rate_limit.json"))
+    _ban_patch.start()
+    rate_limit_guard.reset_for_tests()
+
+
+def tearDownModule():
+    _ban_patch.stop()
+    _ban_dir.cleanup()
+    rate_limit_guard.reset_for_tests()
 
 PROFILE = {
     "profile_completed": True,
@@ -119,8 +137,9 @@ def radar_long_klines(n=55, wick_low=0.975):
 
 
 def yolo_long_klines(n=40):
-    """Choppy drift then a 3x volume candle with a large buyer absorption wick. The wick is narrow enough (stop
-    ~4% from the trigger, x7 leverage = 0.28 of margin) for the 35% YOLO loss cap (issue #64)."""
+    """Choppy drift, a 3x volume candle with a large buyer absorption wick, then a neutral forming candle inside its
+    range (the signal is the last CLOSED candle, klines[-2], issue #85). The wick is narrow enough (stop ~4% from the
+    trigger, x7 leverage = 0.28 of margin) for the 35% YOLO loss cap (issue #64)."""
     ks, price = [], 1.0
     for i in range(n - 1):
         o = price
@@ -129,6 +148,8 @@ def yolo_long_klines(n=40):
         price = c
     o = price
     ks.append([n, str(o), str(o * 1.005), str(o * 0.975), str(o * 1.001), "300"])
+    f = o * 1.001
+    ks.append([n + 1, str(f), str(f * 1.0005), str(f * 0.9995), str(f), "100"])
     return ks
 
 
@@ -243,17 +264,22 @@ class TestBroadMarketRadarCli(_NoOrders):
 # =============================================================================
 # scan_yolo_moonshot -> broad_yolo_scanner.py
 # =============================================================================
-YOLO_TICKERS = [
-    {"symbol": "1000PEPEUSDT", "priceChangePercent": "1.0", "quoteVolume": "1000"},
-    {"symbol": "DOGEUSDT", "priceChangePercent": "1.0", "quoteVolume": "1000"},
-    {"symbol": "BTCUSDT", "priceChangePercent": "0.5", "quoteVolume": "1000000000"},
-]
+def _yolo_info_row(symbol, base, subtype):
+    return {"symbol": symbol, "contractType": "PERPETUAL", "status": "TRADING", "baseAsset": base,
+            "quoteAsset": "USDT", "underlyingType": "COIN", "underlyingSubType": subtype,
+            "filters": [{"filterType": "PRICE_FILTER", "tickSize": "0.0000001"}]}
+
+
+# exchangeInfo (issue #80): two memecoins and BTC (PoW, excluded from the YOLO universe).
+YOLO_EXCHANGE_INFO = {"symbols": [_yolo_info_row("1000PEPEUSDT", "1000PEPE", ["Meme", "Crypto"]),
+                                  _yolo_info_row("DOGEUSDT", "DOGE", ["Meme", "Crypto"]),
+                                  _yolo_info_row("BTCUSDT", "BTC", ["PoW", "Crypto"])]}
 
 
 class TestYoloScannerCli(_NoOrders):
 
     def _run(self, klines_fn, argv, equity=12000.0):
-        routes = [("ticker/24hr", YOLO_TICKERS), ("/fapi/v1/klines", lambda url: klines_fn())]
+        routes = [("exchangeInfo", YOLO_EXCHANGE_INFO), ("/fapi/v1/klines", lambda url: klines_fn())]
         with patch("urllib.request.urlopen", side_effect=fake_urlopen(routes)), \
              patch("quant_risk_engine.get_account_equity", return_value=equity) as mock_eq:
             code, out, err = run_main(bys.main, argv)
@@ -282,7 +308,9 @@ class TestYoloScannerCli(_NoOrders):
         self.assertEqual(rec["direction"], "LONG")
         self.assertEqual(rec["leverage"], 7)
         self.assertAlmostEqual(rec["notional_usdt"], 84.0)
-        self.assertAlmostEqual(rec["roe_tp1_pct"], round(rec["risk_pct"] * 2.2 * 7, 1))
+        # roe_tp1_pct comes from the unrounded risk; the emitted risk_pct is rounded to 2 decimals (x 2.2 x 7 = up to
+        # 0.077 apart) and the ROE to 1 decimal (0.05): compare within that rounding, not on re-rounded values.
+        self.assertAlmostEqual(rec["roe_tp1_pct"], rec["risk_pct"] * 2.2 * 7, delta=0.005 * 2.2 * 7 + 0.05)
         self.assertAlmostEqual(rec["max_loss_usdt"], round(84.0 * rec["risk_pct"] / 100, 2))
         self.assertLess(rec["sl"], rec["price"])
         self.assertGreater(rec["trigger"], rec["price"])
@@ -312,7 +340,7 @@ class TestYoloScannerCli(_NoOrders):
         self.assertEqual(json.loads(out)["slot_status"], "CANDIDATE_SLOT_DISABLED")
 
     def test_no_market_data_exits_1(self):
-        routes = [("ticker/24hr", YOLO_TICKERS), ("/fapi/v1/klines", urllib.error.URLError("down"))]
+        routes = [("exchangeInfo", YOLO_EXCHANGE_INFO), ("/fapi/v1/klines", urllib.error.URLError("down"))]
         with patch("urllib.request.urlopen", side_effect=fake_urlopen(routes)), \
              patch("quant_risk_engine.get_account_equity", return_value=1000.0):
             code, out, _ = run_main(bys.main, ["--json", "--env", "prod"])
@@ -669,7 +697,7 @@ class TestSupportingClis(_NoOrders):
         self.assertEqual(code, 0)
         self.assertIn("AAAUSDT (LONG)", out)
 
-        yolo_routes = [("ticker/24hr", YOLO_TICKERS), ("/fapi/v1/klines", lambda url: yolo_long_klines())]
+        yolo_routes = [("exchangeInfo", YOLO_EXCHANGE_INFO), ("/fapi/v1/klines", lambda url: yolo_long_klines())]
         with patch("urllib.request.urlopen", side_effect=fake_urlopen(yolo_routes)), \
              patch("quant_risk_engine.get_account_equity", return_value=12000.0):
             code, out, _ = run_main(bys.main, ["--env", "prod"])
