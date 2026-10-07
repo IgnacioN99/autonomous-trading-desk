@@ -21,6 +21,9 @@ Dead alpha = held >= max_hours AND mark within 1.2% of entry AND |ROE| < 15%.
 
 Usage:
   python3 scripts/trading_drift_watchdog.py [--env testnet|mainnet] [--max-hours 4.0] [--auto-exit]
+
+Exit status: 1 when any auto-exit close failed (AUTO_EXIT_FAILED; the message shows stop_source/stop_protected),
+else 0.
 """
 
 import os
@@ -127,7 +130,8 @@ def audit_dead_alpha(target_env: str = None, max_hours: float = 4.0, auto_exit: 
                     print(f"  ✅ Position closed at market.")
                 else:
                     item["action_taken"] = "AUTO_EXIT_FAILED"
-                    print(f"  ❌ AUTO-EXIT FAILED: {close_res.get('error')}")
+                    print(f"  ❌ AUTO-EXIT FAILED: {close_res.get('error') or 'close not confirmed (no error text)'} | "
+                          f"stop_source={close_res.get('stop_source')} stop_protected={close_res.get('stop_protected')}")
             else:
                 print(f"  ⚠️  RECOMMENDATION: Market close or tighten SL to Break-Even immediately to eliminate risk.")
                 item["action_taken"] = "RECOMMEND_EXIT"
@@ -149,12 +153,19 @@ def audit_dead_alpha(target_env: str = None, max_hours: float = 4.0, auto_exit: 
         "positions": results
     }
 
-if __name__ == "__main__":
+def main(argv=None) -> int:
+    """CLI entry point. Exit status 1 when any auto-exit close failed (AUTO_EXIT_FAILED), else 0."""
     default_env = resolve_env()
     parser = argparse.ArgumentParser(description="Dead Alpha & Drift Watchdog")
     parser.add_argument("--env", default=default_env, help="Target execution environment (prod/testnet)")
     parser.add_argument("--max-hours", type=float, default=4.0, help="Maximum holding hours before declaring dead alpha")
     parser.add_argument("--auto-exit", action="store_true", help="Closes dead alpha positions at market")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    audit_dead_alpha(target_env=args.env, max_hours=args.max_hours, auto_exit=args.auto_exit)
+    report = audit_dead_alpha(target_env=args.env, max_hours=args.max_hours, auto_exit=args.auto_exit)
+    failed = [p for p in report.get("positions", []) if p.get("action_taken") == "AUTO_EXIT_FAILED"]
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

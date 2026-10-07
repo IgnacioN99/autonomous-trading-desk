@@ -15,6 +15,10 @@ Night Desk Operating Rules:
 
 Usage:
   python3 scripts/loops/night_cutoff_loop.py [--env testnet|mainnet] [--auto-ratchet]
+
+run_night_cutoff returns {"close_failures": [symbols], "unprotected": [symbols]} plus "read_error" when positionRisk
+cannot be read (orphan order cleanup is then skipped). Exit status: 1 when a market close failed, a position remains
+without a verified stop or positions could not be read, else 0 (a failed Break-Even ratchet does not change it).
 """
 
 import os
@@ -50,10 +54,18 @@ def run_night_cutoff(target_env: str = None, auto_ratchet: bool = True, overnigh
     print("=" * 70)
 
     # 1. Fetch active positions from Binance
-    pos_res = eft.send_signed_request("GET", "/fapi/v2/positionRisk", target_env=target_env)
+    summary = {"close_failures": [], "unprotected": []}
+    try:
+        pos_res = eft.send_signed_request("GET", "/fapi/v2/positionRisk", target_env=target_env)
+    except Exception as e:
+        pos_res = {"error": str(e)}
     active = [p for p in pos_res if float(p.get("positionAmt", 0)) != 0] if isinstance(pos_res, list) else []
+    if not isinstance(pos_res, list):
+        summary["read_error"] = f"positionRisk unreadable: {pos_res}"
 
-    if not active:
+    if "read_error" in summary:
+        print(f"❌ CRITICAL: {summary['read_error']}. Open positions UNKNOWN; overnight risk not verified.")
+    elif not active:
         print("✅ ZERO OPEN POSITIONS: Portfolio 100% clean. Zero overnight risk.")
     else:
         print(f"🛡️  AUDITING {len(active)} LIVE POSITION(S) [Mode: {overnight_mode}]:")
@@ -77,6 +89,7 @@ def run_night_cutoff(target_env: str = None, auto_ratchet: bool = True, overnigh
                 if close_res.get("success"):
                     print(f"     ✅ Position {sym} successfully closed at market.")
                 else:
+                    summary["close_failures"].append(sym)
                     print(f"     ❌ Failed to close {sym} at market: {close_res.get('error')}")
                 continue
 
@@ -92,6 +105,7 @@ def run_night_cutoff(target_env: str = None, auto_ratchet: bool = True, overnigh
                     print(f"     🚪 Emergency stop could not be verified; {sym} closed at market (reduce-only).")
                     continue
                 if not heal_res.get("success"):
+                    summary["unprotected"].append(sym)
                     print(f"     ❌ CRITICAL: {sym} remains unprotected ({heal_res.get('reason')}). Manual action required.")
                     continue
                 sl_price = float(heal_res["healed_sl_price"])
@@ -136,14 +150,19 @@ def run_night_cutoff(target_env: str = None, auto_ratchet: bool = True, overnigh
                     if close_res.get("success"):
                         print(f"     ✅ Unhedged position {sym} closed at market (Zero Overnight Risk guaranteed).")
                     else:
+                        summary["close_failures"].append(sym)
                         print(f"     ❌ Failed to close {sym} at market: {close_res.get('error')}")
                 else:
                     print(f"     🛡️ Position {sym} is safely locked at True Net Break-Even. Zero unhedged overnight risk.")
 
     # 2. Cleanup orphan limit orders
     print("\n🧹 ORPHAN LIMIT ORDERS CLEANUP:")
-    open_orders = eft.send_signed_request("GET", "/fapi/v1/openOrders", target_env=target_env)
-    if isinstance(open_orders, list) and open_orders:
+    # Unknown positions: every order would look orphaned (TPs of live positions included), so skip the cleanup.
+    open_orders = None if "read_error" in summary else \
+        eft.send_signed_request("GET", "/fapi/v1/openOrders", target_env=target_env)
+    if "read_error" in summary:
+        print("⚠️  Skipped: positions unknown, orphan orders cannot be identified.")
+    elif isinstance(open_orders, list) and open_orders:
         now_ms = int(time.time() * 1000)
         cancelled_count = 0
         active_symbols = {p["symbol"] for p in active}
@@ -178,13 +197,20 @@ def run_night_cutoff(target_env: str = None, auto_ratchet: bool = True, overnigh
     print("\n" + "=" * 70)
     print("🌙 NIGHT CUTOFF COMPLETED. DESK IN SECURE OVERNIGHT MODE.")
     print("=" * 70)
+    return summary
 
-if __name__ == "__main__":
+def main(argv=None) -> int:
+    """CLI entry point. Exit status 1 when a close failed, a position remains unprotected or positions could not be
+    read, else 0."""
     default_env = resolve_env()
     parser = argparse.ArgumentParser(description="Night Cutoff Loop - Zero Overnight Risk")
     parser.add_argument("--env", default=default_env, help="Target execution environment (prod/testnet)")
     parser.add_argument("--auto-ratchet", action="store_true", default=True)
     parser.add_argument("--overnight-mode", dest="overnight_mode", choices=["ZERO_OVERNIGHT_RISK", "CLOSE_ALL_AT_MARKET", "SWING_STRUCTURAL_STOP"], default=None, help="Override overnight mode from profile")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    run_night_cutoff(target_env=args.env, auto_ratchet=args.auto_ratchet, overnight_mode=args.overnight_mode)
+    summary = run_night_cutoff(target_env=args.env, auto_ratchet=args.auto_ratchet, overnight_mode=args.overnight_mode)
+    return 1 if summary["close_failures"] or summary["unprotected"] or summary.get("read_error") else 0
+
+if __name__ == "__main__":
+    sys.exit(main())
