@@ -56,9 +56,13 @@ def make_record(kind="STOP_MARKET", entry_id="7001", symbol="BTCUSDT", direction
     rec = {"kind": kind, "entry_id": str(entry_id), "symbol": symbol, "direction": direction,
            "entry_side": "BUY" if direction == "LONG" else "SELL", "exit_side": "SELL" if direction == "LONG" else "BUY",
            "target_env": env, "trigger_or_limit_price": 101.0, "total_qty": total_qty, "sl_price": sl,
-           "tp1_price": tp1, "tp2_price": tp2, "leverage": 3, "is_yolo": False, "margin_usdt": 400.0,
+           "tp1_price": tp1, "tp2_price": tp2, "leverage": 3, "is_yolo": False,
            "placed_at_ts": now - 60, "expires_at_ts": now + expires_in}
     rec.update(extra)
+    # Issue #126: margin_usdt consistent with the record's own sizing (total_qty x price / leverage), as at
+    # registration, unless a test sets it; a shrunk total_qty is tested explicitly (test_issue_48_pending_risk_view).
+    rec.setdefault("margin_usdt", round(float(rec["total_qty"]) * float(rec["trigger_or_limit_price"])
+                                        / float(rec["leverage"]), 8))
     return rec
 
 

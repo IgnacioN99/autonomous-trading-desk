@@ -41,7 +41,7 @@ Whenever the user explicitly requests crypto trading operations, Binance Futures
    - **Layer 7: Night Cutoff Loop (`scripts/loops/night_cutoff_loop.py`):**
      * End-of-day protocol: ratchets winning positions to True Net Break-Even (+0.2%), reaps expired orphan limit orders (>90m), and guarantees Zero Overnight Risk.
    - **Layer 8: Position Guardian Loop (`scripts/loops/position_guardian_loop.py`):**
-     * Risk-reducing only (never opens positions): structural trailing stops, dead alpha, orphan audit/heal. `--once` = one cycle, `--interval <s>` = background (cron/systemd), `--dry-run` = report only; state in `logs/guardian_state.json`.
+     * Risk-reducing only (never opens positions): structural trailing stops, dead alpha, orphan audit/heal. `--once` = one cycle, `--interval <s>` = background (systemd), `--dry-run` = report only; state in `logs/guardian_state.json`.
 
 1. **Phase 1: Grounded Intelligence & Market Screening**
    - Consult your quantitative research notebooks (e.g. via NotebookLM using IDs configured in `config/user_context.json` or local research in `research/`) to ground strategies in mathematical principles:

@@ -311,9 +311,14 @@ def handle_post_trade_sync(payload: dict) -> dict:
     sync_script = os.path.join(base_dir, "scripts", "sync_session_state.py")
     if os.path.exists(sync_script):
         try:
-            subprocess.run([sys.executable, sync_script, "--env", target_env], stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=SYNC_TIMEOUT_S)
+            proc = subprocess.run([sys.executable, sync_script, "--env", target_env], stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL, timeout=SYNC_TIMEOUT_S)
             result["synced"] = True
+            rc = getattr(proc, "returncode", 0)
+            if isinstance(rc, int) and rc != 0:
+                # Issue #127: INVALID state written or write failed (exit 1). Warning only, never blocking.
+                sys.stderr.write(f"[POST-TRADE-SYNC WARNING] sync_session_state.py exited {proc.returncode}: "
+                                 "session_state.json is INVALID or was not updated.\n")
         except Exception as e:
             sys.stderr.write(f"[POST-TRADE-SYNC ERROR] Sync failed: {e}\n")
 

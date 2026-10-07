@@ -57,6 +57,8 @@ State file (logs/guardian_state.json):
     "interval_seconds": int | null,    # loop interval; PROD resting entries need a loop with <= 120s
                                        # (execute_futures_trade.check_guardian_alive)
     "cycle_ok": bool,                  # no errors and every position protected at the end of the cycle
+    "error_stages": [str],             # distinct stages of "errors" (issue #40): positions_sync or a pending_* stage
+                                       # other than pending_unknown_entry makes PROD reject new resting entries
     "positions": [{
       "symbol": str, "side": "LONG" | "SHORT", "size": float, "entry_price": float, "mark_price": float,
       "leverage": int, "unrealized_pnl": float, "liquidation_price": float,
@@ -83,13 +85,16 @@ Action record (also one JSON line in logs/guardian_actions.jsonl):
            "pending_sl_crossed_close" | "pending_record_mismatch" | "unknown_resting_entry" (report only, success
            false), "detail": {...}}
 
+A --once run does not overwrite the state of a live loop (mode "loop", fresh by check_guardian_alive's age rule):
+it prints its result and appends its actions only (issue #40).
+
 Scheduling (generic examples; run from the repository root):
-  cron, every 5 minutes, one cycle per run:
-    */5 * * * * cd <repo> && python3 scripts/loops/position_guardian_loop.py --once >> logs/guardian_cron.log 2>&1
-  systemd: a oneshot service with
+  PROD with resting entries: a long-running loop, e.g. a systemd service with Restart=on-failure and
     WorkingDirectory=<repo>
-    ExecStart=/usr/bin/env python3 scripts/loops/position_guardian_loop.py --once
-  triggered by a timer with OnUnitActiveSec=5min (or run the service long-lived without --once).
+    ExecStart=/usr/bin/env python3 scripts/loops/position_guardian_loop.py --interval 60 --env prod
+  (only a loop with --interval <= 120 counts as a live guardian; cron --once runs never do).
+  Without resting entries a cron job running one cycle per run also works:
+    */5 * * * * cd <repo> && python3 scripts/loops/position_guardian_loop.py --once >> logs/guardian_cron.log 2>&1
 """
 
 import os
@@ -393,14 +398,32 @@ class GuardianCycle:
 
     def finish(self):
         self.state["cycle_ok"] = not self.state["errors"] and all(v["protected"] for v in self.state["positions"])
+        self.state["error_stages"] = sorted({str(e.get("stage")) for e in self.state["errors"]})
         self.persist()
         return self.state
 
-    def persist(self):
+    def _keeps_loop_state(self, path):
+        """Issue #40: a --once run never overwrites the state of a guardian loop that is still alive (mode "loop",
+        fresh by check_guardian_alive's age rule, any env), so it cannot drop the loop's liveness attestation."""
+        if self.state.get("mode") != "once":
+            return False
         try:
-            atomic_write_json(os.path.join(self.log_dir, STATE_FILE_NAME), self.state)
-        except Exception as e:
-            print(f"guardian: failed to write state: {e}", file=sys.stderr)
+            with open(path, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+        except (OSError, ValueError):
+            return False
+        return eft.guardian_loop_state_fresh(existing)
+
+    def persist(self):
+        state_path = os.path.join(self.log_dir, STATE_FILE_NAME)
+        if self._keeps_loop_state(state_path):
+            print("guardian: a live guardian loop owns logs/guardian_state.json; this --once cycle is not recorded "
+                  "there (its actions are still appended to logs/guardian_actions.jsonl)", file=sys.stderr)
+        else:
+            try:
+                atomic_write_json(state_path, self.state)
+            except Exception as e:
+                print(f"guardian: failed to write state: {e}", file=sys.stderr)
         actions_path = os.path.join(self.log_dir, ACTIONS_FILE_NAME)
         for rec in self.state["actions"]:
             try:

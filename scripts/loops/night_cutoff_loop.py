@@ -191,8 +191,18 @@ def run_night_cutoff(target_env: str = None, auto_ratchet: bool = True, overnigh
     # 3. Sync Final Session State
     print("\n📡 Synchronizing session state to persist Ground Truth...")
     sync_script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sync_session_state.py")
-    os.system(f"{sys.executable} {sync_script} --env {target_env} > /dev/null 2>&1")
-    print("✅ session_state.json updated with nightly cutoff state.")
+    rc = os.system(f"{sys.executable} {sync_script} --env {target_env} > /dev/null 2>&1")
+    if isinstance(rc, int) and rc != 0:
+        # Issue #127: the sync wrote an INVALID state or could not write it; warning only (exit code unchanged).
+        exit_code = rc   # Windows: os.system returns the exit code itself
+        if os.name != "nt":   # POSIX: a wait status
+            try:
+                exit_code = os.waitstatus_to_exitcode(rc)
+            except (AttributeError, ValueError):
+                exit_code = rc >> 8
+        print(f"⚠️ session_state.json sync FAILED (exit code {exit_code}): the state is INVALID or was not updated.")
+    else:
+        print("✅ session_state.json updated with nightly cutoff state.")
 
     print("\n" + "=" * 70)
     print("🌙 NIGHT CUTOFF COMPLETED. DESK IN SECURE OVERNIGHT MODE.")
