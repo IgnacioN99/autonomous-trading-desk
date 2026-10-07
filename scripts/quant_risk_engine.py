@@ -24,6 +24,7 @@ import time
 import math
 import argparse
 import contextlib
+import urllib.error
 import urllib.request
 import warnings
 warnings.filterwarnings('ignore', category=FutureWarning)
@@ -35,19 +36,39 @@ import statsmodels.tsa.stattools as ts
 # Ensure local path resolution
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import execute_futures_trade as eft
+from utils import rate_limit_guard
+from utils.rate_limit_guard import RateLimitedError
 
 BASE_FAPI = "https://fapi.binance.com"
 
 def fetch_json(url, timeout=6):
+    """Public market-data GET. With the process-wide rate-limit guard enabled (scan CLIs only), an active ban
+    raises RateLimitedError before the request and HTTP 429/418 trip it."""
+    rate_limit_guard.raise_if_banned()
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        rate_limit_guard.on_http_error(e)
+        raise
+
+def _is_rate_limit_response(res) -> bool:
+    """True when send_signed_request returned Binance's rate-limit answer: code -1003, or an HTTP 429/418 error from
+    the REST path ("HTTP 429: ...") or the MCP gateway ("MCP Gateway HTTP 429: ...", http_code 429)."""
+    if not isinstance(res, dict):
+        return False
+    if res.get("code") == -1003 or res.get("http_code") in (429, 418):
+        return True
+    err = str(res.get("error") or "")
+    return "HTTP 429" in err or "HTTP 418" in err
 
 def get_account_equity(target_env="testnet") -> float:
     """Total USDT wallet balance used for risk sizing and the PROD monetary risk gate.
     PROD (any env other than testnet) always reads the live ledger (GET /fapi/v2/balance) and never the
     logs/session_state.json cache, so an edited operating_balance cannot widen the risk cap (issue #101); it raises
-    (callers fail closed) when the live read fails. TESTNET may use the cache when its target_env matches."""
+    (callers fail closed) when the live read fails, RateLimitedError (a RuntimeError) when Binance answered with a
+    rate limit (issue #91.2). TESTNET may use the cache when its target_env matches."""
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     state_file = os.path.join(base_dir, "logs", "session_state.json")
     target_env_clean = str(target_env).strip().lower()
@@ -66,8 +87,10 @@ def get_account_equity(target_env="testnet") -> float:
             pass
 
     # Direct ledger query via Binance REST API
+    rate_limited = False
     try:
         res = eft.send_signed_request("GET", "/fapi/v2/balance", target_env=target_env_clean)
+        rate_limited = _is_rate_limit_response(res)
         if isinstance(res, list):
             for b in res:
                 if b.get("asset") == "USDT":
@@ -77,6 +100,8 @@ def get_account_equity(target_env="testnet") -> float:
     except Exception as e:
         print(f"Warning: Failed to fetch balance from REST API: {e}", file=sys.stderr)
 
+    if rate_limited:
+        raise RateLimitedError(f"FAIL-CLOSED: Binance rate limit on the account equity read ('{target_env_clean}').")
     raise RuntimeError(f"FAIL-CLOSED: Unable to sync account equity for environment '{target_env_clean}'.")
 
 def calculate_dynamic_equity_sizing(
@@ -454,6 +479,8 @@ def calculate_pair_cointegration(sym_a, sym_b, interval="1h", limit=1000):
             "recommendation": trade_recommendation,
             "is_actionable": is_actionable
         }
+    except RateLimitedError:
+        raise  # the scan stops: no further market-data requests
     except Exception as e:
         return None
 
@@ -641,6 +668,19 @@ def main(argv=None):
         sys.stderr.write(f"error: {e}\n")
         return 2
 
+    # Process-wide market-data rate-limit guard (scan CLI): a persisted ban skips the pairs scan without calling
+    # Binance; a 429/418 recorded during this run is persisted on exit.
+    with rate_limit_guard.scan_session():
+        if rate_limit_guard.is_banned() and args.command in (None, "pairs"):
+            err = rate_limit_guard.error_payload(args.command or "legacy", env)
+            if getattr(args, "json", False):
+                emit_json(err, sys.stdout)
+            else:
+                sys.stderr.write(f"{args.command or 'scan'} skipped: {err['market_data_status']}\n")
+            return 1
+        return _run_command(args, env)
+
+def _run_command(args, env):
     if not args.command:
         return legacy_report(env)
 
@@ -659,6 +699,8 @@ def main(argv=None):
             code, result = runner(args, env)
     except Exception as e:
         code, result = 1, {"error": f"{type(e).__name__}: {e}"}
+        if isinstance(e, RateLimitedError) and rate_limit_guard.is_banned():
+            result["market_data_status"] = rate_limit_guard.unavailable_text()
 
     if args.json:
         payload = {"status": "ok" if code == 0 else "error", "command": args.command, "env": env}

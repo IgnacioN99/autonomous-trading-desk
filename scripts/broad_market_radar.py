@@ -12,6 +12,7 @@ CLI:
 Exit codes: 0 ok, 1 data/API error, 2 bad usage.
 """
 
+import urllib.error
 import urllib.request
 import json
 import time
@@ -25,6 +26,7 @@ from decimal import Decimal
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import microstructure_engine as me
+from utils import rate_limit_guard
 
 SUPPORTED_INTERVALS = ("5m", "15m", "1h")
 DEFAULT_INTERVAL = "15m"
@@ -88,11 +90,21 @@ def calculate_atr(highs, lows, closes, period=14):
         atr = (atr * (period - 1) + tr) / period
     return atr
 
+def _get_json(url, timeout):
+    """Public market-data GET through the process-wide rate-limit guard (utils/rate_limit_guard.py): an active ban
+    raises RateLimitedError before the request; HTTP 429/418 trip it (enabled guard only)."""
+    rate_limit_guard.raise_if_banned()
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        rate_limit_guard.on_http_error(e)
+        raise
+
 def fetch_klines(symbol, interval=DEFAULT_INTERVAL, limit=55):
     url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=6) as resp:
-        return json.loads(resp.read().decode())
+    return _get_json(url, 6)
 
 def tier_code(confidence):
     """Stable machine-readable tier code (the `tier` field is a human label)."""
@@ -380,9 +392,7 @@ def scan_all_liquid_pairs(top_n=DEFAULT_UNIVERSE, interval=DEFAULT_INTERVAL):
     if interval not in SUPPORTED_INTERVALS:
         raise ValueError(f"Unsupported interval '{interval}'. Must be one of: {', '.join(SUPPORTED_INTERVALS)}")
     # Fetch liquid symbols
-    info_req = urllib.request.Request('https://fapi.binance.com/fapi/v1/exchangeInfo', headers={'User-Agent': 'Mozilla/5.0'})
-    with urllib.request.urlopen(info_req, timeout=8) as r:
-        info = json.loads(r.read().decode())
+    info = _get_json('https://fapi.binance.com/fapi/v1/exchangeInfo', 8)
 
     valid_symbols = [
         s['symbol'] for s in info['symbols']
@@ -393,9 +403,7 @@ def scan_all_liquid_pairs(top_n=DEFAULT_UNIVERSE, interval=DEFAULT_INTERVAL):
         and not any(x in s['symbol'] for x in ['USDC', 'EUR', 'XAU', 'XAG', 'PAXG', 'BUSD'])
     ]
 
-    ticker_req = urllib.request.Request('https://fapi.binance.com/fapi/v1/ticker/24hr', headers={'User-Agent': 'Mozilla/5.0'})
-    with urllib.request.urlopen(ticker_req, timeout=8) as r:
-        tickers = json.loads(r.read().decode())
+    tickers = _get_json('https://fapi.binance.com/fapi/v1/ticker/24hr', 8)
 
     ticker_map = {t['symbol']: float(t['quoteVolume']) for t in tickers if t['symbol'] in valid_symbols}
     sorted_symbols = sorted(ticker_map.keys(), key=lambda s: ticker_map[s], reverse=True)[:top_n]
@@ -499,13 +507,25 @@ def main(argv=None):
 
     real_stdout = sys.stdout
     t0 = time.time()
-    try:
-        # Keep stdout pure JSON: anything printed by library code goes to stderr.
-        with contextlib.redirect_stdout(sys.stderr if args.json else real_stdout):
-            candidates = scan_all_liquid_pairs(top_n=args.universe, interval=args.interval)
-    except Exception as e:
-        err = {"status": "error", "command": "scan", "env": env, "interval": args.interval,
-               "error": f"{type(e).__name__}: {e}"}
+    err = None
+    # Process-wide market-data rate-limit guard: a persisted ban skips the scan without calling Binance; a 429/418
+    # during the scan (even one swallowed by a per-symbol fetch) fails the run and is persisted on exit.
+    with rate_limit_guard.scan_session():
+        if rate_limit_guard.is_banned():
+            err = rate_limit_guard.error_payload("scan", env, interval=args.interval)
+        else:
+            try:
+                # Keep stdout pure JSON: anything printed by library code goes to stderr.
+                with contextlib.redirect_stdout(sys.stderr if args.json else real_stdout):
+                    candidates = scan_all_liquid_pairs(top_n=args.universe, interval=args.interval)
+                if rate_limit_guard.is_banned():
+                    raise rate_limit_guard.RateLimitedError("Binance rate limit during the scan")
+            except Exception as e:
+                err = {"status": "error", "command": "scan", "env": env, "interval": args.interval,
+                       "error": f"{type(e).__name__}: {e}"}
+                if isinstance(e, rate_limit_guard.RateLimitedError):
+                    err["market_data_status"] = rate_limit_guard.unavailable_text()
+    if err is not None:
         if args.json:
             emit_json(err, real_stdout)
         else:

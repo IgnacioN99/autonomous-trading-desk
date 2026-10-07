@@ -25,12 +25,14 @@ import os
 import sys
 import json
 import time
+import uuid
 import subprocess
 from typing import Dict, Any, List, Optional
 
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
+from utils.yolo_scan_health import RUN_ID_ENV, YOLO_DISABLED_STATUS  # stdlib-only module (no pipeline import)
 
 BASE_DIR = os.path.dirname(SCRIPTS_DIR)
 LOGS_DIR = os.path.join(BASE_DIR, "logs")
@@ -43,6 +45,9 @@ DEFAULT_RISK_PCT_EQUITY = 0.005   # Fallback when the profile has no risk_pct_eq
 # Issue #66: a crashed pipeline with the Barbell slot enabled is UNAVAILABLE (not INACTIVE "Preserving capital").
 YOLO_PIPELINE_FAILED_REASON = "screening pipeline failed"
 YOLO_PIPELINE_FAILED_SUMMARY = f"UNAVAILABLE: {YOLO_PIPELINE_FAILED_REASON}. YOLO slot kept empty."
+# Issue #91.6: a usable payload whose run_id is not this brief's run id is not trusted (stale or foreign output).
+YOLO_RUN_ID_MISMATCH_REASON = "screening payload run id mismatch"
+YOLO_RUN_ID_MISMATCH_SUMMARY = f"UNAVAILABLE: {YOLO_RUN_ID_MISMATCH_REASON}. YOLO slot kept empty."
 
 
 def ensure_fresh_state(max_age_sec: int = 600, target_env: str = "prod") -> dict:
@@ -94,11 +99,16 @@ def load_recent_insights(limit: int = 3) -> List[dict]:
         return []
 
 
-def get_latest_screening_payload(target_env: str = "prod") -> dict:
-    """Fetches the latest market screening payload or invokes screening_pipeline."""
+def get_latest_screening_payload(target_env: str = "prod", run_id: Optional[str] = None) -> dict:
+    """Fetches the latest market screening payload or invokes screening_pipeline. `run_id` is passed to the
+    subprocess as DESK_SCAN_RUN_ID; the pipeline echoes it in the payload and its YOLO health record."""
     pipeline_script = os.path.join(BASE_DIR, "scripts", "screening_pipeline.py")
+    env = dict(os.environ)
+    if run_id:
+        env[RUN_ID_ENV] = run_id
     try:
-        res = subprocess.run([sys.executable, pipeline_script, "--json", "--env", target_env], capture_output=True, text=True, timeout=60)
+        res = subprocess.run([sys.executable, pipeline_script, "--json", "--env", target_env], capture_output=True,
+                             text=True, timeout=60, env=env)
         if res.returncode == 0 and res.stdout.strip():
             payload = json.loads(res.stdout.strip())
             if isinstance(payload, dict):
@@ -113,19 +123,17 @@ def screening_payload_unusable(screening: Any) -> bool:
     return not isinstance(screening, dict) or not ("yolo_slot" in screening or "yolo_slot_status" in screening)
 
 
-def _record_pipeline_failure(started_ts: float) -> None:
-    """Counts a failed pipeline as an UNAVAILABLE YOLO run (logs/yolo_scan_health.json). Skipped when the health
-    file was updated after `started_ts` (the pipeline subprocess already recorded this run before failing).
-    Fail-open."""
+def _record_pipeline_failure(run_id: str, reason: str = YOLO_PIPELINE_FAILED_REASON) -> None:
+    """Counts a failed pipeline as an UNAVAILABLE YOLO run (logs/yolo_scan_health.json). Skipped only when the
+    health record carries this run's id with status UNAVAILABLE (the pipeline subprocess already counted this run
+    as failed). A record of this run with another status (e.g. OK recorded, then the subprocess crashed while
+    writing its output) or of another run does not suppress the count (issue #91.6). Fail-open."""
     try:
         from utils import yolo_scan_health
-        try:
-            updated_ts = float(yolo_scan_health.read_health().get("updated_ts", 0) or 0)
-        except (TypeError, ValueError):
-            updated_ts = 0.0
-        if updated_ts > started_ts:  # strict: a tie (coarse Windows clock) still counts this run
+        health = yolo_scan_health.read_health()
+        if run_id and health.get("last_run_id") == run_id and health.get("last_status") == "UNAVAILABLE":
             return
-        yolo_scan_health.record_scan("UNAVAILABLE", YOLO_PIPELINE_FAILED_REASON)
+        yolo_scan_health.record_scan("UNAVAILABLE", reason, run_id=run_id)
     except Exception as e:
         print(f"YOLO scan health not recorded ({type(e).__name__})", file=sys.stderr)
 
@@ -234,9 +242,9 @@ def _write_json(path: str, data: dict) -> None:
 
 
 def assemble_primed_brief(target_env: str = "prod", out_path: Optional[str] = None) -> dict:
-    started_ts = time.time()
+    run_id = uuid.uuid4().hex
     state = ensure_fresh_state(target_env=target_env)
-    screening = get_latest_screening_payload(target_env=target_env)
+    screening = get_latest_screening_payload(target_env=target_env, run_id=run_id)
     insights = load_recent_insights(limit=3)
     risk_profile = build_risk_profile(target_env)
 
@@ -246,9 +254,17 @@ def assemble_primed_brief(target_env: str = "prod", out_path: Optional[str] = No
     generated_at_ts = int(time.time())
 
     yolo_slot = build_yolo_slot_brief(screening)
-    if screening_payload_unusable(screening) and risk_profile.get("yolo_slot_enabled"):
-        yolo_slot = {"status": "UNAVAILABLE", "summary": YOLO_PIPELINE_FAILED_SUMMARY, "candidates": []}
-        _record_pipeline_failure(started_ts)
+    unusable = screening_payload_unusable(screening)
+    if risk_profile.get("yolo_slot_enabled"):
+        if unusable:
+            yolo_slot = {"status": "UNAVAILABLE", "summary": YOLO_PIPELINE_FAILED_SUMMARY, "candidates": []}
+            _record_pipeline_failure(run_id)
+        elif screening.get("run_id") != run_id:  # missing or foreign run id: fail closed (issue #91.6)
+            yolo_slot = {"status": "UNAVAILABLE", "summary": YOLO_RUN_ID_MISMATCH_SUMMARY, "candidates": []}
+            _record_pipeline_failure(run_id, YOLO_RUN_ID_MISMATCH_REASON)
+    elif unusable:
+        yolo_slot = {"status": "DISABLED", "summary": YOLO_DISABLED_STATUS, "candidates": []}
+    market_data_status = screening.get("market_data_status") if isinstance(screening, dict) else None
 
     # Condensed context pack (token-budget optimized)
     brief = {
@@ -257,6 +273,7 @@ def assemble_primed_brief(target_env: str = "prod", out_path: Optional[str] = No
         "max_age_seconds": BRIEF_MAX_AGE_SECONDS,
         "target_env": str(target_env).upper(),
         "state_env": str(state.get("target_env", "unknown")).upper(),
+        "market_data_status": str(market_data_status) if market_data_status else None,
         "risk_profile": risk_profile,
         "ground_truth_portfolio": {
             "delta_bias": portfolio.get("delta_bias", "NEUTRAL"),
@@ -321,6 +338,8 @@ def format_markdown_brief(brief: dict) -> str:
         f"**YOLO slot:** {'ON' if rp.get('yolo_slot_enabled') else 'OFF'} (margin {rp.get('yolo_margin_usdt')})"
     )
     lines.append(f"**Brief file:** `logs/primed_brief.json` (generated_at_ts {brief.get('generated_at_ts')}, max age {brief.get('max_age_seconds', BRIEF_MAX_AGE_SECONDS) // 60} min)")
+    if brief.get("market_data_status"):
+        lines.append(f"**Market data:** {brief['market_data_status']}")
     lines.append("")
     lines.append("### ⚖️ Portfolio Ground Truth (Binance Ledger)")
     lines.append(f"- **Active Positions ({p['active_positions_count']}):** " + (", ".join([f"{x['symbol']} ({x['dir']} PnL: ${x['pnl']})" for x in p['positions_summary']]) if p['positions_summary'] else "None"))

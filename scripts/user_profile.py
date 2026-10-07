@@ -64,9 +64,17 @@ def get_yolo_margin(target_env="testnet") -> float:
             pass
     yolo_pct = float(prof.get("yolo_equity_pct", 0.12))
     try:
-        from quant_risk_engine import get_account_equity
-        equity = get_account_equity(target_env=target_env)
+        from quant_risk_engine import get_account_equity, RateLimitedError
     except Exception:
+        get_account_equity, RateLimitedError = None, None
+    try:
+        if get_account_equity is None:
+            raise RuntimeError("quant_risk_engine unavailable")
+        equity = get_account_equity(target_env=target_env)
+    except Exception as e:
+        # A Binance rate limit on the equity read stops the caller (issue #91.2): never size from a default.
+        if RateLimitedError is not None and isinstance(e, RateLimitedError):
+            raise
         equity = 10000.0 if str(target_env).lower() == "testnet" else 100.0
     return round(min(max(equity * yolo_pct, 10.0), 15.0), 2)
 
