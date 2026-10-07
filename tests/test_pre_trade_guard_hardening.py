@@ -629,12 +629,19 @@ class TestPreTradeGuardHardening(unittest.TestCase):
             {"price": "65000.0"} if endpoint == "/fapi/v1/ticker/price"
             else {"code": -1021, "msg": "Timestamp for this request was 1000ms ahead"}
         )
-        with patch("sync_session_state.STATE_FILE", self.state_path):
+        # Issue #127: the error state is written only atomically (no plain open(..., "w") fallback); temp logs dir.
+        with patch("sync_session_state.STATE_FILE", self.state_path), \
+             patch("sync_session_state.LOGS_DIR", self.logs_dir), \
+             patch("sync_session_state.AUDIT_LOG", os.path.join(self.logs_dir, "trades_audit.jsonl")):
             state = sync_session_state.sync_session_state(target_env="testnet")
             self.assertFalse(state.get("is_valid"))
             self.assertIn("Failed to fetch positionRisk", state.get("error", ""))
             self.assertIn("last_updated_ts", state)
             self.assertEqual(state.get("portfolio_exposure", {}).get("delta_bias"), "UNKNOWN")
+            self.assertNotIn("state_write_error", state)
+            with open(self.state_path, "r", encoding="utf-8") as f:
+                self.assertEqual(json.load(f), state)
+            self.assertEqual([n for n in os.listdir(self.logs_dir) if ".tmp_" in n], [])
 
     @patch("execute_futures_trade.send_signed_request")
     def test_sync_session_state_fails_closed_on_api_exception(self, mock_request):
@@ -645,11 +652,15 @@ class TestPreTradeGuardHardening(unittest.TestCase):
             raise ConnectionError("Connection refused by Binance Gateway")
 
         mock_request.side_effect = fake_request
-        with patch("sync_session_state.STATE_FILE", self.state_path):
+        with patch("sync_session_state.STATE_FILE", self.state_path), \
+             patch("sync_session_state.LOGS_DIR", self.logs_dir), \
+             patch("sync_session_state.AUDIT_LOG", os.path.join(self.logs_dir, "trades_audit.jsonl")):
             state = sync_session_state.sync_session_state(target_env="testnet")
             self.assertFalse(state.get("is_valid"))
             self.assertIn("Connection refused", state.get("error", ""))
             self.assertIn("last_updated_ts", state)
+            with open(self.state_path, "r", encoding="utf-8") as f:
+                self.assertEqual(json.load(f), state)
 
     # =========================================================================
     # 8. EXECUTE_FUTURES_TRADE.PY SESSION STATE GATE (Finding 6)

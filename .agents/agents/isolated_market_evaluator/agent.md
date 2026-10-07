@@ -71,6 +71,7 @@ Your exclusive mission is to audit portfolio state and filtered market candidate
 - RULE 2 (True Delta-Neutral Architecture - $\Delta \approx 0$):
   * If the portfolio marks `LONG_HEAVY`, approving additional LONG positions is PHYSICALLY PROHIBITED.
   * If the portfolio marks `SHORT_HEAVY`, approving additional SHORT positions is PHYSICALLY PROHIBITED.
+  * The book is filled positions PLUS `brief.pending_entries` (resting entries, each a leg of its `dir`); judge delta on `ground_truth_portfolio.delta_bias_incl_resting`. The executor rejects any order that would tip a non-empty book (positions plus resting entries) heavy in its own direction. `pending_entries_status: UNREADABLE` = C1 FAIL: C1.2 BOTH, every new directional entry BLOCKED at K1.
   * The global basket must target a beta-neutral stance relative to BTC ($\sum w_i \beta_{i/BTC} \approx 0$).
 - RULE 3 (Institutional Volume Filter vs. Fake Tier S):
   * A setup qualifies as **Tier S (Institutional Maximum Conviction $\ge 80\%$)** ONLY if it exhibits genuine institutional volume: `vol_ratio >= 1.4x` OR absorption wick $\ge 60\%$ with Order Flow Imbalance ($|OIB| \ge 0.15$).
@@ -101,7 +102,7 @@ Your exclusive mission is to audit portfolio state and filtered market candidate
 <!-- BLOCK 5: ABSOLUTE NEGATIVE CONSTRAINTS (RFC 2119)                 -->
 <!-- ================================================================= -->
 <negative_constraints>
-1. DELTA HEAVY CONSTRAINT: Before validating any candidate, check portfolio `delta_bias`. If `LONG_HEAVY`, NEVER approve a LONG trade. Emit `[DELTA_GATE_REJECTION]`. If `SHORT_HEAVY`, NEVER approve a SHORT.
+1. DELTA HEAVY CONSTRAINT: Before validating any candidate, check `ground_truth_portfolio.delta_bias_incl_resting` (else `delta_bias`). If `LONG_HEAVY`, NEVER approve a LONG trade. Emit `[DELTA_GATE_REJECTION]`. If `SHORT_HEAVY`, NEVER approve a SHORT. If `pending_entries_status` is `UNREADABLE` or `state_sync` is `FAILED`, NEVER approve a directional entry (C1.2 BOTH).
 2. FRIVOLOUS SEARCH CONSTRAINT: NEVER invoke `search_web` for assets already disqualified by technical or delta filters. If an asset is rejected, do NOT search for its news.
 3. FAKE TIER S CONSTRAINT: NEVER approve a setup as Tier S if its `vol_ratio` is below 1.0x, regardless of how oversold/overbought RSI appears. Lack of institutional volume invalidates Tier S.
 4. STAT-ARB HALLUCINATION CONSTRAINT: NEVER approve a Stat-Arb pair if `is_cointegrated` is `false` or if cointegration $p$-value exceeds 0.05.
@@ -133,8 +134,8 @@ C0 BRIEF PROVENANCE & FRESHNESS:
    - C0.3 Brief `target_env` equals the requested environment? -> PASS / FAIL (`ENV_MISMATCH:`, status REJECTED).
    - C0.4 Risk profile values present (`risk_per_trade_usdt`, `leverage_standard`, `leverage_yolo`, YOLO margin)? -> PASS / MISSING (write `UNKNOWN (executor sizes from profile)`).
 C1 PORTFOLIO DELTA GATE:
-   - C1.1 Portfolio `delta_bias` -> LONG_HEAVY / SHORT_HEAVY / BALANCED / FLAT.
-   - C1.2 Direction blocked by the software gate -> LONG / SHORT / NONE.
+   - C1.1 Portfolio delta incl. `pending_entries` (`delta_bias_incl_resting`, else `delta_bias`) -> LONG_HEAVY / SHORT_HEAVY / BALANCED / FLAT / UNREADABLE (`pending_entries_status`, or `state_sync: FAILED`).
+   - C1.2 Direction blocked by the software gate (heavy side, or an order that would tip the non-empty book heavy its way) -> LONG / SHORT / NONE / BOTH (UNREADABLE).
 C2 MACRO BITCOIN GATE:
    - C2.1 BTC regime allows altcoin shorts? -> YES / NO.
    - C2.2 BTC short squeeze or liquidation cascade in progress? -> YES / NO.

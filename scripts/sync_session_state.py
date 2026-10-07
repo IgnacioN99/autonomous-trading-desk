@@ -7,6 +7,12 @@ apply the stricter of the cache and the live view (issue #101).
 
 Zero LLM Tokens / Latency ~600ms.
 Generates 'logs/session_state.json' and outputs a typed executive summary for cold-start priming.
+Issue #48: portfolio_exposure also carries resting_entries [{"symbol", "dir", "kind"}] (same-env
+logs/pending_entries.json records whose entry order still rests on openAlgoOrders / openOrders and whose symbol has
+no open position), resting_margin_usdt (sum of their margin_usdt) and delta_bias_incl_resting (delta_bias with each
+resting entry as a leg of its direction; "UNKNOWN" when the registry or an order listing cannot be read).
+delta_bias itself is unchanged. The state is only ever written atomically (issue #127): a failed write leaves the
+previous file. CLI exit code 1 when the state written is INVALID or the write failed, else 0.
 """
 
 import os
@@ -19,7 +25,7 @@ from typing import Dict, List, Any
 # Ensure local path resolution
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import execute_futures_trade as eft
-from utils.portfolio_exposure import compute_exposure, LONG_HEAVY, SHORT_HEAVY
+from utils.portfolio_exposure import compute_exposure, book_exposure, LONG_HEAVY, SHORT_HEAVY
 from utils import position_timing as pt
 from utils.env_resolver import resolve_env
 
@@ -76,6 +82,9 @@ def write_error_state(err_msg: str, now_ts: int, now_utc: str, target_env: str, 
             "short_notional_usdt": 0.0,
             "net_notional_delta_usdt": 0.0,
             "delta_bias": "UNKNOWN",
+            "delta_bias_incl_resting": "UNKNOWN",
+            "resting_entries": [],
+            "resting_margin_usdt": 0.0,
             "delta_advice": f"🚨 LEDGER SYNC FAILED: {err_msg}",
             "total_floating_pnl_usdt": 0.0
         },
@@ -92,13 +101,75 @@ def write_error_state(err_msg: str, now_ts: int, now_utc: str, target_env: str, 
             "net_realized_pnl_usdt": 0.0
         }
     }
+    return _write_state(error_state)
+
+
+def _write_state(state: dict) -> dict:
+    """Writes the state atomically (temp file + os.replace). Issue #127: there is no plain open(..., "w") fallback;
+    a failed write prints the error, leaves the previous file and returns the state with "state_write_error" (the CLI
+    then exits 1). Readers judge the previous file by its own last_updated_ts, so it cannot look fresh."""
     try:
         from utils.atomic_writer import atomic_write_json
-        atomic_write_json(STATE_FILE, error_state)
-    except Exception:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(error_state, f, indent=2, ensure_ascii=False)
-    return error_state
+        atomic_write_json(STATE_FILE, state)
+    except Exception as e:
+        print(f"sync_session_state: session_state.json NOT written ({type(e).__name__}: {e}); the previous file is "
+              "kept", file=sys.stderr)
+        return dict(state, state_write_error=f"{type(e).__name__}: {e}")
+    return state
+
+
+def _load_registry_records(target_env: str):
+    """Same-env records of logs/pending_entries.json (LOGS_DIR). Returns (records, error): a missing file is no
+    records; an unreadable or malformed one is an error."""
+    path = os.path.join(LOGS_DIR, "pending_entries.json")
+    if not os.path.exists(path):
+        return [], None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        return [], f"pending entries registry unreadable ({e})"
+    if not isinstance(data, dict) or not isinstance(data.get("entries"), dict):
+        return [], "pending entries registry malformed"
+    return [r for r in data["entries"].values() if isinstance(r, dict) and r.get("target_env") == target_env], None
+
+
+def resting_entry_exposure(target_env: str, algos_res, open_orders_res, exposure: dict) -> dict:
+    """Issue #48: resting entries of the registry that still rest on the exchange. A record counts only when its
+    entry order (by entry_id: algoId for STOP_MARKET, orderId for LIMIT) is among the opening orders of the listings
+    already fetched (eft.live_resting_opening_orders: not closePosition / reduceOnly, no final algoStatus) and its
+    symbol has no open position (a filled record waiting for its protect cycle is not counted twice). Each one is a
+    leg of its direction at trigger_or_limit_price x total_qty. Returns {"resting_entries", "resting_margin_usdt",
+    "delta_bias_incl_resting"}; "UNKNOWN" when the registry or a listing cannot be read."""
+    out = {"resting_entries": [], "resting_margin_usdt": 0.0, "delta_bias_incl_resting": "UNKNOWN"}
+    if not isinstance(algos_res, list) or not isinstance(open_orders_res, list):
+        return out
+    records, err = _load_registry_records(target_env)
+    if err:
+        return out
+    live = eft.live_resting_opening_orders({"open_algo_orders": algos_res, "open_orders": open_orders_res})
+    live_ids = {(str(o.get("symbol") or "").upper(), kind, str(eft._order_id(o))) for _src, kind, o in live}
+    open_symbols = set(exposure["symbols"])
+    long_n, short_n, margin = exposure["long_notional"], exposure["short_notional"], 0.0
+    for rec in records:
+        sym = str(rec.get("symbol") or "").upper()
+        kind = "STOP_MARKET" if str(rec.get("kind") or "").upper() == "STOP_MARKET" else "LIMIT"
+        if sym in open_symbols or (sym, kind, str(rec.get("entry_id"))) not in live_ids:
+            continue
+        is_long = str(rec.get("direction") or "").upper() == "LONG"
+        try:
+            notional = abs(float(rec.get("trigger_or_limit_price")) * float(rec.get("total_qty")))
+            margin += float(rec.get("margin_usdt") or 0.0)
+        except (TypeError, ValueError):
+            return {"resting_entries": [], "resting_margin_usdt": 0.0, "delta_bias_incl_resting": "UNKNOWN"}
+        if is_long:
+            long_n += notional
+        else:
+            short_n += notional
+        out["resting_entries"].append({"symbol": sym, "dir": "LONG" if is_long else "SHORT", "kind": kind})
+    out["resting_margin_usdt"] = round(margin, 2)
+    out["delta_bias_incl_resting"] = book_exposure(long_n, short_n)["delta_bias"]
+    return out
 
 def sync_session_state(target_env: str = None) -> dict:
     """
@@ -251,6 +322,7 @@ def sync_session_state(target_env: str = None) -> dict:
     # (utils/portfolio_exposure.compute_exposure: delta_ratio = (long - short) / (long + short), +/-0.35 thresholds)
     net_notional_delta = exposure["net_notional"]
     portfolio_delta_bias = exposure["delta_bias"]
+    resting = resting_entry_exposure(target_env, algos_res, open_orders_res, exposure)
 
     if portfolio_delta_bias == LONG_HEAVY:
         delta_advice = "🚨 BULLISH IMBALANCE: Additional Longs prohibited. Short hedge or risk neutralization required prior to new exposure."
@@ -307,6 +379,9 @@ def sync_session_state(target_env: str = None) -> dict:
             "short_notional_usdt": round(short_notional, 2),
             "net_notional_delta_usdt": round(net_notional_delta, 2),
             "delta_bias": portfolio_delta_bias,
+            "delta_bias_incl_resting": resting["delta_bias_incl_resting"],
+            "resting_entries": resting["resting_entries"],
+            "resting_margin_usdt": resting["resting_margin_usdt"],
             "delta_advice": delta_advice,
             "total_floating_pnl_usdt": round(sum(p["unrealized_pnl_usdt"] for p in active_positions), 4)
         },
@@ -325,15 +400,8 @@ def sync_session_state(target_env: str = None) -> dict:
         "shadow_desk_summary": shadow_summary
     }
 
-    # Save to atomic file with kernel-level replace
-    try:
-        from utils.atomic_writer import atomic_write_json
-        atomic_write_json(STATE_FILE, state)
-    except Exception:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2, ensure_ascii=False)
-
-    return state
+    # Save to atomic file with kernel-level replace (no non-atomic fallback, issue #127)
+    return _write_state(state)
 
 def format_markdown_summary(state: dict) -> str:
     """Generates a compact Markdown report for direct consumption by any agent."""
@@ -361,6 +429,8 @@ def format_markdown_summary(state: dict) -> str:
         f"### ⚖️ Portfolio Exposure & Delta: `{exp['delta_bias']}`",
         f"* **Long Notional:** ${exp['long_notional_usdt']:.2f} | **Short Notional:** ${exp['short_notional_usdt']:.2f} | **Net Delta:** ${exp['net_notional_delta_usdt']:+.2f}",
         f"* **Tactical Rule:** {exp['delta_advice']}",
+        f"* **Incl. resting entries:** `{exp.get('delta_bias_incl_resting', 'UNKNOWN')}` "
+        f"({len(exp.get('resting_entries') or [])} resting, margin ${exp.get('resting_margin_usdt', 0.0):.2f})",
         "",
         f"### 🛡️ Active Positions ({exp['total_active_positions']})"
     ]
@@ -385,12 +455,12 @@ def format_markdown_summary(state: dict) -> str:
 
     return "\n".join(lines)
 
-if __name__ == "__main__":
+def main(argv=None) -> int:
     import argparse
     parser = argparse.ArgumentParser(description="Deterministic Session State Synchronizer")
     parser.add_argument("env_pos", nargs="?", default=None, help="Target execution environment (positional)")
     parser.add_argument("--env", default=None, help="Target execution environment (--env)")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     cfg = eft.load_env()
     default_env = (os.environ.get("BINANCE_API_ENV") or cfg.get("BINANCE_API_ENV", "prod")).lower()
@@ -398,3 +468,9 @@ if __name__ == "__main__":
     target_env = resolve_env(args.env or args.env_pos or default_env)
     state = sync_session_state(target_env=target_env)
     print(format_markdown_summary(state))
+    # Issue #127: a written INVALID state (or a failed write) is a failed sync for the callers' return code.
+    return 1 if state.get("is_valid") is not True or state.get("state_write_error") else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

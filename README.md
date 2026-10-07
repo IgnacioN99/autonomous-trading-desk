@@ -256,11 +256,7 @@ python3 scripts/loops/position_guardian_loop.py --once --env prod         # one 
 python3 scripts/loops/position_guardian_loop.py --interval 300 --env prod # long-running
 ```
 
-Schedule it outside the agent session, for example with cron (`crontab -e`):
-```cron
-*/5 * * * * cd /path/to/repo && python3 scripts/loops/position_guardian_loop.py --once --env prod >> logs/guardian.log 2>&1
-```
-or with a systemd user service:
+Schedule it outside the agent session as a long-running loop. PROD resting entries (untriggered `STOP_MARKET`, `LIMIT`) require a live loop with `--interval` <= 120 s whose last cycle had no position-sync or pending-entry errors; a `--once` run never counts as live and does not overwrite a live loop's `logs/guardian_state.json`. A systemd user service (use `--interval 60` when you place resting entries):
 ```ini
 # ~/.config/systemd/user/position-guardian.service
 [Unit]
@@ -268,13 +264,16 @@ Description=Trading desk position guardian
 
 [Service]
 WorkingDirectory=/path/to/repo
-ExecStart=/usr/bin/env python3 scripts/loops/position_guardian_loop.py --interval 300 --env prod
+ExecStart=/usr/bin/env python3 scripts/loops/position_guardian_loop.py --interval 60 --env prod
 Restart=on-failure
 
 [Install]
 WantedBy=default.target
 ```
-Enable it with `systemctl --user enable --now position-guardian.service`.
+Enable it with `systemctl --user enable --now position-guardian.service`. Without resting entries, a cron job (`crontab -e`) running one cycle per run also works:
+```cron
+*/5 * * * * cd /path/to/repo && python3 scripts/loops/position_guardian_loop.py --once --env prod >> logs/guardian.log 2>&1
+```
 
 ### 5. Migration from the `crypto_radar` MCP server
 The `crypto_radar` MCP server (`scripts/radar_mcp_server.py`) has been retired. Scans are now CLI scripts (`--json`), execution and position management go through `scripts/execute_futures_trade.py`, and trailing / dead-alpha / orphan checks run in the position guardian loop. The pre-trade guard denies any remaining `crypto_radar` tool call. If you registered the server outside this repository, remove it:

@@ -80,7 +80,9 @@ JSON schemas (stable; extra keys may be added, existing keys are never renamed):
                 "success": bool,
                 "dry_run": bool, "detail": {...}}],
       "errors": [{"key", "symbol", "stage", "error"}],
-      "warnings"?: [{"key", "symbol", "stage": "loss_cap_check", "warning"}]}   # issue #118 check deferred
+      "warnings"?: [{"key", "symbol", "stage": "loss_cap_check" | "qty_check", "warning"}]}   # check deferred
+      (issue #118 loss cap; issue #126 total_qty: a record whose total_qty is below margin_usdt x leverage / price
+      x 0.98 minus one stepSize is untrusted, pending_record_mismatch)
   trade deployment: {"success": bool, "symbol", "direction", "leverage", "entry_price", "total_qty",
       "sl_price", "tp1_price", "tp2_price", ..., "error"?: str, "hard_gate_rejection"?: bool}
       Resting entries (untriggered STOP_MARKET via the algo order API, resting LIMIT) return
@@ -100,6 +102,14 @@ JSON schemas (stable; extra keys may be added, existing keys are never renamed):
       Issue #119: Gate 1 classifies filled positions plus resting opening orders and also rejects an order that
       would itself tip a non-empty book heavy in its direction; Gate 2 sizes the loss cap on
       min(wallet balance, balance + unrealized PnL of the snapshot's positionRisk rows).
+      Issue #126: a defaulted standard margin is sized on that same equity; algo rows with a final algoStatus
+      are not resting; the registry match of a quantity-less algo without an id allows half a tick (tick_size
+      stored in the record). Issue #127: the snapshot captures logs/pending_entries.json before its exchange reads
+      (Gate 0A and Gate 1 use it). Issue #94: Gate 0A reads only the last 4 MiB of logs/trades_audit.jsonl and, in
+      PROD, rejects when the file exists but cannot be read. Issue #40: registry writes hold
+      logs/pending_entries.json.lock (PendingRegistryLockError when not acquired: nothing is written); resting entries
+      also need the guardian's last cycle free of positions_sync / pending_* errors; an abort or close that does not
+      end flat or protected files a CRITICAL/P0 issue (_report_abort_failure).
 """
 
 import os
@@ -114,6 +124,7 @@ import urllib.parse
 import urllib.request
 import json
 import logging
+import threading
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 
 logger = logging.getLogger("execute_futures_trade")
@@ -1121,6 +1132,9 @@ def heal_orphan_position(position, target_env=None, close_on_failure=False, *, p
         out["close_result"] = close_res
         out["success"] = out["closed"]
         out["reason"] = "closed_after_failed_heal" if out["closed"] else "heal_and_close_failed"
+        if not out["closed"]:
+            _report_abort_failure(sym, target_env, "heal_orphan_position",
+                                  f"heal stop unverified and reduce-only close not confirmed ({close_res})")
     return out
 
 
@@ -1390,9 +1404,11 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
     it rejects when that book is heavy in the order's direction and, on a non-empty book, when adding the order
     (total_qty x effective entry) would make it so. Gate 2 (standard orders) caps the loss at
     min(wallet balance, balance + unrealized PnL of the snapshot's open positions) x risk_pct_equity x 1.25; a
-    missing unRealizedProfit on an open position rejects. Sizing (execute_complete_trade margin) still uses the wallet
-    balance from get_account_equity, so with large open losses a full-size standard order is rejected by Gate 2
-    rather than sized down. TESTNET skips Gate 1 and keeps the 10000 fallback.
+    missing unRealizedProfit on an open position rejects. Issue #126: in PROD a defaulted standard margin
+    (execute_complete_trade, no explicit --margin) is sized on the same min(wallet, wallet + uPnL), so open losses
+    size the order down instead of making Gate 2 reject it; an explicit margin is the user's and is not re-sized.
+    Gate 0A and Gate 1 read the registry captured in the snapshot (issue #127). TESTNET skips Gate 1 and keeps the
+    10000 fallback.
     """
     ref = entry_price if entry_price else cur_price
     target_env = resolve_env(target_env)
@@ -1506,7 +1522,9 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
         # opening orders resting on the exchange (resting_opening_legs; MCP algos without a quantity take it from
         # their logs/pending_entries.json record).
         live_exp = live_snapshot["exposure"]
-        entries, reg_err = load_pending_entries()
+        # Issue #127: the registry captured before the snapshot's exchange reads (a fill or cancel in between is a
+        # record without a live order: ignored).
+        entries, reg_err, _missing = _snapshot_registry(live_snapshot)
         if reg_err:
             return False, (f"MECHANICAL HARD GATE REJECTION: FAIL-CLOSED — {reg_err}; cannot measure the resting "
                            "opening orders for the delta-neutral gate. Order blocked.")
@@ -1514,7 +1532,7 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
         resting = [dict(resting_entry_info(source, kind, o), executed_qty=o.get('executedQty'))
                    for source, kind, o in live_resting_opening_orders(live_snapshot)]
         try:
-            legs = resting_opening_legs(resting, records)
+            legs = resting_opening_legs(resting, records, price_tol_by_symbol=record_price_tolerances(records))
         except ValueError as e:
             return False, (f"MECHANICAL HARD GATE REJECTION: FAIL-CLOSED — {e}. The delta-neutral gate cannot "
                            "measure the portfolio. Order blocked.")
@@ -1769,22 +1787,51 @@ def load_pending_entries(base_dir=None):
     return entries, err
 
 
+PENDING_REGISTRY_LOCK_WAIT_S = 5.0
+_registry_lock_state = threading.local()
+
+
+class PendingRegistryLockError(RuntimeError):
+    """The registry lock (logs/pending_entries.json.lock) was not acquired, or update_pending_entries was re-entered
+    while this thread holds it (issue #40). The registry is never written unlocked."""
+
+
 def update_pending_entries(mutate, base_dir=None):
     """Read-modify-write of logs/pending_entries.json: re-reads the registry, applies mutate(entries) and writes
-    it atomically. Raises on an unreadable registry or a failed write."""
-    entries, err = load_pending_entries(base_dir)
-    if err:
-        raise IOError(err)
-    mutate(entries)
-    from utils.atomic_writer import atomic_write_json
-    atomic_write_json(pending_entries_path(base_dir), {"schema_version": PENDING_ENTRIES_SCHEMA_VERSION, "entries": entries})
+    it atomically. Raises on an unreadable registry or a failed write.
+    Issue #40: the whole read-modify-write holds an exclusive lock on logs/pending_entries.json.lock
+    (utils.file_lock.locked, wait PENDING_REGISTRY_LOCK_WAIT_S), so concurrent writers (registration, the guardian's
+    --protect-pending) never lose a record. Not acquired -> PendingRegistryLockError and nothing is written
+    (registration then cancels the entry; protect keeps the record for the next run). A nested call from inside the
+    lock (e.g. from `mutate`) would wait on its own flock: it raises PendingRegistryLockError at once instead."""
+    if getattr(_registry_lock_state, 'held', False):
+        raise PendingRegistryLockError("update_pending_entries re-entered while the registry lock is held "
+                                       "(nested registry update)")
+    from utils.file_lock import locked
+    path = pending_entries_path(base_dir)
+    with locked(path, wait_s=PENDING_REGISTRY_LOCK_WAIT_S) as held:
+        if not held:
+            raise PendingRegistryLockError(f"registry lock {os.path.basename(path)}.lock not acquired within "
+                                           f"{PENDING_REGISTRY_LOCK_WAIT_S:.0f}s; registry not written")
+        _registry_lock_state.held = True
+        try:
+            entries, err = load_pending_entries(base_dir)
+            if err:
+                raise IOError(err)
+            mutate(entries)
+            from utils.atomic_writer import atomic_write_json
+            atomic_write_json(path, {"schema_version": PENDING_ENTRIES_SCHEMA_VERSION, "entries": entries})
+        finally:
+            _registry_lock_state.held = False
     return entries
 
 
 def register_resting_entry(kind, entry_id, symbol, direction, entry_side, exit_side, target_env, price, total_qty,
-                           sl_price, tp1_price, tp2_price, leverage, is_yolo, margin_usdt, prearm=None):
+                           sl_price, tp1_price, tp2_price, leverage, is_yolo, margin_usdt, prearm=None,
+                           tick_size=None, step_size=None):
     """Records a resting entry in logs/pending_entries.json (schema v2; `prearm`: the prearm_resting_entry_stop
-    fields). Returns (key, record); raises on failure."""
+    fields; tick_size / step_size: the symbol filters used for rounding, stored when given for the half-tick
+    registry match of Gate 1 and the total_qty check, issue #126). Returns (key, record); raises on failure."""
     now = int(time.time())
     key = pending_entry_key(target_env, symbol, entry_id)
     record = {
@@ -1806,6 +1853,9 @@ def register_resting_entry(kind, entry_id, symbol, direction, entry_side, exit_s
         'placed_at_ts': now,
         'expires_at_ts': now + PENDING_ENTRY_TIMEOUT_SECONDS,
     }
+    for name, value in (('tick_size', tick_size), ('step_size', step_size)):
+        if _to_float(value) > 0:
+            record[name] = _to_float(value)
     record.update(prearm or {})
     update_pending_entries(lambda entries: entries.__setitem__(key, record))
     return key, record
@@ -2006,7 +2056,11 @@ def cancel_resting_entry(symbol, kind, entry_id, target_env=None):
 def check_guardian_alive(target_env, now=None):
     """(ok, reason): logs/guardian_state.json was written by a running guardian LOOP (mode "loop", not a single
     --once run) for target_env, not in --dry-run, with interval_seconds <= GUARDIAN_MAX_INTERVAL_FOR_RESTING and a
-    last cycle no older than 2 * interval_seconds + 30s. Read-only."""
+    last cycle no older than max_age = 2 * interval_seconds + 30s (guardian_loop_state_fresh). Issue #40: the last
+    cycle must also be healthy for resting entries: its error_stages may not hold "positions_sync" or a "pending_*"
+    stage other than the report-only "pending_unknown_entry" (trailing / dead-alpha errors do not count; a state
+    without error_stages, written before issue #40, is healthy). A loop killed after its last write still reads as
+    alive for up to max_age (inherent to a liveness file; declined in issue #40). Read-only."""
     now = int(now if now is not None else time.time())
     path = os.path.join(_workspace_dir(), 'logs', 'guardian_state.json')
     try:
@@ -2036,9 +2090,33 @@ def check_guardian_alive(target_env, now=None):
         return False, "guardian state has no valid timestamp"
     age = now - ts
     max_age = 2 * interval + 30
-    if ts <= 0 or age > max_age or age < -60:
+    if not guardian_loop_state_fresh(state, now):
         return False, f"guardian state is stale ({age}s old, limit {max_age}s for a {interval}s loop)"
+    stages = state.get('error_stages')
+    if stages is not None:
+        if not isinstance(stages, list):
+            return False, "guardian state error_stages is malformed"
+        blocking = sorted({str(s) for s in stages if s == 'positions_sync'
+                           or (str(s).startswith('pending_') and s != 'pending_unknown_entry')})
+        if blocking:
+            return False, (f"the guardian's last cycle failed in {', '.join(blocking)} (it cannot protect resting "
+                           "entries reliably)")
     return True, f"guardian alive ({age}s old, {interval}s loop)"
+
+
+def guardian_loop_state_fresh(state, now=None):
+    """True when a guardian_state dict was written by a loop (mode "loop") with a positive interval_seconds and a
+    timestamp no older than 2 * interval_seconds + 30s (and at most 60s in the future): the age rule of
+    check_guardian_alive, also used by the guardian's --once to keep a live loop's state (issue #40). Pure."""
+    now = int(now if now is not None else time.time())
+    if not isinstance(state, dict) or state.get('mode') != 'loop':
+        return False
+    try:
+        interval, ts = int(state.get('interval_seconds')), int(state.get('timestamp'))
+    except (TypeError, ValueError):
+        return False
+    age = now - ts
+    return interval > 0 and ts > 0 and -60 <= age <= 2 * interval + 30
 
 
 def check_pending_entry_conflict(symbol, target_env):
@@ -2066,10 +2144,14 @@ def fetch_live_gate_snapshot(target_env):
     unregistered-resting-entry check (1d) all read this snapshot, so editing or deleting
     logs/session_state.json / logs/pending_entries.json cannot make a gate pass that the live state would fail.
     Returns (snapshot, error): snapshot = {"env", "fetched_at", "positions": [rows], "exposure":
-    utils.portfolio_exposure.compute_exposure(rows), "open_algo_orders": [...], "open_orders": [...]}; error is
-    set (callers reject the order) when any query fails or returns a non-list. Read-only.
+    utils.portfolio_exposure.compute_exposure(rows), "open_algo_orders": [...], "open_orders": [...],
+    "registry": load_pending_entries_status()}; error is set (callers reject the order) when any query fails or
+    returns a non-list. Issue #127: the registry is read BEFORE the exchange queries and Gate 0A / Gate 1 use this
+    capture, so an entry that fills or is cancelled between the reads is a record without a live order (ignored),
+    never a live order without its record (a spurious rejection). Check 1d keeps its own read after the queries
+    (#46). A registry read error is kept in the capture (the gates fail closed on it as before). Read-only.
     """
-    snap = {"env": target_env, "fetched_at": int(time.time())}
+    snap = {"env": target_env, "fetched_at": int(time.time()), "registry": load_pending_entries_status()}
     for name, endpoint in (('positions', '/fapi/v2/positionRisk'), ('open_algo_orders', '/fapi/v1/openAlgoOrders'),
                            ('open_orders', '/fapi/v1/openOrders')):
         try:
@@ -2086,6 +2168,27 @@ def fetch_live_gate_snapshot(target_env):
     return snap, None
 
 
+def record_price_tolerances(records):
+    """Issue #126: {symbol: half a tick} from the tick_size stored in registry records at registration (exchangeInfo
+    is not cached, so no extra read here). Records without a positive tick_size add nothing (exact match)."""
+    out = {}
+    for r in records or []:
+        tick = _to_float((r or {}).get('tick_size')) if isinstance(r, dict) else 0.0
+        if tick > 0:
+            sym = str(r.get('symbol') or '').upper()
+            out[sym] = min(out.get(sym, tick / 2.0), tick / 2.0)
+    return out
+
+
+def _snapshot_registry(live, base_dir=None):
+    """(entries, error, missing) of the registry: the capture of a fetch_live_gate_snapshot (issue #127) when `live`
+    carries one and no other base_dir is asked for, else a fresh load_pending_entries_status(base_dir)."""
+    captured = (live or {}).get('registry') if isinstance(live, dict) else None
+    if base_dir is None and isinstance(captured, tuple) and len(captured) == 3:
+        return captured
+    return load_pending_entries_status(base_dir=base_dir)
+
+
 def _live_snapshot_or_error(live, target_env, prefix):
     """Returns (snapshot, None) or (None, rejection message): reuses `live` when given, else fetches it."""
     if live is not None:
@@ -2097,13 +2200,26 @@ def _live_snapshot_or_error(live, target_env, prefix):
     return live, None
 
 
+ALGO_FINAL_STATUSES = frozenset({'TRIGGERED', 'FINISHED', 'CANCELED', 'EXPIRED', 'REJECTED'})
+
+
+def _is_opening_order(source, o):
+    """An opening order of a listing: a dict that is neither closePosition nor reduceOnly (Stop Losses and TPs never
+    count). Issue #126: an algo row with a FINAL algoStatus (ALGO_FINAL_STATUSES: TRIGGERED, FINISHED, CANCELED,
+    EXPIRED, REJECTED; its child order / position is listed elsewhere) is not resting. NEW, TRIGGERING, unknown or
+    missing statuses (the MCP listing drops it) stay resting (fail closed)."""
+    if not isinstance(o, dict) or _truthy(o.get('closePosition')) or _truthy(o.get('reduceOnly')):
+        return False
+    return not (source == 'algo' and str(o.get('algoStatus') or '').strip().upper() in ALGO_FINAL_STATUSES)
+
+
 def live_resting_opening_orders(live):
     """Opening orders resting in a live snapshot: [(source, kind, order)] for every algo / regular order that is
-    neither closePosition nor reduceOnly (Stop Losses and TPs never count). kind is the cancel_resting_entry kind."""
+    neither closePosition nor reduceOnly (Stop Losses and TPs never count), nor an algo row with a final algoStatus
+    (ALGO_FINAL_STATUSES, _is_opening_order). kind is the cancel_resting_entry kind."""
     out = []
     for source, key, kind in (('algo', 'open_algo_orders', 'STOP_MARKET'), ('order', 'open_orders', 'LIMIT')):
-        out.extend((source, kind, o) for o in (live or {}).get(key) or [] if isinstance(o, dict)
-                   and not _truthy(o.get('closePosition')) and not _truthy(o.get('reduceOnly')))
+        out.extend((source, kind, o) for o in (live or {}).get(key) or [] if _is_opening_order(source, o))
     return out
 
 
@@ -2136,8 +2252,7 @@ def find_unregistered_resting_entries(target_env, live=None):
                 res = {"error": str(e)}
             if not isinstance(res, list):
                 return [], f"{endpoint} query failed: {res}"
-            listed.extend((source, kind, o) for o in res if isinstance(o, dict)
-                          and not _truthy(o.get('closePosition')) and not _truthy(o.get('reduceOnly')))
+            listed.extend((source, kind, o) for o in res if _is_opening_order(source, o))
     entries, err = load_pending_entries()
     if err:
         return [], err
@@ -2188,6 +2303,39 @@ def unregistered_entries_message(unknown, missing=False):
             "Cancel them (or restore their registry records) before any new entry.")
 
 
+AUDIT_TAIL_BYTES = 4 * 1024 * 1024   # issue #94: Gate 0A reads at most the last 4 MiB of logs/trades_audit.jsonl
+
+
+def read_audit_tail(path, max_bytes=None):
+    """JSON-object records of the last `max_bytes` (AUDIT_TAIL_BYTES) of a JSONL file, in file order (issue #94).
+    When the read starts after offset 0 its first, partial line is dropped; malformed lines are skipped. Raises
+    OSError when the file cannot be read."""
+    max_bytes = AUDIT_TAIL_BYTES if max_bytes is None else max_bytes
+    with open(path, 'rb') as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        start = max(0, size - max_bytes)
+        # One byte earlier: when it is the newline ending the previous line, the first chunk is empty, so dropping
+        # it never loses a complete line.
+        f.seek(start - 1 if start > 0 else 0)
+        data = f.read()
+    lines = data.split(b'\n')
+    if start > 0:
+        lines = lines[1:]
+    records = []
+    for raw in lines:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            r = json.loads(raw.decode('utf-8'))
+        except (ValueError, TypeError, UnicodeDecodeError):
+            continue
+        if isinstance(r, dict):
+            records.append(r)
+    return records
+
+
 def check_max_open_positions(prof, target_env, base_dir=None, live=None):
     """
     Gate 0A (max_open_positions), evaluated before any write. Committed slots = open positions (logs/session_state.json)
@@ -2200,9 +2348,11 @@ def check_max_open_positions(prof, target_env, base_dir=None, live=None):
       open = max(file count, |file symbols U live positionRisk symbols|); pending = registry symbols U symbols with a
       live resting opening order (not reduceOnly / closePosition), minus open symbols; recent fills skip open symbols.
       A missing or corrupt session_state.json rejects; a missing registry while opening orders rest on the exchange
-      rejects (cancel them or restore their records); an unreadable registry rejects.
+      rejects (cancel them or restore their records); an unreadable registry rejects. The registry is the one
+      captured in the snapshot before its exchange reads (issue #127, _snapshot_registry). An existing but
+      unreadable trades_audit.jsonl rejects (issue #94); only its last AUDIT_TAIL_BYTES are read.
     TESTNET is file-only and unchanged: a missing or corrupt session_state counts zero, an unreadable registry counts
-    zero pending entries. Returns (ok, message_or_None). Read-only.
+    zero pending entries, an unreadable audit log counts zero recent fills. Returns (ok, message_or_None). Read-only.
     """
     target_env = resolve_env(target_env)
     is_testnet = str(target_env).lower() == 'testnet'
@@ -2253,7 +2403,7 @@ def check_max_open_positions(prof, target_env, base_dir=None, live=None):
         open_symbols |= live_symbols
         open_count = max(open_count, len(open_symbols))
 
-    entries, err, missing = load_pending_entries_status(base_dir=base)
+    entries, err, missing = _snapshot_registry(live if not is_testnet else None, base_dir=base_dir)
     if err:
         if not is_testnet:
             return False, (f"{prefix}: FAIL-CLOSED — {err}; cannot count pending resting entries "
@@ -2274,23 +2424,18 @@ def check_max_open_positions(prof, target_env, base_dir=None, live=None):
     pending_count = len(pending_symbols)
 
     audit_file = os.path.join(base, 'logs', 'trades_audit.jsonl')
+    # Recent fills are the records since the last session_state sync (Gate 1 requires it <= 300s old in PROD; 300s
+    # without a sync timestamp): a handful of records, so the AUDIT_TAIL_BYTES (4 MiB) tail read covers the window.
     cutoff_ts = last_sync_ts if last_sync_ts > 0 else (time.time() - 300)
     recent_fill_symbols = set()
     if os.path.exists(audit_file):
-        audit_records = []
         try:
-            with open(audit_file, 'r', encoding='utf-8') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        r = json.loads(line)
-                        if isinstance(r, dict):
-                            audit_records.append(r)
-                    except (ValueError, TypeError):
-                        continue
-        except OSError:
+            audit_records = read_audit_tail(audit_file)
+        except OSError as e:
+            # Issue #94: an existing but unreadable audit log hides recent fills: PROD rejects, TESTNET counts none.
+            if not is_testnet:
+                return False, (f"{prefix}: FAIL-CLOSED — logs/trades_audit.jsonl is unreadable ({type(e).__name__}: "
+                               f"{e}); cannot count recent fills. Order blocked.")
             audit_records = []
 
         latest_entry_ts = {}
@@ -2554,6 +2699,26 @@ def pending_record_problems(rec, is_long):
     return out
 
 
+RECORD_QTY_SLACK = 0.02   # issue #126: total_qty may sit this fraction (plus one stepSize) below margin x lev / price
+
+
+def record_qty_problem(rec, step_size=None):
+    """Issue #126 (pure): a record's total_qty must not be shrunk below what its own sizing fields give:
+    total_qty >= margin_usdt x leverage / trigger_or_limit_price x (1 - RECORD_QTY_SLACK) - one step_size (the
+    registration rounds down by less than a step). Checked only when margin_usdt, leverage, trigger_or_limit_price
+    and total_qty are all positive (v1 / partial records skip it). Returns a problem string or None."""
+    margin, lev = _to_float(rec.get('margin_usdt')), _to_float(rec.get('leverage'))
+    price, qty = _to_float(rec.get('trigger_or_limit_price')), _to_float(rec.get('total_qty'))
+    if margin <= 0 or lev <= 0 or price <= 0 or qty <= 0:
+        return None
+    expected = margin * lev / price
+    floor = expected * (1 - RECORD_QTY_SLACK) - max(_to_float(step_size), 0.0)
+    if qty < floor:
+        return (f"total_qty {qty} is below the record's sizing (margin_usdt {margin} x leverage {lev:g} / price "
+                f"{price} = {expected:.8g}; floor {floor:.8g})")
+    return None
+
+
 def pending_entry_order_mismatches(rec, kind, order, is_long, filters=None):
     """Cross-check of the resting entry order on the exchange against its record (issue #101): side == the
     direction's entry side (and the record's entry_side); quantity (algo `quantity` / LIMIT `origQty`) == total_qty
@@ -2656,6 +2821,17 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out, run_ctx=None
         if not dry_run:
             update_pending_entries(mutate)
 
+    def save_before_stop(**fields):
+        """save() for the bookkeeping writes that run BEFORE the stop is placed/verified: a registry lock failure
+        (issue #40) is logged as a "registry_lock" warning and the protection continues in this cycle (the write is
+        retried on the next run). Stop placement is never skipped because of a registry write."""
+        try:
+            save(**fields)
+        except PendingRegistryLockError as e:
+            logger.warning(f"{sym} {key}: registry update {sorted(fields)} deferred ({e}); protection continues")
+            out.setdefault("warnings", []).append({"key": key, "symbol": sym, "stage": "registry_lock",
+                                                   "warning": f"registry update {sorted(fields)} deferred: {e}"})
+
     # Open orders first, then positions: a trigger between the two reads shows up as a position.
     orders_ep = '/fapi/v1/openAlgoOrders' if kind == 'STOP_MARKET' else '/fapi/v1/openOrders'
     open_res = send_signed_request('GET', orders_ep, {'symbol': sym}, target_env=target_env)
@@ -2677,10 +2853,29 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out, run_ctx=None
 
     # The entry (or a position) is visible again: clear a previous "missing" mark.
     if rec.get('missing_since_ts') is not None and (entry_open or position is not None):
-        save(missing_since_ts=None)
+        save_before_stop(missing_since_ts=None)
 
     # --- Record vs exchange cross-check (issue #101): never act on a forged / corrupted record ---------------
     problems = pending_record_problems(rec, is_long)
+    if entry_open or position is not None:
+        # Issue #126: a total_qty shrunk below the record's own sizing makes the record untrusted. The stepSize comes
+        # from the record (stored at registration); exchangeInfo is read only when a record without it is flagged
+        # without the step allowance. Unavailable filters defer the check (warning; never blocks the protection).
+        qty_problem = record_qty_problem(rec, rec.get('step_size'))
+        if qty_problem and _to_float(rec.get('step_size')) <= 0:
+            try:
+                qty_filters = get_symbol_filters(sym, target_env=target_env)
+            except Exception:
+                qty_filters = None
+            if qty_filters:
+                qty_problem = record_qty_problem(rec, qty_filters.get('stepSize'))
+            else:
+                out.setdefault("warnings", []).append({
+                    "key": key, "symbol": sym, "stage": "qty_check",
+                    "warning": "total_qty check deferred to the next run: symbol filters unavailable"})
+                qty_problem = None
+        if qty_problem:
+            problems["entry"].append(qty_problem)
     if (str(target_env).lower() != 'testnet' and (entry_open or position is not None)
             and not problems["sl"] and not problems["entry"]):
         # Issue #118 (PROD): an SL pushed further away (still on the loss side) must not exceed the Gate 2 loss cap.
@@ -2892,7 +3087,7 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out, run_ctx=None
     if (mode is None and rec.get('prearm_algo_id') is not None and tightest is not None
             and str(_order_id(tightest)) == str(rec.get('prearm_algo_id'))
             and str(rec.get('sl_algo_id')) != str(rec.get('prearm_algo_id'))):
-        save(sl_algo_id=rec.get('prearm_algo_id'))   # issue #36: the verified pre-arm is the stop in force
+        save_before_stop(sl_algo_id=rec.get('prearm_algo_id'))   # issue #36: the verified pre-arm is the stop in force
 
     def crossed_close(reason, placement=None):
         """The planned SL is already crossed. Issue #39: the resting entry remainder is cancelled FIRST (it cannot keep
@@ -2929,6 +3124,9 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out, run_ctx=None
                     heal = {"success": False, "reason": f"position re-read failed ({heal_err})"}
             act("pending_sl_crossed_close", False, close=close, flat=False,
                 entry_cancelled=entry_cancel_ok if entry_open else None, heal=heal, **detail)
+            if not stops and not (heal or {}).get('success'):
+                _report_abort_failure(sym, target_env, "pending_sl_crossed_close",
+                                      f"planned SL {sl_p} crossed, close not flat ({close}), no stop kept or healed")
             return fail("sl_crossed_close", f"Planned SL {sl_p} crossed for {sym} but the reduce-only close was not "
                                             f"confirmed flat ({close}); "
                                             + (f"orphan-heal stop verified={bool((heal or {}).get('success'))}; "
@@ -2985,6 +3183,8 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out, run_ctx=None
             act("pending_abort", abort.get("confirmed"), reason="planned_sl_unverified", quantity=qty, abort_exit=abort,
                 entry_cancelled=entry_cancel_ok if entry_open else None)
             if not abort.get("confirmed"):
+                _report_abort_failure(sym, target_env, "pending_abort",
+                                      f"planned SL unverified and auto-destruct not confirmed ({abort.get('order')})")
                 return fail("abort", f"Planned SL unverified and auto-destruct NOT confirmed for {sym} ({abort.get('order')}).")
             if not entry_cancel_ok:
                 return fail("abort_entry_cancel", f"Position closed but the resting entry {entry_id} could not be "
@@ -3136,7 +3336,8 @@ def execute_complete_trade(
         max_margin_ratio = 0.30
 
     # Dynamic margin scaling: if margin_usdt is None or default 100.0, scale dynamically
-    if margin_usdt is None or margin_usdt == 100.0:
+    margin_defaulted = margin_usdt is None or margin_usdt == 100.0
+    if margin_defaulted:
         if is_yolo:
             try:
                 import user_profile as up
@@ -3220,6 +3421,24 @@ def execute_complete_trade(
             return {"success": False, "hard_gate_rejection": True,
                     "error": (f"MECHANICAL HARD GATE REJECTION: FAIL-CLOSED — cannot read the live exchange state for "
                               f"the PROD gates ({live_err}). Order blocked.")}
+        if margin_defaulted and not is_yolo:
+            # Issue #126: a defaulted standard margin is sized on the Gate 2 equity, min(wallet balance, balance +
+            # unrealized PnL of the snapshot's positions), then the per-position cap is re-applied on it (the qty is
+            # rounded from it below), so sizing and Gate 2 agree. A missing uPnL rejects, as in Gate 2.
+            try:
+                unrealized = unrealized_pnl_total(live_snapshot["exposure"])
+            except (ValueError, KeyError, TypeError) as e:
+                return {"success": False, "hard_gate_rejection": True,
+                        "error": (f"MECHANICAL HARD GATE REJECTION: FAIL-CLOSED — cannot read the unrealized PnL of "
+                                  f"the open positions to size the order ({e}). Order blocked.")}
+            sizing_equity = min(account_equity, account_equity + unrealized)
+            margin_usdt = round(min(100.0, max(5.0, sizing_equity * max_margin_ratio * 0.5)), 2)
+            sizing_cap = sizing_equity * max_margin_ratio
+            if margin_usdt > sizing_cap:
+                return {"success": False, "hard_gate_rejection": True,
+                        "error": (f"GUARDRAIL: Margin of {margin_usdt} USDT exceeds max cap of {sizing_cap:.2f} USDT "
+                                  f"({max_margin_ratio*100:.0f}% of equity {sizing_equity:.2f} = min(wallet balance, "
+                                  "balance + unrealized PnL)) on REAL network.")}
     # 1c. Max open positions (Gate 0A, Issue #38): open positions + pending resting entries, checked before any write
     # (check_mechanical_gates re-checks it after sizing).
     slots_ok, slots_err = check_max_open_positions(prof, target_env, live=live_snapshot)
@@ -3304,7 +3523,8 @@ def execute_complete_trade(
         try:
             key, rec = register_resting_entry(
                 kind, entry_id, symbol, direction, entry_side, exit_side, target_env, price, total_qty,
-                sl_p, tp1_p, tp2_p, effective_leverage, is_yolo, margin_usdt, prearm=prearm)
+                sl_p, tp1_p, tp2_p, effective_leverage, is_yolo, margin_usdt, prearm=prearm,
+                tick_size=filters.get('tickSize'), step_size=filters.get('stepSize'))
             return key, rec, None
         except Exception as e:
             cancelled, cancel_res = cancel_resting_entry(symbol, kind, entry_id, target_env=target_env)
@@ -3465,6 +3685,9 @@ def execute_complete_trade(
                                  if live_row is not None and live_err is None else exec_qty)
                     abort_exit = emergency_abort_market_close(symbol, exit_side, close_qty, target_env=target_env)
                     log_emergency_abort(symbol, direction, close_qty, sl_p, sl_order, abort_exit, target_env)
+                    if not abort_exit.get("confirmed"):
+                        _report_abort_failure(symbol, target_env, "partial_fill_abort",
+                                              f"partial-fill SL unverified and MARKET close not confirmed ({abort_exit})")
                     if abort_exit.get("confirmed") and entry_cancel_ok:
                         try:
                             update_pending_entries(lambda entries: entries.pop(key, None))
@@ -4018,6 +4241,25 @@ def _report_close_failure(symbol, target_env, error, stop_source):
             remediation="Check the position on Binance; keep it protected and retry --close-position.")
     except Exception as e:
         logger.error(f"close failure report for {symbol} could not be filed: {e}")
+
+
+def _report_abort_failure(symbol, target_env, site, error):
+    """CRITICAL/P0 issue (issue #40) for a fail-safe abort or close that did not end flat or protected: the
+    pending_abort and crossed-close paths of --protect-pending, the inline partial-fill abort and the
+    heal_orphan_position close. Never raises (reporting must not break the risk-reducing path). error_detail (hashed
+    into the 24h dedup fingerprint with the title) is stable per symbol + site; the full error goes into context."""
+    try:
+        import report_agent_issue
+        report_agent_issue.report_issue(
+            title=f"{site}: fail-safe abort of {symbol} did not end flat or protected",
+            error_detail=f"{symbol} abort not flat or protected at {site}",
+            category="risk_gate", severity="CRITICAL", priority="P0",
+            agent_name=f"execute_futures_trade.{site}",
+            affected_files=f"scripts/execute_futures_trade.py:{site}",
+            context=f"env={target_env}; symbol={symbol}; site={site}; error: {error}",
+            remediation="Check the position on Binance now; protect it or close it with --close-position.")
+    except Exception as e:
+        logger.error(f"abort failure report for {symbol} could not be filed: {e}")
 
 
 def close_position_market(symbol, target_env=None):

@@ -48,31 +48,46 @@ YOLO_PIPELINE_FAILED_SUMMARY = f"UNAVAILABLE: {YOLO_PIPELINE_FAILED_REASON}. YOL
 # Issue #91.6: a usable payload whose run_id is not this brief's run id is not trusted (stale or foreign output).
 YOLO_RUN_ID_MISMATCH_REASON = "screening payload run id mismatch"
 YOLO_RUN_ID_MISMATCH_SUMMARY = f"UNAVAILABLE: {YOLO_RUN_ID_MISMATCH_REASON}. YOLO slot kept empty."
+SYNC_FAILED_KEY = "_state_sync_failed"   # set by ensure_fresh_state, popped by assemble_primed_brief (issue #127)
 
 
 def ensure_fresh_state(max_age_sec: int = 600, target_env: str = "prod") -> dict:
-    """Verifies whether session_state.json is fresh; if not, syncs in ~600ms."""
+    """Verifies whether session_state.json is fresh (its own last_updated_ts; the file mtime only when it has none);
+    if not, syncs in ~600ms. Issue #127: a sync that exits non-zero (INVALID state written, or the write failed and
+    the previous file was kept) adds the private key SYNC_FAILED_KEY to the returned state."""
     needs_sync = True
     if os.path.exists(STATE_FILE):
-        age = time.time() - os.path.getmtime(STATE_FILE)
-        if age < max_age_sec:
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                curr = json.load(f)
             try:
-                with open(STATE_FILE, "r", encoding="utf-8") as f:
-                    curr = json.load(f)
-                    if curr.get("target_env", "").lower() == target_env.lower():
-                        needs_sync = False
-            except Exception:
-                pass
+                ts = float(curr.get("last_updated_ts") or 0)
+            except (TypeError, ValueError):
+                ts = 0.0
+            age = time.time() - (ts if ts > 0 else os.path.getmtime(STATE_FILE))
+            if age < max_age_sec and str(curr.get("target_env", "")).lower() == target_env.lower():
+                needs_sync = False
+        except Exception:
+            pass
 
+    sync_failed = False
     if needs_sync:
         sync_script = os.path.join(BASE_DIR, "scripts", "sync_session_state.py")
-        subprocess.run([sys.executable, sync_script, "--env", target_env], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            proc = subprocess.run([sys.executable, sync_script, "--env", target_env], stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL)
+            sync_failed = proc.returncode != 0
+        except Exception:
+            sync_failed = True
 
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            state = json.load(f)
     except Exception:
-        return {}
+        state = {}
+    if sync_failed and isinstance(state, dict):
+        state[SYNC_FAILED_KEY] = True
+    return state
 
 
 def load_recent_insights(limit: int = 3) -> List[dict]:
@@ -244,6 +259,9 @@ def _write_json(path: str, data: dict) -> None:
 def assemble_primed_brief(target_env: str = "prod", out_path: Optional[str] = None) -> dict:
     run_id = uuid.uuid4().hex
     state = ensure_fresh_state(target_env=target_env)
+    if not isinstance(state, dict):
+        state = {}
+    sync_failed = bool(state.pop(SYNC_FAILED_KEY, False))
     screening = get_latest_screening_payload(target_env=target_env, run_id=run_id)
     insights = load_recent_insights(limit=3)
     risk_profile = build_risk_profile(target_env)
@@ -265,6 +283,11 @@ def assemble_primed_brief(target_env: str = "prod", out_path: Optional[str] = No
     elif unusable:
         yolo_slot = {"status": "DISABLED", "summary": YOLO_DISABLED_STATUS, "candidates": []}
     market_data_status = screening.get("market_data_status") if isinstance(screening, dict) else None
+    # Issue #48 / #127: resting entries come from the session state only (sync_session_state.resting_entry_exposure),
+    # the same view as delta_bias_incl_resting. A missing field (an older state) reads as UNKNOWN (fail closed).
+    resting_bias = portfolio.get("delta_bias_incl_resting", "UNKNOWN")
+    pending_entries = [{"symbol": r.get("symbol"), "dir": r.get("dir"), "kind": r.get("kind")}
+                       for r in (portfolio.get("resting_entries") or []) if isinstance(r, dict)]
 
     # Condensed context pack (token-budget optimized)
     brief = {
@@ -275,8 +298,10 @@ def assemble_primed_brief(target_env: str = "prod", out_path: Optional[str] = No
         "state_env": str(state.get("target_env", "unknown")).upper(),
         "market_data_status": str(market_data_status) if market_data_status else None,
         "risk_profile": risk_profile,
+        "pending_entries": pending_entries,
         "ground_truth_portfolio": {
             "delta_bias": portfolio.get("delta_bias", "NEUTRAL"),
+            "delta_bias_incl_resting": resting_bias,
             "long_notional_usdt": portfolio.get("long_notional_usdt", 0.0),
             "short_notional_usdt": portfolio.get("short_notional_usdt", 0.0),
             "net_delta_usdt": portfolio.get("net_notional_delta_usdt", 0.0),
@@ -314,6 +339,11 @@ def assemble_primed_brief(target_env: str = "prod", out_path: Optional[str] = No
         ]
     }
 
+    if resting_bias == "UNKNOWN":
+        brief["pending_entries_status"] = "UNREADABLE"
+    if sync_failed:
+        brief["state_sync"] = "FAILED"
+
     # Atomic write: the evaluator subagent reads logs/primed_brief.json with view_file
     _write_json(BRIEF_FILE, brief)
     if out_path and os.path.abspath(out_path) != os.path.abspath(BRIEF_FILE):
@@ -346,6 +376,12 @@ def format_markdown_brief(brief: dict) -> str:
     lines.append(f"- **Net Delta:** `${p['net_delta_usdt']:+.2f}` (L: ${p['long_notional_usdt']} | S: ${p['short_notional_usdt']})")
     lines.append(f"- **Realized PnL Today:** `${p['realized_pnl_today']:+.2f}` USDT | **Floating PnL:** `${p['floating_pnl_usdt']:+.2f}` USDT")
     lines.append(f"- **Tactical Rule:** {p['tactical_rule']}")
+    pend = brief.get("pending_entries") or []
+    lines.append(f"- **Pending Entries ({len(pend)}):** "
+                 + (", ".join(f"{x.get('symbol')} ({x.get('dir')} {x.get('kind')})" for x in pend) or "None")
+                 + f" | **Delta incl. resting:** `{p.get('delta_bias_incl_resting', 'UNKNOWN')}`"
+                 + (" | **Pending entries status:** `UNREADABLE`" if brief.get("pending_entries_status") else "")
+                 + (" | **State sync:** `FAILED`" if brief.get("state_sync") else ""))
     lines.append("")
 
     if brief.get("committed_memory_lessons"):

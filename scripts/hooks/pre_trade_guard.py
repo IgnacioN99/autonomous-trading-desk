@@ -66,10 +66,13 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    another or an unknown distro names another filesystem). With a native Linux cwd (/mnt/c/..., /home/...) or none,
    /c/x and //wsl.../x are Linux paths: not sanctioned (ask) (issue #110).
 5. FAIL-CLOSED SESSION STATE & STALENESS CHECK (cache-based pre-check, defense in depth):
-   logs/session_state.json must exist, be valid (is_valid=True) and NOT stale (<= 300s); its position count and
-   delta_bias are checked too. The hook makes no network call, so this reads only the cache: the executor's
-   live-anchored PROD gates (positionRisk, resting opening orders and the new order; issues #101 / #119) are
-   authoritative and reject what a forged fresh file lets through here.
+   logs/session_state.json must exist, be valid (is_valid=True) and NOT stale (<= 300s); its position count plus
+   the same-env symbols of logs/pending_entries.json without an open position (issue #48; an unreadable or
+   malformed registry denies in PROD) must stay below max_open_positions, and its delta_bias_incl_resting (else
+   delta_bias, when missing or UNKNOWN; in PROD an UNKNOWN value while the registry holds a same-env entry without an
+   open position denies) is checked too. The hook makes no network call, so this reads only the
+   caches: the executor's live-anchored PROD gates (positionRisk, resting opening orders and the new order; issues
+   #101 / #119) are authoritative and reject what a forged fresh file lets through here.
 6. EVALUATION DOSSIER PROVENANCE (scripts/utils/dossier_provenance.py):
    PROD requires a schema v2 dossier whose provenance hash is re-verified against the
    isolated_market_evaluator subagent transcript (agy brain or Claude Code subagents/ with
@@ -86,8 +89,8 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    Runtime state that gates PROD orders has exactly one sanctioned writer, which writes it from Python:
    logs/session_state.json <- scripts/sync_session_state.py; logs/guardian_state.json (guardian liveness
    attestation for resting entries) <- scripts/loops/position_guardian_loop.py; logs/pending_entries.json
-   (resting-entry registry / post-fill protection) <- scripts/execute_futures_trade.py (registration and
-   --protect-pending). File tools targeting them are denied: relative, absolute and Windows paths, NTFS aliases
+   (resting-entry registry / post-fill protection; also counted by this hook's max-open-positions pre-check, see 5)
+   <- scripts/execute_futures_trade.py (registration and --protect-pending). File tools targeting them are denied: relative, absolute and Windows paths, NTFS aliases
    (trailing dot/space, ::$DATA streams) and targets whose os.path.realpath / samefile is a protected file
    (symlinked directory, hard link).
    Shell commands. The program of a sub-command is found past VAR=value / VAR+=value assignments, shell keywords
@@ -690,7 +693,8 @@ TRANSCRIPT_ROOT_OVERRIDE_RE = re.compile(
 # session_state.json is a cache for the hook's pre-check (defense in depth): the executor's live-anchored gates are
 # authoritative. guardian_state.json is read directly by the executor (guardian liveness for resting entries).
 # pending_entries.json is cross-checked against the exchange's resting orders and supplies total_qty for MCP algo
-# entries listed without a quantity (Gate 1, issue #119).
+# entries listed without a quantity (Gate 1, issue #119); the hook's own max-open-positions pre-check counts its
+# same-env symbols (issue #48).
 GROUND_TRUTH_FILES = {
     "logs/session_state.json": "`python3 scripts/sync_session_state.py`",
     "logs/guardian_state.json": "`python3 scripts/loops/position_guardian_loop.py`",
@@ -5524,6 +5528,24 @@ def evaluate_file_write(target: str, content: str, base_dir: str) -> Tuple[str, 
 # =============================================================================
 # Trade gates (opening orders through the sanctioned choke point)
 # =============================================================================
+def _pending_entry_symbols(base_dir: str, env: str) -> Tuple[set, Optional[str]]:
+    """(symbols, error) of the logs/pending_entries.json records whose target_env is env (issue #48; stdlib json,
+    no network, no executor import). A missing file is no symbols; an unreadable or malformed file (root or
+    "entries" not a JSON object) is an error (PROD denies, TESTNET ignores it)."""
+    path = os.path.join(base_dir, "logs", "pending_entries.json")
+    if not os.path.exists(path):
+        return set(), None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        return set(), f"pending entries registry unreadable ({e})"
+    if not isinstance(data, dict) or not isinstance(data.get("entries"), dict):
+        return set(), "pending entries registry malformed"
+    return {str(r.get("symbol")).upper() for r in data["entries"].values()
+            if isinstance(r, dict) and r.get("target_env") == env and r.get("symbol")}, None
+
+
 def evaluate_trade_opening(cmd: str, args: dict, mcp_args: dict, base_dir: str,
                            conversation_id: Optional[str], env_hint_cmd: str = "",
                            tokens: Optional[List[str]] = None) -> Tuple[str, str]:
@@ -5663,13 +5685,34 @@ def evaluate_trade_opening(cmd: str, args: dict, mcp_args: dict, base_dir: str,
             total_active = int(total_active)
         except (TypeError, ValueError):
             total_active = 0
-        if total_active >= max_open_positions:
+        # Issue #48: pending resting entries hold a slot too (same-env registry symbols without an open position).
+        pending_syms, reg_err = _pending_entry_symbols(base_dir, env)
+        if reg_err and is_prod:
+            return "deny", (f"🚨 FAIL-CLOSED: {reg_err}; cannot count pending resting entries "
+                            "(logs/pending_entries.json) for the Max Open Positions Gate. Order blocked.")
+        active_syms = {str(p.get("symbol")).upper() for p in state.get("active_positions") or []
+                       if isinstance(p, dict) and p.get("symbol")}
+        pending_count = len(pending_syms - active_syms)
+        if total_active + pending_count >= max_open_positions:
             return "deny", (
                 f"🚨 BLOCKED BY PRE-TOOL-USE HOOK (Max Open Positions Gate): "
-                f"Active positions ({total_active}) reached or exceeded maximum limit ({max_open_positions}) configured in user profile."
+                f"Active positions ({total_active}) + pending resting entries ({pending_count}) reached or exceeded "
+                f"maximum limit ({max_open_positions}) configured in user profile."
             )
 
-        delta_bias = portfolio.get("delta_bias", "NEUTRAL")
+        # Issue #48: the sync's delta incl. resting entries when known, else the filled-only delta_bias.
+        delta_bias = portfolio.get("delta_bias_incl_resting")
+        if is_prod and delta_bias == "UNKNOWN" and pending_syms - active_syms:
+            # PROD: the sync could not measure the resting entries the registry says exist (fail closed).
+            return "deny", (
+                "🚨 FAIL-CLOSED (Delta-Neutral Hard Gate): the resting-entry exposure is UNKNOWN in "
+                f"session_state.json (delta_bias_incl_resting) while logs/pending_entries.json has "
+                f"{len(pending_syms - active_syms)} pending entr(y/ies) without an open position "
+                f"({', '.join(sorted(pending_syms - active_syms))}). Run 'python3 scripts/sync_session_state.py' "
+                "(and 'python3 scripts/execute_futures_trade.py --protect-pending') before opening orders."
+            )
+        if not delta_bias or delta_bias == "UNKNOWN":
+            delta_bias = portfolio.get("delta_bias", "NEUTRAL")
         if delta_bias == "LONG_HEAVY" and trade_dir == "LONG":
             return "deny", (
                 "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Delta-Neutral Hard Gate): "

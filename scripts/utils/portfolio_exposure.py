@@ -109,7 +109,7 @@ def _registry_kind(kind):
     return "STOP_MARKET" if str(kind or "").upper() == "STOP_MARKET" else "LIMIT"
 
 
-def resting_opening_legs(resting, registry_records=()):
+def resting_opening_legs(resting, registry_records=(), price_tol_by_symbol=None):
     """
     Long / short legs of the opening orders resting on the exchange (Gate 1, issue #119).
     `resting`: the live opening orders (neither reduceOnly nor closePosition) as
@@ -122,7 +122,8 @@ def resting_opening_legs(resting, registry_records=()):
       - a live order without one (the MCP algo listing carries no quantity) takes total_qty (and
         trigger_or_limit_price when its own price is not positive) from its registry record, matched by
         symbol + entry id + kind (the find_unregistered_resting_entries key; the MCP listing carries algoId), and
-        only when the live order has no id by symbol + entry_side + price;
+        only when the live order has no id by symbol + entry_side + price (within price_tol_by_symbol[symbol], an
+        absolute tolerance such as half a tick, issue #126; else 1e-9 relative);
       - a registry record without a live order is ignored (filled: already in positionRisk; gone: no exposure).
     Fail closed (ValueError): a live order with no quantity and no registry record, an unparseable quantity, an
     unknown side, or no positive price / registry total_qty.
@@ -158,10 +159,12 @@ def resting_opening_legs(resting, registry_records=()):
             if o.get("id") is not None:
                 rec = by_id.get((sym, str(o.get("id")), _registry_kind(o.get("kind"))))
             else:
+                tol = max(_positive((price_tol_by_symbol or {}).get(sym)) or 0.0,
+                          1e-9 * max(1.0, price or 0.0))
                 rec = next((r for r in records if str(r.get("symbol", "")).upper() == sym
                             and str(r.get("entry_side") or "").upper() == side and price is not None
                             and _positive(r.get("trigger_or_limit_price")) is not None
-                            and abs(float(r["trigger_or_limit_price"]) - price) <= 1e-9 * max(1.0, price)), None)
+                            and abs(float(r["trigger_or_limit_price"]) - price) <= tol), None)
             if rec is None:
                 raise ValueError(f"{label}: the exchange reports no quantity and logs/pending_entries.json has no "
                                  "record for it, so its exposure cannot be measured")
