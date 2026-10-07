@@ -69,7 +69,8 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    logs/session_state.json must exist, be valid (is_valid=True) and NOT stale (<= 300s); its position count plus
    the same-env symbols of logs/pending_entries.json without an open position (issue #48; an unreadable or
    malformed registry denies in PROD) must stay below max_open_positions, and its delta_bias_incl_resting (else
-   delta_bias, when missing or UNKNOWN) is checked too. The hook makes no network call, so this reads only the
+   delta_bias, when missing or UNKNOWN; in PROD an UNKNOWN value while the registry holds a same-env entry without an
+   open position denies) is checked too. The hook makes no network call, so this reads only the
    caches: the executor's live-anchored PROD gates (positionRisk, resting opening orders and the new order; issues
    #101 / #119) are authoritative and reject what a forged fresh file lets through here.
 6. EVALUATION DOSSIER PROVENANCE (scripts/utils/dossier_provenance.py):
@@ -5701,6 +5702,15 @@ def evaluate_trade_opening(cmd: str, args: dict, mcp_args: dict, base_dir: str,
 
         # Issue #48: the sync's delta incl. resting entries when known, else the filled-only delta_bias.
         delta_bias = portfolio.get("delta_bias_incl_resting")
+        if is_prod and delta_bias == "UNKNOWN" and pending_syms - active_syms:
+            # PROD: the sync could not measure the resting entries the registry says exist (fail closed).
+            return "deny", (
+                "🚨 FAIL-CLOSED (Delta-Neutral Hard Gate): the resting-entry exposure is UNKNOWN in "
+                f"session_state.json (delta_bias_incl_resting) while logs/pending_entries.json has "
+                f"{len(pending_syms - active_syms)} pending entr(y/ies) without an open position "
+                f"({', '.join(sorted(pending_syms - active_syms))}). Run 'python3 scripts/sync_session_state.py' "
+                "(and 'python3 scripts/execute_futures_trade.py --protect-pending') before opening orders."
+            )
         if not delta_bias or delta_bias == "UNKNOWN":
             delta_bias = portfolio.get("delta_bias", "NEUTRAL")
         if delta_bias == "LONG_HEAVY" and trade_dir == "LONG":

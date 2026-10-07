@@ -137,7 +137,7 @@ def _load_registry_records(target_env: str):
 def resting_entry_exposure(target_env: str, algos_res, open_orders_res, exposure: dict) -> dict:
     """Issue #48: resting entries of the registry that still rest on the exchange. A record counts only when its
     entry order (by entry_id: algoId for STOP_MARKET, orderId for LIMIT) is among the opening orders of the listings
-    already fetched (eft.live_resting_opening_orders: not closePosition / reduceOnly, KEYS algoStatus NEW) and its
+    already fetched (eft.live_resting_opening_orders: not closePosition / reduceOnly, no final algoStatus) and its
     symbol has no open position (a filled record waiting for its protect cycle is not counted twice). Each one is a
     leg of its direction at trigger_or_limit_price x total_qty. Returns {"resting_entries", "resting_margin_usdt",
     "delta_bias_incl_resting"}; "UNKNOWN" when the registry or a listing cannot be read."""

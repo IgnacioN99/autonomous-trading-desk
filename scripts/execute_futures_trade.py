@@ -102,7 +102,7 @@ JSON schemas (stable; extra keys may be added, existing keys are never renamed):
       Issue #119: Gate 1 classifies filled positions plus resting opening orders and also rejects an order that
       would itself tip a non-empty book heavy in its direction; Gate 2 sizes the loss cap on
       min(wallet balance, balance + unrealized PnL of the snapshot's positionRisk rows).
-      Issue #126: a defaulted standard margin is sized on that same equity; algo rows whose algoStatus is not NEW
+      Issue #126: a defaulted standard margin is sized on that same equity; algo rows with a final algoStatus
       are not resting; the registry match of a quantity-less algo without an id allows half a tick (tick_size
       stored in the record). Issue #127: the snapshot captures logs/pending_entries.json before its exchange reads
       (Gate 0A and Gate 1 use it). Issue #94: Gate 0A reads only the last 4 MiB of logs/trades_audit.jsonl and, in
@@ -2200,20 +2200,23 @@ def _live_snapshot_or_error(live, target_env, prefix):
     return live, None
 
 
+ALGO_FINAL_STATUSES = frozenset({'TRIGGERED', 'FINISHED', 'CANCELED', 'EXPIRED', 'REJECTED'})
+
+
 def _is_opening_order(source, o):
     """An opening order of a listing: a dict that is neither closePosition nor reduceOnly (Stop Losses and TPs never
-    count). Issue #126: an algo row whose algoStatus is present and not "NEW" (e.g. TRIGGERED: its child order and
-    position are listed elsewhere) is not resting; rows without algoStatus (the MCP listing drops it) are kept."""
+    count). Issue #126: an algo row with a FINAL algoStatus (ALGO_FINAL_STATUSES: TRIGGERED, FINISHED, CANCELED,
+    EXPIRED, REJECTED; its child order / position is listed elsewhere) is not resting. NEW, TRIGGERING, unknown or
+    missing statuses (the MCP listing drops it) stay resting (fail closed)."""
     if not isinstance(o, dict) or _truthy(o.get('closePosition')) or _truthy(o.get('reduceOnly')):
         return False
-    status = o.get('algoStatus')
-    return not (source == 'algo' and status not in (None, '') and str(status).upper() != 'NEW')
+    return not (source == 'algo' and str(o.get('algoStatus') or '').strip().upper() in ALGO_FINAL_STATUSES)
 
 
 def live_resting_opening_orders(live):
     """Opening orders resting in a live snapshot: [(source, kind, order)] for every algo / regular order that is
-    neither closePosition nor reduceOnly (Stop Losses and TPs never count), nor an algo row whose algoStatus is not
-    NEW (_is_opening_order). kind is the cancel_resting_entry kind."""
+    neither closePosition nor reduceOnly (Stop Losses and TPs never count), nor an algo row with a final algoStatus
+    (ALGO_FINAL_STATUSES, _is_opening_order). kind is the cancel_resting_entry kind."""
     out = []
     for source, key, kind in (('algo', 'open_algo_orders', 'STOP_MARKET'), ('order', 'open_orders', 'LIMIT')):
         out.extend((source, kind, o) for o in (live or {}).get(key) or [] if _is_opening_order(source, o))

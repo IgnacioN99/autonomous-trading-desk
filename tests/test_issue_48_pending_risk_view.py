@@ -174,6 +174,39 @@ class TestHookCountsPendingEntries(unittest.TestCase):
         self.state(symbols=(), bias="SHORT_HEAVY")   # older state without the field
         self.assertEqual(self.hook("SHORT")[0], "deny")
 
+    def test_prod_unknown_resting_exposure_with_pending_records_denies(self):
+        self.state(symbols=("BTCUSDT",), bias="DELTA_BALANCED", delta_bias_incl_resting="UNKNOWN")
+        write_registry(self.ws, prod_record(symbol="XRPUSDT"))
+        for direction in ("LONG", "SHORT"):
+            with self.subTest(direction=direction):
+                decision, reason = self.hook(direction)
+                self.assertEqual(decision, "deny")
+                self.assertIn("resting-entry exposure is UNKNOWN", reason)
+                self.assertIn("XRPUSDT", reason)
+                self.assertIn("sync_session_state.py", reason)
+                self.assertIn("--protect-pending", reason)
+
+    def test_prod_unknown_without_pending_records_falls_back(self):
+        self.state(symbols=("BTCUSDT",), bias="DELTA_BALANCED", delta_bias_incl_resting="UNKNOWN")
+        write_registry(self.ws, prod_record(symbol="BTCUSDT"),                  # on an open position: not pending
+                       make_record(symbol="XRPUSDT", env="testnet"))            # other env
+        self.assertEqual(self.hook("LONG")[0], "allow")
+
+    def test_testnet_unknown_keeps_the_delta_bias_fallback(self):
+        self.state(symbols=(), bias="DELTA_BALANCED", env="testnet", delta_bias_incl_resting="UNKNOWN")
+        write_registry(self.ws, make_record(symbol="XRPUSDT", env="testnet"))
+        self.assertEqual(self.hook("LONG", env="testnet")[0], "allow")
+        self.state(symbols=(), bias="LONG_HEAVY", env="testnet", delta_bias_incl_resting="UNKNOWN")
+        self.assertEqual(self.hook("LONG", env="testnet")[0], "deny")
+
+    def test_risk_reducing_commands_are_not_affected(self):
+        self.state(symbols=("BTCUSDT",), bias="DELTA_BALANCED", delta_bias_incl_resting="UNKNOWN")
+        write_registry(self.ws, prod_record(symbol="XRPUSDT"))
+        for cmd in ("python3 scripts/execute_futures_trade.py --close-position --symbol BTCUSDT",
+                    "python3 scripts/execute_futures_trade.py --protect-pending"):
+            with self.subTest(cmd=cmd):
+                self.assertTrue(pre_trade_guard.is_risk_reducing_action(cmd, {"CommandLine": cmd}, self.ws, self.ws))
+
 
 # =============================================================================
 # #48.3 / #127 sync_session_state: resting fields, exit code, atomic-only write
@@ -440,21 +473,43 @@ class TestDefaultMarginSizedOnGate2Equity(t101.Workspace):
 # =============================================================================
 class TestTriggeredAlgoRows(t101.Workspace):
 
-    def test_rows_with_a_non_new_algo_status_are_not_resting(self):
+    def test_only_final_algo_statuses_are_not_resting(self):
         live = {"open_algo_orders": [keys_algo(1, "BTCUSDT"), keys_algo(2, "ETHUSDT", algoStatus="TRIGGERED"),
-                                     keys_algo(3, "XRPUSDT", algoStatus="NEW")],
+                                     keys_algo(3, "XRPUSDT", algoStatus="NEW"),
+                                     keys_algo(5, "ADAUSDT", algoStatus="TRIGGERING"),
+                                     keys_algo(6, "DOTUSDT", algoStatus="finished"),
+                                     keys_algo(7, "LINKUSDT", algoStatus="SOMETHING_NEW"),
+                                     keys_algo(8, "AVAXUSDT", algoStatus="CANCELED"),
+                                     keys_algo(9, "NEARUSDT", algoStatus="Expired"),
+                                     keys_algo(10, "APTUSDT", algoStatus="REJECTED")],
                 "open_orders": [resting_limit(4, "SOLUSDT")]}
-        self.assertEqual([eft._order_id(o) for _s, _k, o in eft.live_resting_opening_orders(live)], [1, 3, 4])
+        # missing, NEW, TRIGGERING and unknown statuses stay resting (fail closed); final ones are skipped
+        self.assertEqual([eft._order_id(o) for _s, _k, o in eft.live_resting_opening_orders(live)], [1, 3, 5, 7, 4])
+
+    def test_triggering_and_unknown_rows_count_in_gate0a(self):
+        self.write_state([])
+        for status in ("TRIGGERING", "PAUSED_BY_EXCHANGE"):
+            with self.subTest(status=status):
+                ok, msg = self.slots(LiveExchange(algos=[keys_algo(2, "ETHUSDT", algoStatus=status)]))
+                self.assertFalse(ok)
+                self.assertIn("the registry file is MISSING", msg)
+        self.assertEqual(self.slots(LiveExchange(algos=[keys_algo(2, "ETHUSDT", algoStatus="FINISHED")])),
+                         (True, None))
 
     def test_non_live_path_skips_triggered_rows(self):
         with patch("execute_futures_trade.send_signed_request",
                    side_effect=LiveExchange(algos=[keys_algo(2, "ETHUSDT", algoStatus="TRIGGERED")])):
             self.assertEqual(eft.find_unregistered_resting_entries("prod"), ([], None))
+        for status in ("NEW", "TRIGGERING", "UNKNOWN_STATUS"):
+            with self.subTest(status=status), patch("execute_futures_trade.send_signed_request",
+                                                    side_effect=LiveExchange(algos=[keys_algo(2, "ETHUSDT",
+                                                                                              algoStatus=status)])):
+                unknown, err = eft.find_unregistered_resting_entries("prod")
+                self.assertIsNone(err)
+                self.assertEqual([u["id"] for u in unknown], [2])
         with patch("execute_futures_trade.send_signed_request",
-                   side_effect=LiveExchange(algos=[keys_algo(2, "ETHUSDT", algoStatus="NEW")])):
-            unknown, err = eft.find_unregistered_resting_entries("prod")
-        self.assertIsNone(err)
-        self.assertEqual([u["id"] for u in unknown], [2])
+                   side_effect=LiveExchange(algos=[keys_algo(2, "ETHUSDT", algoStatus="FINISHED")])):
+            self.assertEqual(eft.find_unregistered_resting_entries("prod"), ([], None))
 
     def test_gate0a_does_not_count_a_triggered_row(self):
         self.write_state([])
