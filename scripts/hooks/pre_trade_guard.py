@@ -79,7 +79,9 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    Writes into logs/evaluations/, Antigravity brain transcripts or Claude Code subagent transcripts
    are denied, and so are agent-set transcript-root overrides (AGY_BRAIN_DIRS / CLAUDE_PROJECTS_DIRS);
    harness files (incl. .claude/agents/) require explicit confirmation (force_ask), and so do file-tool writes to
-   git config / hook files (GIT_EXEC_CONFIG_PATH_RE, see 8).
+   git config / hook files (GIT_EXEC_CONFIG_PATH_RE, see 8). File-tool content with trading primitives outside
+   scripts/ and tests/ requires force_ask; scripts/ and tests/ of a linked git worktree of the same repository
+   (its .git file and <common git dir>/worktrees/<name>/gitdir point at each other; issue #148) count as inside.
 8. GROUND TRUTH PROTECTION (GROUND_TRUTH_FILES):
    Runtime state that gates PROD orders has exactly one sanctioned writer, which writes it from Python:
    logs/session_state.json <- scripts/sync_session_state.py; logs/guardian_state.json (guardian liveness
@@ -5346,6 +5348,72 @@ def _normalize_target(path: str, base_dir: str) -> Tuple[str, str]:
     return abs_norm, rel
 
 
+def _linked_worktree_rel(abs_path: str, base_dir: str) -> str:
+    """Path of abs_path relative to the root of a linked git worktree of the same repository as base_dir, or ''.
+    Pure filesystem reads (no git): the nearest ancestor with a .git entry must hold a .git file whose gitdir is
+    <common git dir of base_dir>/worktrees/<name> and whose <gitdir>/gitdir points back to that .git file."""
+    def _read(path: str) -> str:
+        with open(path, "rb") as f:
+            data = f.read(4097)
+        if len(data) > 4096:
+            raise ValueError("git pointer file too large")
+        return data.decode("utf-8")
+
+    def _resolve(value: str, rel_to: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("empty git pointer")
+        return os.path.realpath(value if os.path.isabs(value) else os.path.join(rel_to, value))
+
+    def _gitdir_of(dot_git_file: str) -> str:
+        m = re.match(r"^gitdir:\s*(.+)$", (_read(dot_git_file).splitlines() or [""])[0])
+        if not m:
+            raise ValueError("not a gitdir pointer")
+        return _resolve(m.group(1), os.path.dirname(dot_git_file))
+
+    try:
+        base_git = os.path.join(base_dir, ".git")
+        if os.path.isdir(base_git):
+            common = os.path.realpath(base_git)
+        elif os.path.isfile(base_git):
+            base_gitdir = _gitdir_of(base_git)
+            commondir = os.path.join(base_gitdir, "commondir")
+            if not os.path.isfile(commondir):
+                return ""
+            common = _resolve(_read(commondir), base_gitdir)
+        else:
+            return ""
+        host = _host_path(abs_path, base_dir)
+        cur = os.path.dirname(host)
+        for _ in range(64):
+            dot_git = os.path.join(cur, ".git")
+            if os.path.lexists(dot_git):
+                break
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                return ""
+            cur = parent
+        else:
+            return ""
+        # A symlinked .git (F/.git -> W/.git) is not a worktree: never follow the .git entry itself
+        if os.path.islink(dot_git) or not os.path.isfile(dot_git):
+            return ""
+        gitdir = _gitdir_of(dot_git)
+        same = lambda a, b: os.path.normcase(a) == os.path.normcase(b)  # noqa: E731
+        if not same(os.path.dirname(gitdir), os.path.realpath(os.path.join(common, "worktrees"))):
+            return ""
+        back = os.path.join(gitdir, "gitdir")
+        root = os.path.realpath(cur)
+        if not os.path.isfile(back) or not same(_resolve(_read(back), gitdir), os.path.join(root, ".git")):
+            return ""
+        if same(root, os.path.realpath(base_dir)):
+            return ""
+        rel = os.path.relpath(os.path.realpath(host), root).replace("\\", "/")
+    except (OSError, ValueError, UnicodeError):
+        return ""
+    return "" if rel == "." or rel == ".." or rel.startswith("../") else rel
+
+
 def _strip_windows_aliases(path: str) -> str:
     """NTFS aliases of the same file: trailing dots/spaces of each component and alternate data streams
     (guardian_state.json. / guardian_state.json::$DATA / name:stream). The drive letter is kept."""
@@ -5446,7 +5514,10 @@ def evaluate_file_write(target: str, content: str, base_dir: str) -> Tuple[str, 
     if content and WRITE_ENDPOINT_PRIMITIVES_RE.search(content):
         return "force_ask", f"'{rel or abs_norm}' contains order-placing primitives. Explicit confirmation required."
     if content and not (rel_l.startswith("scripts/") or rel_l.startswith("tests/")) and SCRIPT_TRADING_PRIMITIVES_RE.search(content):
-        return "force_ask", f"'{rel or abs_norm}' (outside scripts/) contains trading primitives. Explicit confirmation required."
+        # scripts/ and tests/ of a linked worktree of this repository are in scope too (issue #148)
+        wt_rel = "" if rel else _linked_worktree_rel(target, base_dir).lower()
+        if not (wt_rel.startswith("scripts/") or wt_rel.startswith("tests/")):
+            return "force_ask", f"'{rel or abs_norm}' (outside scripts/) contains trading primitives. Explicit confirmation required."
     return "ask", ""
 
 
