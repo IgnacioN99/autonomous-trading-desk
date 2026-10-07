@@ -64,7 +64,11 @@ JSON schemas (stable; extra keys may be added, existing keys are never renamed):
       "dry_run": bool
     }
 
-  --close-position: {"success": bool, "closed": {...exchange response...}, "error"?: str}
+  --close-position (exit 0 iff success; stops are cancelled only once positionRisk shows the position flat):
+      success: {"success": true, "closed": {...last close response...}, "attempts": int, "cleanup_errors": [str]}
+      failure: {"success": false, "error": str, "attempts"?: int, "position_amt"?: float,
+                "stop_protected"?: bool, "stop_source"?: "kept" | "healed" | "none", "closed"?: {...}, "heal"?: {...}}
+                (no position / unreadable positionRisk ("position state unknown") return only "error")
   --audit-orphans / --auto-heal: {"total_active": int, "orphans_count": int, "all_protected": bool,
       "positions": [{"symbol", "direction", "amount", "entry_price", "mark_price", "leverage", "unpnl",
                      "is_protected", "active_sl_orders", "sl_triggers", "auto_heal_attempted"?,
@@ -764,6 +768,7 @@ TRUE_NET_BE_FEE_BUFFER = 0.002          # True Net Break-Even: entry +/- 0.2% ro
 BE_MIN_EXPANSION_ATR = 2.0              # Anti-truncation: standard positions move to BE only after >= 2x ATR_15m
 STOP_VERIFY_RETRY_DELAYS = (0.8, 1.0, 1.2)  # Progressive verification (~3s) to absorb Mainnet indexing latency
 ORPHAN_HEAL_SL_DISTANCE = 0.025         # Emergency stop distance for orphan positions (2.5%)
+CLOSE_RETRY_DELAYS = (0.3, 0.6, 1.0)    # close_position_market: backoff after each of the 3 close attempts
 
 
 def _workspace_dir():
@@ -3533,39 +3538,111 @@ def audit_and_auto_heal_orphans(target_env=None):
     target_env = resolve_env(target_env)
     return audit_orphan_positions(target_env=target_env, auto_heal=True)
 
+def _read_open_position(symbol, target_env=None, is_long=None):
+    """Read-only positionRisk lookup. Returns (row_or_None, error_or_None): the first non-zero row of symbol (in the
+    given direction when is_long is not None); (None, None) means flat, an error means the state is unknown."""
+    try:
+        pos_res = send_signed_request('GET', '/fapi/v2/positionRisk', {'symbol': symbol}, target_env=target_env)
+    except Exception as e:
+        return None, str(e)
+    if not isinstance(pos_res, list):
+        return None, str(pos_res)
+    for p in pos_res:
+        if not isinstance(p, dict) or str(p.get('symbol', symbol)).upper() != symbol.upper():
+            continue
+        amt = _to_float(p.get('positionAmt'))
+        if amt != 0 and (is_long is None or (amt > 0) == is_long):
+            return p, None
+    return None, None
+
+
+def _report_close_failure(symbol, target_env, error, stop_source):
+    """CRITICAL/P0 issue for a close that was not confirmed flat. Never raises (the close path must not break)."""
+    try:
+        import report_agent_issue
+        report_agent_issue.report_issue(
+            title=f"close_position_market: reduce-only close of {symbol} not confirmed flat",
+            error_detail=error, category="risk_gate", severity="CRITICAL", priority="P0",
+            agent_name="execute_futures_trade.close_position_market",
+            affected_files="scripts/execute_futures_trade.py:close_position_market",
+            context=f"env={target_env}; symbol={symbol}; stop_source={stop_source}; no order was cancelled",
+            remediation="Check the position on Binance; keep it protected and retry --close-position.")
+    except Exception as e:
+        logger.error(f"close failure report for {symbol} could not be filed: {e}")
+
+
 def close_position_market(symbol, target_env=None):
+    """
+    Risk-reducing reduce-only MARKET close of the open position of symbol (same in PROD/TESTNET, KEYS/MCP).
+    The protective stop is never cancelled before the position is confirmed flat on positionRisk:
+      1. read positionRisk (an unreadable state sends nothing),
+      2. send the reduce-only MARKET close, up to 3 attempts (CLOSE_RETRY_DELAYS backoff), re-reading the size
+         before each retry (partial fills retry the residual; already flat = done),
+      3. flat: cancel leftover orders/stops (_cancel_symbol_orders); cleanup errors are returned, not fatal,
+      4. not flat: cancel nothing, verify a stop on openAlgoOrders (heal one if none) and report CRITICAL/P0.
+    """
     target_env = resolve_env(target_env)
-    # 1. Active position
-    pos_res = send_signed_request('GET', '/fapi/v2/positionRisk', {'symbol': symbol}, target_env=target_env)
-    active = [p for p in pos_res if float(p.get('positionAmt', 0)) != 0] if isinstance(pos_res, list) else []
-    if not active:
+    symbol = str(symbol).upper()  # every read/write (and _wait_until_flat's match) uses the exchange's symbol case
+    row, err = _read_open_position(symbol, target_env)
+    if err is not None:
+        return {"success": False, "error": f"position state unknown: {err}"}
+    if row is None:
         return {"success": False, "error": f"No open position in {symbol}"}
 
-    amt = float(active[0]['positionAmt'])
-    exit_side = 'SELL' if amt > 0 else 'BUY'
-    qty = abs(amt)
+    is_long = _to_float(row.get('positionAmt')) > 0
+    exit_side = 'SELL' if is_long else 'BUY'
+    qty = abs(_to_float(row.get('positionAmt')))
+    res, attempts, flat, state_unknown = None, 0, False, None
 
-    # 2. Cancel all standard open orders
-    send_signed_request('DELETE', '/fapi/v1/allOpenOrders', {'symbol': symbol}, target_env=target_env)
+    for attempts, delay in enumerate(CLOSE_RETRY_DELAYS, start=1):
+        try:
+            res = send_signed_request('POST', '/fapi/v1/order', {'symbol': symbol, 'side': exit_side, 'type': 'MARKET',
+                                                                'quantity': qty, 'reduceOnly': 'true'},
+                                      target_env=target_env)
+        except Exception as e:
+            res = {"error": str(e)}
+        if _market_order_accepted(res) and _wait_until_flat(symbol, is_long, target_env):
+            flat = True
+            break
+        time.sleep(delay)
+        fresh, state_unknown = _read_open_position(symbol, target_env, is_long=is_long)
+        if state_unknown is None and fresh is None:
+            flat = True
+            break
+        if fresh is not None:
+            # Partial fill: the next attempt closes the residual (an unreadable state keeps the last known size).
+            row, qty = fresh, abs(_to_float(fresh.get('positionAmt')))
 
-    # 3. Cancel all open algo orders via native REST
-    open_algos = send_signed_request('GET', '/fapi/v1/openAlgoOrders', {'symbol': symbol}, target_env=target_env)
-    if isinstance(open_algos, list):
-        for ao in open_algos:
-            aid = ao.get('algoId') or ao.get('orderId')
-            if aid:
-                send_signed_request('DELETE', '/fapi/v1/algoOrder', {'symbol': symbol, 'algoId': aid}, target_env=target_env)
+    if flat:
+        cleanup_errors = _cancel_symbol_orders(symbol, target_env)
+        for ce in cleanup_errors:
+            print(f"WARNING: {symbol} closed but a leftover order could not be cancelled: {ce}", file=sys.stderr)
+        return {"success": True, "closed": res, "attempts": attempts, "cleanup_errors": cleanup_errors}
 
-    # 4. Market close with reduceOnly
-    params = {
-        'symbol': symbol,
-        'side': exit_side,
-        'type': 'MARKET',
-        'quantity': qty,
-        'reduceOnly': 'true'
-    }
-    res = send_signed_request('POST', '/fapi/v1/order', params, target_env=target_env)
-    return {"success": True, "closed": res}
+    # Not confirmed flat: nothing is cancelled; make sure the (residual) position keeps a verified stop.
+    stops, stop_err = get_open_stop_orders(symbol, exit_side, target_env=target_env)
+    heal = None
+    if stops:
+        stop_source = "kept"
+    else:
+        try:
+            heal = heal_orphan_position(row, target_env=target_env, close_on_failure=False)
+        except Exception as e:
+            heal = {"verified": False, "reason": f"heal failed: {e}"}
+        stop_source = "healed" if heal.get("verified") else "none"
+    error = (f"Reduce-only MARKET close of {symbol} not confirmed flat after {attempts} attempt(s) "
+             f"(last response: {res}); nothing cancelled; stop {stop_source}")
+    if state_unknown is not None:
+        error += f"; position state unknown on the last read: {state_unknown}"
+    if stop_err and not stops:
+        error += f"; stop check: {stop_err}"
+    logger.error(error)
+    _report_close_failure(symbol, target_env, error, stop_source)
+    out = {"success": False, "error": error, "attempts": attempts, "position_amt": _to_float(row.get('positionAmt')),
+           "stop_protected": stop_source != "none", "stop_source": stop_source, "closed": res}
+    if heal is not None:
+        out["heal"] = heal
+    return out
 
 def deploy_futures_trade(
     symbol,

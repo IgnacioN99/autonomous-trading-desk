@@ -325,6 +325,8 @@ class GuardianCycle:
             return
         res = eft.close_position_market(sym, target_env=self.env)
         self.action(sym, "dead_alpha_close", bool(res.get("success")), {"dead_alpha": view["dead_alpha"], "result": res})
+        if not res.get("success"):
+            self.error(sym, "dead_alpha_close", res.get("error") or "close not confirmed")
 
     def _protect_pending(self):
         """Post-fill protection of resting entries (planned SL/TPs) BEFORE the orphan audit, so a freshly filled

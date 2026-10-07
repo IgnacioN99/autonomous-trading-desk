@@ -121,9 +121,13 @@ def audit_dead_alpha(target_env: str = None, max_hours: float = 4.0, auto_exit: 
             elif auto_exit:
                 print(f"  ⚡ TRIGGERING AUTO-EXIT: Closing position at market to recycle capital...")
                 close_res = eft.close_position_market(sym, target_env=target_env)
-                item["action_taken"] = "AUTO_EXIT_CLOSED"
                 item["close_result"] = close_res
-                print(f"  ✅ Position closed at market.")
+                if close_res.get("success"):
+                    item["action_taken"] = "AUTO_EXIT_CLOSED"
+                    print(f"  ✅ Position closed at market.")
+                else:
+                    item["action_taken"] = "AUTO_EXIT_FAILED"
+                    print(f"  ❌ AUTO-EXIT FAILED: {close_res.get('error')}")
             else:
                 print(f"  ⚠️  RECOMMENDATION: Market close or tighten SL to Break-Even immediately to eliminate risk.")
                 item["action_taken"] = "RECOMMEND_EXIT"
