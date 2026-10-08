@@ -70,4 +70,6 @@ Python dependencies live in WSL. Copy `.claude/settings.local.json.example` to `
 (gitignored), replace `<WSL_DISTRO>` and `<REPO_PATH_IN_WSL>`, and run scripts as
 `wsl.exe -d <WSL_DISTRO> -- python3 scripts/...`. Hooks from both files are merged: the `settings.json`
 copies fail as non-blocking errors and the WSL copies make the decisions. Inside WSL the transcript lookup
-also searches `/mnt/<drive>/Users/*/.claude/projects`.
+also searches `/mnt/<drive>/Users/*/.claude/projects`. Native Git Bash does not set `WSL_DISTRO_NAME`: without
+it, `wsl.exe -d <distro>` cannot verify the active distribution as the repository's own, so risk-reducing exits
+ask for user confirmation rather than auto-allowing.

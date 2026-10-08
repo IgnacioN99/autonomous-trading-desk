@@ -85,6 +85,9 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    git config / hook files (GIT_EXEC_CONFIG_PATH_RE, see 8). File-tool content with trading primitives outside
    scripts/ and tests/ requires force_ask; scripts/ and tests/ of a linked git worktree of the same repository
    (its .git file and <common git dir>/worktrees/<name>/gitdir point at each other; issue #148) count as inside.
+   Inside a linked worktree, HARNESS_FILES / HARNESS_DIRS do not apply, so <wt>/scripts/hooks/* gets a plain ask
+   (worktree copies are not live hooks; they reach main only via PR review and CI; if a session is launched from
+   a worktree, that worktree becomes base_dir and harness checks apply again).
 8. GROUND TRUTH PROTECTION (GROUND_TRUTH_FILES):
    Runtime state that gates PROD orders has exactly one sanctioned writer, which writes it from Python:
    logs/session_state.json <- scripts/sync_session_state.py; logs/guardian_state.json (guardian liveness
@@ -1120,6 +1123,7 @@ IS_YOLO_FLAG_RE = re.compile(r"(?<![\w-])--is(?:[-_][a-z]*)?(?![\w-])", re.IGNOR
 # Executor confirmation flags. Only the exact tokens count: abbreviations argparse would also accept are deliberately
 # not recognised (a missed confirmation denies, which fails closed).
 EXECUTOR_CONFIRM_OPTIONS = ("--confirmed", "--user-confirmed")
+CONFIRM_RE_RUN_HINT = "👉 Ask the user to confirm in chat and re-run with the '--confirmed' flag."
 
 
 def parse_mcp_arguments(args_dict: dict) -> dict:
@@ -2086,6 +2090,38 @@ def _restore_quoted_newline(tok: str) -> str:
     return tok.replace(QUOTED_NEWLINE_SENTINEL, "\n")
 
 
+def _unwrap_subcommand(tokens: List[str], depth: int = 0) -> List[List[str]]:
+    """Unwraps nested execution wrappers (wsl.exe ... --, sh/bash/zsh/dash -c / -lc '...') down to the
+    underlying sub-commands so that flags and programs are visible to downstream checks. Beyond
+    NESTED_DEPTH_LIMIT levels, fails closed by returning the tokens unwrapped."""
+    if depth > NESTED_DEPTH_LIMIT:
+        return [tokens]
+    if not tokens:
+        return [tokens]
+    idx = _program_index(tokens)
+    if idx >= len(tokens):
+        return [tokens]
+    prog = os.path.basename(tokens[idx]).lower()
+    if prog.endswith(".exe"):
+        prog = prog[:-4]
+    if prog == "wsl":
+        linux_cmd = _wsl_command(tokens[idx + 1:])
+        if linux_cmd:
+            return _unwrap_subcommand(linux_cmd, depth + 1)
+        return [tokens]
+    if prog in SHELL_INTERPRETERS:
+        parsed = _shell_args(tokens[idx + 1:])
+        inner = parsed.get("command")
+        if inner is not None:
+            subs = split_subcommands(inner)
+            unwrapped: List[List[str]] = []
+            for s in subs:
+                unwrapped.extend(_unwrap_subcommand(s, depth + 1))
+            return unwrapped if unwrapped else [tokens]
+        return [tokens]
+    return [tokens]
+
+
 def split_subcommands(command_line: str) -> List[List[str]]:
     """Quote-aware split of compound shell commands (&&, ||, ;, |, &, newlines). A quoted line break stays inside
     its sub-command as an argument holding a real newline."""
@@ -2278,14 +2314,21 @@ def executor_confirmed(cmd: str, tokens: Optional[List[str]] = None, depth: int 
     """
     True only if the executor itself would receive --confirmed / --user-confirmed (exact tokens; abbreviations and
     =value forms are not recognised, which fails closed). Flags are read from the tokens after the
-    execute_futures_trade script path (not env assignments or wrappers before it) and up to a shell comment.
+    execute_futures_trade script path (not env assignments or wrappers before it) and up to a shell comment
+    or redirect.
     When the script sits inside the -c / --command string of sh/bash/... (parsed by _shell_args, e.g.
     wsl.exe -- bash -lc '...', bash -eo pipefail -c '...'), that string is re-tokenised and every segment running
     the executor must be confirmed; arguments after it are the shell's $0/$1..., never the executor's.
     """
     if depth > NESTED_DEPTH_LIMIT:
         return False
-    tokens = list(tokens) if tokens is not None else _tokenize_subcommand(cmd)
+    if tokens is None:
+        matching_subs = [seg for seg in split_subcommands(cmd) if TRADE_ENGINE_RE.search(" ".join(seg))]
+        if not matching_subs:
+            return False
+        return all(executor_confirmed("", seg, depth + 1) for seg in matching_subs)
+
+    tokens = list(tokens)
     idx = _program_index(tokens)
     while idx < len(tokens) and not TRADE_ENGINE_RE.search(tokens[idx]):
         idx += 1
@@ -2304,7 +2347,7 @@ def executor_confirmed(cmd: str, tokens: Optional[List[str]] = None, depth: int 
             # means the executor's own arguments cannot be verified -> not confirmed (fails closed).
             return bool(segments) and all(executor_confirmed("", seg, depth + 1) for seg in segments)
     for tok in tokens[idx + 1:]:
-        if tok.startswith("#"):
+        if tok.startswith("#") or _is_redirect(tok):
             break
         if tok in EXECUTOR_CONFIRM_OPTIONS:
             return True
@@ -2417,6 +2460,9 @@ def _sanctioned_script(script: str, cwd: str, base_dir: str, in_wsl: bool,
     for key in RISK_REDUCING_SCRIPTS:
         if full == _lexical_host_path(posixpath.join(root, key), git_bash=False):
             return key
+    wt_rel = _linked_worktree_rel(full, base_dir)
+    if wt_rel in RISK_REDUCING_SCRIPTS:
+        return wt_rel
     return None
 
 
@@ -4615,6 +4661,9 @@ def _unsanctioned_trading_script(tokens: List[str], cwd: str, base_dir: str) -> 
         rel = os.path.relpath(os.path.normcase(path), base_norm).replace("\\", "/")
         if not rel.startswith("..") and (rel.startswith("scripts/") or rel.startswith("tests/")):
             continue
+        wt_rel = _linked_worktree_rel(path, base_dir)
+        if wt_rel and (wt_rel.startswith("scripts/") or wt_rel.startswith("tests/")):
+            continue
         try:
             if os.path.getsize(path) > 2 * 1024 * 1024:
                 return path
@@ -4835,6 +4884,8 @@ def _wsl_invocation(args: List[str]) -> Optional[Tuple[List[str], bool]]:
             return args[i + 1:], a == "--"
         if a in WSL_VALUE_OPTIONS:
             i += 2
+        elif "=" in a and a.partition("=")[0] in WSL_VALUE_OPTIONS:
+            i += 1
         elif a.startswith("-"):
             return None
         else:
@@ -4852,9 +4903,17 @@ def _wsl_leading_options(args: List[str]) -> List[Tuple[str, str]]:
     """(option, value) pairs of the value-taking wsl.exe options before the Linux command (-d X, -u X, --cd X ...)."""
     out: List[Tuple[str, str]] = []
     i = 0
-    while i < len(args) and args[i] in WSL_VALUE_OPTIONS:
-        out.append((args[i], args[i + 1] if i + 1 < len(args) else ""))
-        i += 2
+    while i < len(args):
+        a = args[i]
+        if a in WSL_VALUE_OPTIONS:
+            out.append((a, args[i + 1] if i + 1 < len(args) else ""))
+            i += 2
+        elif "=" in a and a.partition("=")[0] in WSL_VALUE_OPTIONS:
+            opt, _, val = a.partition("=")
+            out.append((opt, val))
+            i += 1
+        else:
+            break
     return out
 
 
@@ -5038,9 +5097,6 @@ def _risk_prefix_blocker(tokens: List[str]) -> Optional[str]:
                 return "it changes the working directory"
             own = os.environ.get("WSL_DISTRO_NAME", "").lower()
             pairs = _wsl_leading_options(tokens[idx + 1:])
-            rest = tokens[idx + 1 + 2 * len(pairs):]
-            if rest and rest[0].startswith("--shell-type="):
-                pairs = pairs + [("--shell-type", rest[0].split("=", 1)[1])]
             for opt, value in pairs:
                 if opt == "--shell-type" and value.lower() == "login":
                     return "it runs a wsl.exe login shell (--shell-type login sources the profile)"
@@ -5069,10 +5125,43 @@ def _risk_prefix_blocker(tokens: List[str]) -> Optional[str]:
     return "it nests wsl.exe calls too deeply"
 
 
+def _strip_git_message_data(command_line: str) -> str:
+    """Replaces literal git commit/tag message arguments (-m '...', -m "...", --message='...', --message="...")
+    with empty strings when they do not contain shell substitutions ($ or `), treating them as inert data."""
+    def _repl(m: re.Match) -> str:
+        content = m.group(1) if m.group(1) is not None else m.group(2)
+        if "$" in content or "`" in content:
+            return m.group(0)
+        return ""
+
+    pattern = re.compile(r"""(?<![\w-])(?:-m|--message)(?:\s+|=)?(?:'([^']*)'|"([^"]*)")""")
+    return pattern.sub(_repl, command_line)
+
+
+def _is_trade_engine_invocation(tokens: List[str], text: str) -> bool:
+    """True when tokens/text invoke the trade execution engine as executable code, rather than referencing it as data
+    in an issue reporter or inspection command."""
+    if not TRADE_ENGINE_RE.search(text):
+        return False
+    for tok in tokens:
+        for m in COMMAND_SUBSTITUTION_RE.finditer(tok):
+            inner = m.group(1) or m.group(2) or ""
+            if TRADE_ENGINE_RE.search(inner):
+                return True
+    prog = _program(tokens)
+    toks, i, _ = _executed_script_at(tokens)
+    script_name = os.path.basename(toks[i]).lower() if (toks and 0 <= i < len(toks)) else ""
+    if (prog in ("report_issue.sh", "report_agent_issue.py")
+            or script_name in ("report_issue.sh", "report_agent_issue.py")
+            or prog in INSPECTION_PROGRAMS):
+        return False
+    return True
+
+
 def _analyze_run_command(command_line: str, cwd: str, base_dir: str, shell: str = "bash") -> Dict[str, Any]:
     result: Dict[str, Any] = {
         "deny": None, "force_ask": None, "trading": [], "trading_tokens": [], "batch": [], "risk_reducing": False,
-        "risk_blocker": None, "all_safe": True, "record_eval": None,
+        "risk_blocker": None, "all_safe": True, "record_eval": None, "ask_reason": None,
     }
     if not command_line.strip():
         return result
@@ -5081,7 +5170,8 @@ def _analyze_run_command(command_line: str, cwd: str, base_dir: str, shell: str 
     subcommands = split_subcommands(command_line)
 
     # 1. Evaluation trail is immutable for the agent (record_evaluation.py --from-subagent writes it itself)
-    if EVALUATION_TRAIL_CMD_RE.search(command_line):
+    eval_check_cmd = _strip_git_message_data(command_line)
+    if EVALUATION_TRAIL_CMD_RE.search(eval_check_cmd):
         result["deny"] = (
             "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Evaluation Trail Protection): Commands must not read or write "
             "logs/evaluations/, latest_dossier.json, Antigravity brain transcripts or Claude Code subagent "
@@ -5198,28 +5288,42 @@ def _analyze_run_command(command_line: str, cwd: str, base_dir: str, shell: str 
             if _redirect_targets(tokens):
                 result["all_safe"] = False
             continue
-        if TRADE_ENGINE_RE.search(text):
-            flags = _flags(tokens)
-            if flags & EXECUTOR_MOVE_BREAKEVEN_FLAGS and _symbol_count(text) != 1:
-                result["deny"] = (
-                    "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Structured Risk Parsing): `execute_futures_trade.py "
-                    "--move-breakeven` requires exactly one --symbol (e.g. --move-breakeven --symbol BTCUSDT)."
-                )
-                return result
-            non_opening = EXECUTOR_READ_ONLY_FLAGS | EXECUTOR_RISK_FLAGS | set(HELP_FLAGS)
-            opening_text = text
-            if flags & EXECUTOR_MOVE_BREAKEVEN_FLAGS:
-                # --is-yolo (also abbreviated) next to --move-breakeven never opens: a break-even call that is not
-                # the exact sanctioned one-liner (another path, an unknown flag) asks, it is never sent to the gates
-                opening_text = " ".join(t for t in tokens if not _is_breakeven_yolo_spelling(t))
-            if not _executor_opening_named(opening_text) and any(
-                    f in non_opening or (len(f) > 3 and any(o.startswith(f) for o in non_opening)) for f in flags):
-                # Read-only listing, or an exit / help that is not the exact sanctioned one-liner (another path, an
-                # unknown flag, a nested shell): normal permission policy (ask), never auto-allowed
-                result["all_safe"] = False
-            else:
-                result["trading"].append(text)
-                result["trading_tokens"].append(tokens)
+        if _is_trade_engine_invocation(tokens, text):
+            unwrapped_list = _unwrap_subcommand(tokens)
+            engine_subs = [s for s in unwrapped_list if _is_trade_engine_invocation(s, " ".join(s))]
+            if not engine_subs:
+                engine_subs = [tokens]
+            _, _, outer_in_wsl = _executed_script_at(tokens)
+
+            for eng_tokens in engine_subs:
+                eng_text = " ".join(eng_tokens)
+                toks, i, in_wsl = _executed_script_at(eng_tokens)
+                in_wsl = in_wsl or outer_in_wsl
+                script_path = toks[i] if (toks and 0 <= i < len(toks)) else ""
+                sanctioned = _sanctioned_script(script_path, cwd, base_dir or find_workspace_root(), in_wsl, _windows_side_cwd(cwd))
+                if not sanctioned and script_path:
+                    result["ask_reason"] = f"Script path '{script_path}' is not the sanctioned repository script; user confirmation required."
+                flags = _flags(eng_tokens)
+                if flags & EXECUTOR_MOVE_BREAKEVEN_FLAGS and _symbol_count(eng_text) != 1:
+                    result["deny"] = (
+                        "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Structured Risk Parsing): `execute_futures_trade.py "
+                        "--move-breakeven` requires exactly one --symbol (e.g. --move-breakeven --symbol BTCUSDT)."
+                    )
+                    return result
+                non_opening = EXECUTOR_READ_ONLY_FLAGS | EXECUTOR_RISK_FLAGS | set(HELP_FLAGS)
+                opening_text = eng_text
+                if flags & EXECUTOR_MOVE_BREAKEVEN_FLAGS:
+                    # --is-yolo (also abbreviated) next to --move-breakeven never opens: a break-even call that is not
+                    # the exact sanctioned one-liner (another path, an unknown flag) asks, it is never sent to the gates
+                    opening_text = " ".join(t for t in eng_tokens if not _is_breakeven_yolo_spelling(t))
+                if not _executor_opening_named(opening_text) and any(
+                        f in non_opening or (len(f) > 3 and any(o.startswith(f) for o in non_opening)) for f in flags):
+                    # Read-only listing, or an exit / help that is not the exact sanctioned one-liner (another path, an
+                    # unknown flag, a nested shell): normal permission policy (ask), never auto-allowed
+                    result["all_safe"] = False
+                else:
+                    result["trading"].append(eng_text)
+                    result["trading_tokens"].append(eng_tokens)
             continue
 
         if prog not in BENIGN_PROGRAMS or _redirect_targets(tokens):
@@ -5594,17 +5698,69 @@ def evaluate_trade_opening(cmd: str, args: dict, mcp_args: dict, base_dir: str,
             )
 
     std_lev, _ceiling, _yolo_cap = leverage_limits(user_prof)
-    is_yolo_trade = (bool(IS_YOLO_FLAG_RE.search(cmd))
+
+    if tokens is not None:
+        unwrapped = [s for s in _unwrap_subcommand(tokens) if TRADE_ENGINE_RE.search(" ".join(s))]
+        exec_tokens = unwrapped[0] if unwrapped else list(tokens)
+    else:
+        subs = [s for seg in split_subcommands(cmd) for s in _unwrap_subcommand(seg)]
+        matching_subs = [s for s in subs if TRADE_ENGINE_RE.search(" ".join(s))]
+        exec_tokens = matching_subs[0] if matching_subs else _tokenize(cmd)
+
+    idx = _program_index(exec_tokens)
+    while idx < len(exec_tokens) and not TRADE_ENGINE_RE.search(exec_tokens[idx]):
+        idx += 1
+    scoped_tokens: List[str] = []
+    start_i = (idx + 1) if idx < len(exec_tokens) else 0
+    for tok in exec_tokens[start_i:]:
+        if tok.startswith("#") or _is_redirect(tok):
+            break
+        scoped_tokens.append(tok)
+
+    is_yolo_cli = any(bool(IS_YOLO_FLAG_RE.search(tok)) for tok in scoped_tokens)
+    is_yolo_trade = (is_yolo_cli
                      or _arg_truthy(args.get("is_yolo")) or _arg_truthy(mcp_args.get("is_yolo")))
+
+    lev_flag_present = False
+    lev_val_str: Optional[str] = None
+    i = 0
+    while i < len(scoped_tokens):
+        tok = scoped_tokens[i]
+        if tok == "--leverage":
+            lev_flag_present = True
+            if i + 1 < len(scoped_tokens):
+                if (scoped_tokens[i + 1] == "("
+                        and i + 3 < len(scoped_tokens)
+                        and scoped_tokens[i + 3] == ")"
+                        and re.match(r"^\d+$", scoped_tokens[i + 2])):
+                    lev_val_str = scoped_tokens[i + 2]
+                    i += 3
+                else:
+                    lev_val_str = scoped_tokens[i + 1]
+                    i += 1
+            else:
+                m_paren = re.search(r"--leverage(?:\s+|=)\(\s*(\d+)\s*\)", env_hint_cmd or cmd)
+                lev_val_str = m_paren.group(1) if m_paren else ""
+        elif tok.startswith("--leverage="):
+            lev_flag_present = True
+            lev_val_str = tok.split("=", 1)[1]
+        i += 1
+
     trade_lev = 3
-    m_lev = re.search(r"--leverage(?:\s+|=)(\d+)", cmd)
-    if m_lev:
-        trade_lev = int(m_lev.group(1))
-    elif "leverage" in mcp_args:
-        try:
-            trade_lev = int(float(_decode_value(mcp_args["leverage"])))
-        except (TypeError, ValueError):
-            return "deny", f"🚨 FAIL-CLOSED: Invalid leverage value ({mcp_args.get('leverage')})."
+    if lev_flag_present:
+        if lev_val_str == PS_NESTED_PLACEHOLDER:
+            trade_lev = std_lev
+        elif not re.match(r"^\d+$", lev_val_str or ""):
+            return "deny", "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Leverage Gate): leverage must be a literal number."
+        else:
+            trade_lev = int(lev_val_str)
+    elif "leverage" in mcp_args or "leverage" in args:
+        mcp_lev = mcp_args.get("leverage") if "leverage" in mcp_args else args.get("leverage")
+        mcp_lev_str = str(_decode_value(mcp_lev)).strip()
+        if not re.match(r"^\d+$", mcp_lev_str):
+            return "deny", "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Leverage Gate): leverage must be a literal number."
+        trade_lev = int(mcp_lev_str)
+
     if trade_lev > std_lev:
         is_yolo_trade = True
     if is_yolo_trade and not user_prof.get("yolo_slot_enabled", False):
@@ -5630,21 +5786,21 @@ def evaluate_trade_opening(cmd: str, args: dict, mcp_args: dict, base_dir: str,
                 "Executing orders directly in primary chat without a fresh, provenance-verified 'APPROVED' "
                 "dossier (< 20 min) is STRICTLY PROHIBITED.\n👉 " + EVALUATOR_HINT
             )
-        if _candidate_is_yolo(cand) and not user_prof.get("yolo_slot_enabled", False):
+        if _candidate_is_yolo(cand, truthy=_arg_truthy) and not user_prof.get("yolo_slot_enabled", False):
             return "deny", "🚨 BLOCKED BY PRE-TOOL-USE HOOK (YOLO Slot Disabled): Candidate requires YOLO moonshot slot, which is disabled in user profile."
         # Mirror of execute_futures_trade.enforce_evaluation_dossier (PROD), same order (issue #63)
         if is_prod and isinstance(cand, dict) and _arg_truthy(cand.get("requires_user_confirmation")) and not is_confirmed:
             return "deny", (
                 f"🚨 BLOCKED BY PRE-TOOL-USE HOOK (User Confirmation Required): The evaluator approved {target_sym} "
                 "pending explicit user confirmation (requires_user_confirmation=true).\n"
-                "👉 Ask the user to confirm in chat and re-run with the '--confirmed' flag."
+                + CONFIRM_RE_RUN_HINT
             )
         if is_prod and (is_yolo_trade or _candidate_is_yolo(cand, truthy=_arg_truthy)) and not is_confirmed:
             return "deny", (
                 f"🚨 BLOCKED BY PRE-TOOL-USE HOOK (YOLO Confirmation): {target_sym} is a YOLO entry. YOLO entries "
                 "are never fast-tracked (not even with autonomous_execution_tier_s) and always require explicit "
                 "user confirmation in PROD.\n"
-                "👉 Ask the user to confirm in chat and re-run with the '--confirmed' flag."
+                + CONFIRM_RE_RUN_HINT
             )
 
     # GATE 2: DELTA-NEUTRAL & SESSION STATE AUDIT (cache-based pre-check, docstring 5: no network in the hook; the
@@ -5818,7 +5974,7 @@ def _evaluate_shell_command(command_line: str, cwd: str, base_dir: str, conversa
             return "ask", (f"Risk-reducing action / exit, not auto-allowed because {analysis['risk_blocker']}: run "
                            "the sanctioned command as one flat call; user confirmation required.")
         return "allow", "Risk-reducing action / exit authorized."
-    return "ask", ""
+    return "ask", analysis.get("ask_reason") or ""
 
 
 def evaluate_powershell_command(command: str, cwd: str, base_dir: str, conversation_id: Optional[str],

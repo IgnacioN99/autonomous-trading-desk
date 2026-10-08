@@ -2630,5 +2630,126 @@ class TestGitConfigFileChannels(GuardHarness):
             self.assertFalse(match(p), p)
 
 
+class TestUnifiedBatchIssues(TestRiskAutoAllowResiduals):
+    """Unified regression tests for batch issues #21, #59, #71, #104, #124, #154."""
+
+    def test_issue_21_wsl_bash_wrapper_unwrapping(self):
+        # 1. Read-only executor invocation wrapped in wsl and bash -lc is unwrapped and not denied as an opening
+        ro_cmd = "wsl.exe -d Ubuntu -- bash -lc 'cd repo && python3 scripts/execute_futures_trade.py --positions --json'"
+        res_ro = self.agy(self.cmd(ro_cmd))
+        self.assertNotEqual(res_ro.get("decision"), "deny", res_ro)
+        self.assertEqual(res_ro.get("decision"), "ask")
+
+        # 2. Trade opening inside bash -lc '...' is unwrapped, classified as a trade opening, and denied without dossier
+        open_cmd = f"bash -lc 'python3 {self.E} --symbol BTCUSDT --direction LONG --leverage 3'"
+        res_open = self.agy(self.cmd(open_cmd))
+        self.assertEqual(res_open.get("decision"), "deny", res_open)
+        self.assertIn("Clean-Room Evaluator Required", res_open.get("reason", ""))
+
+        # 3. git commit -m with harness file names is not denied
+        for msg in ('git commit -m "update record_evaluation.py"',
+                    'git commit -m "fix latest_dossier.json"',
+                    'git commit --message="refactor scripts/hooks/pre_trade_guard.py"'):
+            res_git = self.agy(self.cmd(msg))
+            self.assertNotEqual(res_git.get("decision"), "deny", f"{msg}: {res_git}")
+
+    def test_issue_59_report_issue_classification(self):
+        # 1. report_issue.sh with an executor command in --repro argument is allowed / ask, not denied as a trade
+        repro_cmd = ('./scripts/report_issue.sh --title "test bug" --category bug '
+                     '--repro "python3 scripts/execute_futures_trade.py --direction LONG"')
+        res = self.agy(self.cmd(repro_cmd))
+        self.assertNotEqual(res.get("decision"), "deny", res)
+
+        # 2. Compound command running report_issue.sh then executor is denied without dossier
+        compound_cmd = ('./scripts/report_issue.sh --title "test"; '
+                        f'python3 {self.E} --symbol BTCUSDT --direction LONG')
+        res_compound = self.agy(self.cmd(compound_cmd))
+        self.assertEqual(res_compound.get("decision"), "deny", res_compound)
+
+        # 3. Command substitution inside report_issue argument is denied as active trade execution
+        subst_cmd = ('./scripts/report_issue.sh --repro '
+                     f'"$(python3 {self.E} --symbol BTCUSDT --direction LONG)"')
+        res_subst = self.agy(self.cmd(subst_cmd))
+        self.assertEqual(res_subst.get("decision"), "deny", res_subst)
+
+    def test_issue_71_strict_numeric_leverage(self):
+        # 1. Non-numeric leverage via shell substitution is denied with explicit leverage gate error
+        c1 = f"python3 {self.E} --symbol BTCUSDT --direction LONG --leverage $(echo 50)"
+        res1 = self.agy(self.cmd(c1))
+        self.assertEqual(res1.get("decision"), "deny")
+        self.assertIn("leverage must be a literal number", res1.get("reason", ""))
+
+        # 2. Non-numeric leverage via shell variable is denied
+        c2 = f'python3 {self.E} --symbol BTCUSDT --direction LONG --leverage "$X"'
+        res2 = self.agy(self.cmd(c2))
+        self.assertEqual(res2.get("decision"), "deny")
+        self.assertIn("leverage must be a literal number", res2.get("reason", ""))
+
+        # 3. Direct trade evaluation with invalid / float leverage in mcp_args
+        for bad_lev in ("50.5", "$X", "invalid"):
+            decision, reason = pre_trade_guard.evaluate_trade_opening(
+                "", {}, {"symbol": "BTCUSDT", "direction": "LONG", "leverage": bad_lev},
+                self.root, None
+            )
+            self.assertEqual(decision, "deny")
+            self.assertIn("leverage must be a literal number", reason)
+
+    def test_issue_104_confirmation_and_redirect_parsing(self):
+        # 1. Output redirect > --confirmed is not parsed as --confirmed
+        c_redir = f"python3 {self.E} --symbol BTCUSDT --direction LONG > --confirmed"
+        self.assertFalse(pre_trade_guard.executor_confirmed(c_redir))
+
+        # 2. Another subcommand's --confirmed is not attributed to the executor
+        c_echo = f"echo --confirmed && python3 {self.E} --symbol BTCUSDT --direction LONG"
+        self.assertFalse(pre_trade_guard.executor_confirmed(c_echo))
+
+        # 3. Flag after redirect or comment is not parsed as executor flag
+        c_comment = f"python3 {self.E} --symbol BTCUSDT --direction LONG # --confirmed"
+        self.assertFalse(pre_trade_guard.executor_confirmed(c_comment))
+
+    def test_issue_124_wsl_opt_val_and_offpath_reasons(self):
+        # 1. --shell-type=login reports descriptive login shell reason
+        c_login = f"wsl.exe -d Ubuntu --shell-type=login -- {self.DOCTOR}"
+        self.assertAsk(c_login)
+        res_login = self.agy(self.cmd(c_login))
+        self.assertIn("login shell", res_login.get("reason", ""))
+
+        # 2. --shell-type=standard is allowed
+        c_std = f"wsl.exe -d Ubuntu --shell-type=standard -- {self.DOCTOR}"
+        self.assertEqual(self.decisions(c_std), ("allow", "allow", "allow"))
+
+        # 3. Off-path script reports descriptive unsanctioned repository script reason
+        c_off = "python3 /tmp/elsewhere/scripts/execute_futures_trade.py --move-breakeven --symbol PEPEUSDT --is-yolo"
+        res_off = self.agy(self.cmd(c_off))
+        self.assertEqual(res_off.get("decision"), "ask")
+        self.assertIn("Script path '/tmp/elsewhere/scripts/execute_futures_trade.py' is not the sanctioned repository script; user confirmation required.",
+                      res_off.get("reason", ""))
+
+        # 4. --fo abbreviation next to --move-breakeven asks, never auto-allowed
+        c_fo = f"python3 {self.E} --move-breakeven --symbol BTCUSDT --fo"
+        self.assertAsk(c_fo)
+
+    def test_issue_154_linked_worktree_executor_path(self):
+        # Create a hermetic linked worktree
+        git_dir = os.path.join(self.root, ".git")
+        os.makedirs(os.path.join(git_dir, "worktrees", "wt1"), exist_ok=True)
+        wt_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(wt_tmp.cleanup)
+        wt_root = os.path.realpath(wt_tmp.name)
+        os.makedirs(os.path.join(wt_root, "scripts"), exist_ok=True)
+        with open(os.path.join(git_dir, "worktrees", "wt1", "gitdir"), "w") as f:
+            f.write(os.path.join(wt_root, ".git") + "\n")
+        with open(os.path.join(git_dir, "worktrees", "wt1", "commondir"), "w") as f:
+            f.write("../..\n")
+        with open(os.path.join(wt_root, ".git"), "w") as f:
+            f.write(f"gitdir: {os.path.join(git_dir, 'worktrees', 'wt1')}\n")
+
+        # Script inside linked worktree has parity with canonical route
+        wt_script = os.path.join(wt_root, "scripts", "execute_futures_trade.py")
+        c_wt = f"python3 {wt_script} --close-position --symbol BTCUSDT"
+        res_wt = self.agy(self.cmd(c_wt))
+        self.assertEqual(res_wt.get("decision"), "allow")
+
+
 if __name__ == "__main__":
     unittest.main()
