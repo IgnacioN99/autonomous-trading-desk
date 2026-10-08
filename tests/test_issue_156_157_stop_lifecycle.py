@@ -539,7 +539,7 @@ class TestMinus4130ExtraListing(ReporterMocked):
 # ---------------------------------------------------------------------------------------------
 # #157.5 MARKET verification by algo id
 # ---------------------------------------------------------------------------------------------
-def market_execute(fx):
+def market_execute(fx, mcp=False):
     """execute_complete_trade (TESTNET MARKET entry) with the real verify_algo_stop_loss on a fake exchange."""
     ws = tempfile.mkdtemp()
 
@@ -556,7 +556,7 @@ def market_execute(fx):
         return fx(method, endpoint, params, target_env)
 
     with patch("execute_futures_trade.send_signed_request", side_effect=send), \
-         patch("execute_futures_trade.uses_mcp_gateway", return_value=False), \
+         patch("execute_futures_trade.uses_mcp_gateway", return_value=mcp), \
          patch("execute_futures_trade._workspace_dir", return_value=ws), \
          patch("execute_futures_trade.get_symbol_filters", return_value=dict(EX_FILTERS)), \
          patch("execute_futures_trade.check_mechanical_gates", return_value=(True, None)), \
@@ -611,6 +611,154 @@ class TestMarketVerifyByAlgoId(ReporterMocked):
             self.assertTrue(ok)
             self.assertEqual(info["algoId"], 9, "by id only, whatever the price")
             self.assertEqual(eft.verify_algo_stop_loss("BTCUSDT", "SELL", 95.0, target_env="testnet")[1]["algoId"], 555)
+
+
+# ---------------------------------------------------------------------------------------------
+# Round 2 (PR #176 reviews): R2.1 lost MARKET SL response, R2.2 MCP algo id mapping, R2.3 -4130 fallback limits
+# ---------------------------------------------------------------------------------------------
+def lost_sl_response(fx, trigger=None, fail_reads_before_post=False):
+    """The first closePosition SL POST creates the stop on the exchange (new id 9100, at `trigger` or the requested
+    price) but its response is lost (-1007, no id); a re-placement then gets -4130. fail_reads_before_post: every
+    openAlgoOrders read before that POST fails (the pre-placement snapshot is unknown)."""
+    state = {"posted": False}
+
+    def send(method, endpoint, params=None, target_env=None, retry_count=0):
+        params = dict(params or {})
+        if method == "GET" and endpoint == ALGO_READ and fail_reads_before_post and not state["posted"]:
+            fx.calls.append((method, endpoint, params))
+            return dict(READ_ERROR)
+        if method == "POST" and endpoint == ALGO_ENDPOINT and params.get("closePosition") == "true":
+            fx.calls.append((method, endpoint, params))
+            if state["posted"]:
+                return dict(MINUS_4130)
+            state["posted"] = True
+            fx.algos.append(stop(9100, trigger if trigger is not None else params["triggerPrice"],
+                                 symbol=params["symbol"]))
+            return {"code": -1007, "msg": "Timeout waiting for response from backend server."}
+        return fx(method, endpoint, params, target_env)
+    return send
+
+
+class TestMarketLostResponse(ReporterMocked):
+
+    def test_own_stop_created_with_lost_response_verifies(self):
+        fx = FakeExchange([], algos=[stop(555, 90.0, symbol="SOLUSDT")])   # an unrelated stop elsewhere
+        res, mock_abort = market_execute(lost_sl_response(fx))
+        self.assertTrue(res["success"], res.get("error"))
+        mock_abort.assert_not_called()
+        self.report.assert_not_called()
+        self.assertEqual(res["sl_algo_order"]["algoId"], 9100)
+
+    def test_snapshot_unknown_and_id_less_response_auto_destructs(self):
+        fx = FakeExchange([])
+        res, mock_abort = market_execute(lost_sl_response(fx, fail_reads_before_post=True))
+        self.assertTrue(res["emergency_abort"])
+        mock_abort.assert_called_once()
+
+    def test_new_stop_at_another_trigger_not_accepted(self):
+        fx = FakeExchange([])
+        res, mock_abort = market_execute(lost_sl_response(fx, trigger=96.5))
+        self.assertTrue(res["emergency_abort"])
+        mock_abort.assert_called_once()
+
+    def test_leftover_in_snapshot_with_minus_4130_still_aborts_and_reports(self):
+        fx = FakeExchange([], algos=[stop(555, 97.0, symbol="SOLUSDT")], reject_new_stops=True,
+                          reject_response=MINUS_4130)
+        res, mock_abort = market_execute(fx)
+        self.assertTrue(res["emergency_abort"])
+        self.assertIn("leftover", res["error"])
+        self.report.assert_called_once()
+
+
+class FakeMcpGateway:
+    """call_binance_mcp stand-in: raw gateway rows (orderId, no algoId) for algo orders and newAlgoOrder results."""
+
+    def __init__(self, algo_result, rows=()):
+        self.algo_result = algo_result
+        self.rows = [dict(r) for r in rows]
+
+    def __call__(self, tool_name, args=None, session_id=None):
+        args = dict(args or {})
+        if tool_name == "futures_usds.positionInformationV2":
+            return [long_position("SOLUSDT", amt="0.3", entry="100.0")]
+        if tool_name == "futures_usds.currentAllAlgoOpenOrders":
+            return [dict(r) for r in self.rows if r["symbol"] == args.get("symbol", r["symbol"])]
+        if tool_name == "tool_execute" and args.get("toolName") == "futures_usds.newAlgoOrder":
+            a = args["arguments"]
+            res = json.loads(json.dumps(self.algo_result))
+            new_id = res.get("orderId") or (res.get("data") or {}).get("orderId") or (res.get("result") or {}).get("algoId")
+            self.rows.append({"orderId": new_id, "symbol": a["symbol"], "side": a["side"], "type": a["type"],
+                              "triggerPrice": a["triggerPrice"], "reduceOnly": a.get("reduceOnly") == "true",
+                              "closePosition": a.get("closePosition") == "true"})
+            return res
+        if tool_name == "futures_usds.newOrder":
+            return {"orderId": 1, "status": "FILLED", "avgPrice": "100.0"}
+        return {}
+
+
+class TestMcpAlgoIdMapping(ReporterMocked):
+
+    def place(self, result):
+        with patch("execute_futures_trade.call_binance_mcp", side_effect=FakeMcpGateway(result)):
+            return eft.send_mcp_gateway_request("POST", ALGO_ENDPOINT, {"symbol": "SOLUSDT", "side": "SELL",
+                                                                        "type": "STOP_MARKET", "triggerPrice": 97.0,
+                                                                        "closePosition": "true"})
+
+    def test_top_level_and_nested_ids_mapped_to_algo_id(self):
+        self.assertEqual(self.place({"orderId": 501, "status": "NEW"})["algoId"], 501)
+        self.assertEqual(self.place({"data": {"orderId": 502}})["algoId"], 502)
+        self.assertEqual(self.place({"result": {"algoId": 503}})["algoId"], 503)
+        self.assertEqual(self.place({"algoId": 7, "data": {"orderId": 8}})["algoId"], 7, "top level wins")
+        self.assertNotIn("algoId", self.place({"code": -2021, "msg": "Order would immediately trigger."}))
+
+    def test_market_path_on_mcp_verifies_by_the_mapped_algo_id(self):
+        for result in ({"orderId": 501, "status": "NEW"}, {"data": {"orderId": 501}}):
+            leftover = {"orderId": 400, "symbol": "SOLUSDT", "side": "SELL", "type": "STOP_MARKET",
+                        "triggerPrice": "97.0", "reduceOnly": True}   # same price, another id
+            gateway = FakeMcpGateway(result, rows=[leftover])
+            route = lambda m, e, p=None, t=None: eft.send_mcp_gateway_request(m, e, p)
+            with patch("execute_futures_trade.call_binance_mcp", side_effect=gateway):
+                res, mock_abort = market_execute(route, mcp=True)
+            self.assertTrue(res["success"], res.get("error"))
+            mock_abort.assert_not_called()
+            self.assertEqual(res["sl_algo_order"]["algoId"], 501)
+
+
+class TestMinus4130FallbackLimits(ReporterMocked):
+    """_ensure_entry_stop after -4130 when every confirmation read fails: only a closePosition stop at sl_price
+    (within one tick) or tighter is kept."""
+
+    def ensure(self, listed):
+        fake = FakeExchange([], reject_new_stops=True, reject_response=MINUS_4130)
+        state = {"fail": 0}
+
+        def send(method, endpoint, params=None, target_env=None, retry_count=0):
+            if method == "GET" and endpoint == ALGO_READ and state["fail"] > 0:
+                state["fail"] -= 1
+                return dict(READ_ERROR)
+            res = fake(method, endpoint, params, target_env)
+            if method == "POST" and endpoint == ALGO_ENDPOINT:
+                fake.algos.append(dict(listed))
+                state["fail"] = 1 + len(eft.STOP_VERIFY_RETRY_DELAYS)
+            return res
+        with offline(send):
+            return eft._ensure_entry_stop("BTCUSDT", "SELL", 95.0, tick_size=0.1, target_env="testnet")
+
+    def test_matching_close_position_stop_kept(self):
+        out = self.ensure(stop(9, 95.0))
+        self.assertEqual((out["verified"], out["source"]), (True, "kept"))
+        self.assertTrue(self.ensure(stop(9, 95.1))["verified"], "within one tick")
+        self.assertTrue(self.ensure(stop(9, 96.0))["verified"], "tighter")
+
+    def test_looser_stop_unverified(self):
+        out = self.ensure(stop(9, 94.0))
+        self.assertEqual((out["verified"], out["source"]), (False, None))
+        self.assertFalse(self.ensure(stop(9, 94.85))["verified"], "looser by more than one tick")
+
+    def test_reduce_only_stop_unverified(self):
+        reduce_only = dict(stop(9, 95.0, close_position=False), reduceOnly=True, quantity="4")
+        out = self.ensure(reduce_only)
+        self.assertEqual((out["verified"], out["source"]), (False, None))
 
 
 if __name__ == "__main__":

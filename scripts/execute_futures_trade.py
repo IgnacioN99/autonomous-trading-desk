@@ -103,8 +103,9 @@ JSON schemas (stable; extra keys may be added, existing keys are never renamed):
       "placed" | "rejected:<code-or-text>" | "skipped:mcp" | "skipped:crossed", "prearm_algo_id"); the guardian
       verifies it at fill and is the fallback; it is cancelled (by algo id) when the entry ends without a position.
       Issue #157: a rejected (except -2021) or unverified pre-arm adds "prearm_anomaly": {"status", "message"} and
-      files a MEDIUM issue (the entry is kept). A MARKET entry's SL is verified by its own algo id only; a -4130 on
-      that placement (a leftover closePosition stop) auto-destructs and files a HIGH issue.
+      files a MEDIUM issue (the entry is kept). A MARKET entry's SL is verified by its own algo id only (an id-less
+      placement response: by a stop at the SL within one tick that was not listed before the placement); a -4130 on
+      that placement with no such stop (a leftover closePosition stop) auto-destructs and files a HIGH issue.
       In PROD every new entry is rejected while an opening order rests on the exchange without a registry record
       (find_unregistered_resting_entries; the position guardian reports them as unknown_resting_entry).
       PROD gates are anchored to the exchange (issue #101): logs/session_state.json and logs/pending_entries.json
@@ -528,8 +529,16 @@ def send_mcp_gateway_request(method, endpoint, params=None):
             'toolName': 'futures_usds.newAlgoOrder',
             'arguments': mcp_args
         })
-        if isinstance(res, dict) and 'orderId' in res and 'algoId' not in res:
-            res['algoId'] = res['orderId']
+        if isinstance(res, dict) and 'algoId' not in res:
+            # The verification of the stop is by algo id (issue #157): map the gateway's id to a top-level algoId,
+            # from orderId or from an id nested one level (e.g. {"data": {"orderId": N}}, {"result": {"algoId": N}}).
+            if 'orderId' in res:
+                res['algoId'] = res['orderId']
+            else:
+                for inner in (res.get('data'), res.get('result')):
+                    if isinstance(inner, dict) and (inner.get('algoId') is not None or inner.get('orderId') is not None):
+                        res['algoId'] = inner['algoId'] if inner.get('algoId') is not None else inner['orderId']
+                        break
         return res
 
     # 12. Notional & leverage brackets (read-only; used by the liquidation gate).
@@ -2006,7 +2015,9 @@ def prearm_resting_entry_stop(symbol, exit_side, sl_price, ref_price, target_env
     Never blocks the entry. Returns the v2 registry fields: {"prearm_status": "placed" | "rejected:<code-or-text>" |
     "skipped:mcp" | "skipped:crossed"}, plus prearm_algo_id / prearm_price (the listed trigger once verified, else
     the requested sl_price) when an algo id was returned (cancelled
-    with the entry) and sl_close_position: True / sl_qty: None once verified on /fapi/v1/openAlgoOrders. Never
+    with the entry) and sl_close_position: True / sl_qty: None once verified on /fapi/v1/openAlgoOrders
+    (wait_for_stop_confirmation: by algo id, falling back to a trigger match within one tick; only the MARKET-entry
+    stop is verified by id alone, issue #157). Never
     raises: an unexpected error is "rejected:<error>" (the entry must still be registered).
     """
     try:
@@ -2110,12 +2121,13 @@ def _ensure_entry_stop(symbol, exit_side, sl_price, prearm_algo_id=None, quantit
       1. a pre-armed stop (prearm_algo_id) verified on /fapi/v1/openAlgoOrders (by algo id, then by price within one
          tick; one read) is kept: no placement;
       2. otherwise (no pre-arm, or it was consumed, e.g. triggered before the fill) the planned stop is placed as
-         before (quantity=None: closePosition) and verified with progressive retries;
-      3. a -4130 on that placement means a closePosition stop already exists: re-verified by listing, "kept"; when
-         that fails, one more error-aware listing (get_open_stop_orders_with_retry) keeps a listed protective stop
-         (issue #157; closePosition preferred, its own trigger in "info", which may differ from sl_price: callers
-         reach here with no stop listed just before, so it is taken as the pre-arm / own stop); an empty or failed
-         listing is unverified.
+         before (quantity=None: closePosition) and verified with progressive retries (wait_for_stop_confirmation: by
+         the placement's algo id, falling back to a trigger match within one tick; unlike the id-only MARKET path);
+      3. a -4130 on that placement means a closePosition stop already exists: re-verified by listing (pre-arm id,
+         else the same one-tick price match), "kept"; when that fails, one more error-aware listing
+         (get_open_stop_orders_with_retry, issue #157) keeps a listed closePosition stop whose trigger is at sl_price
+         within one tick or tighter (on MCP the listing folds reduceOnly into closePosition, so the flag cannot be
+         told apart there); a looser or reduceOnly-only stop, an empty or a failed listing is unverified.
     Returns {"verified", "source": "prearm" | "placed" | "kept" | None, "placement", "info"}.
     """
     if prearm_algo_id is not None:
@@ -2132,12 +2144,18 @@ def _ensure_entry_stop(symbol, exit_side, sl_price, prearm_algo_id=None, quantit
                                                     tick_size=tick_size, target_env=target_env)
         if not verified:
             # Issue #157: wait_for_stop_confirmation cannot tell "every read failed" from "no stop": one error-aware
-            # listing more. A protective stop listed for symbol/side is the closePosition stop -4130 refers to
-            # (kept); an empty listing or another failed read stays unverified (the caller auto-destructs).
+            # listing more. Kept only: a closePosition stop (the one -4130 refers to; a reduceOnly-only stop may not
+            # cover the position) whose trigger is not looser than sl_price beyond one tick. Anything else, an empty
+            # listing or another failed read stays unverified (the caller auto-destructs).
             stops, err = get_open_stop_orders_with_retry(symbol, exit_side, target_env=target_env)
-            if err is None and stops:
-                close_stops = [s for s in stops if _truthy(s.get('closePosition'))]
-                verified, info = True, tightest_stop(close_stops or stops, str(exit_side).upper() == 'SELL')
+            if err is None:
+                is_long = str(exit_side).upper() == 'SELL'
+                sl = float(sl_price)
+                tol = _to_float(tick_size) * 1.01 if _to_float(tick_size) > 0 else abs(sl) * 0.0005
+                kept =[s for s in stops if _truthy(s.get('closePosition'))
+                        and (abs(_trigger_price(s) - sl) <= tol or is_tighter_stop(_trigger_price(s), sl, is_long))]
+                if kept:
+                    verified, info = True, tightest_stop(kept, is_long)
         return {"verified": verified, "source": "kept" if verified else None, "placement": placement, "info": info}
     placed_id = _order_id(placement) if isinstance(placement, dict) else None
     verified, info = wait_for_stop_confirmation(symbol, exit_side, sl_price, algo_id=placed_id, tick_size=tick_size,
@@ -4022,16 +4040,32 @@ def execute_complete_trade(
     # Enclose in try/except to guarantee emergency auto-destruct on ANY failure.
     try:
         # 9. Execute Hard Stop Loss (Algo Order, closePosition=true, reduceOnly=true)
+        # Ids of the protective stops that exist BEFORE this placement (one read, no retry delay before the stop is
+        # placed); None = unknown (read failed).
+        pre_stops, pre_err = get_open_stop_orders(symbol, exit_side, target_env=target_env)
+        pre_ids = None if pre_err else {str(_order_id(s)) for s in pre_stops}
         sl_order = place_algo_stop_loss(symbol, exit_side, sl_p, target_env=target_env)
 
         def verify_placed_stop():
             # Issue #157: verified by the algo id of THIS placement only (never by price), so a leftover stop on the
-            # symbol (e.g. an old pre-arm at the same price) cannot confirm it. A placement without an id (e.g. -4130:
-            # a closePosition stop already exists) is unverified and auto-destructs (accepted, fail closed).
+            # symbol (e.g. an old pre-arm at the same price) cannot confirm it. A placement without an id (lost
+            # response, error, -4130) is verified only by a stop listed now that was NOT listed before the placement
+            # (pre_ids) at sl_p within one tick: this trade's own stop whose response was lost. A pre-existing stop
+            # never counts; an unknown pre-placement listing or no such stop is unverified and auto-destructs
+            # (accepted, fail closed).
             placed_id = _order_id(sl_order) if isinstance(sl_order, dict) and not _is_api_error(sl_order) else None
-            if placed_id is None:
+            if placed_id is not None:
+                return verify_algo_stop_loss(symbol, exit_side, sl_p, target_env=target_env, algo_id=placed_id)
+            if pre_ids is None:
                 return False, None
-            return verify_algo_stop_loss(symbol, exit_side, sl_p, target_env=target_env, algo_id=placed_id)
+            now_stops, now_err = get_open_stop_orders(symbol, exit_side, target_env=target_env)
+            if now_err:
+                return False, None
+            tol = _to_float(filters.get('tickSize')) * 1.01 or abs(float(sl_p)) * 0.0005
+            for s in now_stops:
+                if str(_order_id(s)) not in pre_ids and abs(_trigger_price(s) - float(sl_p)) <= tol:
+                    return True, s
+            return False, None
 
         sl_verified, sl_info = verify_placed_stop()
 
