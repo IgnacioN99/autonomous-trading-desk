@@ -4201,7 +4201,9 @@ def _names_only_own_ground_truth(tokens: List[str], mentioned: List[str], info: 
     script's own outputs, of which it is the sole sanctioned writer (scripts/trade_outcomes.py ->
     logs/trade_outcomes.jsonl; issue #191). Only RISK_ENV_ASSIGNMENTS may precede it. Any other program, interpreter
     path, script or named protected file (another script's output, a glob reaching other files) keeps the
-    ground-truth denial."""
+    ground-truth denial. This exemption does not apply the risk-prefix blockers: a wrapped own-output call (e.g.
+    `sudo python3 scripts/trade_outcomes.py --output logs/trade_outcomes.jsonl`) drops from deny to ASK (never allow),
+    because the writer is still the sole sanctioned one and the read-only auto-allow keeps every blocker (PR #212)."""
     if any(var not in RISK_ENV_ASSIGNMENTS for var, _value in info.get("assigns") or []):
         return False
     key = _read_only_script_key(tokens, cwd, base_dir)

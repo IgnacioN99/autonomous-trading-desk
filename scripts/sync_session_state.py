@@ -423,8 +423,16 @@ def sync_session_state(target_env: str = None) -> dict:
                 open_positions={(p["symbol"].upper(), p["direction"]) for p in active_positions})
         except Exception as e:
             day_error = f"{type(e).__name__}: {e}"[:200]
-            # PR #212 review: never report "0 closed trades" after real exits; fall back to the legacy per-fill
-            # counts (counted_by "fills") so the brief still sees activity, with the error alongside.
+        # PR #212 review: never report "0 closed trades" after real exits. When the per-trade summary failed, the audit
+        # could not be read, or closing fills exist but no audit trade matched them (e.g. manual exits of positions
+        # missing from the audit), fall back to the legacy per-fill counts (counted_by "fills").
+        open_symbols = {str(p["symbol"]).upper() for p in active_positions}
+        flat_closing_fills = any(float(t.get("realizedPnl", 0)) != 0 and str(t.get("symbol") or "").upper()
+                                 not in open_symbols for t in trades_res)  # a TP1 partial of an open trade is not
+        if day_error is None and (audit_read_error or (day["trades_closed"] == 0 and flat_closing_fills)):
+            day_error = ("audit unreadable: per-trade counts unavailable" if audit_read_error
+                         else "closing fills without a matching audit trade")
+        if day_error is not None:
             wins_f = sum(1 for t in trades_res if float(t.get("realizedPnl", 0)) > 0)
             losses_f = sum(1 for t in trades_res if float(t.get("realizedPnl", 0)) < 0)
             day = {"trades_closed": wins_f + losses_f, "wins": wins_f, "losses": losses_f, "scratches": 0,
@@ -525,7 +533,10 @@ def sync_session_state(target_env: str = None) -> dict:
         },
         "shadow_desk_summary": shadow_summary
     }
-    state["closed_today_summary"]["counted_by"] = "fills" if day_error else "trades"
+    state["closed_today_summary"]["counted_by"] = ("unavailable" if not isinstance(trades_res, list)
+                                                   else "fills" if day_error else "trades")
+    if not isinstance(trades_res, list):  # PR #212 review: an unreadable day-fill read is visible, never a silent 0
+        state["closed_today_summary"]["fills_error"] = str(trades_res)[:200]
     if day_error:
         state["closed_today_summary"]["trade_summary_error"] = day_error
 

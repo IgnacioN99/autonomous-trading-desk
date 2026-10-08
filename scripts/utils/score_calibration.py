@@ -171,25 +171,22 @@ def _same_trade(stored: dict, row: dict) -> bool:
 def merge_store(existing: Optional[dict], rows: Iterable[dict], now: Optional[float] = None,
                 min_trades: int = DEFAULT_MIN_TRADES) -> dict:
     """New store: the existing `trades` map updated with this run's closed PROD rows (same key = same trade, the
-    newer row wins), then the buckets recomputed from the whole map. PR #212: a row's earlier keys for the same audit
-    record (re-keyed entry_ts after better entry matching, or a pre-#210 legacy key) are removed first, and a row that
-    is now no_entry_fill removes its stored trade, so one audit record is counted at most once. Rows with fills
-    `truncated` are not stored. Fewer stored trades can only leave a bucket uncalibrated (fail-closed)."""
+    newer row wins), then the buckets recomputed from the whole map. PR #212: a closed row REPLACES any earlier key of
+    the same audit record (re-keyed entry_ts after better entry matching, or a pre-#210 legacy key), so one audit
+    record is counted at most once. Nothing is ever deleted otherwise: a `truncated` (degraded fills), open,
+    no_entry_fill or fills_unavailable row leaves the stored trades untouched, because dropping a stored loss could
+    lift a bucket over its calibration threshold (that would loosen the Tier S confirmation gate)."""
     trades = {}
     if isinstance(existing, dict) and isinstance(existing.get("trades"), dict):
         trades = {k: v for k, v in existing["trades"].items() if isinstance(v, dict)}
     for row in rows or []:
-        if not isinstance(row, dict) or _norm_env(row.get("env")) != "prod" or row.get("is_yolo") is True:
+        if (not isinstance(row, dict) or _norm_env(row.get("env")) != "prod" or row.get("is_yolo") is True
+                or row.get("status") != "closed" or row.get("truncated") is True):
             continue
         key = trade_key(row)
-        if row.get("status") in ("closed", "no_entry_fill"):
-            for old in [k for k, v in trades.items() if k != key and _same_trade(v, row)]:
-                del trades[old]
-        if row.get("status") == "no_entry_fill" or row.get("truncated") is True:
-            trades.pop(key, None)
-            continue
-        if row.get("status") == "closed":
-            trades[key] = dict({k: row.get(k) for k in _STORE_FIELDS}, env="prod")
+        for old in [k for k, v in trades.items() if k != key and _same_trade(v, row)]:
+            del trades[old]  # same audit record under its previous key: replaced, not added
+        trades[key] = dict({k: row.get(k) for k in _STORE_FIELDS}, env="prod")
     store = build_calibration(trades.values(), STORE_ENV, min_trades)
     store.update(schema_version=SCHEMA_VERSION, generated_at_ts=int(time.time() if now is None else now),
                  trades=trades)

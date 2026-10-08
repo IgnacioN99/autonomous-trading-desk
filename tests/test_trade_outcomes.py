@@ -87,7 +87,8 @@ class OutcomesBase(unittest.TestCase):
         self.filters = {}  # exchangeInfo filters by symbol served to trade_outcomes.load_filters
         for p in (patch("execute_futures_trade._workspace_dir", return_value=self.ws),
                   patch("urllib.request.urlopen", side_effect=AssertionError("network access in offline test")),
-                  patch("trade_outcomes.load_filters", side_effect=lambda env: self.filters)):
+                  patch("trade_outcomes.load_filters", side_effect=lambda env: self.filters),
+                  patch("trade_outcomes.time.sleep")):  # userTrades pacing / backoff (PR #212 review)
             p.start()
             self.addCleanup(p.stop)
 

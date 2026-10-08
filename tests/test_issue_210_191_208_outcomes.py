@@ -170,15 +170,16 @@ class TestEntryMatching(OutcomesBase):
         self.assertEqual(by["LONG"]["status"], "no_entry_fill")
         self.assertEqual([l["order_id"] for l in by["SHORT"]["legs"]], [300])
 
-    def test_entry_vwap_is_the_r_basis(self):
-        # Entry fills 100 x 5 and 102 x 5 (VWAP 101, audit entry 100), SL 95, exit 107: R = 6 / 6 = 1.0.
+    def test_entry_vwap_is_the_move_basis_over_the_sized_risk(self):
+        # Entry fills 100 x 5 and 102 x 5 (VWAP 101, audit entry 100), SL 95, exit 107: move 6 from the VWAP over the
+        # sized risk |100 - 95| = 5 -> 1.2R (PR #212 review: R denominator = the risk the order was sized on).
         self.audit(entry_order_id=1)
         fills = {"BTCUSDT": [fill(1, 1, "BUY", 100, 5, T0), fill(2, 1, "BUY", 102, 5, T0 + 1000),
                              fill(3, 2, "SELL", 107, 10, T0 + H)]}
         self.run_cli(FakeFills(fills), ["--no-klines"])
         t = self.rows()[0]
-        self.assertEqual((t["entry_price"], t["entry_vwap"], t["initial_risk"]), (100.0, 101.0, 6.0))
-        self.assertAlmostEqual(t["realized_r_gross"], 1.0, places=4)
+        self.assertEqual((t["entry_price"], t["entry_vwap"], t["initial_risk"]), (100.0, 101.0, 5.0))
+        self.assertAlmostEqual(t["realized_r_gross"], 1.2, places=4)
 
 
 # ======================================================================================================= #191 labels
@@ -531,6 +532,22 @@ class TestSyncClosedTodayKeys(unittest.TestCase):
              patch("execute_futures_trade.send_signed_request", side_effect=fake):
             return sss.sync_session_state(target_env="prod")
 
+    def test_unreadable_day_fills_are_visible(self):
+        """PR #212 review: a non-list first userTrades read is flagged, not a silent 0."""
+        state = self.run_sync(DayExchange([], error={"code": -1102, "msg": "symbol required"}), audit=[])
+        c = state["closed_today_summary"]
+        self.assertEqual(c["counted_by"], "unavailable")
+        self.assertIn("symbol required", c["fills_error"])
+
+    def test_unmatched_closing_fills_fall_back_to_fill_counts(self):
+        """PR #212 review: closing fills of a flat symbol with no matching audit trade (e.g. a manual exit of a
+        position missing from the audit) never read as 0 closed trades."""
+        fills = [fill(9, 9, "SELL", 104, 7, DAY + 3 * H, pnl=28.0, comm=0.2)]
+        state = self.run_sync(DayExchange(fills), audit=[])
+        c = state["closed_today_summary"]
+        self.assertEqual((c["closed_trades_count"], c["wins"], c["counted_by"]), (1, 1, "fills"))
+        self.assertIn("without a matching audit trade", c["trade_summary_error"])
+
     def test_summary_failure_falls_back_to_fill_counts(self):
         """PR #212 review: a summarize_closed_today exception never reports 0 closed trades after real exits."""
         rec = dict(symbol="BTCUSDT", direction="LONG", entry_price=100.0, sl_price=95.0, total_qty=10.0,
@@ -692,11 +709,15 @@ class TestCalibrationStoreRekeying(unittest.TestCase):
         merged = sc.merge_store(first, [self.row()], now=2)
         self.assertEqual(len(merged["trades"]), 1)
 
-    def test_no_entry_fill_removes_stored_trade(self):
+    def test_non_closed_or_degraded_rows_never_delete(self):
+        """Dropping a stored loss could lift a bucket over its threshold (loosen the Tier S gate): never delete."""
         from utils import score_calibration as sc
-        merged = sc.merge_store(self.legacy_store(), [self.row(status="no_entry_fill", entry_ts=self.AUDIT * 1000)],
-                                now=2)
-        self.assertEqual(merged["trades"], {})
+        store = self.legacy_store()
+        for row in (self.row(status="no_entry_fill", entry_ts=self.AUDIT * 1000), self.row(status="open"),
+                    self.row(status="fills_unavailable"), self.row(truncated=True), self.row(truncated=True, entry_ts=1)):
+            with self.subTest(row=row):
+                merged = sc.merge_store(store, [row], now=2)
+                self.assertEqual(merged["trades"], store["trades"])
 
     def test_truncated_rows_not_stored(self):
         from utils import score_calibration as sc
@@ -712,8 +733,10 @@ class TestCalibrationStoreRekeying(unittest.TestCase):
 
 class TestRealizedRBudget(unittest.TestCase):
 
-    def test_budget_r_uses_audit_entry(self):
-        """Entry slippage shows in realized_r_budget (sized on the audit entry), not in VWAP-based realized_r_gross."""
+    def test_r_is_measured_on_the_sized_risk(self):
+        """PR #212 review: R = real move from the fill basis over the risk the order was sized on (audit entry - SL),
+        so adverse entry slippage is never hidden: fill 102 -> exit 92 on a planned 100 / SL 90 is -1.0R; stopped at
+        90 it would be -1.2R."""
         rec = {"symbol": "BTCUSDT", "direction": "LONG", "entry_price": 100.0, "sl_price": 90.0, "total_qty": 1.0,
                "timestamp": 1000, "entry_order_id": 7}
         fills = [{"id": 1, "orderId": 7, "side": "BUY", "price": "102", "qty": "1", "time": 999000,
@@ -722,5 +745,50 @@ class TestRealizedRBudget(unittest.TestCase):
                   "realizedPnl": "-10", "commission": "0", "commissionAsset": "USDT"}]
         out = to.resolve_trade(rec, fills, {}, [], None, "prod", klines=False)
         self.assertEqual(out["audit_ts"], 1000)
-        self.assertAlmostEqual(out["realized_r_gross"], -10 / 12, places=3)  # VWAP 102, R 12
-        self.assertAlmostEqual(out["realized_r_budget"], -0.8, places=3)  # audit entry 100, R 10
+        self.assertAlmostEqual(out["initial_risk"], 10.0)
+        self.assertAlmostEqual(out["entry_vwap"], 102.0)
+        self.assertAlmostEqual(out["realized_r_gross"], -1.0, places=3)
+        self.assertAlmostEqual(out["realized_r_net"], -1.0, places=3)
+        self.assertNotIn("realized_r_budget", out)
+        fills[1].update(price="90", realizedPnl="-12")
+        out = to.resolve_trade(rec, fills, {}, [], None, "prod", klines=False)
+        self.assertAlmostEqual(out["realized_r_gross"], -1.2, places=3)
+
+
+class TestUserTradesPacing(unittest.TestCase):
+    """PR #212 review: userTrades requests are paced, a rate limit is retried with backoff, a ban never is."""
+
+    def run_window(self, replies):
+        calls = []
+
+        def fake(method, endpoint, params=None, target_env=None, retry_count=0):
+            calls.append(params)
+            return replies[min(len(calls), len(replies)) - 1]
+
+        budget = {"requests": 0}
+        seen = {}
+        with patch("execute_futures_trade.send_signed_request", side_effect=fake), \
+                patch("trade_outcomes.time.sleep") as sleep:
+            err = to._fetch_window("BTCUSDT", 0, 10, "prod", seen, budget)
+        return err, calls, sleep, seen
+
+    def test_rate_limit_retried_then_succeeds(self):
+        err, calls, sleep, seen = self.run_window([{"code": -1003, "msg": "Too many requests"},
+                                                   [{"id": 1, "time": 5}]])
+        self.assertIsNone(err)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [1.0])
+        self.assertIn("1", seen)
+
+    def test_ban_never_retried(self):
+        for reply in ({"error": "HTTP 418", "http_code": 418},
+                      {"code": -1003, "msg": "Way too many requests; IP banned"}):
+            err, calls, sleep, _ = self.run_window([reply, [{"id": 1, "time": 5}]])
+            self.assertIsNotNone(err)
+            self.assertEqual(len(calls), 1)
+            sleep.assert_not_called()
+
+    def test_rate_limit_gives_up_after_max_tries(self):
+        err, calls, _, _ = self.run_window([{"code": -1003, "msg": "Too many requests"}])
+        self.assertIsNotNone(err)
+        self.assertEqual(len(calls), to.USER_TRADES_MAX_TRIES)

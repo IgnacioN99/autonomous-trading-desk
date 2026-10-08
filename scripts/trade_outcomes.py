@@ -34,17 +34,17 @@ are never exit legs of another trade. Closing fills (side opposite to the entry,
 after the entry fill, before the next audit entry of the same symbol + direction) are consumed in time order until
 filled_qty is closed (1e-6 relative; a fill shared by two trades is split); otherwise the trade stays "open".
 filled_qty = the matched entry fills' qty when found, else the audit total_qty (a partly filled, then cancelled
-LIMIT entry closes on what filled). entry_vwap = VWAP of the matched entry fills (null without them); the R basis is
-entry_vwap when present, else the audit entry_price (exit_policy_sim replays from it too, while the live guardian's
-trail engine uses the audit entry_price). Leg reasons: orderId == tp1_order_id -> TP1, == tp2_order_id
+LIMIT entry closes on what filled). entry_vwap = VWAP of the matched entry fills (null without them): the position's
+real start (gross R numerator; exit_policy_sim replays from it, while the live guardian's trail engine uses the audit
+entry_price). The R denominator is always the risk the order was sized on (initial_risk = |audit entry_price -
+sl_price|), so adverse entry slippage shows as |R| > 1 at the stop (PR #212 review). Leg reasons: orderId == tp1_order_id -> TP1, == tp2_order_id
 -> TP2; else the nearest of these levels within its tolerance: sl_price and each trail_stop new_sl placed between
 entry and the fill (max(0.3% of the price, 2 x tickSize)) -> SL / TRAILED_STOP, True Net BE entry x (1 + 0.002)
 (LONG; 1 - 0.002 SHORT; +/- 0.15 % of the price) -> BREAKEVEN; else MANUAL_OR_OTHER (stop fills are market child
 orders without the algo id, so stops are matched by price).
-  realized_r_budget = the same gross R measured from the audit entry_price the order was sized on (shows entry
-  slippage against the risk_pct_equity budget); audit_ts = the audit record's timestamp (s), the stable trade identity.
-  realized_r_gross = sum(qty_i x signed(price_i - entry)) / (risk x filled_qty), risk = |entry - sl| (SL on the loss
-  side, else null); realized_r_net = sum(realizedPnl - commission) over the closing legs and the matched entry fills
+  audit_ts = the audit record's timestamp (s), the stable trade identity (calibration store).
+  realized_r_gross = sum(qty_i x signed(price_i - entry_vwap or entry)) / (risk x filled_qty), risk = |audit entry -
+  sl| (SL on the loss side, else null); realized_r_net = sum(realizedPnl - commission) over the closing legs and the matched entry fills
   / (risk x filled_qty), null unless every commission is in USDT (entry_commission_included says whether the entry
   fills were identified). mfe_r / mae_r / mfe_ts from 1m klines after the fill minute whose bar closed by the exit
   (no print after the exit) plus the leg prices; giveback_r = mfe_r - realized_r_gross. entry_ts, exit_ts, mfe_ts and
@@ -92,6 +92,18 @@ BREAKEVEN_MATCH_BAND = 0.0015  # a fill within +/- 0.15 % of the price of that l
 SCRATCH_R = 0.05  # closed-today summary: |R| below this is a scratch
 MAX_SPLIT_DEPTH = 12  # userTrades window halvings per 7-day window
 MAX_REQUESTS_PER_SYMBOL = 200
+USER_TRADES_SLEEP_SECONDS = 0.2  # pause between userTrades requests (PROD IP shared with the guardian / executor)
+USER_TRADES_MAX_TRIES = 3  # per request on a Binance rate limit (-1003 / HTTP 429); a ban (418) is never retried
+
+
+def _rate_limit_kind(res):
+    """'ban' (HTTP 418 / "banned"), 'limit' (-1003 or HTTP 429) or None for a signed-request error reply."""
+    text = str(res)
+    if (isinstance(res, dict) and res.get("http_code") == 418) or "HTTP 418" in text or "banned" in text.lower():
+        return "ban"
+    if (isinstance(res, dict) and (res.get("code") == -1003 or res.get("http_code") == 429)) or "HTTP 429" in text:
+        return "limit"
+    return None
 QTY_TOLERANCE = 1e-6
 KLINES_LIMIT = trade_excursion.KLINES_PAGE_LIMIT  # 1000 (weight 5); pages paced and 429 / 418-retried there
 KLINES_TIMEOUT_SECONDS = 6  # offline CLI: longer than the guardian's 2 s
@@ -206,16 +218,24 @@ def _fetch_window(symbol, start_ms, end_ms, env, seen, budget, depth=0):
     """Adds the userTrades of [start_ms, end_ms] to seen (by id); None or the error text. A full window (FILLS_LIMIT
     rows) is split in half and both halves fetched (down to 1 ms), so paging never depends on the reply's order;
     beyond MAX_SPLIT_DEPTH halvings or MAX_REQUESTS_PER_SYMBOL requests (budget["requests"]) it stops and sets
-    budget["truncated"]."""
+    budget["truncated"]. Requests are USER_TRADES_SLEEP_SECONDS apart; a rate limit (-1003 / HTTP 429) is retried up
+    to USER_TRADES_MAX_TRIES tries (1 s, 2 s); a ban (HTTP 418) is returned at once (PR #212 review)."""
     if budget["requests"] >= MAX_REQUESTS_PER_SYMBOL:
         budget["truncated"] = True
         return None
+    if budget["requests"]:
+        time.sleep(USER_TRADES_SLEEP_SECONDS)
     budget["requests"] += 1
     params = {"symbol": symbol, "startTime": int(start_ms), "endTime": int(end_ms), "limit": FILLS_LIMIT}
-    try:
-        res = eft.send_signed_request("GET", USER_TRADES, params, target_env=env)
-    except Exception as e:
-        return f"{type(e).__name__}: {e}"[:200]
+    for attempt in range(USER_TRADES_MAX_TRIES):
+        try:
+            res = eft.send_signed_request("GET", USER_TRADES, params, target_env=env)
+        except Exception as e:
+            return f"{type(e).__name__}: {e}"[:200]
+        kind = None if isinstance(res, list) else _rate_limit_kind(res)
+        if kind != "limit" or attempt + 1 >= USER_TRADES_MAX_TRIES:
+            break
+        time.sleep(1.0 * (2 ** attempt))  # 1 s, 2 s; a ban is never retried into
     if not isinstance(res, list):
         return str(res)[:200]
     for f in res:
@@ -449,8 +469,8 @@ def resolve_trade(rec, fills, consumed, trail_stops, next_start_ms, env, klines=
                   match=None, tick=None):
     """Outcome dict of one audit entry. consumed: {fill id: qty already assigned to earlier trades} (updated).
     match: the record's match_entry result (default: match_entry(rec, fills)). The qty to close is the filled qty: the
-    sum of the matched entry fills when found, else the audit total_qty; the R basis is their VWAP (entry_vwap), else
-    the audit entry_price. Fills of another audit record's entry (foreign_entry_ids: entry_order_id or matched
+    sum of the matched entry fills when found, else the audit total_qty; R = the move from their VWAP (entry_vwap, else
+    the audit entry_price) over the sized risk |audit entry_price - sl_price|. Fills of another audit record's entry (foreign_entry_ids: entry_order_id or matched
     orderIds) are never exit legs. A "no_entry_fill" record gets no legs and consumes nothing. tick: the symbol's
     tickSize (stop tolerance) when known."""
     direction = str(rec.get("direction")).upper()
@@ -463,8 +483,10 @@ def resolve_trade(rec, fills, consumed, trail_stops, next_start_ms, env, klines=
     entry_qty = sum(_num(f.get("qty"), 0.0) for f in entry_fills)
     entry_vwap = (sum(_num(f.get("price"), 0.0) * _num(f.get("qty"), 0.0) for f in entry_fills) / entry_qty
                   if entry_qty > 0 else None)
-    basis = entry_vwap or entry
-    risk = _initial_risk(direction, basis, sl)
+    basis = entry_vwap or entry  # where the position really started (replay start, gross R numerator)
+    # R is the risk the order was sized on (|audit entry - sl|, PR #212 review): adverse entry slippage then shows as
+    # |R| > 1 at the stop instead of cancelling out, and the calibration store keeps one consistent basis.
+    risk = _initial_risk(direction, entry, sl)
     filled_qty = entry_qty or total_qty
     close_side = "SELL" if direction == "LONG" else "BUY"
     foreign = {str(i) for i in foreign_entry_ids if i is not None}
@@ -476,7 +498,7 @@ def resolve_trade(rec, fills, consumed, trail_stops, next_start_ms, env, klines=
            "is_yolo": bool(rec.get("is_yolo")), **score_fields(rec)}
     if match["match"] == "no_entry_fill":
         out.update(status="no_entry_fill", filled_qty=None, legs=[], exit_ts=None, realized_r_gross=None,
-                   realized_r_net=None, realized_r_budget=None, entry_commission_included=False, tp1_filled=False, exit_reason=None)
+                   realized_r_net=None, entry_commission_included=False, tp1_filled=False, exit_reason=None)
         return out
     if match["match"] == "partial_history":
         out["partial_history"] = True
@@ -502,7 +524,8 @@ def resolve_trade(rec, fills, consumed, trail_stops, next_start_ms, env, klines=
         consumed[fid] = consumed.get(fid, 0.0) + used
         remaining -= used
         share = used / qty if qty else 0.0
-        legs.append({"reason": leg_reason(f, rec, trail_stops, entry_ms, tick=tick, entry=basis), "qty": used,
+        # BE is placed from the audit entry (--move-breakeven, guardian, night cutoff), so label it from there too
+        legs.append({"reason": leg_reason(f, rec, trail_stops, entry_ms, tick=tick, entry=entry), "qty": used,
                      "price": _num(f.get("price"), 0.0), "time": t, "order_id": f.get("orderId"),
                      "realized_pnl": _num(f.get("realizedPnl"), 0.0) * share,
                      "commission": _num(f.get("commission"), 0.0) * share,
@@ -510,10 +533,7 @@ def resolve_trade(rec, fills, consumed, trail_stops, next_start_ms, env, klines=
 
     closed = remaining <= filled_qty * QTY_TOLERANCE
     sign = 1.0 if direction == "LONG" else -1.0
-    gross = net = budget_r = None
-    budget_risk = _initial_risk(direction, entry, sl)  # the risk the order was sized on (audit entry, PR #212)
-    if budget_risk and legs:
-        budget_r = round(sum(l["qty"] * sign * (l["price"] - entry) for l in legs) / (budget_risk * filled_qty), 4)
+    gross = net = None
     if risk and legs:
         gross = round(sum(l["qty"] * sign * (l["price"] - basis) for l in legs) / (risk * filled_qty), 4)
         assets = {str(l["commission_asset"] or "").upper() for l in legs}
@@ -523,8 +543,7 @@ def resolve_trade(rec, fills, consumed, trail_stops, next_start_ms, env, klines=
             pnl -= sum(_num(f.get("commission"), 0.0) for f in entry_fills)
             net = round(pnl / (risk * filled_qty), 4)
     out.update(status="closed" if closed else "open", legs=legs, exit_ts=legs[-1]["time"] if closed else None,
-               realized_r_gross=gross, realized_r_net=net, realized_r_budget=budget_r,
-               entry_commission_included=bool(entry_fills),
+               realized_r_gross=gross, realized_r_net=net, entry_commission_included=bool(entry_fills),
                tp1_filled=any(l["reason"] == "TP1" for l in legs),
                exit_reason=legs[-1]["reason"] if closed else None)
     if klines and closed and risk:
