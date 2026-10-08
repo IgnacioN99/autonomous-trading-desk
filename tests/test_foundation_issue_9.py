@@ -281,11 +281,16 @@ class TestScriptsEnvResolverIntegration(unittest.TestCase):
     def test_trading_doctor_uses_resolve_env(self):
         import trading_doctor
         self.assertTrue(hasattr(trading_doctor, "resolve_env"))
+        # Hermetic (issue #173): the time endpoint fails, so the doctor returns before any ledger sync; the sync is
+        # stubbed anyway so the checkout's logs/session_state.json is never written.
         with patch("trading_doctor.resolve_env", return_value="testnet") as mock_resolve, \
              patch("execute_futures_trade.load_env", return_value={}), \
              patch("execute_futures_trade.get_client_config", return_value=("key", "sec", "http://")), \
+             patch("urllib.request.urlopen", side_effect=OSError("offline test")), \
+             patch("sync_session_state.sync_session_state") as mock_sync, \
              patch("trading_doctor.check_guardian_service", return_value=("ok", "guardian alive (stub)")):
             trading_doctor.run_doctor(target_env="testnet")
+            mock_sync.assert_not_called()
             mock_resolve.assert_called_with("testnet")
 
     def test_post_trade_sync_uses_resolve_env(self):
@@ -297,10 +302,13 @@ class TestScriptsEnvResolverIntegration(unittest.TestCase):
         sys.path.insert(0, os.path.join(SCRIPTS_DIR, "loops"))
         import night_cutoff_loop
         self.assertTrue(hasattr(night_cutoff_loop, "resolve_env"))
+        # os.system stubbed (issue #173): the real sync subprocess would write the checkout's logs/session_state.json.
         with patch("night_cutoff_loop.resolve_env", return_value="testnet") as mock_resolve, \
-             patch("execute_futures_trade.send_signed_request", return_value=[]):
+             patch("execute_futures_trade.send_signed_request", return_value=[]), \
+             patch("night_cutoff_loop.os.system", return_value=0) as mock_system:
             night_cutoff_loop.run_night_cutoff(target_env="testnet")
             mock_resolve.assert_called_with("testnet")
+            mock_system.assert_called_once()
 
     def test_trading_drift_watchdog_uses_resolve_env(self):
         import trading_drift_watchdog

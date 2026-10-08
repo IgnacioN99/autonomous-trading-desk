@@ -20,7 +20,8 @@ warning) and is never dead alpha; it is never "now" (0.0h) and never positionRis
 Dead alpha = held >= max_hours AND mark within 1.2% of entry AND |ROE| < 15%.
 --auto-exit closes only per utils/position_timing.dead_alpha_close_decision (same rule as the guardian's
 --close-dead-alpha): dead alpha AND holding time from Binance fills AND the 15m range stall
-(dynamic_exit_manager.check_dead_alpha_timeout); otherwise RECOMMEND_EXIT with auto_exit_skipped. The watchdog never
+(dynamic_exit_manager.check_dead_alpha_timeout); otherwise RECOMMEND_EXIT with auto_exit_skipped (printed as "stall
+check unavailable" when the stall status is UNKNOWN, else "Coiling/active range"). The watchdog never
 files issue reports itself (close_position_market files the P0 of a not-flat close).
 An unreadable positionRisk returns {"read_error": str, "active_count": None, ...}: open positions UNKNOWN, never
 "zero open positions". A userTrades error is reported per position as entry_time_error (+ entry_time_rate_limited).
@@ -153,7 +154,8 @@ def audit_dead_alpha(target_env: str = None, max_hours: float = 4.0, auto_exit: 
                 if not allowed:
                     item["action_taken"] = "RECOMMEND_EXIT"
                     item["auto_exit_skipped"] = reason
-                    print(f"  ⚠️  AUTO-EXIT SKIPPED: {reason}. Coiling/active range; review manually.")
+                    context = "stall check unavailable" if status == "UNKNOWN" else "Coiling/active range"
+                    print(f"  ⚠️  AUTO-EXIT SKIPPED: {reason}. {context}; review manually.")
                 else:
                     print(f"  ⚡ TRIGGERING AUTO-EXIT: Closing position at market to recycle capital...")
                     close_res = eft.close_position_market(sym, target_env=target_env)

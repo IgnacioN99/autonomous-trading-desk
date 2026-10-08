@@ -383,6 +383,27 @@ def ensure_fresh_ledger(target_env: str, max_age_s: int = LEDGER_MAX_AGE_FOR_TEM
     return True, "ledger synced in-process", None
 
 
+def ledger_audit_warning(state, target_env: str):
+    """Issue #173: WARN text when the same-env ledger reports logs/trades_audit.jsonl unreadable (audit_read_error) or
+    with corrupt lines (audit_corrupt_lines > 0), else None. Suggests report_issue.sh; never files an issue itself."""
+    if not isinstance(state, dict) or pt.norm_env(state.get("target_env")) != pt.norm_env(target_env):
+        return None
+    read_error = state.get("audit_read_error")
+    try:
+        corrupt = int(state.get("audit_corrupt_lines") or 0)
+    except (TypeError, ValueError):
+        corrupt = 0
+    if read_error:
+        problem, severity = f"is unreadable ({str(read_error)[:200]})", "HIGH"
+    elif corrupt > 0:
+        problem, severity = f"has {corrupt} corrupt line(s) (skipped)", "MEDIUM"
+    else:
+        return None
+    return (f"Ledger sync: logs/trades_audit.jsonl {problem}; planned stops and holding times may be missing. "
+            f"If it persists, open a {severity} issue: ./scripts/report_issue.sh --category risk_gate --severity "
+            f"{severity} --title \"trades_audit.jsonl unreadable or corrupt\" --output-file <file with the raw output>.")
+
+
 def run_doctor(target_env: str = None, auto_heal: bool = False) -> int:
     target_env = resolve_env(target_env)
     start_time = time.time()
@@ -571,6 +592,10 @@ def run_doctor(target_env: str = None, auto_heal: bool = False) -> int:
                     warnings.append(msg)
                     print(f"⚠️  [DEAD ALPHA] {msg}")
                 else:
+                    audit_warning = ledger_audit_warning(_read_session_state(), target_env)
+                    if audit_warning:
+                        warnings.append(audit_warning)
+                        print(f"⚠️  [STATE LEDGER] {audit_warning}")
                     try:
                         import trading_drift_watchdog as tdw
                         drift_report = tdw.audit_dead_alpha(target_env=target_env, max_hours=4.0, auto_exit=False)
@@ -578,7 +603,9 @@ def run_doctor(target_env: str = None, auto_heal: bool = False) -> int:
                         unknown = drift_report.get("unknown_holding_symbols") or []
                         read_error = drift_report.get("read_error")
                         if read_error:
-                            msg = f"Temporal audit failed: {read_error}"
+                            msg = (f"Temporal audit failed: {read_error} (watchdog read error: its view may diverge "
+                                   "from the exchange; verify with python3 scripts/execute_futures_trade.py "
+                                   "--positions --json).")
                             warnings.append(msg)
                             print(f"⚠️  [DEAD ALPHA] {msg}")
                         if dead_count > 0:
