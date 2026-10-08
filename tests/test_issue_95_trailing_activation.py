@@ -2,8 +2,9 @@
 """
 test_issue_95_trailing_activation.py - Offline tests for the structural trailing activation gate (Issue #95).
 
-A fresh fill must keep its planned Stop Loss: the trail activates only after +1.0R of planned risk or +2.0x ATR_15m
-of favourable excursion since entry on CLOSED 15m candles, or after TP1 fills. Once active the Chandelier stop is
+A fresh fill must keep its planned Stop Loss: the trail activates only after +1.0R of planned risk (issue #205:
++2.0x ATR_15m alone only with the legacy "r_or_atr" mode or without an R reference) of favourable excursion since
+entry on CLOSED 15m candles, or after TP1 fills. Once active the Chandelier stop is
 anchored to the extreme since entry. YOLO positions are never trailed before TP1, whatever the entry path.
 No network, no orders: the exchange is FakeExchange and klines are synthetic.
 """
@@ -210,7 +211,8 @@ class TestActivation(unittest.TestCase):
             res = dem.update_position_to_structural_stop("BTCUSDT", target_env="testnet")
         self.assertEqual(calc["activation_reason"], "r_multiple")
         self.assertEqual(calc["chandelier_anchor"], 96.4)
-        self.assertLessEqual(calc["new_structural_sl"], eft.round_price(96.4 + 1.8 * atr, 0.1, 1) + 1e-9)
+        # Issue #197: SHORT stops are rounded up (away from price) to the tick.
+        self.assertLessEqual(calc["new_structural_sl"], dem._round_stop(96.4 + 1.8 * atr, "SHORT", 0.1, 1) + 1e-9)
         self.assertTrue(res["updated"], res)
         self.assertEqual(res["activation_reason"], "r_multiple")
         self.assertLess(res["new_sl"], 102.0)
@@ -218,16 +220,38 @@ class TestActivation(unittest.TestCase):
         deletes = fake.write_index("DELETE", ALGO_ENDPOINT)
         self.assertLess(posts[0], deletes[0])
 
-    def test_atr_expansion_with_large_r(self):
-        fake, klines, entry_ts = self._long_run(sl=90.0)  # R = 10: +1R unreachable, MFE 3.6 >= 2x ATR
+    def _wide_stop(self, profile=None):
+        # Issue #205: R = 4.8 (SL 95.2), MFE 3.6 = 0.75R while 2x ATR_15m (~2) is already reached.
+        fake, klines, entry_ts = self._long_run(sl=95.2)
         atr = closed_atr(klines)
         self.assertGreaterEqual(3.6, 2.0 * atr)
-        with offline(fake) as ws, market(klines):
-            write_audit(ws, symbol="BTCUSDT", direction="LONG", entry_price=100.0, sl_price=90.0, total_qty=10,
+        self.assertLess(2.0 * atr, 4.8)
+        with offline(fake, profile=profile) as ws, market(klines):
+            write_audit(ws, symbol="BTCUSDT", direction="LONG", entry_price=100.0, sl_price=95.2, total_qty=10,
                         tp1_qty=3, is_yolo=False, target_env="testnet", timestamp=entry_ts)
             res = dem.update_position_to_structural_stop("BTCUSDT", target_env="testnet")
+        return res, fake
+
+    def test_atr_expansion_with_large_r(self):
+        # Issue #205 (intended change): 2x ATR_15m before +1R no longer activates the trail by default.
+        res, fake = self._wide_stop()
+        self.assertTrue(res["success"], res)
+        self.assertFalse(res["updated"])
+        self.assertEqual(res["reason"], "trail_not_activated")
+        self.assertIsNone(res["activation_reason"])
+        self.assertEqual(res["current_sl"], 95.2)
+        self.assertIn("needs +1R on closed 15m bars", res["message"])
+        self.assertEqual(fake.writes(), [])
+
+    def test_atr_expansion_with_large_r_modes(self):
+        res, fake = self._wide_stop(profile={"exit_management": {"trail_activation": "r_and_atr"}})
+        self.assertEqual(res["reason"], "trail_not_activated")
+        self.assertIn("needs +1R and +2x ATR_15m", res["message"])
+        self.assertEqual(fake.writes(), [])
+        res, fake = self._wide_stop(profile={"exit_management": {"trail_activation": "r_or_atr"}})  # legacy
         self.assertTrue(res["updated"], res)
         self.assertEqual(res["activation_reason"], "atr_expansion")
+        self.assertGreater(res["new_sl"], 95.2)
 
     def test_tp1_filled_activates(self):
         # Issue #163: TP1 counts only for a reference verified against Binance fills (BUY 10 then SELL 3 -> amt 7).
