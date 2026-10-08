@@ -137,6 +137,8 @@ class TestLegsAndR(OutcomesBase):
         summary = json.loads(out)
         self.assertEqual((summary["ok"], summary["trades"], summary["closed"]), (True, 1, 1))
         self.assertEqual(summary["summary"]["by_exit_reason"], {"MANUAL_OR_OTHER": 1})
+        self.assertEqual((t["env"], t["since"]), ("prod", summary["since"]))
+        self.assertRegex(t["since"], r"^\d{4}-\d{2}-\d{2}$")
 
     def test_reason_labels_and_summary(self):
         # BTC: TP1 + TP2. ETH: SL. SOL: TP1 then break-even. XRP: trailed stop. ADA: manual. DOT: still open.
@@ -271,11 +273,13 @@ class TestFillsUnavailableAndRequests(OutcomesBase):
     def test_mcp_error_payload_marks_fills_unavailable_and_exit_1(self):
         self.audit(symbol="BTCUSDT")
         fake = FakeFills({"BTCUSDT": {"error": "Public fallback error: HTTP Error 401"}})
-        code, out = self.run_cli(fake, ["--json", "--no-klines"])
+        since = time.strftime("%Y-%m-%d", time.gmtime(T0 / 1000 - 86400))
+        code, out = self.run_cli(fake, ["--json", "--no-klines", "--since", since])
         self.assertEqual(code, 1)
         t = self.rows()[0]
         self.assertEqual(t["status"], "fills_unavailable")
         self.assertIn("401", t["error"])
+        self.assertEqual((t["env"], t["since"]), ("prod", since))
         self.assertFalse(json.loads(out)["ok"])
 
     def test_one_readable_symbol_gives_exit_0(self):

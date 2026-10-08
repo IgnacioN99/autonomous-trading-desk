@@ -30,7 +30,8 @@ market child orders without the algo id, so stops are matched by price).
   fills were identified). mfe_r / mae_r / mfe_ts from 1m klines after the fill minute up to the exit minute plus the
   leg prices; giveback_r = mfe_r - realized_r_gross. entry_ts, exit_ts, mfe_ts and leg times are in ms.
 
-Output: logs/trade_outcomes.jsonl (rewritten atomically each run, one JSON line per trade) and with --json
+Output: logs/trade_outcomes.jsonl (rewritten atomically each run, one JSON line per trade, each stamped with the
+run's "env" and "since" so offline readers such as trading_scorecard.py can filter and date it) and with --json
 {"ok", "env", "since", "trades", "closed", "summary", "output"}. Exit code 0 when at least one trade was resolved (or
 there is no trade in range), 1 when no symbol's fills were readable.
 
@@ -424,6 +425,8 @@ def main(argv=None):
     output = args.output or os.path.join(_logs_dir(), "trade_outcomes.jsonl")
     trades, readable, unavailable = build_outcomes(env, since_ts, (args.symbol or "").upper() or None,
                                                    klines=not args.no_klines)
+    for t in trades:
+        t["env"], t["since"] = env, since_str
     _write_jsonl_atomic(output, trades)
     ok = not trades or readable > 0
     closed = [t for t in trades if t.get("status") == "closed"]
