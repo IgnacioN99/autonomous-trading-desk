@@ -12,6 +12,7 @@ Verifies:
 6. State Ledger Freshness (session_state.json)
 7. Barbell YOLO scan health (logs/yolo_scan_health.json; WARN only, when yolo_slot_enabled)
 8. Position guardian loop liveness (check_guardian_alive; WARN only, with the install_guardian_service.py hint)
+9. Python dependencies of the scanners (numpy, pydantic, statsmodels; WARN only)
 
 Usage:
   python3 scripts/trading_doctor.py [--env testnet|mainnet] [--heal]
@@ -167,6 +168,26 @@ def check_guardian_service(target_env: str) -> tuple:
         hint = f"Start the loop: python3 scripts/loops/position_guardian_loop.py --interval 60 --env {target_env}"
     return "warn", (f"Position guardian loop not alive ({why}). {impact}; MARKET entries do not need the guardian. "
                     f"{hint}")
+
+
+DEPENDENCY_MODULES = ("numpy", "pydantic", "statsmodels")
+
+
+def check_dependencies(modules=DEPENDENCY_MODULES) -> tuple:
+    """WARN-only check that the scanners' third-party modules are installed (issue #135: the radars import
+    microstructure_engine, which needs numpy at import time). Returns ("ok" | "warn", message). Never critical."""
+    import importlib.util
+    missing = []
+    for name in modules:
+        try:
+            if importlib.util.find_spec(name) is None:
+                missing.append(name)
+        except (ImportError, ValueError):
+            missing.append(name)
+    if missing:
+        return "warn", (f"Missing Python modules: {', '.join(missing)}. Scanners that import them will fail; "
+                        "install requirements.txt.")
+    return "ok", f"Python dependencies present ({', '.join(modules)})."
 
 
 def check_pretool_hook(base_dir: str = None, run_selftest: bool = True, timeout_cap_s: int = 30) -> dict:
@@ -588,6 +609,15 @@ def run_doctor(target_env: str = None, auto_heal: bool = False) -> int:
     else:
         ok_items.append(msg)
         print(f"✅ [GUARDIAN] {msg}")
+
+    # 5d. Python dependencies of the scanners (WARN only, never critical; issue #135)
+    level, msg = check_dependencies()
+    if level == "warn":
+        warnings.append(msg)
+        print(f"⚠️  [DEPENDENCIES] {msg}")
+    else:
+        ok_items.append(msg)
+        print(f"✅ [DEPENDENCIES] {msg}")
 
     # 6. Shadow Desk Counterfactual Audit
     try:

@@ -106,6 +106,8 @@ class CandidateSetup(BaseModel):
     target_dollar_risk: float
     reasons: List[str]
     sizing_entry_price: Optional[float] = None  # entry the sizing was computed from (trigger, else current price)
+    tier_code: Optional[str] = None  # radar tier code (S / A+ / A / B+), kept for the brief (issue #135)
+    absorption_scored: bool = True  # False: the wick/taker candles did not match, absorption gave no score (#135)
 
 class StatArbPair(BaseModel):
     pair: str
@@ -239,8 +241,9 @@ def enrich_and_size_candidate(c: dict, target_env: Optional[str] = None) -> Opti
         sl = float(c["sl"])
         direction = c["direction"]
         lev, max_margin_ratio = _profile_standard_sizing()
-        # Issue #22: size from the conditional entry (breakout trigger). It is always farther from the SL
-        # than the current price, so it is also conservative for MARKET deployments.
+        # Issue #22: size from the conditional entry (breakout trigger), the radar's effective entry. If the price
+        # crosses the trigger before execution, the executor enters at the current price and its gates measure from
+        # there (issue #140).
         # Single expression for both sizing and trigger_price (a 0/None trigger falls back to the price).
         sizing_entry = float(c.get("trigger") or entry)
         # Issue #86: never invent take profits; R:R is measured from the sizing entry, not copied from the radar.
@@ -248,10 +251,16 @@ def enrich_and_size_candidate(c: dict, target_env: Optional[str] = None) -> Opti
             print(f"Radar row for {sym} has no tp1/tp2; candidate skipped (fail closed).", file=sys.stderr)
             return None
         tp1, tp2 = float(c["tp1"]), float(c["tp2"])
-        sl_dist = abs(sizing_entry - sl)
-        if sl_dist <= 0:
+        # Signed distances (issue #140): an SL or TP2 on the wrong side of the entry drops the row.
+        is_long = direction == "LONG"
+        sl_dist = (sizing_entry - sl) if is_long else (sl - sizing_entry)
+        tp2_dist = (tp2 - sizing_entry) if is_long else (sizing_entry - tp2)
+        if sl_dist <= 0 or tp2_dist <= 0:
+            side = "SL" if sl_dist <= 0 else "TP2"
+            print(f"Radar row for {sym} {direction} has its {side} on the wrong side of the entry {sizing_entry}; "
+                  "candidate skipped (fail closed).", file=sys.stderr)
             return None
-        rr_ratio = round(abs(tp2 - sizing_entry) / sl_dist, 2)
+        rr_ratio = round(tp2_dist / sl_dist, 2)
 
         target_env = resolve_env(target_env)
 
@@ -299,9 +308,13 @@ def enrich_and_size_candidate(c: dict, target_env: Optional[str] = None) -> Opti
             step_qty=step_qty,
             actual_notional=actual_notional,
             target_dollar_risk=risk_dollar,
-            reasons=c.get("reasons", [])
+            reasons=c.get("reasons", []),
+            tier_code=c.get("tier_code"),
+            absorption_scored=c.get("absorption_scored") is True,
         )
-    except Exception:
+    except Exception as e:
+        sym = c.get("symbol") if isinstance(c, dict) else None
+        print(f"Radar row for {sym} skipped: {type(e).__name__}: {e}", file=sys.stderr)
         return None
 
 # Prompt-injection defense is shared with the newsletter reader (single source of truth).

@@ -172,21 +172,24 @@ def get_symbol_microstructure(symbol, period="15m", history_limit=30, wick_candl
         is_oi_inflow = (oi_z_score >= 1.25 or oi_change_pct >= 0.40)
         is_oi_outflow = (oi_z_score <= -1.25 or oi_change_pct <= -0.40)
 
+        # Each value is labelled with its period (issue #135): the price change is the forming candle's, OI the
+        # latest row's.
+        regime_vals = f"ΔP(forming)={p_change_pct:+.2f}%, OI(latest) Z={oi_z_score:+.2f}σ, ΔOI={oi_change_pct:+.2f}%"
         if p_change_pct > 0.15 and is_oi_inflow:
             regime = "LONG_BUILDUP"
-            regime_desc = f"Bullish Conviction (Institutional capital inflow: Z={oi_z_score:+.2f}σ, ΔOI={oi_change_pct:+.2f}%)"
+            regime_desc = f"Bullish Conviction (Institutional capital inflow: {regime_vals})"
         elif p_change_pct > 0.15 and is_oi_outflow:
             regime = "SHORT_SQUEEZE"
-            regime_desc = f"Short Squeeze (Mechanical rally via forced short liquidations: Z={oi_z_score:+.2f}σ, ΔOI={oi_change_pct:+.2f}%)"
+            regime_desc = f"Short Squeeze (Mechanical rally via forced short liquidations: {regime_vals})"
         elif p_change_pct < -0.15 and is_oi_inflow:
             regime = "SHORT_BUILDUP"
-            regime_desc = f"Bearish Conviction (Aggressive net seller capital inflow: Z={oi_z_score:+.2f}σ, ΔOI={oi_change_pct:+.2f}%)"
+            regime_desc = f"Bearish Conviction (Aggressive net seller capital inflow: {regime_vals})"
         elif p_change_pct < -0.15 and is_oi_outflow:
             regime = "LONG_UNWINDING"
-            regime_desc = f"Capitulation / Long Unwinding (Massive buyer liquidation: Z={oi_z_score:+.2f}σ, ΔOI={oi_change_pct:+.2f}%)"
+            regime_desc = f"Capitulation / Long Unwinding (Massive buyer liquidation: {regime_vals})"
         else:
             regime = "NEUTRAL_CONSOLIDATION"
-            regime_desc = f"Range Consolidation / Auction Equilibrium (Z_OI={oi_z_score:+.2f}σ)"
+            regime_desc = f"Range Consolidation / Auction Equilibrium (OI(latest) Z_OI={oi_z_score:+.2f}σ)"
 
         # --- LIQUIDITY ABSORPTION DETECTION (CVD Divergence & Limit Walls) ---
         absorption = "NONE"
