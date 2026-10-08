@@ -57,7 +57,7 @@ Rigorously verify the following mathematical axioms in every code change:
    - In standard intraday, the SL only moves to True Net Break-Even after a minimum expansion of $+2.0 \times \text{ATR}_{15m}$ or a TP1 fill.
    - **True Net BE Buffer:** The Break-Even price MUST include the Binance taker roundtrip fee buffer (+0.2%), never the exact entry price (to avoid net losses from fee friction).
    - **Trailing Activation Gate** (same thresholds as AGENTS.md Layer 8 / Dynamic Exit Management; edit both together):
-     - The planned SL is kept until **+1.0R** of favourable excursion since entry (closed 15m bars) or a TP1 fill; profile `exit_management.trail_activation` (`r_only` default, `r_and_atr` also needs +2.0x ATR_15m, legacy `r_or_atr`). +2.0x ATR_15m alone activates only without an R reference.
+     - The planned SL is kept until **+1.0R** of favourable excursion since entry (closed 15m bars) or a TP1 fill; profile `exit_management.trail_activation` (`r_only` default, `r_and_atr` also needs +2.0x ATR_15m, legacy `r_or_atr`). +2.0x ATR_15m alone activates only without an R reference or in legacy `r_or_atr`.
      - YOLO positions are never trailed before TP1.
      - Before +2.0x ATR_15m or TP1 an activated trail stays at least one tick short of entry (never in the fee dead zone). This gives up profit protection on a fast reversal through entry; accepted to stay out of the fee dead zone.
      - TP1 counts only when the trade reference is verified against Binance fills (MCP or unavailable fills: TP1 unknown, no TP1-based trail or BE).

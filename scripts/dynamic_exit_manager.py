@@ -139,6 +139,14 @@ def _round_stop(price, side, tick, precision):
     return float(f"{units * step:.{int(precision)}f}")
 
 
+def _true_net_be(entry_price, is_long, tick, precision):
+    """True Net Break-Even (entry +/- TRUE_NET_BE_FEE_BUFFER) on the tick grid, rounded TOWARD price (LONG up, SHORT
+    down) so the realised buffer is never under 0.2%; on-grid, so the final _round_stop leaves it unchanged."""
+    buf = Decimal(str(eft.TRUE_NET_BE_FEE_BUFFER))
+    be = Decimal(str(entry_price)) * ((1 + buf) if is_long else (1 - buf))
+    return _round_stop(be, "SHORT" if is_long else "LONG", tick, precision)
+
+
 def _profit_lock_step(mfe_r, steps, extend_last_step):
     """(step_mfe_r, lock_r) of the highest step with mfe_r <= MFE_R (beyond the last step, +1.0R of lock per further
     full 1.0R of MFE when extend_last_step), or None below the first step."""
@@ -215,8 +223,11 @@ def calculate_structural_stop(symbol, direction, entry_price, current_sl_price=0
         tick-rounded stop and lock price. Issue #197: with reference_source "current_stop" (R from the current stop,
         possibly an earlier trail) only steps with lock_r <= 0 (True Net BE) apply, without extend_last_step. Before
         BE is allowed the #106 cap above is unchanged. exit_management None loads the profile.
+      - True Net BE (the BE clamp and the lock_r 0 step) is entry +/- 0.2% rounded TOWARD price to the tick
+        (_true_net_be), so the realised fee buffer is never under 0.2% (PR #211 review).
       - Never loosens against current_sl_price; never closer than 0.5x ATR to price (mark_price if given, else
-        the last closed close); this floor may cap the profit lock (capped_by_price_floor).
+        the last closed close); this floor may cap the profit lock (capped_by_price_floor). Mixed price sources:
+        the floor uses the MARK price while the trail / MFE bars are LAST-price 15m klines (no behaviour change).
       - The stop is rounded to an exact tick away from price (_round_stop: LONG down, SHORT up, Issue #197).
     Take-profit orders are never re-based: TP1/TP2 keep their original levels.
 
@@ -344,8 +355,7 @@ def calculate_structural_stop(symbol, direction, entry_price, current_sl_price=0
         if step is not None:
             step_mfe_r, lock_r = step
             if lock_r <= 0:
-                lock_price = entry_price * ((1 + eft.TRUE_NET_BE_FEE_BUFFER) if is_long
-                                            else (1 - eft.TRUE_NET_BE_FEE_BUFFER))
+                lock_price = _true_net_be(entry_price, is_long, tick, filters["precision_price"])
             else:
                 lock_price = (entry_price + lock_r * initial_risk) if is_long else (entry_price - lock_r * initial_risk)
             profit_lock = {"mfe_r": round(mfe_r, 4), "mfe_source": lock_source, "step_mfe_r": step_mfe_r,
@@ -361,11 +371,11 @@ def calculate_structural_stop(symbol, direction, entry_price, current_sl_price=0
 
         # Right-tail preservation: True Net Break-Even only after >= 2.0x ATR expansion since entry or TP1 fill;
         # before that the stop stays at least one tick below entry (never in the fee dead zone, Issue #106).
-        if be_allowed:
-            candidate_stop = max(candidate_stop, entry_price * 1.002)
+        if be_allowed:  # True Net BE rounded up to the tick: the realised buffer stays >= 0.2%
+            candidate_stop = max(candidate_stop, _true_net_be(entry_price, True, tick, filters["precision_price"]))
         else:
-            candidate_stop = min(candidate_stop, eft.round_price(Decimal(str(entry_price)) - Decimal(str(tick)),
-                                                                 tick, filters["precision_price"]))
+            candidate_stop = min(candidate_stop, _round_stop(Decimal(str(entry_price)) - Decimal(str(tick)), "LONG",
+                                                             tick, filters["precision_price"]))
 
         if profit_lock:  # Issue #183: the tighter of the trail and the R step lock
             candidate_stop = max(candidate_stop, profit_lock["lock_price"])
@@ -385,7 +395,7 @@ def calculate_structural_stop(symbol, direction, entry_price, current_sl_price=0
         candidate_stop = min(structural_level, chandelier_stop)
 
         if be_allowed:
-            candidate_stop = min(candidate_stop, entry_price * 0.998)
+            candidate_stop = min(candidate_stop, _true_net_be(entry_price, False, tick, filters["precision_price"]))
         else:  # one tick above entry, rounded up like every SHORT stop here (_round_stop), so strictly above it; an
             # off-grid entry (averaged fills, e.g. 100.05 + 0.1) rounds up to the next tick (100.2, not 100.1)
             candidate_stop = max(candidate_stop, _round_stop(Decimal(str(entry_price)) + Decimal(str(tick)), "SHORT",

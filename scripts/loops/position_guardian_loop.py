@@ -191,6 +191,7 @@ failure: python3 scripts/install_guardian_service.py --install --env prod (--sta
 Only a loop with --interval <= 120 counts as a live guardian; --once runs never do.
 """
 
+import copy
 import os
 import sys
 import time
@@ -329,6 +330,7 @@ class GuardianCycle:
         self._previous = {}  # previous guardian_state.json of this env (read at the start of run())
         self._excursion_misses = set()  # symbols whose excursion reference needed an uncached userTrades read
         self._exit_management = None  # profile exit_management, read once per cycle (issue #197)
+        self._exit_management_failed = False  # that read raised this cycle (reported once, dem loads it itself)
         now = int(time.time())
         self.state = {
             "schema_version": SCHEMA_VERSION,
@@ -492,9 +494,19 @@ class GuardianCycle:
         """Issue #197: the profile's exit_management, read once per cycle (at the first trailing evaluation). Its
         warnings go to state["exit_management_warnings"] and, only when the previous state did not already carry
         them, once to trail_warnings (symbol None); dem gets the settings without them (never repeated per
-        position)."""
+        position). A read that raises is recorded once per cycle (error stage "exit_management") and None is
+        returned for the rest of the cycle, so dem falls back to its own load. Each call gets a deep copy, so one
+        position's dem call can never alter the settings of the next."""
+        if self._exit_management_failed:
+            return None
         if self._exit_management is None:
-            em = user_profile.get_exit_management()
+            try:
+                em = user_profile.get_exit_management()
+            except Exception as e:
+                self._exit_management_failed = True
+                self.error(None, "exit_management", f"profile exit_management read failed ({type(e).__name__}: {e}); "
+                                                    "dynamic_exit_manager loads it per position")
+                return None
             warnings = [str(w) for w in em.get("warnings") or []]
             previous = self._previous.get("exit_management_warnings")
             previous = previous if isinstance(previous, list) else []
@@ -503,7 +515,7 @@ class GuardianCycle:
                 if w not in previous:
                     self.state["trail_warnings"].append({"symbol": None, "warning": w})
             self._exit_management = dict(em, warnings=[])
-        return self._exit_management
+        return copy.deepcopy(self._exit_management)
 
     def _trail(self, p, view):
         sym = view["symbol"]

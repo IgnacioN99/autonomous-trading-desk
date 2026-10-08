@@ -299,6 +299,121 @@ class TestGuardianReadsProfileOnce(GuardianExcursionBase):
         self.assertEqual(state["exit_management_warnings"], ["exit_management.trail_activation invalid: x"])
 
 
+class TestTrueNetBeOnCoarseTick(unittest.TestCase):
+    """PR #211 review: tick 0.1 on a 66.67 entry (0.15% of price). Rounding the BE floor away from price would leave
+    it up to one tick inside the 0.2% fee buffer; it is rounded toward price instead."""
+    ENTRY = 66.67
+    FILTERS = {"tickSize": 0.1, "precision_price": 1}
+
+    def _calc(self, direction, *, lock):
+        from test_issue_95_trailing_activation import flat_pre
+        e = self.ENTRY
+        if direction == "LONG":  # MFE 0.33 = 1.1R (R 0.3): BE step reached; trail well below BE; mark far above
+            post, forming, sl, mark = [(e + 0.33, e - 0.2, e + 0.1)], (e + 0.2, e - 0.1, e + 0.1), e - 0.3, e + 4.0
+        else:
+            post, forming, sl, mark = [(e + 0.2, e - 0.33, e - 0.1)], (e + 0.1, e - 0.2, e - 0.1), e + 0.3, e - 4.0
+        klines, entry_ts = make_klines(flat_pre(center=e), post, forming, time.time())
+        # lock_on_tp1 off: the far mark (price-floor room) must not raise the lock MFE beyond the BE step.
+        settings = em(lock_on_tp1=False) if lock else em(profit_lock_enabled=False)
+        with market(klines):
+            return dem.calculate_structural_stop("XUSDT", direction, e, current_sl_price=sl, target_env="testnet",
+                                                 planned_sl=sl, entry_ts=entry_ts, tp1_filled=True, mark_price=mark,
+                                                 reference_source="trade_audit", exit_management=settings,
+                                                 filters=dict(self.FILTERS))
+
+    def _on_grid(self, price):
+        return abs(price / 0.1 - round(price / 0.1)) < 1e-6
+
+    def test_long_be_at_least_the_buffer(self):
+        for lock in (False, True):
+            with self.subTest(lock=lock):
+                calc = self._calc("LONG", lock=lock)
+                sl = calc["new_structural_sl"]
+                self.assertEqual(sl, 66.9)  # entry x 1.002 = 66.803 rounded UP (66.8 would be a 0.195% buffer)
+                self.assertGreaterEqual(sl, self.ENTRY * 1.002)
+                self.assertTrue(self._on_grid(sl))
+                if lock:
+                    self.assertEqual(calc["profit_lock"]["lock_r"], 0.0)
+                    self.assertEqual(calc["profit_lock"]["lock_price"], 66.9)
+                    self.assertTrue(calc["profit_lock"]["binding"])
+
+    def test_short_be_at_least_the_buffer(self):
+        for lock in (False, True):
+            with self.subTest(lock=lock):
+                calc = self._calc("SHORT", lock=lock)
+                sl = calc["new_structural_sl"]
+                self.assertEqual(sl, 66.5)  # entry x 0.998 = 66.537 rounded DOWN (66.6 would be inside the buffer)
+                self.assertLessEqual(sl, self.ENTRY * 0.998)
+                self.assertTrue(self._on_grid(sl))
+                if lock:
+                    self.assertEqual(calc["profit_lock"]["lock_price"], 66.5)
+
+    def test_true_net_be_helper(self):
+        self.assertEqual(dem._true_net_be(100.0, True, 0.1, 1), 100.2)  # on-grid: unchanged (no float-noise tick)
+        self.assertEqual(dem._true_net_be(100.0, False, 0.1, 1), 99.8)
+        self.assertEqual(dem._true_net_be(66.67, True, 0.1, 1), 66.9)
+        self.assertEqual(dem._true_net_be(66.67, False, 0.1, 1), 66.5)
+        for v in (100.2, 66.9):  # the final away-from-price rounding leaves an on-grid BE unchanged
+            self.assertEqual(dem._round_stop(v, "LONG", 0.1, 1), v)
+        for v in (99.8, 66.5):
+            self.assertEqual(dem._round_stop(v, "SHORT", 0.1, 1), v)
+
+    def test_long_one_tick_cap_uses_round_stop(self):
+        from decimal import Decimal
+        self.assertEqual(dem._round_stop(Decimal("100.05") - Decimal("0.1"), "LONG", 0.1, 1), 99.9)
+
+
+class TestGuardianProfileReadFailure(GuardianExcursionBase):
+
+    def _two(self):
+        return FakeExchange([long_position("BTCUSDT", mark="101.0"), long_position("ETHUSDT", mark="101.0")],
+                            algos=[stop(501, 95.0, symbol="BTCUSDT"), stop(502, 95.0, symbol="ETHUSDT")])
+
+    def test_failure_cached_for_the_cycle_and_dem_loads_itself(self):
+        real = up.get_exit_management
+        calls = []
+
+        def flaky(*a, **k):
+            calls.append(a)
+            if len(calls) == 1:
+                raise RuntimeError("profile boom")
+            return real({})
+
+        seen = []
+        real_trail = dem.update_position_to_structural_stop
+
+        def trail(symbol, *a, **kw):
+            seen.append(kw.get("exit_management"))
+            return real_trail(symbol, *a, **kw)
+
+        with patch("user_profile.get_exit_management", side_effect=flaky), \
+                patch("dynamic_exit_manager.update_position_to_structural_stop", side_effect=trail):
+            state = self.cycle(self._two())
+        errors = [e for e in state["errors"] if e["stage"] == "exit_management"]
+        self.assertEqual(len(errors), 1)
+        self.assertIn("RuntimeError: profile boom", errors[0]["error"])
+        self.assertEqual(seen, [None, None])  # dem falls back to its own load
+        self.assertEqual(len(calls), 3)  # one failed cycle read + one dem load per position
+        self.assertEqual([e for e in state["errors"] if e["stage"] == "trailing"], [])
+
+    def test_each_dem_call_gets_its_own_copy(self):
+        seen = []
+        real_trail = dem.update_position_to_structural_stop
+
+        def trail(symbol, *a, **kw):
+            em_ = kw["exit_management"]
+            seen.append([dict(s) for s in em_["profit_lock_steps"]])
+            em_["profit_lock_steps"].clear()  # a misbehaving callee must not affect the next position
+            em_["profit_lock_enabled"] = False
+            return real_trail(symbol, *a, **kw)
+
+        with patch("dynamic_exit_manager.update_position_to_structural_stop", side_effect=trail):
+            self.cycle(self._two())
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(seen[0], up.DEFAULT_EXIT_MANAGEMENT["profit_lock_steps"])
+        self.assertEqual(seen[1], up.DEFAULT_EXIT_MANAGEMENT["profit_lock_steps"])
+
+
 class TestSimMirrorsTheLiveWindow(unittest.TestCase):
 
     def test_sim_uses_dem_rule(self):
