@@ -118,12 +118,12 @@ def normalize_priority(priority: Any, severity: Any = "HIGH") -> str:
 
 
 def normalize_category(category: Any, required: bool = False) -> str:
-    """Lowercases and validates a category (^[a-z0-9_-]+$). Empty is allowed (no cat:* label) unless required."""
-    value = str(category if category is not None else "").strip().lower()
+    """Lowercases a category, turns runs of spaces/'-' into '_' and validates it. Empty is allowed (no cat:* label) unless required."""
+    value = re.sub(r'[\s-]+', '_', str(category if category is not None else "").strip().lower())
     if not value and not required:
         return ""
     if not CATEGORY_RE.match(value):
-        raise ValueError(f"invalid category {category!r}: lowercase letters, digits, '_' and '-' only")
+        raise ValueError(f"invalid category {category!r}: lowercase letters, digits and '_' only (spaces and '-' become '_')")
     return value
 
 
@@ -329,6 +329,25 @@ def read_capped(path: str, max_chars: int = CONTEXT_FILE_CHARS) -> str:
             return f.read(max_chars)
     except Exception as e:
         return f"(could not read context file {path}: {type(e).__name__})"
+
+
+CREDENTIAL_PATH_RE = re.compile(r'^(\.env(\..*)?|.*\.env|\.?mcp\.json|.*mcp_config.*|.*credentials.*|.*\.pem|.*\.key)$')
+CREDENTIAL_PATH_HINT = ".env, *.env, MCP configs (.mcp.json, mcp_config*), *credentials*, *.pem, *.key"
+
+
+def is_credential_path(path: Any) -> bool:
+    """True when the path as given or its resolved target names a credential-bearing file (#58)."""
+    if path is None or not str(path).strip():
+        return False
+    raw = str(path)
+    try:
+        resolved = os.path.realpath(raw)
+    except (OSError, ValueError):
+        resolved = ""
+    for candidate in (raw, resolved):
+        if candidate and CREDENTIAL_PATH_RE.match(candidate.replace("\\", "/").rsplit("/", 1)[-1].lower()):
+            return True
+    return False
 
 
 def split_items(text: str, separators: str = ",\n") -> List[str]:
