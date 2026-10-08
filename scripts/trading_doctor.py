@@ -151,6 +151,34 @@ def check_yolo_scan_health(profile: dict) -> tuple:
     return "ok", f"YOLO scan healthy (last status {health.get('last_status', 'UNKNOWN')}, {count} consecutive UNAVAILABLE)."
 
 
+def _prod_pending_summary(target_env: str):
+    """Text describing the target env's resting entries in logs/pending_entries.json, an "unreadable" text when the
+    registry cannot be loaded, or None when it holds none."""
+    try:
+        entries, err = eft.load_pending_entries()
+    except Exception as e:
+        entries, err = {}, f"{type(e).__name__}: {e}"
+    if err:
+        return f"pending entries registry unreadable: {err}"
+    count = sum(1 for rec in (entries or {}).values()
+                if isinstance(rec, dict) and rec.get("target_env") == target_env)
+    return f"{count} pending PROD resting entr{'y' if count == 1 else 'ies'}" if count else None
+
+
+def guardian_check_failed(target_env: str, exc: Exception) -> tuple:
+    """(level, message) when check_guardian_service raised (issue #172). PROD with a resting entry in
+    logs/pending_entries.json, or an unreadable registry -> "critical" (fail closed: the guardian may be down while a
+    fill needs its planned SL); otherwise "warn"."""
+    msg = f"Position guardian liveness unreadable ({type(exc).__name__})."
+    if is_prod_environment(target_env):
+        pending = _prod_pending_summary(target_env)
+        if pending:
+            return "critical", (f"{msg[:-1]} with {pending} in logs/pending_entries.json: a filled entry can stay "
+                                "without its planned SL/TPs. Run python3 scripts/execute_futures_trade.py "
+                                "--protect-pending now and check the guardian loop.")
+    return "warn", msg
+
+
 def check_guardian_service(target_env: str) -> tuple:
     """Position guardian liveness (issues #55, #167) from execute_futures_trade.check_guardian_alive (reads
     logs/guardian_state.json; no subprocess). Returns (level, message), level "ok", "warn" or "critical".
@@ -179,16 +207,7 @@ def check_guardian_service(target_env: str) -> tuple:
     else:
         hint = f"Start the loop: python3 scripts/loops/position_guardian_loop.py --interval 60 --env {target_env}"
     if is_prod_environment(target_env):
-        try:
-            entries, err = eft.load_pending_entries()
-        except Exception as e:
-            entries, err = {}, f"{type(e).__name__}: {e}"
-        if err:
-            pending = f"pending entries registry unreadable: {err}"
-        else:
-            count = sum(1 for rec in (entries or {}).values()
-                        if isinstance(rec, dict) and rec.get("target_env") == target_env)
-            pending = f"{count} pending PROD resting entr{'y' if count == 1 else 'ies'}" if count else None
+        pending = _prod_pending_summary(target_env)
         if pending:
             return "critical", (f"Position guardian loop not alive ({why}) with {pending} in logs/pending_entries.json: "
                                 "a filled entry can stay without its planned SL/TPs (MCP: no pre-armed SL). Run "
@@ -688,7 +707,7 @@ def run_doctor(target_env: str = None, auto_heal: bool = False) -> int:
     try:
         level, msg = check_guardian_service(target_env)
     except Exception as e:
-        level, msg = "warn", f"Position guardian liveness unreadable ({type(e).__name__})."
+        level, msg = guardian_check_failed(target_env, e)
     if level == "critical":
         critical_failures.append(msg)
         print(f"❌ [GUARDIAN] {msg}")

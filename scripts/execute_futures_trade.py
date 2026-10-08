@@ -4256,6 +4256,8 @@ def move_sl_to_breakeven(symbol, target_env=None, force=False, is_yolo=None, dry
         only after TP1 has filled (right-tail preservation).
       - Standard positions: only after TP1 has filled or price expanded >= 2x ATR_15m (anti-truncation).
     Never loosens an existing stop and never places a stop that would trigger immediately (even with force).
+    Issue #172: the stops are re-read right before the write; a fresher stop at or beyond break-even gives
+    "already_at_breakeven" (no write), and a failed re-read falls back to the first read (never blocks).
     Returns the --move-breakeven JSON schema documented in the module docstring.
     """
     force = _truthy(force)
@@ -4356,6 +4358,19 @@ def move_sl_to_breakeven(symbol, target_env=None, force=False, is_yolo=None, dry
         result["new_stop"] = {"algo_id": None, "type": "STOP_MARKET", "side": exit_side, "trigger_price": be_price}
         return finish(True, "dry_run", f"DRY RUN: would move {symbol} stop from {old_trigger or 'none'} to {be_price}.")
 
+    # Issue #172: re-read the stops right before writing, so a stop tightened meanwhile (guardian trail, another run) is
+    # neither loosened nor duplicated. A failed re-read never blocks this risk-reducing move: the first read is used.
+    fresh, fresh_err = get_open_stop_orders(symbol, exit_side, target_env=target_env)
+    if not fresh_err:
+        fresh_old = tightest_stop(fresh, is_long)
+        fresh_trigger = _trigger_price(fresh_old) if fresh_old else 0.0
+        result["old_stops"] = [stop_summary(ao) for ao in fresh]
+        result["old_stop"] = stop_summary(fresh_old)
+        if fresh_old and not is_tighter_stop(be_price, fresh_trigger, is_long):
+            return finish(True, "already_at_breakeven",
+                          f"Existing stop {fresh_trigger} for {symbol} is already at or beyond True Net Break-Even "
+                          f"({be_price}) on a fresh read. Unchanged.")
+        old_stops, old_trigger = fresh, fresh_trigger
     rep = replace_protective_stop(symbol, exit_side, be_price, qty, old_stops, target_env=target_env,
                                   tick_size=filters.get('tickSize'))
     if not rep["success"]:

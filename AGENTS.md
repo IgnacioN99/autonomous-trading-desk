@@ -38,11 +38,11 @@ Whenever the user explicitly requests crypto trading operations, Binance Futures
    - **Layer 5: Fail-Closed Atomic Execution & Notion Journaling:**
      * Atomic Stop Loss verification with up to 3 progressive retries (~2.8s) in `/fapi/v1/openAlgoOrders`. If not indexed, triggers immediate market auto-destruct with `reduceOnly=true`. Fail OPEN on Notion (never blocks live trading if external Notion API fails).
    - **Layer 6: Committed and Immutable Memory (`scripts/remember_trade_lesson.py` & `logs/trade_insights.jsonl`):**
-     * Append-only ledger of forensic lessons and Stop Loss root causes for persistent cross-session learning.
+     * Append-only ledger of forensic lessons and Stop Loss root causes for cross-session learning.
    - **Layer 7: Night Cutoff Loop (`scripts/loops/night_cutoff_loop.py`):**
-     * End-of-day protocol: ratchets winning positions to True Net Break-Even (+0.2%), reaps expired orphan limit orders (>90m), and guarantees Zero Overnight Risk.
+     * End-of-day: ratchets winners to True Net Break-Even (+0.2%), reaps orphan limit orders (>90m), guarantees Zero Overnight Risk.
    - **Layer 8: Position Guardian Loop (`scripts/loops/position_guardian_loop.py`):**
-     * Risk-reducing only (never opens positions): structural trailing stops, dead alpha, orphan audit/heal. `--once` = one cycle, `--interval <s>` = background (service), `--dry-run` = report only; state in `logs/guardian_state.json`.
+     * Risk-reducing only (never opens positions): structural trailing, dead alpha, orphan audit/heal. Unverified trade reference = TP1 unknown: no TP1-based BE or trail. `--once` one cycle, `--interval <s>` service, `--dry-run` report only; state: `logs/guardian_state.json`.
 
 1. **Phase 1: Grounded Intelligence & Market Screening**
    - **Deterministic Grounding & Zero-Read Fast-Path:** All quantitative principles (Bitcoin microstructure, CVD absorptions, Kelly sizing, volatility parity, stat-arb cointegration, prompt architecture) are permanently implemented in the Python harness (`scripts/screening_pipeline.py`, `scripts/quant_risk_engine.py`, `scripts/microstructure_engine.py`). Do NOT call `view_file` on research notebooks or skills.
