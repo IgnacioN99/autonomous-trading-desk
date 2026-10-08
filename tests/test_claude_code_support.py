@@ -177,10 +177,10 @@ class TestGeneratedClaudeAssets(unittest.TestCase):
             # C4.2 equals the dossier status.
             c42 = re.findall(r"C4\.2 Overall status:.*-> (APPROVED|REJECTED|NEUTRAL)\s*$", region, re.M)
             self.assertEqual(c42, [dossier["status"]])
-            # Approved candidates never have an unchecked K1-K3 or C3.1 line.
+            # Approved candidates never have an unchecked K1-K5 or C3.1 line (K5: issue #206).
             for symbol in dossier["approved_symbols"]:
                 for line in region.splitlines():
-                    if symbol in line and re.search(r"\b(K1|K2|K3|K4|C3\.1)\b", line):
+                    if symbol in line and re.search(r"\b(K1|K2|K3|K4|K5|C3\.1)\b", line):
                         self.assertTrue(line.strip().startswith("- [x]"), line)
             self.assertEqual([c["symbol"] for c in dossier["approved_candidates"]], dossier["approved_symbols"])
 

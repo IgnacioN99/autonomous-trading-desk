@@ -68,6 +68,7 @@ sorted by confidence. `--top 0` (default) returns all of them.
    "tier_code": "S", "interval": "15m", "price": 142.1, "trigger": 142.4, "trigger_distance_pct": 0.21,
    "sl": 139.4, "tp1": 147.8, "tp2": 154.4, "rr": 4.0, "risk_pct": 2.11, "rsi": 26.4, "rsi_15m": 26.4, "vol_ratio": 2.1,
    "lower_wick": 63.0, "upper_wick": 5.0, "reasons": ["..."], "roe_est_pct": 25.3,
+   "funding_rate_pct": 0.01, "long_crowding_risk": false, "long_crowding_reasons": [],
    "micro": {"taker_ratio": 0.82, "oi_change_pct": 0.4, "oi_z_score": 1.3, "funding_rate_pct": 0.01,
              "regime": "NEUTRAL_CONSOLIDATION", "absorption": "BULLISH_ABSORPTION", "oib_ratio": -0.1,
              "vwap_deviation_pct": -0.8, "cascade_risk": "BASELINE", "...": "..."}}]}
@@ -75,6 +76,13 @@ sorted by confidence. `--top 0` (default) returns all of them.
 
 - `tier_code`: `S` (≥ 80), `A+` (65-79), `A` (55-64). Tier S requires volume ≥ 1.4x or wick ≥ 60%
   (`tier_s_eligible`), also after the microstructure bonus.
+- Squeeze filter (issue #206, `scripts/utils/squeeze_filter.py`): a SHORT with `micro.oi_z_score` ≥ 2.0 or
+  `funding_rate_pct` ≤ -0.01% (per 8h), or without micro data, gets `squeeze_risk: true` + `squeeze_reasons` and is
+  capped at Tier A (score 64, `score_components.squeeze_cap`); never rejected for this alone. A LONG with oi_z ≥ 2.0
+  and funding ≥ +0.05% gets `long_crowding_risk: true` (flag only). The macro rule for altcoin shorts (BTC
+  resistance rejection or `alt_short_climax_ok`, the exact unrounded `vol_ratio` ≥ 2.5x) is a hard gate in
+  `screening_pipeline.py` / the primed brief only (`macro_rejected_shorts`); this standalone CLI has no BTC context
+  and does not apply it.
 - `lower_wick` / `upper_wick` come from ONE closed candle (sum ≤ 100) opening at `wick_candle_open_time` (ms);
   `vol_ratio` is that same candle's volume vs the 20 before it. `micro.wick_candle_mismatch` (candle not in the
   micro fetch) or `micro.taker_candle_matched` not `true` (no taker row for it) → no absorption bonus, reason says

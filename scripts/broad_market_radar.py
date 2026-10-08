@@ -31,6 +31,7 @@ from decimal import Decimal
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import microstructure_engine as me
 from utils import rate_limit_guard
+from utils import squeeze_filter as sqf
 
 SUPPORTED_INTERVALS = ("5m", "15m", "1h")
 DEFAULT_INTERVAL = "15m"
@@ -349,6 +350,8 @@ def analyze_single_symbol(symbol, interval=DEFAULT_INTERVAL):
         "wick_candle_open_time": wick_candle_open_time,  # open time (ms) of the closed candle both wicks come from
         # Exact (unrounded) volume-or-wick rule, re-applied after the microstructure enrichment (issue #134)
         "tier_s_eligible": bool(has_volume_or_wick_climax),
+        # Exact (unrounded) climax part of the macro rule for altcoin shorts (issue #206), read by the pipeline gate
+        "alt_short_climax_ok": bool(vol_ratio >= sqf.ALT_SHORT_CLIMAX_VOL),
         "score_components": score_components,
         "reasons": reasons
     }
@@ -365,8 +368,17 @@ def enrich_candidate_microstructure(cand):
     micro = me.get_symbol_microstructure(sym, period=cand.get('interval', DEFAULT_INTERVAL),
                                          wick_candle_open_time=cand.get('wick_candle_open_time'))
     if not micro:
+        # Issue #206: a SHORT without micro data cannot be checked for squeeze risk, so it is capped (fail closed)
+        cand['funding_rate_pct'] = None
+        if cand.get('direction') == 'SHORT':
+            comps = dict(cand.get('score_components') or {"base": int(cand['confidence'])})
+            cand['confidence'] = _apply_squeeze_cap(cand, comps, int(cand['confidence']),
+                                                    sqf.short_squeeze_reasons(micro))
+            cand['score_components'] = comps
+            _set_tier(cand)
         return cand
     cand['micro'] = micro
+    cand['funding_rate_pct'] = micro.get('funding_rate_pct')
     score = cand['confidence']
     direction = cand['direction']
     reasons = cand['reasons']
@@ -433,7 +445,32 @@ def enrich_candidate_microstructure(cand):
     cand['absorption_scored'] = absorption_scored
     cand['confidence'] = max(20, min(95, score))
     _add_cap_component(comps, cand['confidence'])
+    if direction == 'SHORT':
+        cand['confidence'] = _apply_squeeze_cap(cand, comps, cand['confidence'], sqf.short_squeeze_reasons(micro))
+    elif direction == 'LONG':
+        crowding = sqf.long_crowding_reasons(micro)
+        cand['long_crowding_risk'] = bool(crowding)
+        cand['long_crowding_reasons'] = crowding
     cand['score_components'] = comps
+    _set_tier(cand)
+    return cand
+
+def _apply_squeeze_cap(cand, comps, confidence, reasons):
+    """Issue #206: a SHORT with squeeze risk is flagged and capped at Tier A (score 64), booked as `squeeze_cap` so
+    that sum(components) == confidence. A score already at or below 64 only gets the flag. Returns the score."""
+    cand['squeeze_risk'] = bool(reasons)
+    cand['squeeze_reasons'] = list(reasons)
+    if not reasons:
+        return confidence
+    if confidence > sqf.SQUEEZE_SCORE_CAP:
+        comps['squeeze_cap'] = comps.get('squeeze_cap', 0) + sqf.SQUEEZE_SCORE_CAP - confidence
+        confidence = sqf.SQUEEZE_SCORE_CAP
+    # First line, so the brief's two-reason table shows it
+    cand.setdefault('reasons', []).insert(0, f"⚠️ Squeeze risk: {', '.join(reasons)} → capped at Tier A")
+    return confidence
+
+def _set_tier(cand):
+    """Tier label and code from the final enrichment confidence."""
     if cand['confidence'] >= 80:
         cand['tier'] = "Tier S (🔥 Top Score, order flow confirmed)"
     elif cand['confidence'] >= 65:
