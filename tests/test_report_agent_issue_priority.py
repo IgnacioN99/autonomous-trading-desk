@@ -9,6 +9,7 @@ import contextlib
 import io
 import json
 import os
+import socket
 import sys
 import tempfile
 import unittest
@@ -26,9 +27,10 @@ import report_agent_issue  # noqa: E402
 from utils import issue_telemetry  # noqa: E402
 
 
-def fake_response(data):
+def fake_response(data, status=201, raw=None):
     resp = MagicMock()
-    resp.read.return_value = json.dumps(data).encode("utf-8")
+    resp.status = status
+    resp.read.return_value = raw if raw is not None else json.dumps(data).encode("utf-8")
     cm = MagicMock()
     cm.__enter__.return_value = resp
     cm.__exit__.return_value = False
@@ -158,10 +160,16 @@ class TestReportIssuePriority(_BacklogCase):
         cleaned = report_agent_issue.sanitize_telemetry(
             "Net Delta: $+3087.31 | -16.75 | `$+3.20` USDT `+4.10` USDT **5.55** USDT pnl=+7.5 "
             "API3USDT C98USDT 1000SHIBUSDT -0.3% t-stat: -3.34")
-        for leaked in ("3087.31", "16.75", "3.20", "4.10", "5.55", "7.5", "3.34"):
+        for leaked in ("3087.31", "16.75", "3.20", "4.10", "5.55", "7.5"):
             self.assertNotIn(leaked, cleaned)
         for kept in ("API3USDT", "C98USDT", "1000SHIBUSDT", "-0.3%"):
             self.assertIn(kept, cleaned)
+        self.assertIn("t-stat: -3.34", cleaned)  # #61: labelled quant statistics keep their value
+
+    def test_sanitizer_shared_fixtures(self):
+        from test_report_issue import SECRETS_FIXTURE, SECRETS_EXPECTED, QUANT_FIXTURE, QUANT_EXPECTED
+        self.assertEqual(report_agent_issue.sanitize_telemetry(SECRETS_FIXTURE), SECRETS_EXPECTED)
+        self.assertEqual(report_agent_issue.sanitize_telemetry(QUANT_FIXTURE), QUANT_EXPECTED)
 
     def test_sanitizer_redacts_monetary_keys(self):
         cleaned = report_agent_issue.sanitize_telemetry(
@@ -174,6 +182,8 @@ class TestReportIssuePriority(_BacklogCase):
     def test_category_normalized_and_validated(self):
         self.report(severity="HIGH", category="Risk_Gate")
         self.assertEqual(self.last_entry()["labels"][-1], "cat:risk_gate")
+        self.report(severity="HIGH", category="Tool Error", error="spaced")
+        self.assertEqual(self.last_entry()["labels"][-1], "cat:tool_error")
         with self.assertRaises(ValueError):
             self.report(severity="HIGH", category="tool error; rm", error="other")
 
@@ -217,13 +227,22 @@ class TestCliValidation(_BacklogCase):
 
     def test_category_cli_validation(self):
         with self.assertRaises(SystemExit) as cm:
-            self.run_main("--title", "t", "--error", "e", "--category", "tool error")
-        self.assertNotEqual(cm.exception.code, 0)
-        with self.assertRaises(SystemExit):
             self.run_main("--title", "t", "--error", "e", "--category", "not_a_choice")
+        self.assertNotEqual(cm.exception.code, 0)
         self.assertFalse(os.path.exists(self.backlog))
         self.run_main("--title", "t", "--error", "e", "--category", "INFRA")
         self.assertEqual(self.last_entry()["labels"][-1], "cat:infra")
+        # #60: spaces and dashes are normalised to '_' instead of losing the report
+        self.run_main("--title", "t2", "--error", "e2", "--category", "tool error")
+        self.assertEqual(self.last_entry()["labels"][-1], "cat:tool_error")
+        self.run_main("--title", "t3", "--error", "e3", "--category", "Tool-Error")
+        self.assertEqual(self.last_entry()["labels"][-1], "cat:tool_error")
+
+    def test_credential_attachment_cli_exit_2(self):
+        with self.assertRaises(SystemExit) as cm:
+            self.run_main("--title", "t", "--error", "e", "--output-file", ".mcp.json")
+        self.assertEqual(cm.exception.code, 2)
+        self.assertFalse(os.path.exists(self.backlog))
 
     def test_sync_backlog_injects_default_priority_into_legacy_entries(self):
         legacy = {"title": "legacy", "body": "b", "labels": ["agent-failure", "severity:critical", "cat:infra"]}
@@ -273,6 +292,10 @@ class TestDispatchLabelFallback(unittest.TestCase):
         item = self.responses.pop(0)
         if isinstance(item, Exception):
             raise item
+        if isinstance(item, bytes):
+            return fake_response(None, raw=item)
+        if callable(item):
+            return item()
         return fake_response(item)
 
     def dispatch(self, which=None, run=None):
@@ -324,6 +347,159 @@ class TestDispatchLabelFallback(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError):
             self.dispatch()
         self.assertEqual(len(self.requests), 1)
+
+    def test_403_is_not_retried(self):
+        self.responses.append(urllib.error.HTTPError("u", 403, "Forbidden", None, io.BytesIO(b"")))
+        with self.assertRaises(urllib.error.HTTPError):
+            self.dispatch()
+        self.assertEqual(len(self.requests), 1)
+
+    def assert_published_unknown_url(self, res, out):
+        self.assertTrue(res["url_unknown"])
+        self.assertIsNone(res["issue_number"])
+        self.assertFalse(res["labels_applied"])
+        self.assertEqual(len(self.requests), 1)
+        self.assertIn("NOT queued", out)
+        self.assertIn("gh issue list --repo owner/repo --state all --search", out)
+
+    def test_201_with_unparsable_body_is_published_unknown_url(self):
+        self.responses.append(b"<html>proxy")
+        res, out = self.dispatch()  # the default run raises: gh never runs
+        self.assert_published_unknown_url(res, out)
+
+    def test_201_with_read_timeout_is_published_unknown_url(self):
+        def timed_out():
+            cm = fake_response(None)
+            cm.__enter__.return_value.read.side_effect = socket.timeout("read timed out")
+            return cm
+        self.responses.append(timed_out)
+        res, out = self.dispatch()
+        self.assert_published_unknown_url(res, out)
+
+    def test_non_201_with_unparsable_body_raises(self):
+        self.responses.append(lambda: fake_response(None, status=200, raw=b"<html>proxy"))
+        with self.assertRaises(ValueError):
+            self.dispatch()
+
+
+class TestPublishedFingerprints(_BacklogCase):
+    """#62: a 201 with an unreadable body is never queued, and --sync-backlog skips published fingerprints."""
+
+    LABELS = ["agent-failure", "severity:high", "priority:P1", "cat:tool_error"]
+
+    def setUp(self):
+        super().setUp()
+        self.fps_file = os.path.join(self.tmp.name, "fps.json")
+        self.requests = []
+        self.responses = []
+        for p in (patch.object(report_agent_issue.urllib.request, "urlopen", side_effect=self._urlopen),
+                  patch("report_agent_issue.shutil.which", return_value=None),
+                  patch.dict(os.environ, {"GITHUB_TOKEN": "x"})):
+            p.start()
+            self.patches.append(p)  # stopped in reverse order by _BacklogCase.tearDown (env restore order matters)
+
+    def _urlopen(self, req, timeout=None):
+        self.requests.append(json.loads(req.data.decode("utf-8")))
+        item = self.responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        if isinstance(item, bytes):
+            return fake_response(None, raw=item)
+        return fake_response(item)
+
+    def report(self, **kw):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            res = report_agent_issue.report_issue(title="Mock Anomaly", error_detail="boom", severity="HIGH",
+                                                  category="tool_error", repo="owner/repo", **kw)
+        return res, out.getvalue()
+
+    def fingerprints(self):
+        with open(self.fps_file, encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_403_queues_after_single_post(self):
+        self.responses.append(urllib.error.HTTPError("u", 403, "Forbidden", None, io.BytesIO(b"")))
+        res, _ = self.report()
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(self.last_entry()["status"], "QUEUED_OFFLINE")
+        self.assertEqual(self.fingerprints()[res["fingerprint"]]["status"], "QUEUED_OFFLINE")
+
+    def test_201_unparsable_body_not_queued(self):
+        self.responses.append(b"<html>proxy")
+        res, out = self.report()
+        self.assertEqual(res["status"], "PUBLISHED_UNKNOWN_URL")
+        self.assertFalse(os.path.exists(self.backlog))
+        self.assertEqual(self.fingerprints()[res["fingerprint"]]["status"], "PUBLISHED_UNKNOWN_URL")
+        self.assertIn("NOT queued", out)
+        self.assertIn("gh issue list --repo owner/repo --state all --search", out)
+        self.assertIn("URL unknown", out)
+
+    def test_published_status_recorded(self):
+        self.responses.append({"number": 7, "html_url": "u7", "labels": [{"name": l} for l in self.LABELS]})
+        res, _ = self.report()
+        self.assertEqual(res["status"], "PUBLISHED_GITHUB")
+        self.assertFalse(os.path.exists(self.backlog))
+        entry = self.fingerprints()[res["fingerprint"]]
+        self.assertEqual((entry["status"], entry["issue_number"]), ("PUBLISHED_GITHUB", 7))
+
+    def test_sync_skips_published_fingerprints(self):
+        with open(self.fps_file, "w", encoding="utf-8") as f:
+            json.dump({
+                "fpA": {"title": "a", "status": "PUBLISHED_GITHUB", "issue_number": 1, "count": 1},
+                "fpB": {"title": "b", "status": "PUBLISHED_UNKNOWN_URL", "issue_number": None, "count": 1},
+                "fpL": {"title": "l", "issue_number": 5, "count": 1},
+                "fpQ": {"title": "q", "status": "QUEUED_OFFLINE", "count": 3},
+            }, f)
+        entries = [{"fingerprint": fp, "title": fp, "body": "b", "labels": list(self.LABELS)}
+                   for fp in ("fpA", "fpB", "fpL", "fpQ")]
+        entries.append({"title": "nofp", "body": "b", "labels": list(self.LABELS)})
+        with open(self.backlog, "w", encoding="utf-8") as f:
+            f.write("".join(json.dumps(e) + "\n" for e in entries))
+        sent = []
+
+        def fake_dispatch(title, body, labels, repo, token=None):
+            sent.append(title)
+            if title == "fpQ":
+                return {"success": True, "issue_number": None, "html_url": None, "url_unknown": True}
+            return {"success": True, "issue_number": 9, "html_url": "u9"}
+        out = io.StringIO()
+        with patch("report_agent_issue.dispatch_github_issue", side_effect=fake_dispatch), \
+             patch("report_agent_issue.time.sleep"), contextlib.redirect_stdout(out):
+            report_agent_issue.sync_backlog(repo="owner/repo")
+        self.assertEqual(sent, ["fpQ", "nofp"])
+        with open(self.backlog, encoding="utf-8") as f:
+            self.assertEqual(f.read().strip(), "")
+        fps = self.fingerprints()
+        self.assertEqual(fps["fpQ"]["status"], "PUBLISHED_UNKNOWN_URL")
+        self.assertEqual(fps["fpQ"]["count"], 3)
+        self.assertEqual(fps["fpA"]["status"], "PUBLISHED_GITHUB")
+        self.assertIn("3 skipped (already published)", out.getvalue())
+        self.assertIn("Issue published (URL unknown): fpQ", out.getvalue())
+
+    def test_sync_skips_duplicate_entry_in_same_run(self):
+        entry = {"fingerprint": "fpD", "title": "dup", "body": "b", "labels": list(self.LABELS)}
+        with open(self.backlog, "w", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n" + json.dumps(entry) + "\n")
+        dispatch = MagicMock(return_value={"success": True, "issue_number": 4, "html_url": "u4"})
+        out = io.StringIO()
+        with patch("report_agent_issue.dispatch_github_issue", dispatch), \
+             patch("report_agent_issue.time.sleep"), contextlib.redirect_stdout(out):
+            report_agent_issue.sync_backlog(repo="owner/repo")
+        self.assertEqual(dispatch.call_count, 1)
+        self.assertEqual(self.fingerprints()["fpD"]["status"], "PUBLISHED_GITHUB")
+        self.assertIn("1 published, 1 skipped (already published), 0 remaining", out.getvalue())
+
+    def test_credential_attachment_refused(self):
+        with patch.object(report_agent_issue.urllib.request, "urlopen", side_effect=AssertionError("no network")):
+            for kw in ({"output_file": ".env"}, {"context_file": "config/environments/prod.env"}):
+                with self.subTest(**kw):
+                    with self.assertRaises(ValueError) as cm:
+                        self.report(**kw)
+                    self.assertIn("refusing to attach", str(cm.exception))
+        self.assertFalse(os.path.exists(self.backlog))
+        self.assertFalse(os.path.exists(self.fps_file))
+        self.assertEqual(self.requests, [])
 
 
 if __name__ == "__main__":

@@ -11,7 +11,9 @@ Resilience Features:
    or network fails, atomically enqueues the issue in logs/issues_backlog.jsonl for later sync.
 3. Safe Repository Resolution: Derives repo dynamically from GITHUB_REPO env var or git remote origin.
    NEVER defaults to a hardcoded remote.
-4. Telemetry Sanitization: Masks API tokens, secret keys, exact balances, and full state payloads.
+4. Telemetry Sanitization: Masks API tokens, secret keys, the values of any secret/token/password/private-key/api-key
+   key, Binance signature= / listenKey values, exact balances, and full state payloads. Attachments
+   (--context-file / --output-file) naming a credential file (.env, *.env, MCP configs, *.pem, *.key) are refused.
 5. Intelligent Deduplication / Anti-Spam: Computes a SHA-256 fingerprint; if the same failure
    occurred within the past 24 hours, updates telemetry rather than spamming new issues.
 
@@ -34,9 +36,11 @@ import json
 import time
 import re
 import shutil
+import shlex
 import hashlib
 import datetime
 import subprocess
+import http.client
 import urllib.request
 import urllib.error
 import argparse
@@ -52,6 +56,13 @@ LOGS_DIR = os.path.join(BASE_DIR, "logs")
 BACKLOG_FILE = os.path.join(LOGS_DIR, "issues_backlog.jsonl")
 FINGERPRINTS_FILE = os.path.join(LOGS_DIR, "issues_fingerprints.json")
 DEFAULT_REPO = None
+
+PUBLISHED_GITHUB = "PUBLISHED_GITHUB"
+PUBLISHED_UNKNOWN_URL = "PUBLISHED_UNKNOWN_URL"
+PUBLISHED_STATUSES = (PUBLISHED_GITHUB, PUBLISHED_UNKNOWN_URL)
+
+# Labelled quant statistics whose signed values survive the bare signed-decimal rule (#61)
+QUANT_STAT_KEYS = r't[_-]?stat|tstat|z|z[_-]?score|beta|half[_-]?life|hurst|r2|p[_-]?value|pvalue|corr'
 
 # Load local .env manually if present to avoid python-dotenv external dependency
 def load_env_file():
@@ -106,7 +117,11 @@ def sanitize_telemetry(text: str) -> str:
     - Notion tokens (secret_, ntn_)
     - Bearer tokens
     - API keys, secret keys, passwords (Binance, Gmail, etc.)
-    - Exact monetary balances and session state payloads
+    - Values of any *secret* / *token* / *password* / *passwd* / *private_key* / *api_key* key (key=value,
+      key: value, JSON "key": "value"); the key name is kept, so prose such as "tokens: 1800" is over-redacted
+    - Binance signed-request signatures and user-data stream listen keys (signature=, listenKey=)
+    - Exact monetary balances and session state payloads, and bare signed decimals, except the values of
+      labelled quant statistics (t_stat: -3.42, "z": -2.15, beta:-0.87; see QUANT_STAT_KEYS)
     """
     if not text:
         return ""
@@ -127,6 +142,12 @@ def sanitize_telemetry(text: str) -> str:
         r'\1=[REDACTED]',
         text
     )
+    # Generic secret/token/password/private-key/api-key values (key=value, key: value, JSON "key": "value"); key name kept
+    text = re.sub(
+        r'(?i)((?:secret|token|passw(?:or)?d|private[_-]?key|api[_-]?key)[A-Za-z0-9_-]*"?[ \t]*[:=][ \t]*"?)[A-Za-z0-9/+=._~-]+',
+        r'\1[REDACTED]', text)
+    # Binance signed-request signatures and user-data stream listen keys
+    text = re.sub(r'(?i)((?:signature|listen[_-]?key)"?[ \t]*[:=][ \t]*"?)[A-Za-z0-9]+', r'\1[REDACTED]', text)
 
     # Redact exact balances in JSON formats
     text = re.sub(
@@ -149,8 +170,13 @@ def sanitize_telemetry(text: str) -> str:
     # Amounts followed by USDT/USD, also after a closing backtick/bold marker (`3.20` USDT, **3.20** USDT);
     # \b keeps symbols such as API3USDT / C98USDT intact
     text = re.sub(r'(?i)\b\d+(?:\.\d+)?[`*]*\s*(USDT|USD)\b', r'[REDACTED_AMT] USDT', text)
+    # Labelled quant statistics (t_stat: -3.42, "z": -2.15, beta:-0.87) keep their sign: protect it, redact, restore
+    text = re.sub(r'~Q(?:NEG|POS)~', '', text)
+    text = re.sub(r'(?im)(^|[^A-Za-z0-9_])("?(?:' + QUANT_STAT_KEYS + r')"?[ \t]*[:=][ \t]*)-([0-9])', r'\1\2~QNEG~\3', text)
+    text = re.sub(r'(?im)(^|[^A-Za-z0-9_])("?(?:' + QUANT_STAT_KEYS + r')"?[ \t]*[:=][ \t]*)\+([0-9])', r'\1\2~QPOS~\3', text)
     # Bare signed decimals (PnL table cells like "| -16.75 |"), not percentages
     text = re.sub(r'(?<![^\s|`(:])[+-]\d+\.\d+(?![\d%])', '[REDACTED_AMT]', text)
+    text = text.replace('~QNEG~', '-').replace('~QPOS~', '+')
 
     return text
 
@@ -243,7 +269,14 @@ def _post_issue(url: str, headers: Dict[str, str], payload: Dict[str, Any]) -> D
     data_bytes = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data_bytes, headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=12) as response:
-        return json.loads(response.read().decode("utf-8"))
+        status = response.status
+        try:
+            return json.loads(response.read().decode("utf-8"))
+        except (ValueError, OSError, http.client.HTTPException):
+            # A 201 means the issue exists even if its body is unreadable: never let the caller queue a duplicate (#62)
+            if status == 201:
+                return {"number": None, "html_url": None, "labels": None, "_url_unknown": True}
+            raise
 
 def _ensure_labels(repo: str, issue_number: Any, missing: List[str]) -> bool:
     """Adds missing severity/priority labels via gh when available; warns loudly with the exact fix-up command."""
@@ -275,9 +308,11 @@ def dispatch_github_issue(
 ) -> Dict[str, Any]:
     """
     Dispatches HTTP POST request to GitHub REST API.
-    If the labelled create is rejected (HTTP 4xx, e.g. 422 for unknown labels), retries once without labels
-    and with a '[SEV/Px] ' title prefix. Missing severity/priority labels are re-applied with gh when
-    possible, otherwise a warning with the exact `gh issue edit` command is printed.
+    If the labelled create is rejected with HTTP 422 (unknown labels), retries once without labels
+    and with a '[SEV/Px] ' title prefix; any other HTTP error is raised so the caller queues the report.
+    Missing severity/priority labels are re-applied with gh when possible, otherwise a warning with the
+    exact `gh issue edit` command is printed. A 201 whose body cannot be read returns url_unknown=True
+    with a `gh issue list --search` hint instead of raising.
     """
     if not repo:
         raise ValueError("Target repository is not specified.")
@@ -304,13 +339,26 @@ def dispatch_github_issue(
     try:
         res_data = _post_issue(url, headers, payload)
     except urllib.error.HTTPError as e:
-        if not labels or not (400 <= e.code < 500):
+        if not labels or e.code != 422:
             raise
         print(f"⚠️ GitHub rejected the labelled issue (HTTP {e.code}); retrying without labels...")
         res_data = _post_issue(url, headers, {
             "title": issue_telemetry.title_prefix_from_labels(labels) + clean_title,
             "body": body
         })
+
+    if res_data.get("_url_unknown"):
+        print("⚠️ WARNING: GitHub answered HTTP 201 (issue created) but its response could not be read; "
+              "the report was NOT queued to avoid a duplicate. Find it and check its severity/priority labels with:")
+        print(f"   gh issue list --repo {repo} --state all --search {shlex.quote(clean_title + ' in:title')}")
+        return {
+            "success": True,
+            "issue_number": None,
+            "html_url": None,
+            "state": None,
+            "labels_applied": False,
+            "url_unknown": True
+        }
 
     required = issue_telemetry.required_labels(labels)
     applied_names = {l.get("name") for l in (res_data.get("labels") or []) if isinstance(l, dict)}
@@ -354,6 +402,9 @@ def report_issue(
     severity = issue_telemetry.normalize_severity(severity)
     priority = issue_telemetry.normalize_priority(priority, severity)
     category = issue_telemetry.normalize_category(category)
+    for flag, path in (("--context-file", context_file), ("--output-file", output_file)):
+        if path and issue_telemetry.is_credential_path(path):
+            raise ValueError(_credential_refusal(path, flag))
     clean_title = sanitize_telemetry(title)
     target_repo = repo or derive_github_repo()
 
@@ -433,23 +484,28 @@ def report_issue(
     if token:
         try:
             gh_res = dispatch_github_issue(title=clean_title, body=markdown_body, labels=labels, repo=target_repo, token=token)
-            issue_record["status"] = "PUBLISHED_GITHUB"
+            status = PUBLISHED_UNKNOWN_URL if gh_res.get("url_unknown") else PUBLISHED_GITHUB
+            issue_record["status"] = status
             issue_record["issue_number"] = gh_res.get("issue_number")
             issue_record["html_url"] = gh_res.get("html_url")
             issue_record["labels_applied"] = gh_res.get("labels_applied")
 
-            # Record fingerprint
+            # Record fingerprint (the status lets --sync-backlog skip already-published reports)
             fp_cache[fingerprint] = {
                 "title": clean_title,
                 "issue_number": gh_res.get("issue_number"),
                 "html_url": gh_res.get("html_url"),
                 "last_seen_ts": now_ts,
-                "count": 1
+                "count": 1,
+                "status": status
             }
             save_fingerprints(fp_cache)
 
-            print(f"✅ GITHUB ISSUE CREATED SUCCESSFULLY: #{gh_res.get('issue_number')}")
-            print(f"   URL: {gh_res.get('html_url')}")
+            if gh_res.get("url_unknown"):
+                print("✅ GITHUB ISSUE CREATED (URL unknown: see the warning above)")
+            else:
+                print(f"✅ GITHUB ISSUE CREATED SUCCESSFULLY: #{gh_res.get('issue_number')}")
+                print(f"   URL: {gh_res.get('html_url')}")
             return issue_record
         except Exception as e:
             print(f"⚠️ Failed to connect to GitHub API ({e}). Saving issue to local backlog...", file=sys.stderr)
@@ -467,6 +523,14 @@ def report_issue(
     }
     save_fingerprints(fp_cache)
     return issue_record
+
+def _fingerprint_published(entry: Any) -> bool:
+    """True for a fingerprint record of a published issue (legacy records: no status but an issue number)."""
+    if not isinstance(entry, dict):
+        return False
+    if entry.get("status") in PUBLISHED_STATUSES:
+        return True
+    return "status" not in entry and bool(entry.get("issue_number"))
 
 def sync_backlog(repo: Optional[str] = None):
     """Retries dispatch of all pending offline backlog issues."""
@@ -493,12 +557,22 @@ def sync_backlog(repo: Optional[str] = None):
         return
 
     print(f"🔄 Syncing {len(lines)} pending issue(s) to https://github.com/{target_repo}/issues...")
+    fp_cache = load_fingerprints()
+    fp_dirty = False
     remaining = []
     success_count = 0
+    skipped_count = 0
 
     for line in lines:
+        item = {}
         try:
             item = json.loads(line)
+            # Entries without a fingerprint (legacy, bash-written) are always dispatched
+            fp = item.get("fingerprint")
+            if fp and _fingerprint_published(fp_cache.get(fp)):
+                print(f"   ⏭️ Skipped '{item.get('title')}': fingerprint {fp} is already published; dropped from the backlog.")
+                skipped_count += 1
+                continue
             res = dispatch_github_issue(
                 title=item["title"],
                 body=item["body"],
@@ -507,19 +581,39 @@ def sync_backlog(repo: Optional[str] = None):
                 repo=target_repo,
                 token=token
             )
-            print(f"   ✅ Issue #{res.get('issue_number')} published: {item['title']} -> {res.get('html_url')}")
+            if res.get("url_unknown"):
+                print(f"   ✅ Issue published (URL unknown): {item['title']}")
+            else:
+                print(f"   ✅ Issue #{res.get('issue_number')} published: {item['title']} -> {res.get('html_url')}")
             success_count += 1
+            if fp:
+                # Mark it published so a later duplicate entry (same sync or a later one) is skipped
+                entry = fp_cache.get(fp) if isinstance(fp_cache.get(fp), dict) else {}
+                entry.update({
+                    "title": item["title"],
+                    "issue_number": res.get("issue_number"),
+                    "html_url": res.get("html_url"),
+                    "last_seen_ts": int(time.time()),
+                    "status": PUBLISHED_UNKNOWN_URL if res.get("url_unknown") else PUBLISHED_GITHUB,
+                    "count": entry.get("count", 1),
+                })
+                fp_cache[fp] = entry
+                fp_dirty = True
             time.sleep(1)  # Rate limit cushion
         except Exception as e:
             print(f"   ❌ Failed to dispatch '{item.get('title')}': {e}")
             remaining.append(line)
+
+    if fp_dirty:
+        save_fingerprints(fp_cache)
 
     # Rewrite backlog only with remaining failures
     with open(BACKLOG_FILE, "w", encoding="utf-8") as f:
         for r in remaining:
             f.write(r + "\n")
 
-    print(f"🏁 Sync completed: {success_count} published, {len(remaining)} remaining in backlog.")
+    print(f"🏁 Sync completed: {success_count} published, {skipped_count} skipped (already published), "
+          f"{len(remaining)} remaining in backlog.")
 
 def _severity_arg(value: str) -> str:
     try:
@@ -533,6 +627,17 @@ def _category_arg(value: str) -> str:
     except ValueError as e:
         raise argparse.ArgumentTypeError(str(e))
 
+def _credential_refusal(path: str, flag: str) -> str:
+    return (f"refusing to attach '{path}' ({flag}): credential-bearing file ({issue_telemetry.CREDENTIAL_PATH_HINT}). "
+            "Copy only the relevant non-secret lines into logs/issue_output_<unix_ts>.log and attach that file instead.")
+
+def _attachment_arg(flag: str):
+    def check(value: str) -> str:
+        if issue_telemetry.is_credential_path(value):
+            raise argparse.ArgumentTypeError(_credential_refusal(value, flag))
+        return value
+    return check
+
 def _priority_arg(value: str) -> str:
     if not str(value).strip():
         return ""
@@ -545,7 +650,7 @@ def main():
     parser = argparse.ArgumentParser(description="Autonomous GitHub Issue Reporter for Agent Failures")
     parser.add_argument("--title", type=str, help="Descriptive title of the failure or anomaly")
     parser.add_argument("--error", type=str, help="Detailed description of the failure or anomaly")
-    parser.add_argument("--category", type=_category_arg, default="agent_failure", choices=["agent_failure", "risk_gate", "tool_error", "quant_logic", "infra", "enhancement"], help="Issue category")
+    parser.add_argument("--category", type=_category_arg, default="agent_failure", choices=["agent_failure", "risk_gate", "tool_error", "quant_logic", "infra", "enhancement"], help="Issue category (spaces/dashes become '_')")
     parser.add_argument("--severity", type=_severity_arg, default="HIGH", help="CRITICAL | HIGH | MEDIUM | LOW (case-insensitive, default: HIGH)")
     parser.add_argument("--priority", type=_priority_arg, default=None, help="P0 | P1 | P2 | P3 (default from severity: CRITICAL->P0, HIGH->P1, MEDIUM->P2, LOW->P3)")
     parser.add_argument("--agent", type=str, default="cli_operator", help="Reporting subagent or module name")
@@ -555,8 +660,8 @@ def main():
     parser.add_argument("--root-cause", type=str, default="", help="Suspected or confirmed root cause")
     parser.add_argument("--affected-files", type=str, default="", help="Comma-separated code pointers (path:lines, ...)")
     parser.add_argument("--context", type=str, default="", help="Narrative context: what the agent was doing and what it observed")
-    parser.add_argument("--context-file", type=str, default="", help="File whose content is appended to --context (first 8000 chars)")
-    parser.add_argument("--output-file", type=str, default="", help="Raw command/agent output; the last 200 lines (max 12000 chars) are attached")
+    parser.add_argument("--context-file", type=_attachment_arg("--context-file"), default="", help="File whose content is appended to --context (first 8000 chars; credential files such as .env/*.env/MCP configs are refused: exit 2)")
+    parser.add_argument("--output-file", type=_attachment_arg("--output-file"), default="", help="Raw command/agent output; the last 200 lines (max 12000 chars) are attached (credential files such as .env/*.env/MCP configs are refused: exit 2)")
     parser.add_argument("--impact", type=str, default="", help="Operational impact on the trading desk (default derived from category)")
     parser.add_argument("--acceptance-criteria", type=str, default="", help="Acceptance criteria, one per line or ';'-separated")
     parser.add_argument("--repo", type=str, default=None, help="Target repository (e.g. owner/repo). If omitted, derived from GITHUB_REPO or git remote origin.")

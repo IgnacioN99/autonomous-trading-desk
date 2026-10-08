@@ -156,6 +156,45 @@ SUMMARY_AMOUNTS = ("3087.31", "16.75", "3.20", "0.68", "2.45", "4321.87", "1234.
 SIGNED_AMOUNTS_TEXT = ("API3USDT and 1000SHIBUSDT rejected: **Net Delta:** $+3087.31, cell | -16.75 |, "
                        "`$+3.20` USDT, `+3.20` USDT, (-0.68), ROE -0.3% kept")
 
+# Shared sanitizer fixtures (#58, #61): both sanitizers must produce exactly the *_EXPECTED text
+SECRET_HEX64 = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+SECRETS_FIXTURE = "\n".join([
+    "BINANCE_API_KEY=Ab12Cd34Ef56Gh78",
+    "BINANCE_SECRET_KEY=" + SECRET_HEX64,
+    "BINANCE_API_SECRET: " + SECRET_HEX64,
+    '"MCP_GATEWAY_TOKEN": "mcpgw_live_9f8e7d6c5b4a"',
+    "GET https://api.example.test/v1/account?timestamp=1700000000000&signature=" + SECRET_HEX64 + " -> HTTP 400",
+    "listenKey=pqia91ma19a5s61cv6a81va65sdf19v8a65a1a5s61cv6a81va65sdf19v8a65a1",
+    '{"listenKey":"pqia91ma19a5s61cv6a81va65sdf19v8a65a1"}',
+    "private_key: abcDEF123 db_password=hunter2 short token=abc",
+    "kept: API3USDT C98USDT 1000SHIBUSDT ROE -0.3% +8.4%",
+])
+SECRETS_EXPECTED = "\n".join([
+    "BINANCE_API_KEY=[REDACTED]",
+    "BINANCE_SECRET_KEY=[REDACTED]",
+    "BINANCE_API_SECRET: [REDACTED]",
+    '"MCP_GATEWAY_TOKEN": "[REDACTED]"',
+    "GET https://api.example.test/v1/account?timestamp=1700000000000&signature=[REDACTED] -> HTTP 400",
+    "listenKey=[REDACTED]",
+    '{"listenKey":"[REDACTED]"}',
+    "private_key: [REDACTED] db_password=[REDACTED] short token=[REDACTED]",
+    "kept: API3USDT C98USDT 1000SHIBUSDT ROE -0.3% +8.4%",
+])
+QUANT_FIXTURE = "\n".join([
+    "t_stat=-3.42 z=-2.15 beta=+0.87",
+    't_stat: -3.42 | "z": -2.15 | beta:-0.87 | zscore: +2.31 | half_life: 14.2 | p_value: -0.01',
+    "t-stat: -3.34 hurst=-0.12 corr: -0.91",
+    "| BTCUSDT | -16.75 | +3.20 |",
+    "spread_z: -2.4 (-0.68) Net Delta: -3087.31 forged ~QNEG~-5.55",
+])
+QUANT_EXPECTED = "\n".join([
+    "t_stat=-3.42 z=-2.15 beta=+0.87",
+    't_stat: -3.42 | "z": -2.15 | beta:-0.87 | zscore: +2.31 | half_life: 14.2 | p_value: -0.01',
+    "t-stat: -3.34 hurst=-0.12 corr: -0.91",
+    "| BTCUSDT | [REDACTED_AMT] | [REDACTED_AMT] |",
+    "spread_z: [REDACTED_AMT] ([REDACTED_AMT]) Net Delta: [REDACTED_AMT] forged [REDACTED_AMT]",
+])
+
 
 def market_summary_text():
     """The real stdout summary of scripts/sync_session_state.py for summary_state()."""
@@ -646,6 +685,58 @@ class TestReportIssueViaGh(unittest.TestCase):
         data = self.payload()
         self.assertEqual(data["labels"][-1], "cat:risk_gate")
         self.assertIn("| **Category** | `risk_gate` |", data["body"])
+        # #60: spaces and dashes are normalised to '_' instead of losing the report
+        res = self.run_script("--title", "t", "--error", "e", "--category", "tool error")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertEqual(self.payload()["labels"][-1], "cat:tool_error")
+
+    def test_credential_attachments_are_refused(self):
+        backlog = os.path.join(self.logs_dir, "issues_backlog.jsonl")
+        for path, flag in ((".env", "--context-file"), ("config/environments/prod.env", "--output-file"),
+                           (".mcp.json", "--output-file"), (".agents/mcp_config.json", "--context-file")):
+            with self.subTest(path=path, flag=flag):
+                res = self.run_script("--title", "t", "--error", "e", flag, path)
+                self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+                self.assertIn("refusing to attach", res.stdout)
+                self.assertFalse(os.path.exists(os.path.join(self.stub_dir, "payload.json")))
+                self.assertFalse(os.path.exists(backlog))
+                self.assertFalse([c for c in self.calls() if c.startswith("api -X POST")])
+        real = os.path.join(self.logs_dir, "prod.env")
+        with open(real, "w", encoding="utf-8") as f:
+            f.write("BINANCE_SECRET_KEY=" + SECRET_HEX64 + "\n")
+        link = os.path.join(self.logs_dir, "notes.txt")
+        try:
+            os.symlink(real, link)
+        except OSError:
+            return
+        res = self.run_script("--title", "t", "--error", "e", "--context-file", link)
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+        self.assertIn("refusing to attach", res.stdout)
+        self.assertNotIn(SECRET_HEX64, res.stdout + res.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.stub_dir, "payload.json")))
+        self.assertFalse(os.path.exists(backlog))
+
+    def test_secrets_fixture_redacted_end_to_end(self):
+        out = os.path.join(self.logs_dir, "issue_output_1.log")
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(SECRETS_FIXTURE + "\n")
+        res = self.run_script("--title", "t", "--error", "listenKey=abcdef123456 signature=deadbeef99",
+                              "--output-file", out)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        body = self.payload()["body"]
+        for leaked in (SECRET_HEX64, "mcpgw_live_9f8e7d6c5b4a", "pqia91ma19a5s61cv6a81va65sdf19v8a65a1",
+                       "hunter2", "abcdef123456", "deadbeef99"):
+            self.assertNotIn(leaked, body)
+        for kept in ("API3USDT", "C98USDT", "ROE -0.3%", '"MCP_GATEWAY_TOKEN": "[REDACTED]"'):
+            self.assertIn(kept, body)
+
+    def test_quant_values_survive_end_to_end(self):
+        res = self.run_script("--title", "t", "--error", 't_stat: -3.42 "z": -2.15 beta:-0.87 | -16.75 |')
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        body = self.payload()["body"]
+        for kept in ("t_stat: -3.42", '"z": -2.15', "beta:-0.87"):
+            self.assertIn(kept, body)
+        self.assertNotIn("16.75", body)
 
     def test_agent_name_is_sanitized(self):
         res = self.run_script("--title", "t", "--error", "e", "--agent", "bot ghp_abcdefghijklmnopqrstuvwxyz123")
@@ -660,6 +751,39 @@ class TestReportIssueViaGh(unittest.TestCase):
         for flag in ("--priority", "--repro", "--root-cause", "--affected-files", "--context-file",
                      "--output-file", "--impact", "--acceptance-criteria", "CRITICAL->P0", "LOW->P3"):
             self.assertIn(flag, res.stdout)
+
+
+@unittest.skipUnless(shutil.which("bash") and os.name != "nt", "requires a POSIX bash")
+class TestSanitizerParity(unittest.TestCase):
+    """The bash and Python sanitizers produce byte-identical output on the shared fixtures (#58, #61)."""
+
+    @classmethod
+    def setUpClass(cls):
+        res = subprocess.run(["sed", "-n", "/^sanitize_telemetry() {/,/^}/p", SCRIPT],
+                             capture_output=True, text=True, timeout=30)
+        cls.func = res.stdout
+        if SCRIPTS_DIR not in sys.path:
+            sys.path.insert(0, SCRIPTS_DIR)
+        import report_agent_issue
+        cls.py_sanitize = staticmethod(report_agent_issue.sanitize_telemetry)
+
+    def bash_sanitize(self, text):
+        res = subprocess.run(["bash", "-c", self.func + '\nsanitize_telemetry "$1"', "_", text],
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        return res.stdout.rstrip("\n")
+
+    def test_function_extracted(self):
+        self.assertIn("sanitize_telemetry() {", self.func)
+
+    def test_fixtures_byte_identical(self):
+        for fixture, expected in ((SECRETS_FIXTURE, SECRETS_EXPECTED), (QUANT_FIXTURE, QUANT_EXPECTED)):
+            with self.subTest(fixture=fixture.splitlines()[0]):
+                bash_out = self.bash_sanitize(fixture)
+                py_out = self.py_sanitize(fixture)
+                self.assertEqual(bash_out, expected)
+                self.assertEqual(py_out, expected)
+                self.assertEqual(bash_out, py_out)
 
 
 if __name__ == "__main__":

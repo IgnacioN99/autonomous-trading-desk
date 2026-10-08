@@ -73,10 +73,11 @@ class TestCategoryAndLegacyLabels(unittest.TestCase):
 
     def test_normalize_category(self):
         for raw, want in (("tool_error", "tool_error"), ("INFRA", "infra"), (" Risk_Gate ", "risk_gate"),
-                          ("quant-logic2", "quant-logic2")):
+                          ("quant-logic2", "quant_logic2"), ("tool error", "tool_error"), ("Tool-Error", "tool_error"),
+                          (" tool  error ", "tool_error")):
             self.assertEqual(it.normalize_category(raw), want)
         self.assertEqual(it.normalize_category(""), "")
-        for bad in ("tool error", "cat;rm", "a/b", "ünicode", "`x`"):
+        for bad in ("tool error; rm", "cat;rm", "a/b", "ünicode", "`x`"):
             with self.assertRaises(ValueError):
                 it.normalize_category(bad)
         with self.assertRaises(ValueError):
@@ -260,6 +261,27 @@ class TestRenderIssueBody(unittest.TestCase):
             self.assertLessEqual(len(it.read_tail(path, max_chars=50)), 50)
             self.assertEqual(len(it.read_capped(path, 100)), 100)
             self.assertIn("could not read", it.read_tail(os.path.join(tmp, "missing.txt")))
+
+    def test_is_credential_path(self):
+        refused = (".env", "./.env", "logs/../.env", "config/environments/prod.env", "config/environments/TESTNET.ENV",
+                   ".mcp.json", ".agents/mcp_config.json", ".vscode/mcp.json", "C:\\x\\.env", ".env.example",
+                   ".env.local", "/home/u/.aws/credentials", "certs/a.pem", "my.key")
+        allowed = ("logs/issue_output_1700000000.log", "/tmp/out.json", "environment.txt", "logs/envelope.log",
+                   "logs/keys.txt", "", "   ", None)
+        for path in refused:
+            self.assertTrue(it.is_credential_path(path), path)
+        for path in allowed:
+            self.assertFalse(it.is_credential_path(path), path)
+        with tempfile.TemporaryDirectory() as tmp:
+            real = os.path.join(tmp, "real.env")
+            with open(real, "w", encoding="utf-8") as f:
+                f.write("X=1\n")
+            link = os.path.join(tmp, "link.txt")
+            try:
+                os.symlink(real, link)
+            except OSError:
+                self.skipTest("symlinks unavailable")
+            self.assertTrue(it.is_credential_path(link))
 
 
 class TestIssueFormsAndTriage(unittest.TestCase):
