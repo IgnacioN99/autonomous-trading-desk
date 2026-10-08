@@ -22,9 +22,12 @@ Per cycle:
      never loosens, stops re-read right before a write. YOLO positions are skipped until TP1 has filled
      (right-tail preservation). is_yolo / yolo_source / tp1_filled come from dem's result (its matched trade
      reference; issue #163: TP1 is unknown when the reference is unverified). Activation
-     gate (Issue #95): the planned SL is kept (reason "trail_not_activated") until +1.0R of planned risk or
-     +2.0x ATR_15m of favourable excursion since entry on closed 15m bars, or TP1 fill; the Chandelier stop is
-     then anchored to the extreme since entry. Take-profit orders are never re-based. userTrades is read at most
+     gate (Issues #95, #205): the planned SL is kept (reason "trail_not_activated") until +1.0R of planned risk
+     since entry on closed 15m bars (profile exit_management.trail_activation: "r_only" default, "r_and_atr" also
+     +2.0x ATR_15m, "r_or_atr" legacy either; +2.0x ATR_15m alone without an R reference), or TP1 fill; the
+     Chandelier stop is then anchored to the extreme since entry. Take-profit orders are never re-based. The
+     profile's exit_management is read once per cycle (issue #197) and its warnings are listed once (see
+     exit_management_warnings). userTrades is read at most
      once per symbol per cycle (shared with step 4). "reference_unverified" is reported once per position (not
      repeated while the previous state already flags it). An unreadable / corrupt logs/trades_audit.jsonl
      (audit_health) files one issue per state change through report_agent_issue (never in --dry-run, never
@@ -45,7 +48,12 @@ Per cycle:
      no SL on fill; each one is reported (unknown_resting_entry action + pending_unknown_entry error, so
      cycle_ok is false) and never cancelled. A query failure is a pending_unknown_entry error too.
      Before step 5, after steps 2-4 have run for EVERY position, excursion tracking (issue #182, data capture only)
-     reads one 1m klines page per position (2 s timeout); its failures never count as errors.
+     reads one 1m klines page per position (2 s timeout); its failures never count as errors. Issue #192: the pass
+     has a total budget of EXCURSION_PASS_BUDGET_SECONDS (5 s, far inside the 120 s resting-entry liveness rule);
+     positions not reached keep their previous record unchanged (view excursion_skipped_budget). The klines host
+     is resolved once per env per cycle (a config error becomes an excursion_warnings entry
+     "klines_host_fallback: <msg>"); EXCURSION_FAIL_REPORT_AFTER (10) consecutive tracker failures of a position
+     file one MEDIUM/P2 report (never in --dry-run).
   6. State is written atomically to logs/guardian_state.json and every action is appended to
      logs/guardian_actions.jsonl.
 
@@ -107,6 +115,7 @@ State file (logs/guardian_state.json):
                    "warnings"?: [str]} | null,  # "reference_unverified" (no userTrades open time),
                                                   # "audit_unreadable", "audit_corrupt_lines:<n>", cancel errors,
                                                   # "intrabar_unavailable" (#183 1m read failed)
+                                                  # (activation_reason "atr_expansion": r_or_atr or no R, #205)
       "dead_alpha": {"status": "DEAD_ALPHA_STALLED" | "HEALTHY_MOMENTUM" | "STALLED_WITHIN_HORIZON" |
                                 "UNKNOWN_HOLDING_TIME" | "UNKNOWN", "range_pct", "recommendation", "message",
                      # only when the 15m stall fired:
@@ -114,18 +123,28 @@ State file (logs/guardian_state.json):
                      "holding_verdict"?: "DEAD_ALPHA" | "HEALTHY" | "UNKNOWN", "close_blocked"?: str} | null,
       "error": str | null,
       "mfe_r"?, "mae_r"?, "peak_price"?,  # mirror of this position's "excursions" record (issue #182)
-      "excursion_error"?: str            # excursion tracking failed this cycle (never an error, no cycle_ok effect)
+      "excursion_error"?: str,           # excursion tracking failed this cycle (never an error, no cycle_ok effect)
+      "excursion_skipped_budget"?: true  # issue #192: pass budget spent before this position (record kept as is)
     }],
     "excursions": {"SYMBOL|SIDE": {     # issue #182, data capture only: MFE / MAE since entry (utils/trade_excursion)
       "symbol", "side", "entry_price", "entry_ts" (s), "initial_sl", "initial_risk",  # risk / R only from a matched
       "reference_source": "trade_audit" | null,       # trades_audit record with the SL on the loss side, else null
       "is_yolo", "tp1_filled", "tp1_seen_ts" (first cycle with tp1_filled), "last_stop_price",
       "first_seen_ts", "last_seen_ts", "peak_price", "trough_price", "mfe_r", "mae_r", "mfe_pct", "mae_pct",
-      "mfe_ts", "mae_ts", "last_bar_open_ms" (ms), "partial": bool}},  # partial: entry time unknown (tracked from
+      "mfe_ts", "mae_ts", "last_bar_open_ms" (ms), "partial": bool,  # partial: entry time unknown (tracked from
                                        # first sight) or more than 99 1m bars to catch up in one cycle
+      "price_source": "last_1m+mark",  # MFE / MAE fold LAST-price 1m klines plus the MARK price (issue #192)
+      "fail_count": int, "reported": bool}},  # consecutive tracker failures (0 after a success); reported: the
+                                       # EXCURSION_FAIL_REPORT_AFTER report was filed (a failing position without a
+                                       # record gets a minimal one: symbol, side, entry_price, seen times, partial)
                                        # Closed 1m bars after the fill minute plus the mark price; carried over from
                                        # the previous state (reset on a new entry price, kept on a positions_sync
                                        # failure); a record whose position is gone becomes a position_closed action.
+    "excursion_warnings": [{"symbol", "stage", "warning"}],  # issue #192, never errors: "klines_host"
+                                       # ("klines_host_fallback: <msg>") and "position_closed" (emit failure)
+    "exit_management_warnings": [str],  # issue #197: profile exit_management warnings of this cycle's single read
+                                       # (carried when no trailing ran); listed in trail_warnings (symbol null) only
+                                       # when the previous state did not already carry them
     "actions": [ACTION, ...],
     "errors": [{"symbol": str | null, "stage": str, "error": str}],
     "pending_warnings": [{"key", "symbol", "stage", "warning"}]  # protect_pending_entries "warnings" (issue #156):
@@ -133,7 +152,8 @@ State file (logs/guardian_state.json):
                                        # deferral_report; printed, never errors (no effect on cycle_ok or liveness)
     "trail_warnings": [{"symbol", "warning"}]  # dem write-path warnings (issue #172): "stops_requery_failed:<err>",
                                        # old-stop cancel errors, "intrabar_unavailable", exit_management profile
-                                       # warnings (#183); printed, never errors (no effect on cycle_ok)
+                                       # warnings (#183; once, symbol null, #197); printed, never errors (no effect
+                                       # on cycle_ok)
   }
 
 Action record (also one JSON line in logs/guardian_actions.jsonl):
@@ -146,7 +166,8 @@ Action record (also one JSON line in logs/guardian_actions.jsonl):
   observation only, also in --dry-run): a previous "excursions" record whose symbol + side is no longer open; detail =
   that record + "last_stop_r" (last stop in R, favourable sign, null without risk), "disappeared_after_ts" (previous
   state's timestamp), "detected_ts". Never after a positions_sync failure, never from a cycle that does not write the
-  state file (below).
+  state file (below), never twice for the same env + symbol + side + entry_ts (issue #192: the last
+  POSITION_CLOSED_DEDUPE_LINES lines of logs/guardian_actions.jsonl are checked, e.g. after a failed state write).
 
 A --once run does not overwrite the state of a live loop (mode "loop", fresh by check_guardian_alive's age rule):
 it prints its result and appends its actions only (issue #40). Likewise a non-PROD cycle never overwrites a live
@@ -157,7 +178,7 @@ IP, shared with the executor and the scanners): GET /fapi/v2/positionRisk (all s
 protect_pending_entries (calls only for pending records); all-symbol GET /fapi/v1/openAlgoOrders and
 /fapi/v1/openOrders (find_unregistered_resting_entries, 40 each); per position: symbol openAlgoOrders twice (orphan
 audit + dem, 1 each), exchangeInfo (calculate_structural_stop, 1), 15m klines limit=99 and limit=10 (1 each),
-userTrades at most once (5), 1m klines limit=16 only after a verified TP1 fill (dem profit lock, issue #183, 1),
+userTrades at most once (5), 1m klines limit=31 only after a verified TP1 fill (dem profit lock, issue #183, 1),
 1m klines from the next bar limit=99 (excursion tracking, 1; runs after all positions
 are protected, 2 s timeout; skipped when no bar has closed since the last read); per actual stop write: one more openAlgoOrders re-read, exchangeInfo, the POST, the
 verification reads and the DELETE (issue #172: when that re-read finds no stop, one symbol positionRisk read (5)
@@ -193,6 +214,7 @@ except ImportError:
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import execute_futures_trade as eft
 import dynamic_exit_manager as dem
+import user_profile
 from utils.env_resolver import resolve_env
 from utils.atomic_writer import atomic_write_json, atomic_append_jsonl
 from utils import position_timing as pt
@@ -209,6 +231,9 @@ LEGACY_LOCK_FILE_NAME = "guardian_loop.lock"  # shared lock of loops started bef
 LOG_FILE_MAX_BYTES = 5 * 1024 * 1024
 LOG_FILE_BACKUPS = 3
 STOP_UNKNOWN_ESCALATE_AFTER = 3  # consecutive UNKNOWN stop reads before heal_unknown_stop + P0 report (issue #173)
+EXCURSION_PASS_BUDGET_SECONDS = 5  # issue #192: total time of the excursion pass; later positions are skipped
+EXCURSION_FAIL_REPORT_AFTER = 10  # issue #192: consecutive tracker failures of one position before one report
+POSITION_CLOSED_DEDUPE_LINES = 500  # issue #192: guardian_actions.jsonl tail checked before a position_closed
 _UNRESOLVED = object()  # persist(): owner not resolved by the caller
 
 
@@ -302,6 +327,7 @@ class GuardianCycle:
         self._crossed_close_reported = set()  # symbols whose failed crossed close filed a P0 this cycle (issue #160)
         self._previous = {}  # previous guardian_state.json of this env (read at the start of run())
         self._excursion_misses = set()  # symbols whose excursion reference needed an uncached userTrades read
+        self._exit_management = None  # profile exit_management, read once per cycle (issue #197)
         now = int(time.time())
         self.state = {
             "schema_version": SCHEMA_VERSION,
@@ -320,6 +346,8 @@ class GuardianCycle:
             "pending_warnings": [],
             "trail_warnings": [],
             "excursions": {},
+            "excursion_warnings": [],
+            "exit_management_warnings": [],
         }
 
     # -- bookkeeping -------------------------------------------------------
@@ -459,11 +487,28 @@ class GuardianCycle:
         self.error(sym, "orphan", view["error"])
         return "failed"
 
+    def _cycle_exit_management(self):
+        """Issue #197: the profile's exit_management, read once per cycle (at the first trailing evaluation). Its
+        warnings go to state["exit_management_warnings"] and, only when the previous state did not already carry
+        them, once to trail_warnings (symbol None); dem gets the settings without them (never repeated per
+        position)."""
+        if self._exit_management is None:
+            em = user_profile.get_exit_management()
+            warnings = [str(w) for w in em.get("warnings") or []]
+            previous = self._previous.get("exit_management_warnings")
+            previous = previous if isinstance(previous, list) else []
+            self.state["exit_management_warnings"] = warnings
+            for w in warnings:
+                if w not in previous:
+                    self.state["trail_warnings"].append({"symbol": None, "warning": w})
+            self._exit_management = dict(em, warnings=[])
+        return self._exit_management
+
     def _trail(self, p, view):
         sym = view["symbol"]
         try:
             res = dem.update_position_to_structural_stop(sym, target_env=self.env, dry_run=self.dry_run, position=p,
-                                                         fetch=self._fetch)
+                                                         fetch=self._fetch, exit_management=self._cycle_exit_management())
         except Exception as e:
             self.error(sym, "trailing", e)
             view["trailing"] = {"success": False, "updated": False, "reason": "exception", "message": str(e)}
@@ -628,18 +673,46 @@ class GuardianCycle:
                    initial_risk=risk, reference_source=source, is_yolo=bool(view.get("is_yolo")),
                    tp1_filled=True if tp1 else view.get("tp1_filled"),
                    tp1_seen_ts=prev.get("tp1_seen_ts") or (now_s if view.get("tp1_filled") is True else None),
-                   last_stop_price=view.get("stop_price"), first_seen_ts=first_seen, last_seen_ts=now_s)
+                   last_stop_price=view.get("stop_price"), first_seen_ts=first_seen, last_seen_ts=now_s,
+                   price_source=trade_excursion.PRICE_SOURCE, fail_count=0, reported=False)
         self.state["excursions"][key] = rec
         view.update(mfe_r=rec.get("mfe_r"), mae_r=rec.get("mae_r"), peak_price=rec.get("peak_price"))
 
     def _excursion_failed(self, view, exc):
         """A tracker failure is recorded on the view only (no self.error: cycle_ok / exit code unchanged); the
-        previous record is kept so one bad cycle never resets the excursion history."""
+        previous record is kept so one bad cycle never resets the excursion history. Issue #192: the record's
+        fail_count counts consecutive failures (a position without a record gets a minimal one); at
+        EXCURSION_FAIL_REPORT_AFTER one MEDIUM/P2 report is filed (reported: true; never in --dry-run)."""
         view["excursion_error"] = f"{type(exc).__name__}: {exc}"
+        key = f"{view['symbol']}|{view['side']}"
+        if key in self.state["excursions"]:
+            return
+        now_s = self.state["timestamp"]
+        prev = self._previous_excursions().get(key)
+        if isinstance(prev, dict):
+            rec = dict(prev, last_seen_ts=now_s)
+        else:
+            rec = {"symbol": view["symbol"], "side": view["side"], "entry_price": view["entry_price"],
+                   "first_seen_ts": now_s, "last_seen_ts": now_s, "partial": True,
+                   "price_source": trade_excursion.PRICE_SOURCE}
+        try:
+            count = max(int(rec.get("fail_count") or 0), 0) + 1
+        except (TypeError, ValueError):
+            count = 1
+        rec["fail_count"] = count
+        rec["reported"] = rec.get("reported") is True
+        if count >= EXCURSION_FAIL_REPORT_AFTER and not rec["reported"] and not self.dry_run:
+            _report_excursion_failure(self.env, view["symbol"], view["side"], count, view["excursion_error"])
+            rec["reported"] = True
+        self.state["excursions"][key] = rec
+
+    def _skip_excursion_budget(self, view):
+        """Issue #192: the excursion pass budget is spent; the previous record (if any) is kept unchanged."""
+        view["excursion_skipped_budget"] = True
         key = f"{view['symbol']}|{view['side']}"
         prev = self._previous_excursions().get(key)
         if key not in self.state["excursions"] and isinstance(prev, dict):
-            self.state["excursions"][key] = dict(prev, last_seen_ts=self.state["timestamp"])
+            self.state["excursions"][key] = dict(prev)
 
     def _carry_excursion(self, view):
         """Issue #172: a position flattened this cycle keeps its previous excursion record (no klines read); the last
@@ -667,9 +740,15 @@ class GuardianCycle:
             return
         open_keys = {f"{v['symbol']}|{v['side']}" for v in self.state["positions"]}
         now_s = self.state["timestamp"]
+        already = None
         for key, rec in previous.items():
             if key in open_keys or not isinstance(rec, dict):
                 continue
+            if already is None:
+                already = self._logged_position_closed_keys()
+            symbol = rec.get("symbol") or key.split("|")[0]
+            if _closed_key(self.env, symbol, rec.get("side"), rec.get("entry_ts")) in already:
+                continue  # issue #192: already recorded (e.g. the state write after it failed)
             last_stop, entry, risk = _f(rec.get("last_stop_price"), None), _f(rec.get("entry_price")), _f(rec.get("initial_risk"), None)
             last_stop_r = None
             if last_stop is not None and risk and risk > 0:
@@ -677,7 +756,22 @@ class GuardianCycle:
                 last_stop_r = round(diff / risk, 4)
             detail = dict(rec, last_stop_r=last_stop_r, disappeared_after_ts=self._previous.get("timestamp"),
                           detected_ts=now_s)
-            self.action(rec.get("symbol") or key.split("|")[0], "position_closed", True, detail)
+            self.action(symbol, "position_closed", True, detail)
+
+    def _logged_position_closed_keys(self):
+        """Issue #192: _closed_key of every position_closed action in the last POSITION_CLOSED_DEDUPE_LINES lines of
+        logs/guardian_actions.jsonl (unreadable file or lines: ignored)."""
+        keys = set()
+        for line in _tail_lines(os.path.join(self.log_dir, ACTIONS_FILE_NAME), POSITION_CLOSED_DEDUPE_LINES):
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and rec.get("type") == "position_closed":
+                detail = rec.get("detail") if isinstance(rec.get("detail"), dict) else {}
+                keys.add(_closed_key(rec.get("env"), rec.get("symbol") or detail.get("symbol"), detail.get("side"),
+                                     detail.get("entry_ts")))
+        return keys
 
     def _protect_pending(self):
         """Post-fill protection of resting entries (planned SL/TPs) BEFORE the orphan audit, so a freshly filled
@@ -721,6 +815,14 @@ class GuardianCycle:
 
     # -- cycle -------------------------------------------------------------
     def run(self):
+        # Issue #192: the klines host is resolved once per env for this cycle only (other callers are unaffected).
+        trade_excursion.reset_klines_host_cache()
+        try:
+            return self._run()
+        finally:
+            trade_excursion.reset_klines_host_cache(enabled=False)
+
+    def _run(self):
         self._previous = self._load_previous_state()
         self._protect_pending()
         try:
@@ -749,12 +851,16 @@ class GuardianCycle:
                 view["error"] = f"{type(e).__name__}: {e}"
                 self.error(view["symbol"], "exception", f"{view['error']}\n{traceback.format_exc(limit=3)}")
         # Excursion tracking (data capture only) runs after every position went through its protective steps, so a
-        # slow klines read can never delay another position's orphan heal or trail.
+        # slow klines read can never delay another position's orphan heal or trail. Issue #192: total time budget.
+        started = time.monotonic()
         for p, view in guarded:
             if view["size"] == 0:
                 # Flattened this cycle (trailing position_closed or orphan close): no klines read; the stored record is
                 # carried so the next cycle's position_closed action reports its last stop (issue #172).
                 self._carry_excursion(view)
+                continue
+            if time.monotonic() - started >= EXCURSION_PASS_BUDGET_SECONDS:
+                self._skip_excursion_budget(view)
                 continue
             try:
                 self._track_excursion(p, view)
@@ -769,11 +875,18 @@ class GuardianCycle:
         previous_health = self._previous.get("audit_health")
         health = self._audit_health(previous_health)
         self.state["audit_health"] = health
+        if self._exit_management is None:  # no trailing ran: keep the previous cycle's profile warnings (#197)
+            previous_em = self._previous.get("exit_management_warnings")
+            self.state["exit_management_warnings"] = list(previous_em) if isinstance(previous_em, list) else []
+        for w in trade_excursion.klines_host_warnings():
+            self.state["excursion_warnings"].append({"symbol": None, "stage": "klines_host", "warning": w})
         owner = self._keeps_loop_state(os.path.join(self.log_dir, STATE_FILE_NAME))
         try:
             self._emit_position_closed(writes_state=owner is None)
         except Exception as e:  # observation only: never changes cycle_ok or the exit code
             print(f"guardian: position_closed records skipped ({type(e).__name__}: {e})", file=sys.stderr)
+            self.state["excursion_warnings"].append({"symbol": None, "stage": "position_closed",
+                                                     "warning": f"{type(e).__name__}: {e}"})
         self.persist(owner=owner)
         baseline = previous_health
         if self.memory is not None:
@@ -857,6 +970,46 @@ def _report_audit_health(env, health, detail):
         print(f"guardian: trades_audit health report could not be filed ({type(e).__name__}: {e})", file=sys.stderr)
 
 
+def _closed_key(env, symbol, side, entry_ts):
+    """Issue #192 dedupe key of a position_closed record: (env, SYMBOL, SIDE, entry_ts as float or None)."""
+    return (str(env or ""), str(symbol or "").upper(), str(side or "").upper(), _f(entry_ts, None))
+
+
+def _tail_lines(path, n, block=65536):
+    """Last n lines of a text file (read backwards in blocks); [] when it is missing or unreadable."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            pos = f.tell()
+            data = b""
+            while pos > 0 and data.count(b"\n") <= n:
+                step = min(block, pos)
+                pos -= step
+                f.seek(pos)
+                data = f.read(step) + data
+    except OSError:
+        return []
+    return data.decode("utf-8", errors="replace").splitlines()[-n:]
+
+
+def _report_excursion_failure(env, symbol, side, count, error):
+    """Issue #192: MEDIUM/P2 issue for excursion tracking failing `count` consecutive cycles for one position
+    (data capture only: protection is unaffected). Never raises."""
+    try:
+        import report_agent_issue
+        report_agent_issue.report_issue(
+            title=f"position_guardian_loop: excursion tracking of {symbol} {side} failing for {count} cycles",
+            error_detail=f"{symbol} {side} excursion tracking failed {count} consecutive cycles",
+            category="infra", severity="MEDIUM", priority="P2",
+            agent_name="position_guardian_loop",
+            affected_files="scripts/loops/position_guardian_loop.py:_track_excursion, scripts/utils/trade_excursion.py",
+            context=f"env={env}; symbol={symbol}; side={side}; fail_count={count}; last error: {error}",
+            remediation="Check the public 1m klines endpoint / host of this env; MFE / MAE data is missing meanwhile.")
+    except Exception as e:
+        print(f"guardian: excursion failure report for {symbol} could not be filed ({type(e).__name__}: {e})",
+              file=sys.stderr)
+
+
 def _report_unknown_stop(env, symbol, cycles, result, detail):
     """Issue #173: CRITICAL/P0 issue for a stop read UNKNOWN for `cycles` consecutive guardian cycles, with the
     heal_unknown_stop result. Never raises. error_detail carries the count and result, so a repeat at a later multiple
@@ -904,6 +1057,9 @@ def format_state(state):
                      f"{(str(w.get('warning')).splitlines() or [''])[0]}")
     for w in state.get("trail_warnings") or []:
         lines.append(f"  ~ warning trailing {w.get('symbol') or ''}: "
+                     f"{(str(w.get('warning')).splitlines() or [''])[0]}")
+    for w in state.get("excursion_warnings") or []:
+        lines.append(f"  ~ warning excursion {w.get('stage')} {w.get('symbol') or ''}: "
                      f"{(str(w.get('warning')).splitlines() or [''])[0]}")
     if state.get("lock_warning"):
         lines.append(f"  ! lock: {state['lock_warning']}")

@@ -18,7 +18,9 @@ Replay (per trade, per policy, 1m resolution, from the first full 1m bar after e
     last 98 closed 15m bars plus a forming stand-in row built from the forming candle's 1m bars) and filters: on every
     closed 1m bar (--trail-cadence 1m, default, like the 60 s guardian) or only on 15m closes (--trail-cadence 15m,
     faster), and always in the minute TP1 fills, with mark = that 1m close and, after a TP1 fill, the intrabar extreme
-    of the forming 15m candle. The TP1 fill counts
+    of the live window (dem._intrabar_start_ms: the forming 15m candle, plus the fill candle when it is the previous
+    one). Policy "current" uses the profile defaults (trail_activation "r_only", issue #205); "legacy_r_or_atr" the
+    pre-#205 activation (+1R or +2x ATR_15m). The TP1 fill counts
     as verified (KEYS mode); MCP mode never verifies TP1 live, so fidelity there is lower. A new stop is applied only
     when should_update and it stays on the protective side of the bar close; YOLO rows are not trailed before TP1.
   - At the horizon (or the end of the available data) the remaining size is marked at the last close ("capped").
@@ -104,6 +106,7 @@ def build_policies():
                                   {"mfe_r": 2.75, "lock_r": 2.0}])
     return {
         "current": dict(base),
+        "legacy_r_or_atr": dict(base, lock=dict(lock, trail_activation="r_or_atr")),  # pre-#205 activation
         "current_no_lock": dict(base, lock={"profit_lock_enabled": False}),
         "tp2_2_5r": dict(base, tp2_r=2.5),
         "lock_gap_0_75": dict(base, lock=gap),
@@ -309,7 +312,7 @@ def replay(row, path, policy, filters, env, taker_fee, maker_fee, trail_cadence=
             return  # YOLO: never trailed before TP1 (dynamic_exit_manager, update_position_to_structural_stop)
         intrabar = None
         if tp1_filled:
-            start = max(trade_excursion.first_post_entry_bar_ms(entry_ts_s), t_end_ms // BAR_15M_MS * BAR_15M_MS)
+            start = dem._intrabar_start_ms(entry_ts_s, t_end_ms)  # the live window (forming + previous fill candle)
             closed_1m = [k for k in path.bars if start <= int(k[0]) and int(k[0]) + BAR_1M_MS <= t_end_ms]
             if closed_1m:
                 intrabar = (max(float(k[2]) for k in closed_1m) if is_long else min(float(k[3]) for k in closed_1m))

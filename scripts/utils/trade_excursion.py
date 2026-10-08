@@ -9,6 +9,8 @@ kept as a single function so tests patch trade_excursion.fetch_klines_range.
 Units: entry_ts / now_ts in seconds; kline open/close times, mfe_ts, mae_ts and last_bar_open_ms in milliseconds.
 R multiples use the initial risk |entry - planned SL|: mfe_r >= 0, mae_r <= 0, None without a risk. Percent values
 are signed like scripts/shadow_tracker.py (mfe_pct >= 0, mae_pct <= 0, percent of entry).
+Price source (PRICE_SOURCE): 1m klines are LAST-price bars and the folded mark price is the MARK price, so on a thin
+book a mark spike can set the peak / trough.
 """
 
 import json
@@ -19,19 +21,48 @@ BAR_MS = 60_000
 GUARDIAN_KLINES_LIMIT = 99  # weight 1 per request (Binance: limit in [1, 100) -> weight 1)
 KLINES_TIMEOUT_SECONDS = 2  # guardian excursion read: short, so a slow host never stalls the cycle
 DEFAULT_HOSTS = {"prod": "https://fapi.binance.com", "testnet": "https://testnet.binancefuture.com"}
+# Issue #192: price source of the guardian's MFE / MAE: LAST-price 1m klines folded with the MARK price.
+PRICE_SOURCE = "last_1m+mark"
+
+_HOST_CACHE = None  # {env: (base_url, warning)} only while armed by reset_klines_host_cache() (guardian cycle)
 
 
-def klines_base_url(target_env):
-    """Futures REST host for target_env: the executor's base-url resolution (BINANCE_FUTURES_BASE_URL or the env's
-    default host) when it resolves one, else the env's default host. Never the other env's host."""
+def reset_klines_host_cache(enabled=True):
+    """Issue #192: arm (empty) the per-env host cache, so klines_base_url resolves each env once until the next reset;
+    enabled=False disarms it (every call resolves again, the behaviour for callers that never arm it)."""
+    global _HOST_CACHE
+    _HOST_CACHE = {} if enabled else None
+
+
+def resolve_klines_host(target_env):
+    """(base_url, warning | None) for target_env: the executor's base-url resolution (BINANCE_FUTURES_BASE_URL or the
+    env's default host) when it resolves one, else the env's default host, never the other env's host. A config error
+    falls back to the default host with warning "klines_host_fallback: <Type>: <msg>". Cached while armed."""
     from utils.env_resolver import resolve_env
     env = resolve_env(target_env)
+    if _HOST_CACHE is not None and env in _HOST_CACHE:
+        return _HOST_CACHE[env]
+    warning = None
     try:
         import execute_futures_trade as eft
         base = eft.get_client_config(env)[2]
-    except Exception:
+    except Exception as e:
         base = None
-    return str(base or DEFAULT_HOSTS[env]).rstrip("/")
+        warning = f"klines_host_fallback: {type(e).__name__}: {e}"[:200]
+    out = (str(base or DEFAULT_HOSTS[env]).rstrip("/"), warning)
+    if _HOST_CACHE is not None:
+        _HOST_CACHE[env] = out
+    return out
+
+
+def klines_base_url(target_env):
+    """Futures REST host for target_env (resolve_klines_host without the warning)."""
+    return resolve_klines_host(target_env)[0]
+
+
+def klines_host_warnings():
+    """Distinct klines_host_fallback warnings of the hosts resolved since the last reset ([] when not armed)."""
+    return sorted({w for _, w in (_HOST_CACHE or {}).values() if w})
 
 
 def fetch_klines_range(symbol, interval, start_ms, limit, target_env, timeout=None):

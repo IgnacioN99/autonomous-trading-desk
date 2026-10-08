@@ -265,7 +265,7 @@ class TestOndoReplayUpdatePath(unittest.TestCase):
         self.assertEqual(len(bars.calls), 1)
         call = bars.calls[0]
         self.assertEqual((call["symbol"], call["interval"], call["limit"], call["target_env"]),
-                         (ONDO, "1m", 16, "testnet"))
+                         (ONDO, "1m", 31, "testnet"))  # issue #197: forming + fill candle, weight 1
         self.assertGreaterEqual(call["start_ms"], tx.first_post_entry_bar_ms(entry_ts))
         self.assertLess(fake.write_index("POST", ALGO_ENDPOINT)[0], fake.write_index("DELETE", ALGO_ENDPOINT)[0])
 
@@ -276,7 +276,7 @@ class TestOndoReplayUpdatePath(unittest.TestCase):
         self.assertTrue(res["success"], res)
         self.assertTrue(res["updated"], res)
         lock = res["profit_lock"]
-        self.assertEqual(lock["mfe_source"], "mark")  # mark +2.46R beats tp1_price +1.80R
+        self.assertEqual(lock["mfe_source"], "mark")  # mark +2.46R (tp1_price ignored: no tp1_order_id, #197)
         self.assertEqual(lock["lock_r"], 1.0)
         self.assertLessEqual(res["new_sl"], ONDO_ENTRY - ONDO_R)
 
