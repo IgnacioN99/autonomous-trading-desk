@@ -95,8 +95,20 @@ State file (logs/guardian_state.json):
                      # only when the 15m stall fired:
                      "elapsed_hours"?: float | null, "entry_time_source"?: "userTrades" | "trades_audit" | "UNKNOWN",
                      "holding_verdict"?: "DEAD_ALPHA" | "HEALTHY" | "UNKNOWN", "close_blocked"?: str} | null,
-      "error": str | null
+      "error": str | null,
+      "mfe_r"?, "mae_r"?, "peak_price"?,  # mirror of this position's "excursions" record (issue #182)
+      "excursion_error"?: str            # excursion tracking failed this cycle (never an error, no cycle_ok effect)
     }],
+    "excursions": {"SYMBOL|SIDE": {     # issue #182, data capture only: MFE / MAE since entry (utils/trade_excursion)
+      "symbol", "side", "entry_price", "entry_ts" (s), "initial_sl", "initial_risk",  # risk / R only from a matched
+      "reference_source": "trade_audit" | null,       # trades_audit record with the SL on the loss side, else null
+      "is_yolo", "tp1_filled", "tp1_seen_ts" (first cycle with tp1_filled), "last_stop_price",
+      "first_seen_ts", "last_seen_ts", "peak_price", "trough_price", "mfe_r", "mae_r", "mfe_pct", "mae_pct",
+      "mfe_ts", "mae_ts", "last_bar_open_ms" (ms), "partial": bool}},  # partial: entry time unknown (tracked from
+                                       # first sight) or more than 99 1m bars to catch up in one cycle
+                                       # Closed 1m bars after the fill minute plus the mark price; carried over from
+                                       # the previous state (reset on a new entry price, kept on a positions_sync
+                                       # failure); a record whose position is gone becomes a position_closed action.
     "actions": [ACTION, ...],
     "errors": [{"symbol": str | null, "stage": str, "error": str}],
     "pending_warnings": [{"key", "symbol", "stage", "warning"}]  # protect_pending_entries "warnings" (issue #156):
@@ -109,7 +121,12 @@ Action record (also one JSON line in logs/guardian_actions.jsonl):
    "type": "orphan_heal" | "orphan_close" | "trail_stop" | "dead_alpha_close" | "pending_protect_sl" |
            "pending_tp_placed" | "pending_abort" | "pending_timeout_cancel" | "pending_dropped" |
            "pending_sl_crossed_close" | "pending_record_mismatch" | "unknown_resting_entry" (report only, success
-           false), "detail": {...}}
+           false) | "position_closed", "detail": {...}}
+  trail_stop details carry "new_stop" (the new algo stop) when a stop was replaced. position_closed (issue #182,
+  observation only, also in --dry-run): a previous "excursions" record whose symbol + side is no longer open; detail =
+  that record + "last_stop_r" (last stop in R, favourable sign, null without risk), "disappeared_after_ts" (previous
+  state's timestamp), "detected_ts". Never after a positions_sync failure, never from a cycle that does not write the
+  state file (below).
 
 A --once run does not overwrite the state of a live loop (mode "loop", fresh by check_guardian_alive's age rule):
 it prints its result and appends its actions only (issue #40). Likewise a non-PROD cycle never overwrites a live
@@ -120,8 +137,9 @@ IP, shared with the executor and the scanners): GET /fapi/v2/positionRisk (all s
 protect_pending_entries (calls only for pending records); all-symbol GET /fapi/v1/openAlgoOrders and
 /fapi/v1/openOrders (find_unregistered_resting_entries, 40 each); per position: symbol openAlgoOrders twice (orphan
 audit + dem, 1 each), exchangeInfo (calculate_structural_stop, 1), 15m klines limit=99 and limit=10 (1 each),
-userTrades at most once (5); per actual stop write: one more openAlgoOrders re-read, exchangeInfo, the POST, the
-verification reads and the DELETE. About 85 + ~10 per position per cycle: at the 60s default even 10 positions use
+userTrades at most once (5), 1m klines from the next bar limit=99 (excursion tracking, 1; skipped when no bar has
+closed since the last read); per actual stop write: one more openAlgoOrders re-read, exchangeInfo, the POST, the
+verification reads and the DELETE. About 85 + ~11 per position per cycle: at the 60s default even 10 positions use
 well under 10% of the per-minute limit.
 
 Scheduling: on Windows (WSL) install it as a Task Scheduler task that starts the loop at logon and restarts it on
@@ -156,6 +174,7 @@ import dynamic_exit_manager as dem
 from utils.env_resolver import resolve_env
 from utils.atomic_writer import atomic_write_json, atomic_append_jsonl
 from utils import position_timing as pt
+from utils import trade_excursion
 
 SCHEMA_VERSION = 1
 DEFAULT_INTERVAL_SECONDS = eft.GUARDIAN_MAX_INTERVAL_FOR_RESTING // 2
@@ -167,6 +186,7 @@ LOCK_FILE_TEMPLATE = "guardian_loop.{env}.lock"
 LEGACY_LOCK_FILE_NAME = "guardian_loop.lock"  # shared lock of loops started before issue #167
 LOG_FILE_MAX_BYTES = 5 * 1024 * 1024
 LOG_FILE_BACKUPS = 3
+_UNRESOLVED = object()  # persist(): owner not resolved by the caller
 
 
 def lock_file_name(env):
@@ -233,6 +253,7 @@ class GuardianCycle:
         self._audit_kinds = set()  # dem's raw audit_* warnings of this cycle (issue #163 escalation)
         self._audit_resolved = False  # at least one trailing evaluation resolved the trade reference
         self._previous = {}  # previous guardian_state.json of this env (read at the start of run())
+        self._excursion_misses = set()  # symbols whose excursion reference needed an uncached userTrades read
         now = int(time.time())
         self.state = {
             "schema_version": SCHEMA_VERSION,
@@ -249,6 +270,7 @@ class GuardianCycle:
             "actions": [],
             "errors": [],
             "pending_warnings": [],
+            "excursions": {},
         }
 
     # -- bookkeeping -------------------------------------------------------
@@ -364,7 +386,7 @@ class GuardianCycle:
         raw_warnings = list(res.get("warnings") or [])
         self._audit_kinds.update(w for w in raw_warnings if isinstance(w, str) and w.startswith("audit_"))
         view["reference_unverified"] = "reference_unverified" in raw_warnings
-        keys = ("success", "updated", "reason", "previous_sl", "new_sl", "planned_sl", "activation_reason",
+        keys = ("success", "updated", "reason", "previous_sl", "new_sl", "new_stop", "planned_sl", "activation_reason",
                 "reference_source", "message", "error", "warnings")
         view["trailing"] = {k: res.get(k) for k in keys if k in res}
         if "warnings" in view["trailing"]:
@@ -434,6 +456,115 @@ class GuardianCycle:
         if not res.get("success"):
             self.error(sym, "dead_alpha_close", res.get("error") or "close not confirmed")
 
+    # -- excursion tracking (issue #182: data capture only, never orders, never errors) -----------------------------
+    def _previous_excursions(self):
+        prev = self._previous.get("excursions")
+        return prev if isinstance(prev, dict) else {}
+
+    def _cached_user_trades(self, method, endpoint, params=None, target_env=None, **kw):
+        """Fetch for the excursion reference: userTrades only from this cycle's cache (the trail's read); a miss is
+        recorded in self._excursion_misses and raises, so the reference never adds a userTrades call. Other requests
+        pass through _fetch."""
+        if method == "GET" and endpoint == "/fapi/v1/userTrades":
+            p = params or {}
+            key = (str(p.get("symbol")).upper(), p.get("limit"))
+            if key not in self._user_trades:
+                self._excursion_misses.add(key[0])
+                raise LookupError("userTrades not read by the trail this cycle")
+            return self._user_trades[key]
+        return self._fetch(method, endpoint, params, target_env=target_env, **kw)
+
+    def _excursion_reference(self, p, view):
+        """(initial_sl, initial_risk, entry_ts_s, reference_source) from dem's trade reference (same matched
+        trades_audit record as the trail). Only a trade_audit reference counts: risk = |entry - planned SL| when the
+        SL is on the loss side, entry_ts = the record's timestamp; otherwise (None, None, None, None). Skipped (no
+        reference) when verifying the record would need a userTrades read the trail did not make this cycle."""
+        sym = str(view["symbol"]).upper()
+        self._excursion_misses.discard(sym)
+        planned_sl, _, source, rec, _ = dem._resolve_trade_reference_full(
+            view["symbol"], p, view["side"], _f(view.get("stop_price")), self.env, fetch=self._cached_user_trades)
+        if sym in self._excursion_misses or source != "trade_audit" or not isinstance(rec, dict):
+            return None, None, None, None
+        entry = view["entry_price"]
+        sl = _f(planned_sl, None)
+        on_loss_side = sl is not None and sl > 0 and ((sl < entry) if view["side"] == "LONG" else (sl > entry))
+        entry_ts = _f(rec.get("timestamp"), None) if rec.get("timestamp") else None
+        return (sl if on_loss_side else None), (abs(entry - sl) if on_loss_side else None), entry_ts, "trade_audit"
+
+    def _track_excursion(self, p, view):
+        """MFE / MAE of the position since entry (utils/trade_excursion) from one 1m klines read (limit 99, weight 1)
+        plus the mark price, carried over from the previous state's "excursions" (reset on a new entry price)."""
+        sym, side = view["symbol"], view["side"]
+        key = f"{sym}|{side}"
+        now_s = self.state["timestamp"]
+        prev = self._previous_excursions().get(key)
+        if isinstance(prev, dict):
+            prev_entry = _f(prev.get("entry_price"))
+            if abs(prev_entry - view["entry_price"]) > 1e-9 * max(abs(view["entry_price"]), abs(prev_entry)):
+                prev = None  # same symbol and side reopened at another entry: a new trade
+        prev = dict(prev) if isinstance(prev, dict) else {}
+        initial_sl, risk, entry_ts, source = self._excursion_reference(p, view)
+        first_seen = prev.get("first_seen_ts") or now_s
+        skipped = str(sym).upper() in self._excursion_misses
+        if (skipped and prev.get("reference_source") == "trade_audit" and prev.get("entry_ts") is not None):
+            # Reference skipped this cycle (the trail made no userTrades read): keep the one resolved earlier.
+            initial_sl, risk, entry_ts, source = (prev.get("initial_sl"), prev.get("initial_risk"), prev["entry_ts"],
+                                                  "trade_audit")
+        if entry_ts is None:
+            entry_ts = prev.get("entry_ts") or first_seen  # no reference entry time: tracked from first sight
+            prev["partial"] = True
+        start_ms = trade_excursion.next_bar_start_ms(prev, entry_ts)
+        klines = []
+        if start_ms is not None and start_ms + trade_excursion.BAR_MS <= now_s * 1000:
+            klines = trade_excursion.fetch_klines_range(sym, "1m", start_ms, trade_excursion.GUARDIAN_KLINES_LIMIT,
+                                                        self.env)
+        rec = trade_excursion.update_excursion(prev, side=side, entry_price=view["entry_price"], risk=risk,
+                                               entry_ts=entry_ts, klines=klines, mark_price=view["mark_price"],
+                                               now_ts=now_s)
+        tp1 = prev.get("tp1_filled") is True or view.get("tp1_filled") is True
+        rec.update(symbol=sym, side=side, entry_price=view["entry_price"], entry_ts=entry_ts, initial_sl=initial_sl,
+                   initial_risk=risk, reference_source=source, is_yolo=bool(view.get("is_yolo")),
+                   tp1_filled=True if tp1 else view.get("tp1_filled"),
+                   tp1_seen_ts=prev.get("tp1_seen_ts") or (now_s if view.get("tp1_filled") is True else None),
+                   last_stop_price=view.get("stop_price"), first_seen_ts=first_seen, last_seen_ts=now_s)
+        self.state["excursions"][key] = rec
+        view.update(mfe_r=rec.get("mfe_r"), mae_r=rec.get("mae_r"), peak_price=rec.get("peak_price"))
+
+    def _excursion_failed(self, view, exc):
+        """A tracker failure is recorded on the view only (no self.error: cycle_ok / exit code unchanged); the
+        previous record is kept so one bad cycle never resets the excursion history."""
+        view["excursion_error"] = f"{type(exc).__name__}: {exc}"
+        key = f"{view['symbol']}|{view['side']}"
+        prev = self._previous_excursions().get(key)
+        if key not in self.state["excursions"] and isinstance(prev, dict):
+            self.state["excursions"][key] = dict(prev, last_seen_ts=self.state["timestamp"])
+
+    def _emit_position_closed(self, writes_state):
+        """position_closed for every previous excursion whose symbol + side is no longer open (issue #182). Not after
+        a positions_sync / position_parse failure (open positions unknown: the previous records are carried over)
+        nor when this cycle does not write the state file (a --once run beside a live loop)."""
+        stages = {e.get("stage") for e in self.state["errors"]}
+        previous = self._previous_excursions()
+        if "positions_sync" in stages or "position_parse" in stages:
+            for key, rec in previous.items():
+                self.state["excursions"].setdefault(key, rec)
+            return
+        if not writes_state:
+            return
+        open_keys = {f"{v['symbol']}|{v['side']}" for v in self.state["positions"]}
+        now_s = self.state["timestamp"]
+        for key, rec in previous.items():
+            if key in open_keys or not isinstance(rec, dict):
+                continue
+            last_stop, entry, risk = _f(rec.get("last_stop_price"), None), _f(rec.get("entry_price")), _f(rec.get("initial_risk"), None)
+            last_stop_r = None
+            if last_stop is not None and risk and risk > 0:
+                diff = (entry - last_stop) if rec.get("side") == "SHORT" else (last_stop - entry)
+                last_stop_r = round(diff / risk, 4)
+            detail = dict(rec, last_stop_r=last_stop_r, disappeared_after_ts=self._previous.get("timestamp"),
+                          detected_ts=now_s)
+            self.action(rec.get("symbol") or key.split("|")[0], "position_closed", True, detail)
+
     def _protect_pending(self):
         """Post-fill protection of resting entries (planned SL/TPs) BEFORE the orphan audit, so a freshly filled
         entry gets its planned stop instead of the emergency orphan stop. No-op without logs/pending_entries.json."""
@@ -499,6 +630,10 @@ class GuardianCycle:
             except Exception as e:
                 view["error"] = f"{type(e).__name__}: {e}"
                 self.error(view["symbol"], "exception", f"{view['error']}\n{traceback.format_exc(limit=3)}")
+            try:
+                self._track_excursion(p, view)
+            except Exception as e:
+                self._excursion_failed(view, e)
         self._check_unknown_entries()
         return self.finish()
 
@@ -508,7 +643,12 @@ class GuardianCycle:
         previous_health = self._previous.get("audit_health")
         health = self._audit_health(previous_health)
         self.state["audit_health"] = health
-        self.persist()
+        owner = self._keeps_loop_state(os.path.join(self.log_dir, STATE_FILE_NAME))
+        try:
+            self._emit_position_closed(writes_state=owner is None)
+        except Exception as e:  # observation only: never changes cycle_ok or the exit code
+            print(f"guardian: position_closed records skipped ({type(e).__name__}: {e})", file=sys.stderr)
+        self.persist(owner=owner)
         if health in ("unreadable", "corrupt") and health != previous_health and not self.dry_run:
             _report_audit_health(self.env, health, sorted(self._audit_kinds))
         return self.state
@@ -540,9 +680,12 @@ class GuardianCycle:
             return str(existing.get("env") or "unknown-env")
         return None
 
-    def persist(self):
+    def persist(self, owner=_UNRESOLVED):
+        """Writes the state (unless a live loop owns it) and appends the actions. owner: finish()'s
+        _keeps_loop_state result (resolved once per cycle); resolved here when not given."""
         state_path = os.path.join(self.log_dir, STATE_FILE_NAME)
-        owner = self._keeps_loop_state(state_path)
+        if owner is _UNRESOLVED:
+            owner = self._keeps_loop_state(state_path)
         if owner is not None:
             print(f"guardian: a live {owner} guardian loop owns logs/guardian_state.json; this cycle is not recorded "
                   "there (its actions are still appended to logs/guardian_actions.jsonl)", file=sys.stderr)
