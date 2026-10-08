@@ -103,7 +103,7 @@ Whenever the user explicitly requests crypto trading operations, Binance Futures
      * Orders 3 & 4: TP1 (30% at +1.8R to lock in fees and enter free-trade state) and TP2 (70% at +4.0R structural target to preserve positive right-tail skewness) Limit with `reduceOnly: true`.
      * **Dynamic Exit Management (Right-Tail Preservation & True Net BE; guardian loop, Layer 8):**
        - **Activation Gate:** keep planned SL until **+1.0R** or **+2.0x ATR_15m** since entry (closed 15m bars) or TP1 fill; YOLO: no trail before TP1. Then trail **15m Swings** + Chandelier (1.8x ATR_15m) from the extreme since entry. TPs never re-based.
-       - **Anti-Truncation:** **True Net Break-Even** (+0.2% fees) only after **$+2.0 \times ATR_{15m}$** or TP1.
+       - **Anti-Truncation:** **True Net Break-Even** (+0.2% fees) only after **$+2.0 \times ATR_{15m}$** or TP1; then profit-lock steps (profile `exit_management`; default 2R→+1R, 3R→+2R, +1R per further R), on a verified TP1 from intrabar MFE.
      * **Volatility Compression vs Dead Alpha:** Do not prematurely exit positions showing range compression on dry volume if structural stop is intact; treat as volatility coiling/accumulation.
      * **Continuous Orphan Audit (guardian loop or `execute_futures_trade.py --audit-orphans`):** Regularly audit all open positions. If an unprotected position lacking an active Stop Loss is detected, trigger immediate auto-healing (`--auto-heal`).
 
