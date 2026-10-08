@@ -478,8 +478,9 @@ class TestGroundTruthProtection(GuardHarness):
         "session_state.json": "scripts/sync_session_state.py",
         "guardian_state.json": "scripts/loops/position_guardian_loop.py",
         "pending_entries.json": "scripts/execute_futures_trade.py",
+        "hook_heartbeat.json": "scripts/hooks/pre_trade_guard.py",
     }
-    NEW_FILES = ("guardian_state.json", "pending_entries.json")
+    NEW_FILES = ("guardian_state.json", "pending_entries.json", "hook_heartbeat.json")
 
     def assertGroundTruthDenied(self, res, name, label=""):
         self.assertDenied(res, "Ground Truth Protection")

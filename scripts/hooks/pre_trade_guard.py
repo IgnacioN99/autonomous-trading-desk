@@ -81,7 +81,11 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
 7. EVALUATION TRAIL PROTECTION:
    Writes into logs/evaluations/, Antigravity brain transcripts or Claude Code subagent transcripts
    are denied, and so are agent-set transcript-root overrides (AGY_BRAIN_DIRS / CLAUDE_PROJECTS_DIRS);
-   harness files (incl. .claude/agents/) require explicit confirmation (force_ask), and so do file-tool writes to
+   harness files (incl. .claude/agents/) and the gate modules (scripts/utils/gate_limits.py,
+   scripts/execute_futures_trade.py, scripts/utils/portfolio_exposure.py, scripts/utils/env_resolver.py,
+   scripts/user_profile.py; issue #79) require explicit confirmation (force_ask) from the file tools and from shell
+   writes (redirect target, cp / mv / tee / rm, sed -i / perl -i, git checkout / restore, inline code that writes,
+   PowerShell write cmdlets); running the executor or user_profile.py is never a write. So do file-tool writes to
    git config / hook files (GIT_EXEC_CONFIG_PATH_RE, see 8). File-tool content with trading primitives outside
    scripts/ and tests/ requires force_ask; scripts/ and tests/ of a linked git worktree of the same repository
    (its .git file and <common git dir>/worktrees/<name>/gitdir point at each other; issue #148) count as inside.
@@ -93,7 +97,8 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    logs/session_state.json <- scripts/sync_session_state.py; logs/guardian_state.json (guardian liveness
    attestation for resting entries) <- scripts/loops/position_guardian_loop.py; logs/pending_entries.json
    (resting-entry registry / post-fill protection; also counted by this hook's max-open-positions pre-check, see 5)
-   <- scripts/execute_futures_trade.py (registration and --protect-pending). File tools targeting them are denied: relative, absolute and Windows paths, NTFS aliases
+   <- scripts/execute_futures_trade.py (registration and --protect-pending); logs/hook_heartbeat.json (hook
+   liveness, see 11) <- this hook itself (issue #73). File tools targeting them are denied: relative, absolute and Windows paths, NTFS aliases
    (trailing dot/space, ::$DATA streams) and targets whose os.path.realpath / samefile is a protected file
    (symlinked directory, hard link).
    Shell commands. The program of a sub-command is found past VAR=value / VAR+=value assignments, shell keywords
@@ -285,12 +290,19 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    counts only next to such a construct. Encoded payloads (powershell/pwsh -EncodedCommand / -enc / -ec / -e,
    FromBase64String executed), Invoke-RestMethod / Invoke-WebRequest writes to Binance and unparseable commands
    (unbalanced quotes) are always denied. Not covered: names assembled at runtime (string concatenation, variables).
+   Harness paths next to such a construct require confirmation (force_ask); for scripts/execute_futures_trade.py
+   and scripts/user_profile.py (run as programs) a mention counts unless it is the script a Python interpreter
+   runs as the statement's program (python / py / & C:\\...\\python.exe / wsl.exe -- python3 <path>, only
+   interpreter options in between), also inside (...) or a $variable assignment (issue #79).
 10. PASS-THROUGH:
    Tool calls unrelated to trading return "ask" so the runtime's normal permission policy applies.
    "allow" is reserved for calls that passed every trading gate or are purely risk-reducing (4), written as one
    flat single-line command; anything the analysis cannot vouch for is downgraded to "ask".
 11. HEARTBEAT:
-   Every invocation refreshes logs/hook_heartbeat.json (best effort, never alters the decision).
+   Every invocation refreshes logs/hook_heartbeat.json (best effort, never alters the decision). The file is
+   ground truth (8) written only by this hook from Python: an agent command that merely names it outside a
+   read-only program is denied like the other ground-truth files (report_issue.sh: pass such text through
+   --context-file / --output-file).
 
 Target latency: < 15ms (plus dossier provenance re-verification on trade openings, and reading / judging the shell
 script files a command runs).
@@ -306,6 +318,7 @@ import fnmatch
 import hashlib
 import contextlib
 import functools
+import ntpath
 import posixpath
 import datetime
 from typing import Dict, Any, Tuple, Optional, List
@@ -697,11 +710,13 @@ TRANSCRIPT_ROOT_OVERRIDE_RE = re.compile(
 # authoritative. guardian_state.json is read directly by the executor (guardian liveness for resting entries).
 # pending_entries.json is cross-checked against the exchange's resting orders and supplies total_qty for MCP algo
 # entries listed without a quantity (Gate 1, issue #119); the hook's own max-open-positions pre-check counts its
-# same-env symbols (issue #48).
+# same-env symbols (issue #48). hook_heartbeat.json is this guard's liveness attestation (issue #73): the guard
+# refreshes it from Python on every live invocation (_write_heartbeat); a forged one would make the hooks look alive.
 GROUND_TRUTH_FILES = {
     "logs/session_state.json": "`python3 scripts/sync_session_state.py`",
     "logs/guardian_state.json": "`python3 scripts/loops/position_guardian_loop.py`",
     "logs/pending_entries.json": "`python3 scripts/execute_futures_trade.py` (resting-entry registration and --protect-pending)",
+    "logs/hook_heartbeat.json": "`scripts/hooks/pre_trade_guard.py` itself (refreshed on every live hook invocation)",
 }
 GROUND_TRUTH_BASENAMES = {path.rsplit("/", 1)[-1].lower(): path for path in GROUND_TRUTH_FILES}
 GROUND_TRUTH_RE = re.compile("|".join(re.escape(n) for n in GROUND_TRUTH_BASENAMES), re.IGNORECASE)
@@ -890,9 +905,21 @@ PIPE_TO_CODE_INTERPRETER_RE = re.compile(
 HARNESS_PATH_CMD_RE = re.compile(
     r"scripts[\\/]+hooks[\\/]|\.agents[\\/]+hooks\.json|dossier_provenance\.py|record_evaluation\.py|"
     r"\.agents[\\/]+agents[\\/]|\.claude[\\/]+agents[\\/]|\.claude[\\/]+settings|config[\\/]+user_profile\.json|"
-    r"scripts[\\/]+report_issue\.sh",
+    r"scripts[\\/]+report_issue\.sh|"
+    # Gate modules never run as programs (issue #79): path and bare basename
+    r"(?<![\w-])(?:gate_limits|portfolio_exposure|env_resolver)\.py",
     re.IGNORECASE,
 )
+# Gate modules that are also run as programs (issue #79): only a write target counts, never the program being run
+# (python3 scripts/execute_futures_trade.py --close-position 2>&1 keeps its decision)
+GATE_PROGRAM_PATH_RE = re.compile(r"scripts[\\/]+(?:execute_futures_trade|user_profile)\.py", re.IGNORECASE)
+# A whole token that is such a path (relative, ./, absolute or drive form): the script operand of an interpreter
+GATE_PROGRAM_TOKEN_RE = re.compile(r"(?:[^\s'\"();|&<>]*[\\/])?scripts[\\/]+(?:execute_futures_trade|user_profile)\.py",
+                                   re.IGNORECASE)
+# Python interpreters / launcher that run a gate module in PowerShell (python, python3.12, python.exe, py)
+PS_PYTHON_RUNNER_RE = re.compile(r"^(?:python[0-9.]*|py)(?:\.exe)?$")
+HARNESS_WRITE_REASON = ("Command modifies trading harness / gate modules (hooks, dossier provenance, profile, "
+                        "executor gates). Explicit confirmation required.")
 # Git config / hook files a later, innocent git command executes (core.fsmonitor, hooks, aliases, include.path):
 # matched on the normalised path (forward slashes, no drive, '.' / '..' collapsed, lower case) whatever the root, so
 # ./.git/config, /abs/repo/.git/hooks/pre-commit, ~/.gitconfig and $HOME/.config/git/config all match. A bare .git
@@ -977,6 +1004,9 @@ INLINE_ANCESTOR_MARKERS_RE = re.compile(
 HARNESS_FILES = {
     ".agents/hooks.json", "scripts/utils/dossier_provenance.py", "scripts/record_evaluation.py",
     ".claude/settings.json", ".claude/settings.local.json", "config/user_profile.json", "scripts/report_issue.sh",
+    # Gate modules (issue #79): PROD gate values, gate classification, env resolution, leverage ceiling
+    "scripts/utils/gate_limits.py", "scripts/execute_futures_trade.py", "scripts/utils/portfolio_exposure.py",
+    "scripts/utils/env_resolver.py", "scripts/user_profile.py",
 }
 HARNESS_DIRS = ("scripts/hooks/", ".agents/agents/", ".claude/agents/")
 BRAIN_PATH_RE = re.compile(r"(?:^|/)\.gemini/[^/]+/brain(?:/|$)", re.IGNORECASE)
@@ -2567,7 +2597,7 @@ def _subcommand_writes_path(tokens: List[str], text: str, path_re: re.Pattern, i
 
 
 # -----------------------------------------------------------------------------
-# Ground-truth runtime state (session_state / guardian_state / pending_entries)
+# Ground-truth runtime state (session_state / guardian_state / pending_entries / hook_heartbeat)
 # -----------------------------------------------------------------------------
 def ground_truth_denial(paths: List[str]) -> str:
     """Denial reason naming each protected file and its sole sanctioned writer (GROUND_TRUTH_FILES order), and the
@@ -4991,6 +5021,44 @@ def _powershell_unlisted_command(tokens: List[str]) -> Optional[str]:
     return None
 
 
+def _powershell_statement_program(tokens: List[str], k: int) -> bool:
+    """True when tokens[k] is the program of its statement: first token, after a separator / the & call operator,
+    or the command of a `wsl.exe [options] --|-e|--exec <cmd>` statement."""
+    if k == 0 or tokens[k - 1] in SHELL_SEPARATORS:
+        return True
+    if tokens[k - 1] not in WSL_COMMAND_OPTIONS:
+        return False
+    s = k - 1
+    while s > 0 and tokens[s - 1] not in SHELL_SEPARATORS:
+        s -= 1
+    return ntpath.basename(tokens[s]).lower() in ("wsl", "wsl.exe")
+
+
+def _powershell_writes_gate_program(command_line: str, tokens: List[str]) -> bool:
+    """True when a PowerShell command names a gate module that is also run as a program (GATE_PROGRAM_PATH_RE)
+    anywhere other than as the script a Python interpreter runs, next to any write construct
+    (_powershell_write_construct: write cmdlets, redirection, .NET / method calls, provider variables, call
+    operator...). Parenthesized targets (-Path ('x'), (Join-Path . x)) and variables ($p = 'x'; Set-Content $p) are
+    covered because any such mention counts. Running the program (python scripts\\execute_futures_trade.py
+    --close-position 2>&1 | Out-File x.log, & python ..., wsl.exe -- python3 ...) is not a write."""
+    if not GATE_PROGRAM_PATH_RE.search(command_line):
+        return False
+    named = False
+    for i, tok in enumerate(tokens):
+        if not GATE_PROGRAM_PATH_RE.search(tok):
+            continue
+        j = i - 1
+        while j >= 0 and tokens[j].startswith("-") and tokens[j] not in SHELL_SEPARATORS:
+            j -= 1  # interpreter options (python -u -B script.py)
+        run = (GATE_PROGRAM_TOKEN_RE.fullmatch(tok) is not None and j >= 0
+               and PS_PYTHON_RUNNER_RE.match(ntpath.basename(tokens[j]).lower()) is not None
+               and _powershell_statement_program(tokens, j))
+        if not run:
+            named = True
+            break
+    return named and _powershell_write_construct(command_line, tokens) is not None
+
+
 def powershell_backstop(command_line: str, cwd: str, base_dir: str) -> Tuple[Optional[str], Optional[str]]:
     """(deny reason, force_ask reason) for a normalised PowerShell command, applied on top of analyze_run_command.
     A command naming a ground-truth file (also through a logs/ glob or an 8.3 short name), the evaluation trail or
@@ -5012,8 +5080,9 @@ def powershell_backstop(command_line: str, cwd: str, base_dir: str) -> Tuple[Opt
     logs_dir = bool(logs_words)
     logs_literal = any(not SHELL_GLOB_RE.search(w) for w in logs_words)
     harness = bool(HARNESS_PATH_CMD_RE.search(command_line))
+    gate_program_write = _powershell_writes_gate_program(command_line, tokens)
     git_config = any(_git_exec_config_path(w) for w in words)
-    if not (ground_truth or trail or logs_dir or harness or git_config):
+    if not (ground_truth or trail or logs_dir or harness or git_config or gate_program_write):
         return None, None
     construct = _powershell_write_construct(command_line, tokens)
     unlisted = None if construct else _powershell_unlisted_command(tokens)
@@ -5030,9 +5099,8 @@ def powershell_backstop(command_line: str, cwd: str, base_dir: str) -> Tuple[Opt
         return ground_truth_denial(list(GROUND_TRUTH_FILES)).rstrip(".") + " (they live in logs/)." + suffix, None
     if git_config and construct:
         return GIT_EXEC_CONFIG_REASON + f" PowerShell {construct} next to a git config / hook path.", None
-    if harness and construct:
-        return None, ("PowerShell command modifies trading harness files (hooks, dossier provenance, profile). "
-                      "Explicit confirmation required.")
+    if (harness and construct) or gate_program_write:
+        return None, "PowerShell " + HARNESS_WRITE_REASON[0].lower() + HARNESS_WRITE_REASON[1:]
     return None, None
 
 
@@ -5245,8 +5313,9 @@ def _analyze_run_command(command_line: str, cwd: str, base_dir: str, shell: str 
             result["risk_blocker"] = result["risk_blocker"] or "it changes the working directory"
 
         # 5. Harness files require explicit confirmation
-        if HARNESS_PATH_CMD_RE.search(text) and _subcommand_writes_path(tokens, text, HARNESS_PATH_CMD_RE, inline):
-            result["force_ask"] = "Command modifies trading harness files (hooks, dossier provenance, profile). Explicit confirmation required."
+        if any(rx.search(text) and _subcommand_writes_path(tokens, text, rx, inline)
+               for rx in (HARNESS_PATH_CMD_RE, GATE_PROGRAM_PATH_RE)):
+            result["force_ask"] = HARNESS_WRITE_REASON
         if USER_PROFILE_SET_RE.search(text):
             result["force_ask"] = "Command changes the trading user profile (risk/autonomy/YOLO settings). Explicit confirmation required."
 
@@ -5615,7 +5684,8 @@ def evaluate_file_write(target: str, content: str, base_dir: str) -> Tuple[str, 
     if protected:
         return "deny", ground_truth_denial([protected])
     if rel_l in HARNESS_FILES or any(rel_l.startswith(d) for d in HARNESS_DIRS):
-        return "force_ask", f"'{rel}' is a trading harness file (hooks / dossier provenance / evaluator). Explicit confirmation required."
+        return "force_ask", (f"'{rel}' is a trading harness file / gate module (hooks / dossier provenance / "
+                             "evaluator / executor gates). Explicit confirmation required.")
     if _git_exec_config_file_target(target, abs_norm, rel, base_dir):
         return "force_ask", (f"'{rel or abs_norm}' is a git config / hook file: a later git command runs what it "
                              "configures (core.fsmonitor, hooks, aliases). Explicit confirmation required.")

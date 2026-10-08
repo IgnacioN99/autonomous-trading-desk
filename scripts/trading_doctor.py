@@ -91,6 +91,58 @@ def _hook_script_paths(command: str, hooks_dir: str) -> list:
     return paths
 
 
+CLAUDE_SETTINGS_FILES = (".claude/settings.json", ".claude/settings.local.json")
+# Tools the Claude Code PreToolUse matcher must route to pre_trade_guard.py (issues #49, #73)
+CLAUDE_GUARDED_TOOLS = ("Bash", "PowerShell", "NotebookEdit", "Write", "Edit", "MultiEdit", "mcp__binance__x")
+CLAUDE_GUARD_COMMAND_RE = re.compile(r"(?:^|[\\/\s\"'])pre_trade_guard\.py(?=$|[\s\"'])")
+
+
+def check_claude_hook_matcher(base_dir: str) -> tuple:
+    """Claude Code runtime check (issue #73): every tool in CLAUDE_GUARDED_TOOLS must be matched (_matcher_matches)
+    by a PreToolUse entry of .claude/settings.json or .claude/settings.local.json (union of both) whose command runs
+    pre_trade_guard.py (basename match: "$CLAUDE_PROJECT_DIR"/... and wsl.exe ... python3 /abs/... both count).
+    Returns (critical, info) lists: no settings file -> skipped (agy-only install, info); an existing file that
+    cannot be parsed or whose hooks / hooks.PreToolUse has the wrong type, or an uncovered tool -> critical. A file
+    without hooks (permissions only) adds no coverage."""
+    critical, info, covered, found = [], [], set(), []
+    for rel in CLAUDE_SETTINGS_FILES:
+        path = os.path.join(base_dir, *rel.split("/"))
+        if not os.path.exists(path):
+            continue
+        found.append(rel)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            # A file without hooks (Claude Code's own permissions-only settings.local.json) adds no coverage
+            if not isinstance(cfg, dict) or not isinstance(cfg.get("hooks", {}), dict):
+                raise ValueError("top-level value or 'hooks' is not an object")
+            groups = cfg.get("hooks", {}).get("PreToolUse", [])
+            if not isinstance(groups, list):
+                raise ValueError("hooks.PreToolUse is not a list")
+        except Exception as e:
+            critical.append(f"{rel} cannot be parsed ({e}): the Claude Code PreToolUse guard cannot be verified.")
+            continue
+        for group in groups:
+            if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+                continue
+            if not any(isinstance(h, dict) and CLAUDE_GUARD_COMMAND_RE.search(str(h.get("command") or ""))
+                       for h in group["hooks"]):
+                continue
+            covered.update(t for t in CLAUDE_GUARDED_TOOLS if _matcher_matches(group.get("matcher"), t))
+    if not found:
+        info.append("Claude Code matcher check skipped: no .claude/settings.json or .claude/settings.local.json "
+                    "(agy-only install).")
+        return critical, info
+    missing = [t for t in CLAUDE_GUARDED_TOOLS if t not in covered]
+    if missing:
+        critical.append(f"Claude Code PreToolUse matcher in {' / '.join(found)} does not route {', '.join(missing)} "
+                        "to pre_trade_guard.py.")
+    elif not critical:
+        info.append(f"Claude Code PreToolUse matcher ({' / '.join(found)}) routes "
+                    f"{', '.join(CLAUDE_GUARDED_TOOLS)} to pre_trade_guard.py.")
+    return critical, info
+
+
 def _last_json_object(text: str):
     for line in reversed((text or "").strip().splitlines()):
         line = line.strip()
@@ -239,8 +291,11 @@ def check_dependencies(modules=DEPENDENCY_MODULES) -> tuple:
 
 def check_pretool_hook(base_dir: str = None, run_selftest: bool = True, timeout_cap_s: int = 30) -> dict:
     """
-    Real activation check of the agy PreToolUse safety guard (replaces the old string match):
-      1. Parses .agents/hooks.json and collects enabled PreToolUse handlers whose matcher covers call_mcp_tool.
+    Real activation check of the PreToolUse safety guard for both runtimes (replaces the old string match):
+      0. Claude Code: check_claude_hook_matcher (.claude/settings.json / settings.local.json route Bash, PowerShell,
+         NotebookEdit, Write, Edit, MultiEdit and mcp__* to pre_trade_guard.py; skipped without either file).
+         Runs before, and independently of, the agy checks below.
+      1. agy: parses .agents/hooks.json and collects enabled PreToolUse handlers whose matcher covers call_mcp_tool.
       2. Resolves every hook command's script path relative to .agents/ (agy runs hooks with cwd = hooks.json dir)
          and verifies it exists; verifies the interpreter is on PATH.
       3. POSIX: executes each such PreToolUse command via `sh -c` (cwd .agents) with a synthetic Binance
@@ -264,6 +319,11 @@ def check_pretool_hook(base_dir: str = None, run_selftest: bool = True, timeout_
         report["info"].append(
             f"Hook heartbeat {hb['age_s']}s ago (hook={hb.get('hook')}, mode={hb.get('mode')}, tool={hb.get('tool')}, decision={hb.get('decision')})."
         )
+
+    # Claude Code runtime, independent of the agy checks below (and of their early returns)
+    claude_critical, claude_info = check_claude_hook_matcher(base_dir)
+    report["critical"].extend(claude_critical)
+    report["info"].extend(claude_info)
 
     if not os.path.exists(hooks_path):
         report["critical"].append(".agents/hooks.json not found: no PreToolUse safety guard is configured.")
@@ -561,7 +621,8 @@ def run_doctor(target_env: str = None, auto_heal: bool = False) -> int:
         warnings.append(f"Safety hooks: {msg}")
         print(f"⚠️  [SAFETY HOOKS] {msg}")
     if hook_report.get("ok"):
-        ok_items.append("PreToolUse safety guard verified (.agents/hooks.json)")
+        ok_items.append("PreToolUse safety guard verified (agy .agents/hooks.json; Claude Code .claude/settings*.json "
+                        "when present)")
         print("✅ [SAFETY HOOKS] PreToolUse execution guard configured and verified.")
     else:
         for msg in hook_report.get("critical", []) or ["PreToolUse guard could not be verified."]:
