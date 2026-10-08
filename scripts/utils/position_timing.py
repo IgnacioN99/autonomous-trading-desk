@@ -23,6 +23,11 @@ Entry time of the CURRENT position (resolve_entry_time), in order:
 
 Dead alpha (assess_dead_alpha): held >= max_hours (default 4h) AND stagnant (mark within 1.2% of entry AND
 |ROE| < 15%). An unknown holding time is verdict UNKNOWN: never dead alpha, never reported as 0.0h.
+"Stagnant" needs BOTH tests. ROE = price move x leverage L, so the effective price band is min(1.2%, 15%/L): the
+|ROE| < 15% test governs above 12.5x (15/1.2). Autonomous closes (guardian --close-dead-alpha, watchdog --auto-exit)
+follow dead_alpha_close_decision: DEAD_ALPHA verdict AND userTrades holding time AND the 15m range stall
+(dynamic_exit_manager.check_dead_alpha_timeout status STALL_STATUS).
+resolve_entry_time_detailed also returns the userTrades diagnostics (user_trades_error, rate_limited).
 """
 
 import json
@@ -43,6 +48,7 @@ STAGNANT_PRICE_DIFF_PCT = 1.2
 STAGNANT_ROE_PCT = 15.0
 USER_TRADES_LIMIT = 1000
 AUDIT_ENTRY_PRICE_TOLERANCE_PCT = 0.5
+STALL_STATUS = "DEAD_ALPHA_STALLED"   # dynamic_exit_manager.check_dead_alpha_timeout: 15m range stalled
 
 
 def _dec(value):
@@ -139,15 +145,51 @@ def resolve_entry_time(symbol, direction, position_amt, target_env, *, entry_pri
 
     Snapshot race: positionRisk and userTrades are separate reads; a fill landing between them leaves the walk
     unreconciled (or reconciled against the new fill), and an unreconciled walk falls through like a short window."""
+    entry_ts, source, _ = resolve_entry_time_detailed(symbol, direction, position_amt, target_env,
+                                                      entry_price=entry_price, fetch=fetch, audit_path=audit_path,
+                                                      audit_records=audit_records)
+    return entry_ts, source
+
+
+def _user_trades_diag(res=None, exc=None):
+    """{"user_trades_error": str | None, "rate_limited": bool} for a userTrades reply (or exception)."""
+    err, rate_limited = None, False
+    if exc is not None:
+        err = f"exception: {type(exc).__name__}: {exc}"
+    elif not isinstance(res, list):
+        if isinstance(res, dict) and res.get("code") is not None:
+            err = f"{res.get('code')}: {res.get('msg')}"
+            rate_limited = str(res.get("code")) == "-1003"
+        elif isinstance(res, dict) and res.get("error") is not None:
+            err = str(res.get("error"))
+        else:
+            err = f"unexpected response: {type(res).__name__}"
+        if isinstance(res, dict) and res.get("http_code") in (429, 418):
+            rate_limited = True
+    if err is not None:
+        if "HTTP 429" in err or "HTTP 418" in err:
+            rate_limited = True
+        err = err[:160]
+    return {"user_trades_error": err, "rate_limited": rate_limited}
+
+
+def resolve_entry_time_detailed(symbol, direction, position_amt, target_env, *, entry_price=None, fetch=None,
+                                audit_path=None, audit_records=None):
+    """resolve_entry_time plus diagnostics: returns (entry_ts | None, source, diag), diag = {"user_trades_error":
+    str | None (exception, API error code/msg or unexpected reply, max 160 chars), "rate_limited": bool (-1003, HTTP
+    429/418)}. No retries."""
+    diag = _user_trades_diag([])
     if fetch is not None:
         try:
             fills = fetch("GET", "/fapi/v1/userTrades", {"symbol": symbol, "limit": USER_TRADES_LIMIT},
                           target_env=target_env)
-        except Exception:
+            diag = _user_trades_diag(fills)
+        except Exception as e:
             fills = None
+            diag = _user_trades_diag(exc=e)
         ts = entry_time_from_fills(fills, position_amt) if isinstance(fills, list) else None
         if ts:
-            return ts, SOURCE_USER_TRADES
+            return ts, SOURCE_USER_TRADES, diag
     rec = None
     if audit_records is not None:
         rec = _latest_from_records(audit_records, symbol, direction, target_env)
@@ -159,8 +201,8 @@ def resolve_entry_time(symbol, direction, position_amt, target_env, *, entry_pri
         except (TypeError, ValueError):
             ts = 0
         if ts > 0:
-            return ts, SOURCE_TRADES_AUDIT
-    return None, SOURCE_UNKNOWN
+            return ts, SOURCE_TRADES_AUDIT, diag
+    return None, SOURCE_UNKNOWN, diag
 
 
 def is_autonomous_close_allowed(entry_time_source):
@@ -169,7 +211,19 @@ def is_autonomous_close_allowed(entry_time_source):
     return entry_time_source == SOURCE_USER_TRADES
 
 
-def _norm_env(env):
+def dead_alpha_close_decision(verdict, entry_time_source, stall_status):
+    """One autonomous dead-alpha close rule: (allowed, reason_or_None). Requires the DEAD_ALPHA verdict, a holding
+    time from Binance fills and the 15m range stall (stall_status == STALL_STATUS)."""
+    if verdict != VERDICT_DEAD_ALPHA:
+        return False, "not dead alpha"
+    if not is_autonomous_close_allowed(entry_time_source):
+        return False, f"entry time source {entry_time_source}: report only"
+    if stall_status != STALL_STATUS:
+        return False, f"15m range not stalled ({stall_status}): report only"
+    return True, None
+
+
+def norm_env(env):
     """'prod' / 'testnet' for any env alias (mainnet, production, ...); None when empty; lower-cased when unknown."""
     if not env:
         return None
@@ -180,15 +234,18 @@ def _norm_env(env):
         return str(env).strip().lower()
 
 
+_norm_env = norm_env
+
+
 def _latest_from_records(records, symbol, direction, target_env):
     symbol, direction = str(symbol).upper(), str(direction).upper()
-    env = _norm_env(target_env)
+    env = norm_env(target_env)
     for rec in reversed(list(records or [])):
         if not isinstance(rec, dict) or rec.get("event") or "total_qty" not in rec:
             continue
         if str(rec.get("symbol", "")).upper() != symbol or str(rec.get("direction", "")).upper() != direction:
             continue
-        rec_env = _norm_env(rec.get("target_env"))
+        rec_env = norm_env(rec.get("target_env"))
         if env and rec_env and rec_env != env:
             continue
         return rec
@@ -222,7 +279,9 @@ def position_roe_pct(row):
 
 def assess_dead_alpha(*, elapsed_hours, entry_price, mark_price, roe_pct, max_hours=DEFAULT_MAX_HOURS):
     """Dead-alpha verdict shared by the watchdog and the guardian: overdue (elapsed >= max_hours) AND stagnant
-    (price within 1.2% of entry AND |ROE| < 15%). elapsed None (unknown entry time) -> UNKNOWN, never dead alpha."""
+    (price within 1.2% of entry AND |ROE| < 15%). elapsed None (unknown entry time) -> UNKNOWN, never dead alpha.
+    Stagnant needs both tests: at leverage L the effective price band is min(1.2%, 15%/L), so the ROE test governs
+    above 12.5x. The thresholds are owner policy (not leverage-aware by design)."""
     try:
         entry_price = float(entry_price)
         mark_price = float(mark_price)

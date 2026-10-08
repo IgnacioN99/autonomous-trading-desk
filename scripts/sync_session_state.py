@@ -39,29 +39,45 @@ def get_start_of_day_utc() -> int:
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     return int(start.timestamp() * 1000)
 
-def load_audit_metadata(target_env: str = None) -> Dict[str, dict]:
-    """Loads latest metadata from trades_audit.jsonl keyed by symbol, strictly filtered by target_env."""
+def _read_audit_records() -> List[dict]:
+    """Parsed dict lines of trades_audit.jsonl (AUDIT_LOG), read once per sync; [] when missing or unreadable, bad
+    lines skipped."""
+    records = []
+    if not os.path.exists(AUDIT_LOG):
+        return records
+    try:
+        with open(AUDIT_LOG, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(record, dict):
+                    records.append(record)
+    except Exception:
+        return []
+    return records
+
+
+def load_audit_metadata(target_env: str = None, records: List[dict] = None) -> Dict[str, dict]:
+    """Loads latest metadata from trades_audit.jsonl (or the pre-read records) keyed by symbol, strictly filtered by
+    target_env."""
     meta = {}
     # Env aliases normalised on both sides ("mainnet" == "prod"), same as utils/position_timing (issue #92).
-    norm_env = pt._norm_env(target_env)
-    if os.path.exists(AUDIT_LOG):
+    norm_env = pt.norm_env(target_env)
+    for record in (_read_audit_records() if records is None else records):
         try:
-            with open(AUDIT_LOG, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        try:
-                            record = json.loads(line)
-                            rec_env = pt._norm_env(record.get("target_env"))
-                            if norm_env and rec_env and rec_env != norm_env:
-                                continue
-                            sym = record.get("symbol")
-                            if sym:
-                                meta[sym] = record
-                        except Exception:
-                            continue
+            rec_env = pt.norm_env(record.get("target_env"))
+            if norm_env and rec_env and rec_env != norm_env:
+                continue
+            sym = record.get("symbol")
+            if sym:
+                meta[sym] = record
         except Exception:
-            pass
+            continue
     return meta
 
 def write_error_state(err_msg: str, now_ts: int, now_utc: str, target_env: str, btc_price: float) -> dict:
@@ -181,7 +197,8 @@ def sync_session_state(target_env: str = None) -> dict:
         target_env = (os.environ.get("BINANCE_API_ENV") or cfg.get("BINANCE_API_ENV", "prod")).lower()
     target_env = resolve_env(target_env)  # "mainnet" -> "prod": one spelling in the ledger (issue #92)
     os.makedirs(LOGS_DIR, exist_ok=True)
-    audit_meta = load_audit_metadata(target_env=target_env)
+    records = _read_audit_records()   # one read of trades_audit.jsonl per sync (issue #138)
+    audit_meta = load_audit_metadata(target_env, records=records)
     now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     now_ts = int(time.time())
 
@@ -228,9 +245,9 @@ def sync_session_state(target_env: str = None) -> dict:
         meta_trade = audit_meta.get(sym, {})
         # Entry time of the CURRENT position (issue #92): Binance fills, then a matching trades_audit record, else
         # UNKNOWN (null). Never positionRisk updateTime and never "now" (that reported 0.0h holding).
-        entry_ts, entry_source = pt.resolve_entry_time(sym, direction, p.get("positionAmt"), target_env,
-                                                       entry_price=entry_p, fetch=eft.send_signed_request,
-                                                       audit_path=AUDIT_LOG)
+        entry_ts, entry_source, entry_diag = pt.resolve_entry_time_detailed(
+            sym, direction, p.get("positionAmt"), target_env, entry_price=entry_p, fetch=eft.send_signed_request,
+            audit_records=records)
         active_positions.append({
             "symbol": sym,
             "direction": direction,
@@ -252,6 +269,10 @@ def sync_session_state(target_env: str = None) -> dict:
             "tp1_price": meta_trade.get("tp1_price"),
             "tp2_price": meta_trade.get("tp2_price")
         })
+        if entry_diag["user_trades_error"]:
+            active_positions[-1]["entry_time_error"] = entry_diag["user_trades_error"]
+            if entry_diag["rate_limited"]:
+                active_positions[-1]["entry_time_rate_limited"] = True
 
     # 3. Active Algo Orders (Stop Loss) on Binance
     algos_res = eft.send_signed_request("GET", "/fapi/v1/openAlgoOrders", target_env=target_env)

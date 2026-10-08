@@ -39,6 +39,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import execute_futures_trade as eft
 import sync_session_state as sss
 from utils.env_resolver import resolve_env, is_prod_environment, find_workspace_root
+from utils import position_timing as pt
 
 # The temporal (dead-alpha) audit only runs on a ledger synced within this window (issue #92).
 LEDGER_MAX_AGE_FOR_TEMPORAL_AUDIT_S = 300
@@ -355,13 +356,6 @@ def _read_session_state():
         return None
 
 
-def _norm_env(env):
-    try:
-        return resolve_env(str(env)) if env else None
-    except ValueError:
-        return str(env).strip().lower()
-
-
 def ensure_fresh_ledger(target_env: str, max_age_s: int = LEDGER_MAX_AGE_FOR_TEMPORAL_AUDIT_S) -> tuple:
     """Issue #92: the temporal audit runs on a ledger synced within max_age_s. The ledger
     (sync_session_state.STATE_FILE) is synced in-process when it is missing, or stale/invalid for the SAME env.
@@ -371,9 +365,9 @@ def ensure_fresh_ledger(target_env: str, max_age_s: int = LEDGER_MAX_AGE_FOR_TEM
     state = _read_session_state()
     if state is not None and os.path.exists(sss.STATE_FILE):
         age = time.time() - os.path.getmtime(sss.STATE_FILE)
-        ledger_env = _norm_env(state.get("target_env"))
+        ledger_env = pt.norm_env(state.get("target_env"))
         fresh_valid = state.get("is_valid", True) is not False and age <= max_age_s
-        if ledger_env and ledger_env != _norm_env(target_env):
+        if ledger_env and ledger_env != pt.norm_env(target_env):
             return True, "other-env ledger kept", (
                 f"session_state.json belongs to {str(ledger_env).upper()} ({int(age)}s old); not overwritten by the "
                 f"{str(target_env).upper()} doctor (temporal audit runs on live positions without a ledger sync).")
@@ -523,7 +517,9 @@ def run_doctor(target_env: str = None, auto_heal: bool = False) -> int:
         pos_res = eft.send_signed_request("GET", "/fapi/v2/positionRisk", target_env=target_env)
         active_positions = [p for p in pos_res if float(p.get("positionAmt", 0)) != 0] if isinstance(pos_res, list) else []
 
-        algos_res = eft.send_signed_request("GET", "/fapi/v1/openAlgoOrders", target_env=target_env)
+        # Issue #151: unreadable reads are UNKNOWN (critical), never "clean portfolio" or "every position orphan".
+        algos_res = eft.send_signed_request("GET", "/fapi/v1/openAlgoOrders", target_env=target_env) \
+            if isinstance(pos_res, list) else None
         active_algos = algos_res if isinstance(algos_res, list) else []
         algo_symbols = {a.get("symbol") for a in active_algos if a.get("orderType") in ["STOP_MARKET", "STOP"]}
 
@@ -533,7 +529,16 @@ def run_doctor(target_env: str = None, auto_heal: bool = False) -> int:
             if sym not in algo_symbols:
                 orphan_positions.append(p)
 
-        if orphan_positions:
+        if not isinstance(pos_res, list):
+            msg = f"Orphan audit: positionRisk unreadable ({pos_res}); open positions UNKNOWN."
+            critical_failures.append(msg)
+            print(f"❌ [ORPHAN AUDIT] {msg}")
+        elif active_positions and not isinstance(algos_res, list):
+            msg = (f"Orphan audit: openAlgoOrders unreadable ({algos_res}); stop protection UNKNOWN for "
+                   f"{[p.get('symbol') for p in active_positions]}; no heal attempted.")
+            critical_failures.append(msg)
+            print(f"❌ [ORPHAN AUDIT] {msg}")
+        elif orphan_positions:
             err_msg = f"Detected {len(orphan_positions)} ORPHAN position(s) lacking Stop Loss on Binance: {[p['symbol'] for p in orphan_positions]}"
             if auto_heal:
                 print(f"🚨 [ORPHAN AUDIT] {err_msg} — TRIGGERING AUTO-HEAL...")
@@ -571,14 +576,21 @@ def run_doctor(target_env: str = None, auto_heal: bool = False) -> int:
                         drift_report = tdw.audit_dead_alpha(target_env=target_env, max_hours=4.0, auto_exit=False)
                         dead_count = drift_report.get("dead_alpha_count", 0)
                         unknown = drift_report.get("unknown_holding_symbols") or []
+                        read_error = drift_report.get("read_error")
+                        if read_error:
+                            msg = f"Temporal audit failed: {read_error}"
+                            warnings.append(msg)
+                            print(f"⚠️  [DEAD ALPHA] {msg}")
                         if dead_count > 0:
                             warnings.append(f"Detected {dead_count} position(s) with Dead Alpha (>4h stagnant).")
                             print(f"⚠️  [DEAD ALPHA] {dead_count} stagnant position(s) exceed intraday holding threshold.")
                         if unknown:
                             warnings.append(f"Holding time UNKNOWN for {unknown}: no Binance fill or trades_audit "
-                                            "record; dead alpha cannot be assessed for them.")
-                            print(f"⚠️  [DEAD ALPHA] Holding time UNKNOWN for {unknown}.")
-                        if not dead_count and not unknown:
+                                            "record; dead alpha cannot be assessed for them. Review manually: "
+                                            "python3 scripts/execute_futures_trade.py --positions --json.")
+                            print(f"⚠️  [DEAD ALPHA] Holding time UNKNOWN for {unknown}. Review manually: "
+                                  "python3 scripts/execute_futures_trade.py --positions --json.")
+                        if not dead_count and not unknown and not read_error:
                             ok_items.append("Active position holding health OK (Zero Dead Alpha).")
                     except Exception as e:
                         msg = f"Temporal audit failed: {type(e).__name__}: {e}"

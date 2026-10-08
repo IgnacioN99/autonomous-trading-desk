@@ -369,7 +369,7 @@ class TestMcpClose(unittest.TestCase):
         self.assertEqual(res["stop_source"], "healed")
         self.assertEqual(len(mcp.algos), 1)
         self.assertEqual((mcp.algos[0]["side"], mcp.algos[0]["quantity"], mcp.algos[0]["reduceOnly"]),
-                         ("SELL", "10.0", True))
+                         ("SELL", "10", True))   # issue #152: plain decimal (format_order_qty)
         mock_report.assert_called_once()
 
 
@@ -387,6 +387,7 @@ class TestCallersBranchOnSuccess(unittest.TestCase):
 
     def test_watchdog_auto_exit_failure(self):
         with offline(self.overdue_fake()), \
+                patch("dynamic_exit_manager.check_dead_alpha_timeout", return_value=dict(STALLED)), \
                 patch("execute_futures_trade.close_position_market", return_value=dict(FAILED_CLOSE)) as mc:
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
@@ -400,6 +401,7 @@ class TestCallersBranchOnSuccess(unittest.TestCase):
 
     def test_watchdog_auto_exit_success_unchanged(self):
         with offline(self.overdue_fake()), \
+                patch("dynamic_exit_manager.check_dead_alpha_timeout", return_value=dict(STALLED)), \
                 patch("execute_futures_trade.close_position_market", return_value={"success": True}):
             rep = quiet(tdw.audit_dead_alpha, target_env="testnet", auto_exit=True)
         self.assertEqual(rep["positions"][0]["action_taken"], "AUTO_EXIT_CLOSED")

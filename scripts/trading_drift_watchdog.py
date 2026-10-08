@@ -18,12 +18,18 @@ position guardian (issue #92): the entry time of each LIVE position is resolved 
 then the trades audit log, else UNKNOWN. An unknown entry time is reported as such (elapsed_hours None plus a
 warning) and is never dead alpha; it is never "now" (0.0h) and never positionRisk updateTime.
 Dead alpha = held >= max_hours AND mark within 1.2% of entry AND |ROE| < 15%.
+--auto-exit closes only per utils/position_timing.dead_alpha_close_decision (same rule as the guardian's
+--close-dead-alpha): dead alpha AND holding time from Binance fills AND the 15m range stall
+(dynamic_exit_manager.check_dead_alpha_timeout); otherwise RECOMMEND_EXIT with auto_exit_skipped. The watchdog never
+files issue reports itself (close_position_market files the P0 of a not-flat close).
+An unreadable positionRisk returns {"read_error": str, "active_count": None, ...}: open positions UNKNOWN, never
+"zero open positions". A userTrades error is reported per position as entry_time_error (+ entry_time_rate_limited).
 
 Usage:
   python3 scripts/trading_drift_watchdog.py [--env testnet|mainnet] [--max-hours 4.0] [--auto-exit]
 
-Exit status: 1 when any auto-exit close failed (AUTO_EXIT_FAILED; the message shows stop_source/stop_protected),
-else 0.
+Exit status: 1 when positionRisk could not be read (read_error) or any auto-exit close failed (AUTO_EXIT_FAILED; the
+message shows stop_source/stop_protected), else 0.
 """
 
 import os
@@ -52,8 +58,17 @@ def audit_dead_alpha(target_env: str = None, max_hours: float = 4.0, auto_exit: 
     print("=" * 70)
 
     # 1. Fetch active Binance positions
-    pos_res = eft.send_signed_request("GET", "/fapi/v2/positionRisk", target_env=target_env)
-    active = [p for p in pos_res if float(p.get("positionAmt", 0)) != 0] if isinstance(pos_res, list) else []
+    try:
+        pos_res = eft.send_signed_request("GET", "/fapi/v2/positionRisk", target_env=target_env)
+        detail = None if isinstance(pos_res, list) else str(pos_res)
+    except Exception as e:
+        pos_res, detail = None, f"{type(e).__name__}: {e}"
+    if detail is not None:
+        read_error = f"positionRisk unreadable: {detail}"
+        print(f"❌ POSITION READ FAILED: {read_error}. Open positions UNKNOWN; temporal audit not performed.")
+        return {"read_error": read_error, "active_count": None, "dead_alpha_count": 0, "unknown_holding_count": 0,
+                "unknown_holding_symbols": [], "positions": []}
+    active = [p for p in pos_res if float(p.get("positionAmt", 0)) != 0]
 
     if not active:
         print("✅ ZERO OPEN POSITIONS: Zero temporal drift. Clean portfolio.")
@@ -76,9 +91,9 @@ def audit_dead_alpha(target_env: str = None, max_hours: float = 4.0, auto_exit: 
         unpnl = float(p.get("unRealizedProfit", 0))
         roe_pct = pt.position_roe_pct(p)
 
-        entry_time_ts, entry_source = pt.resolve_entry_time(sym, direction, p["positionAmt"], target_env,
-                                                            entry_price=entry_p, fetch=eft.send_signed_request,
-                                                            audit_path=audit_path)
+        entry_time_ts, entry_source, entry_diag = pt.resolve_entry_time_detailed(
+            sym, direction, p["positionAmt"], target_env, entry_price=entry_p, fetch=eft.send_signed_request,
+            audit_path=audit_path)
         elapsed_hours = pt.holding_hours(entry_time_ts, now_ts)
         verdict = pt.assess_dead_alpha(elapsed_hours=elapsed_hours, entry_price=entry_p, mark_price=mark_p,
                                        roe_pct=roe_pct, max_hours=max_hours)
@@ -100,11 +115,16 @@ def audit_dead_alpha(target_env: str = None, max_hours: float = 4.0, auto_exit: 
             "is_dead_alpha": is_dead_alpha,
             "action_taken": "NONE"
         }
+        if entry_diag["user_trades_error"]:
+            item["entry_time_error"] = entry_diag["user_trades_error"]
+            if entry_diag["rate_limited"]:
+                item["entry_time_rate_limited"] = True
 
         print(f"\n• Position: {sym} ({direction}) | Entry: {entry_p} | Mark: {mark_p}")
         if elapsed_hours is None:
             item["warning"] = (f"Holding time UNKNOWN for {sym}: no reconcilable Binance fill and no matching "
-                               f"trades_audit record. Temporal audit not possible for this position.")
+                               f"trades_audit record. Temporal audit not possible for this position. Review "
+                               f"manually: python3 scripts/execute_futures_trade.py --positions --json.")
             unknown_holding.append(sym)
             print(f"  Holding Duration: UNKNOWN (Limit: {max_hours}h) | PnL: ${unpnl:+.2f} USDT ({roe_pct:+.1f}% ROE)")
             print(f"  ⚠️  WARNING: {item['warning']}")
@@ -122,16 +142,31 @@ def audit_dead_alpha(target_env: str = None, max_hours: float = 4.0, auto_exit: 
                 item["action_taken"] = "RECOMMEND_EXIT"
                 item["auto_exit_skipped"] = f"entry time source {entry_source}: report only"
             elif auto_exit:
-                print(f"  ⚡ TRIGGERING AUTO-EXIT: Closing position at market to recycle capital...")
-                close_res = eft.close_position_market(sym, target_env=target_env)
-                item["close_result"] = close_res
-                if close_res.get("success"):
-                    item["action_taken"] = "AUTO_EXIT_CLOSED"
-                    print(f"  ✅ Position closed at market.")
+                # Same close rule as the guardian (issue #138): the 15m range stall is required too.
+                try:
+                    import dynamic_exit_manager as dem
+                    status = (dem.check_dead_alpha_timeout(sym, target_env=target_env) or {}).get("status") or "UNKNOWN"
+                except Exception:
+                    status = "UNKNOWN"
+                item["stall_status"] = status
+                allowed, reason = pt.dead_alpha_close_decision(verdict["verdict"], entry_source, status)
+                if not allowed:
+                    item["action_taken"] = "RECOMMEND_EXIT"
+                    item["auto_exit_skipped"] = reason
+                    print(f"  ⚠️  AUTO-EXIT SKIPPED: {reason}. Coiling/active range; review manually.")
                 else:
-                    item["action_taken"] = "AUTO_EXIT_FAILED"
-                    print(f"  ❌ AUTO-EXIT FAILED: {close_res.get('error') or 'close not confirmed (no error text)'} | "
-                          f"stop_source={close_res.get('stop_source')} stop_protected={close_res.get('stop_protected')}")
+                    print(f"  ⚡ TRIGGERING AUTO-EXIT: Closing position at market to recycle capital...")
+                    close_res = eft.close_position_market(sym, target_env=target_env)
+                    item["close_result"] = close_res
+                    if close_res.get("success"):
+                        item["action_taken"] = "AUTO_EXIT_CLOSED"
+                        print(f"  ✅ Position closed at market.")
+                    else:
+                        item["action_taken"] = "AUTO_EXIT_FAILED"
+                        protected = close_res.get("stop_protected")
+                        print(f"  ❌ AUTO-EXIT FAILED: {close_res.get('error') or 'close not confirmed (no error text)'} | "
+                              f"stop_source={close_res.get('stop_source')} stop_protected={protected}"
+                              f"{'' if protected is True else ' (treat as UNPROTECTED)'}")
             else:
                 print(f"  ⚠️  RECOMMENDATION: Market close or tighten SL to Break-Even immediately to eliminate risk.")
                 item["action_taken"] = "RECOMMEND_EXIT"
@@ -154,7 +189,8 @@ def audit_dead_alpha(target_env: str = None, max_hours: float = 4.0, auto_exit: 
     }
 
 def main(argv=None) -> int:
-    """CLI entry point. Exit status 1 when any auto-exit close failed (AUTO_EXIT_FAILED), else 0."""
+    """CLI entry point. Exit status 1 when positionRisk could not be read (read_error) or any auto-exit close failed
+    (AUTO_EXIT_FAILED), else 0."""
     default_env = resolve_env()
     parser = argparse.ArgumentParser(description="Dead Alpha & Drift Watchdog")
     parser.add_argument("--env", default=default_env, help="Target execution environment (prod/testnet)")
@@ -164,7 +200,7 @@ def main(argv=None) -> int:
 
     report = audit_dead_alpha(target_env=args.env, max_hours=args.max_hours, auto_exit=args.auto_exit)
     failed = [p for p in report.get("positions", []) if p.get("action_taken") == "AUTO_EXIT_FAILED"]
-    return 1 if failed else 0
+    return 1 if failed or report.get("read_error") else 0
 
 
 if __name__ == "__main__":
