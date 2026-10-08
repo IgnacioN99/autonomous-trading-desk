@@ -178,7 +178,9 @@ class TestDeadZoneCap(unittest.TestCase):
         calc, klines, _ = self._calc("SHORT", SHORT_POST, SHORT_FORMING, 101.0, 101.0, 99.0, tp1_filled=True)
         atr = closed_atr(klines)
         expected = max(min(99.4 + 0.3 * atr, 98.8 + 1.8 * atr, 100.0 * 0.998), 99.0 + 0.5 * atr)
-        self.assertEqual(calc["new_structural_sl"], eft.round_price(expected, 0.1, 1))
+        # Issue #197: SHORT stops are rounded up (away from price) to the tick.
+        self.assertEqual(calc["new_structural_sl"], dem._round_stop(expected, "SHORT", 0.1, 1))
+        self.assertGreaterEqual(calc["new_structural_sl"], expected)
         self.assertLessEqual(calc["new_structural_sl"], 99.8)
 
 

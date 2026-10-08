@@ -151,11 +151,16 @@ def get_leverage_ceiling(profile: Optional[Dict[str, Any]] = None) -> int:
 
 # Issue #183: R-based profit-lock steps applied by dynamic_exit_manager once True Net BE is allowed (verified TP1
 # fill or closed-15m MFE >= 2x ATR_15m). lock_r 0 = True Net BE; lock_r > 0 = entry +/- lock_r x initial risk.
+# Issue #205: trail_activation = pre-TP1 trail activation rule with an R reference: "r_only" (MFE >= 1R), "r_and_atr"
+# (>= 1R and >= 2x ATR_15m) or "r_or_atr" (legacy: either one; on wide stops 2x ATR fired well before +1R).
+TRAIL_ACTIVATION_MODES = ("r_only", "r_and_atr", "r_or_atr")
+PROFIT_LOCK_MIN_GAP_R = 0.5  # issue #197: every step needs mfe_r - lock_r >= 0.5
 DEFAULT_EXIT_MANAGEMENT = {
     "profit_lock_enabled": True,
     "profit_lock_steps": [{"mfe_r": 1.0, "lock_r": 0.0}, {"mfe_r": 2.0, "lock_r": 1.0}, {"mfe_r": 3.0, "lock_r": 2.0}],
     "extend_last_step": True,   # beyond the last step, each further full 1.0R of MFE raises the lock by 1.0R
     "lock_on_tp1": True,        # on a verified TP1 fill the lock also uses intrabar MFE (closed 1m bars, mark, TP1)
+    "trail_activation": "r_only",
 }
 
 
@@ -177,6 +182,8 @@ def _profit_lock_steps_error(steps) -> Optional[str]:
             return f"step {i} mfe_r must be > 0"
         if not 0 <= lock_r < mfe_r:
             return f"step {i} needs 0 <= lock_r < mfe_r"
+        if mfe_r - lock_r < PROFIT_LOCK_MIN_GAP_R - 1e-9:
+            return f"step {i} needs mfe_r - lock_r >= {PROFIT_LOCK_MIN_GAP_R:g}"
         if prev is not None and mfe_r <= prev:
             return f"step {i} mfe_r must be strictly ascending"
         prev = mfe_r
@@ -186,7 +193,9 @@ def _profit_lock_steps_error(steps) -> Optional[str]:
 def get_exit_management(profile: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Profile `exit_management` (issue #183) merged key by key over DEFAULT_EXIT_MANAGEMENT. An invalid value falls
     back to the default for that key only and adds a warning. Returns profit_lock_enabled, profit_lock_steps (list of
-    {"mfe_r": float, "lock_r": float}), extend_last_step, lock_on_tp1 and warnings (list of str). Never raises."""
+    {"mfe_r": float, "lock_r": float}, each with mfe_r - lock_r >= PROFIT_LOCK_MIN_GAP_R), extend_last_step,
+    lock_on_tp1, trail_activation (one of TRAIL_ACTIVATION_MODES, issue #205) and warnings (list of str). Never
+    raises."""
     warnings = []
     out = {k: v for k, v in DEFAULT_EXIT_MANAGEMENT.items() if k != "profit_lock_steps"}
     out["profit_lock_steps"] = [dict(s) for s in DEFAULT_EXIT_MANAGEMENT["profit_lock_steps"]]
@@ -206,6 +215,12 @@ def get_exit_management(profile: Optional[Dict[str, Any]] = None) -> Dict[str, A
                 out[key] = raw[key]
             else:
                 warnings.append(f"exit_management.{key} invalid: must be true or false; defaults used")
+    if raw and "trail_activation" in raw:
+        if isinstance(raw["trail_activation"], str) and raw["trail_activation"] in TRAIL_ACTIVATION_MODES:
+            out["trail_activation"] = raw["trail_activation"]
+        else:
+            warnings.append("exit_management.trail_activation invalid: must be one of "
+                            f"{', '.join(TRAIL_ACTIVATION_MODES)}; defaults used")
     if raw and "profit_lock_steps" in raw:
         err = _profit_lock_steps_error(raw["profit_lock_steps"])
         if err:

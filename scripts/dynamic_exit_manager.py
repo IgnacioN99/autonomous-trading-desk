@@ -4,9 +4,12 @@ dynamic_exit_manager.py - Quantitative Dynamic Exit and Structural Trailing Stop
 Replaces flat break-even with microstructural levels (15m Swing High/Low + Chandelier ATR),
 preserving positive right-tail convexity and managing Alpha Decay (stalled momentum timeouts).
 
-Activation gate (Issue #95): the planned Stop Loss is left untouched until the trade has earned a trail:
-+1.0R of planned risk (TRAIL_ACTIVATION_R) or +2.0x ATR_15m (TRAIL_ACTIVATION_ATR) of favourable excursion
-since entry on CLOSED 15m candles, or a TP1 fill. Once active, the Chandelier stop is anchored to the extreme
+Activation gate (Issues #95, #205): the planned Stop Loss is left untouched until the trade has earned a trail: a
+TP1 fill, or favourable excursion since entry on CLOSED 15m candles of +1.0R of planned risk (TRAIL_ACTIVATION_R;
+profile exit_management.trail_activation "r_only", default), +1.0R and +2.0x ATR_15m (TRAIL_ACTIVATION_ATR,
+"r_and_atr") or either one ("r_or_atr", legacy). Without an R reference +2.0x ATR_15m stays the only pre-TP1
+activation. The executor's user-invoked --move-breakeven keeps its own rule (TP1 or +2.0x ATR_15m, --force) and is
+not gated by +1R. Once active, the Chandelier stop is anchored to the extreme
 since entry (not the forming candle). Before +2.0x ATR_15m MFE or a TP1 fill an activated trail may tighten up
 to one tick short of entry, never into the True Net BE dead zone (Issue #106); this gives up profit protection on
 a fast reversal through entry (accepted to keep the stop out of the fee dead zone). YOLO positions are never
@@ -16,7 +19,10 @@ unknown). TP1/TP2 are never re-based.
 Profit lock (Issue #183): once True Net BE is allowed (verified TP1 fill or +2.0x ATR_15m) and R is known, the stop
 is at least the R step reached by the MFE (profile exit_management; default 1R -> True Net BE, 2R -> +1R,
 3R -> +2R, +1R per further full R). On a verified TP1 fill the lock MFE also uses the closed 1m bars of the forming
-15m candle, the mark price and the TP1 price, so the lock moves in the same cycle. The 0.5x ATR floor still wins.
+15m candle (and of the fill candle when it is the previous one), the mark price and the TP1 price (only when the TP1
+order id is among the userTrades fills), so the lock moves in the same cycle. The 0.5x ATR floor still wins. Steps
+above True Net BE need an audit R (Issue #197): with the "current_stop" fallback only the BE step applies. Stops
+are rounded to the tick away from price (LONG down, SHORT up).
 
 TP1 trust (Issue #163): a TP1 fill counts only when the matched trades_audit record is verified against the
 Binance fills (userTrades open time). With "reference_unverified" (fills unavailable, e.g. MCP mode, where the
@@ -38,7 +44,7 @@ import sys
 import json
 import time
 import urllib.request
-from decimal import Decimal
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN
 
 # Ensure local path resolution
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -50,8 +56,9 @@ from utils import trade_excursion
 
 BASE_FAPI = "https://fapi.binance.com"
 
-# Trailing activation gate (Issue #95): the planned SL is kept until price has moved TRAIL_ACTIVATION_R x the
-# initial risk, or TRAIL_ACTIVATION_ATR x ATR_15m, in favour since entry on CLOSED 15m bars, or TP1 has filled.
+# Trailing activation gate (Issues #95, #205): the planned SL is kept until price has moved TRAIL_ACTIVATION_R x the
+# initial risk in favour since entry on CLOSED 15m bars (plus / or TRAIL_ACTIVATION_ATR x ATR_15m per the profile's
+# trail_activation; ATR alone without R), or TP1 has filled.
 TRAIL_ACTIVATION_R = 1.0
 TRAIL_ACTIVATION_ATR = 2.0
 REFERENCE_ENTRY_TOLERANCE = 0.005  # trades_audit entry_price must be within 0.5% of the live entryPrice
@@ -103,8 +110,41 @@ def _bars_since_entry(candles, entry_ts):
     return [k for k in candles if float(k[0]) >= entry_ms]
 
 
-INTRABAR_KLINES_LIMIT = 16  # 1m bars of the forming 15m candle (weight 1), read only after a verified TP1 fill
+INTRABAR_KLINES_LIMIT = 31  # 1m bars (weight 1) of the forming 15m candle and, at most, the fill candle before it
+_BAR_15M_MS = 15 * 60_000
 _EPS = 1e-9
+
+
+def _intrabar_start_ms(entry_ts, now_ms):
+    """Open time (ms) of the first 1m bar of the intrabar read (Issue #197): the first full 1m bar after entry when
+    the entry fell in the forming 15m candle or in the one before it (the fill candle, excluded from the closed-15m
+    MFE), else the forming candle's open. An older fill candle is not covered (the lock only under-reads)."""
+    forming_open = int(now_ms) // _BAR_15M_MS * _BAR_15M_MS
+    first = trade_excursion.first_post_entry_bar_ms(entry_ts)
+    return first if first >= forming_open - _BAR_15M_MS else forming_open
+
+
+def _trail_activation_mode(exit_management):
+    """Profile trail_activation (Issue #205); anything but "r_and_atr" / "r_or_atr" (missing, None) is "r_only"."""
+    mode = exit_management.get("trail_activation") if isinstance(exit_management, dict) else None
+    return mode if mode in ("r_and_atr", "r_or_atr") else "r_only"
+
+
+def _round_stop(price, side, tick, precision):
+    """Stop price on an exact tick multiple, rounded away from price (Issue #197): LONG down, SHORT up. Float noise is
+    dropped first (precision + 6 decimals), so a price already on a tick never moves by a full tick."""
+    d = Decimal(str(price)).quantize(Decimal(1).scaleb(-(int(precision) + 6)), rounding=ROUND_HALF_EVEN)
+    step = Decimal(str(tick))
+    units = (d / step).quantize(Decimal(1), rounding=ROUND_CEILING if side == "SHORT" else ROUND_FLOOR)
+    return float(f"{units * step:.{int(precision)}f}")
+
+
+def _true_net_be(entry_price, is_long, tick, precision):
+    """True Net Break-Even (entry +/- TRUE_NET_BE_FEE_BUFFER) on the tick grid, rounded TOWARD price (LONG up, SHORT
+    down) so the realised buffer is never under 0.2%; on-grid, so the final _round_stop leaves it unchanged."""
+    buf = Decimal(str(eft.TRUE_NET_BE_FEE_BUFFER))
+    be = Decimal(str(entry_price)) * ((1 + buf) if is_long else (1 - buf))
+    return _round_stop(be, "SHORT" if is_long else "LONG", tick, precision)
 
 
 def _profit_lock_step(mfe_r, steps, extend_last_step):
@@ -151,10 +191,14 @@ def calculate_structural_stop(symbol, direction, entry_price, current_sl_price=0
     Calculates the dynamic Stop Loss preserving convexity (positive skewness), on CLOSED 15m candles only
     (the forming candle is dropped, so intrabar noise can neither activate nor anchor the trail).
 
-    ACTIVATION GATE (Issue #95): the planned SL is kept untouched until ONE of these holds (checked in order):
+    ACTIVATION GATE (Issues #95, #205): the planned SL is kept untouched until ONE of these holds (checked in order):
       - "tp1_filled":    TP1 has filled (tp1_filled is True);
-      - "r_multiple":    MFE since entry >= TRAIL_ACTIVATION_R (1.0) x initial risk R = |entry - planned_sl|;
-      - "atr_expansion": MFE since entry >= TRAIL_ACTIVATION_ATR (2.0) x ATR_15m.
+      - "r_multiple":    MFE since entry >= TRAIL_ACTIVATION_R (1.0) x initial risk R = |entry - planned_sl|, and with
+                         exit_management.trail_activation "r_and_atr" also >= TRAIL_ACTIVATION_ATR (2.0) x ATR_15m;
+      - "atr_expansion": MFE since entry >= TRAIL_ACTIVATION_ATR (2.0) x ATR_15m, only with "r_or_atr" (legacy) or
+                         when R does not exist (no R reference to measure: the only pre-TP1 activation).
+    Default "r_only" (missing or unknown key too): never trailed before +1R or TP1. The mode is read from
+    exit_management (the profile is loaded only when the mode decides the result and exit_management is None).
     R exists only when planned_sl is on the loss side of entry; ATR_15m <= 0 means never activated.
     MFE (max favourable excursion) is measured on closed 15m candles opened at/after entry_ts (the fill candle is
     excluded). planned_sl defaults to current_sl_price (reference_source "current_stop"; callers pass the
@@ -175,10 +219,16 @@ def calculate_structural_stop(symbol, direction, entry_price, current_sl_price=0
         1R -> True Net BE, 2R -> +1R, 3R -> +2R, then +1R per further full R). The lock MFE is the closed-15m MFE;
         on a verified TP1 fill (tp1_filled True, lock_on_tp1) also intrabar_extreme (closed 1m bars of the
         forming 15m candle, read by the caller), tp1_price and mark_price. Result "profit_lock": None or
-        {mfe_r, mfe_source, step_mfe_r, lock_r, lock_price, capped_by_price_floor, binding}. Before BE is allowed
-        the #106 cap above is unchanged. exit_management None loads the profile.
+        {mfe_r, mfe_source, step_mfe_r, lock_r, lock_price, capped_by_price_floor, binding}; binding compares the
+        tick-rounded stop and lock price. Issue #197: with reference_source "current_stop" (R from the current stop,
+        possibly an earlier trail) only steps with lock_r <= 0 (True Net BE) apply, without extend_last_step. Before
+        BE is allowed the #106 cap above is unchanged. exit_management None loads the profile.
+      - True Net BE (the BE clamp and the lock_r 0 step) is entry +/- 0.2% rounded TOWARD price to the tick
+        (_true_net_be), so the realised fee buffer is never under 0.2% (PR #211 review).
       - Never loosens against current_sl_price; never closer than 0.5x ATR to price (mark_price if given, else
-        the last closed close); this floor may cap the profit lock (capped_by_price_floor).
+        the last closed close); this floor may cap the profit lock (capped_by_price_floor). Mixed price sources:
+        the floor uses the MARK price while the trail / MFE bars are LAST-price 15m klines (no behaviour change).
+      - The stop is rounded to an exact tick away from price (_round_stop: LONG down, SHORT up, Issue #197).
     Take-profit orders are never re-based: TP1/TP2 keep their original levels.
 
     INJECTED DATA (Issue #182, offline replay in scripts/exit_policy_sim.py): klines_15m (raw 15m klines, last row =
@@ -235,13 +285,22 @@ def calculate_structural_stop(symbol, direction, entry_price, current_sl_price=0
         mfe = 0.0
 
     # No usable ATR -> no activation at all (the chandelier and every buffer need ATR > 0).
+    r_hit = bool(since) and initial_risk is not None and mfe >= TRAIL_ACTIVATION_R * initial_risk
+    atr_hit = bool(since) and mfe >= TRAIL_ACTIVATION_ATR * atr_15m
+    if (exit_management is None and atr_15m > 0 and tp1_filled is not True and initial_risk is not None
+            and r_hit != atr_hit):  # Issue #205: only then does trail_activation decide the result
+        exit_management = user_profile.get_exit_management()
+    mode = _trail_activation_mode(exit_management)
     activation_reason = None
     if atr_15m > 0:
         if tp1_filled is True:
             activation_reason = "tp1_filled"
-        elif since and initial_risk is not None and mfe >= TRAIL_ACTIVATION_R * initial_risk:
+        elif initial_risk is None:
+            if atr_hit:  # no R reference: +2x ATR_15m is the only pre-TP1 activation in every mode
+                activation_reason = "atr_expansion"
+        elif r_hit and (mode != "r_and_atr" or atr_hit):
             activation_reason = "r_multiple"
-        elif since and mfe >= TRAIL_ACTIVATION_ATR * atr_15m:
+        elif mode == "r_or_atr" and atr_hit:
             activation_reason = "atr_expansion"
 
     common = {
@@ -285,13 +344,18 @@ def calculate_structural_stop(symbol, direction, entry_price, current_sl_price=0
                                           exit_management=exit_management, intrabar_extreme=intrabar_extreme,
                                           tp1_price=tp1_price, mark=mark)
         mfe_r = lock_mfe / initial_risk
-        step = _profit_lock_step(mfe_r, exit_management.get("profit_lock_steps") or [],
-                                 bool(exit_management.get("extend_last_step")))
+        steps = exit_management.get("profit_lock_steps") or []
+        extend = bool(exit_management.get("extend_last_step"))
+        if common["reference_source"] == "current_stop":
+            # Issue #197: an R from the current stop may come from an earlier trail (smaller than the true R, so an
+            # inflated MFE in R): only the True Net BE step, never a lock above BE.
+            steps = [s for s in steps if float(s["lock_r"]) <= 0]
+            extend = False
+        step = _profit_lock_step(mfe_r, steps, extend) if steps else None
         if step is not None:
             step_mfe_r, lock_r = step
             if lock_r <= 0:
-                lock_price = entry_price * ((1 + eft.TRUE_NET_BE_FEE_BUFFER) if is_long
-                                            else (1 - eft.TRUE_NET_BE_FEE_BUFFER))
+                lock_price = _true_net_be(entry_price, is_long, tick, filters["precision_price"])
             else:
                 lock_price = (entry_price + lock_r * initial_risk) if is_long else (entry_price - lock_r * initial_risk)
             profit_lock = {"mfe_r": round(mfe_r, 4), "mfe_source": lock_source, "step_mfe_r": step_mfe_r,
@@ -307,11 +371,11 @@ def calculate_structural_stop(symbol, direction, entry_price, current_sl_price=0
 
         # Right-tail preservation: True Net Break-Even only after >= 2.0x ATR expansion since entry or TP1 fill;
         # before that the stop stays at least one tick below entry (never in the fee dead zone, Issue #106).
-        if be_allowed:
-            candidate_stop = max(candidate_stop, entry_price * 1.002)
+        if be_allowed:  # True Net BE rounded up to the tick: the realised buffer stays >= 0.2%
+            candidate_stop = max(candidate_stop, _true_net_be(entry_price, True, tick, filters["precision_price"]))
         else:
-            candidate_stop = min(candidate_stop, eft.round_price(Decimal(str(entry_price)) - Decimal(str(tick)),
-                                                                 tick, filters["precision_price"]))
+            candidate_stop = min(candidate_stop, _round_stop(Decimal(str(entry_price)) - Decimal(str(tick)), "LONG",
+                                                             tick, filters["precision_price"]))
 
         if profit_lock:  # Issue #183: the tighter of the trail and the R step lock
             candidate_stop = max(candidate_stop, profit_lock["lock_price"])
@@ -331,10 +395,11 @@ def calculate_structural_stop(symbol, direction, entry_price, current_sl_price=0
         candidate_stop = min(structural_level, chandelier_stop)
 
         if be_allowed:
-            candidate_stop = min(candidate_stop, entry_price * 0.998)
-        else:  # one tick above entry, rounded like every stop here (round_price), so still strictly above it
-            candidate_stop = max(candidate_stop, eft.round_price(Decimal(str(entry_price)) + Decimal(str(tick)),
-                                                                 tick, filters["precision_price"]))
+            candidate_stop = min(candidate_stop, _true_net_be(entry_price, False, tick, filters["precision_price"]))
+        else:  # one tick above entry, rounded up like every SHORT stop here (_round_stop), so strictly above it; an
+            # off-grid entry (averaged fills, e.g. 100.05 + 0.1) rounds up to the next tick (100.2, not 100.1)
+            candidate_stop = max(candidate_stop, _round_stop(Decimal(str(entry_price)) + Decimal(str(tick)), "SHORT",
+                                                             tick, filters["precision_price"]))
 
         if profit_lock:
             candidate_stop = min(candidate_stop, profit_lock["lock_price"])
@@ -346,9 +411,11 @@ def calculate_structural_stop(symbol, direction, entry_price, current_sl_price=0
         if profit_lock:
             profit_lock["capped_by_price_floor"] = candidate_stop > profit_lock["lock_price"]
 
-    if profit_lock:  # the lock set the stop (not a tighter trail / current stop, not the price floor)
-        profit_lock["binding"] = candidate_stop == profit_lock["lock_price"]
-    rounded_stop = eft.round_price(candidate_stop, filters["tickSize"], filters["precision_price"])
+    side = "LONG" if is_long else "SHORT"
+    rounded_stop = _round_stop(candidate_stop, side, filters["tickSize"], filters["precision_price"])
+    if profit_lock:  # the lock set the stop (not a tighter trail / current stop, not the price floor), on the tick
+        profit_lock["binding"] = rounded_stop == _round_stop(profit_lock["lock_price"], side, filters["tickSize"],
+                                                             filters["precision_price"])
 
     return dict(
         common,
@@ -474,7 +541,8 @@ def _position_is_flat(symbol, target_env):
     return True
 
 
-def update_position_to_structural_stop(symbol, target_env=None, dry_run=False, position=None, *, fetch=None):
+def update_position_to_structural_stop(symbol, target_env=None, dry_run=False, position=None, *, fetch=None,
+                                       exit_management=None):
     """
     Ratchets the Stop Loss of an open position to its structural level, strictly if it tightens risk.
 
@@ -502,19 +570,25 @@ def update_position_to_structural_stop(symbol, target_env=None, dry_run=False, p
         orders_query_failed carry none): trade-reference notices from resolve_trade_reference
         ("reference_unverified", "audit_unreadable", "audit_corrupt_lines:<n>"), plus old-stop cancel errors when
         tightened.
-      - Activation gate (Issue #95): the planned SL (latest matching trades_audit record, else the current stop)
-        is kept until +1.0R or +2.0x ATR_15m since entry on closed 15m bars, or TP1 fill (reason
-        "trail_not_activated", no write). Results carry activation_reason and reference_source. Before +2.0x
-        ATR_15m MFE or a TP1 fill an activated trail stays one tick short of entry: it gives up profit protection
-        on a fast reversal through entry (accepted to keep the stop out of the fee dead zone).
+      - Activation gate (Issues #95, #205): the planned SL (latest matching trades_audit record, else the current
+        stop) is kept until +1.0R since entry on closed 15m bars (profile trail_activation: "r_only" default,
+        "r_and_atr" also needs +2.0x ATR_15m, "r_or_atr" legacy either; without R +2.0x ATR_15m), or TP1 fill
+        (reason "trail_not_activated", no write). Results carry activation_reason and reference_source. Before
+        +2.0x ATR_15m MFE or a TP1 fill an activated trail stays one tick short of entry: it gives up profit
+        protection on a fast reversal through entry (accepted to keep the stop out of the fee dead zone).
       - Profit lock (Issue #183, profile exit_management): once True Net BE is allowed the stop is tightened to the
         R step reached by the MFE (calculate_structural_stop). On a verified TP1 fill only (tp1_filled True,
-        lock_on_tp1) one 1m klines read (trade_excursion.fetch_klines_range, limit 16, weight 1) of the forming
-        15m candle, plus the mark price and the record's tp1_price, raise the lock MFE in the same call; a failed
-        read adds "intrabar_unavailable" and never blocks the trail. MCP / reference_unverified: tp1_filled is
+        lock_on_tp1) one 1m klines read (trade_excursion.fetch_klines_range, limit 31, weight 1) of the forming
+        15m candle (from the first bar after entry when the fill candle is the previous one, _intrabar_start_ms),
+        plus the mark price and the record's tp1_price, raise the lock MFE in the same call. Issue #197: tp1_price
+        counts only when a fill with the record's tp1_order_id is in the userTrades reply already read for the
+        reference (no extra request); a failed read (or start time) adds "intrabar_unavailable" plus
+        intrabar_error "<Type>: <msg>" and never blocks the trail. MCP / reference_unverified: tp1_filled is
         None, so no TP1 lock and no 1m read; closed-15m steps still apply after +2.0x ATR_15m when R exists.
         Results from the calc on carry "profit_lock" (dict or None); exit_management profile warnings join
-        "warnings". The stop still changes only through replace_protective_stop and the #167 re-read.
+        "warnings". exit_management (a get_exit_management() dict) skips the profile read (the guardian reads it
+        once per cycle); None loads it. The stop still changes only through replace_protective_stop and the #167
+        re-read.
       - Take-profit orders are never touched or re-based.
     `position` (a positionRisk row) may be passed to avoid re-querying. `fetch` (send_signed_request-like) is used
     for the userTrades read only (the guardian shares one read per symbol per cycle); no userTrades call is made
@@ -560,8 +634,18 @@ def update_position_to_structural_stop(symbol, target_env=None, dry_run=False, p
 
     # Trade reference first: TP1 state is only trusted when the audit record belongs to THIS position (a stale
     # record from a previous trade must never report tp1_filled, skip the YOLO gate or allow the BE ratchet).
+    # Issue #197: the userTrades reply read for the reference is kept (no extra request) as the TP1 order-id proof.
+    user_trades_seen = []
+    send = fetch or eft.send_signed_request
+
+    def recording_fetch(method, endpoint, params=None, target_env=None, **kw):
+        res = send(method, endpoint, params, target_env=target_env, **kw)
+        if endpoint == "/fapi/v1/userTrades" and isinstance(res, list):
+            user_trades_seen.extend(f for f in res if isinstance(f, dict))
+        return res
+
     planned_sl, entry_ts, reference_source, ref_rec, ref_warnings, candidate = _resolve_trade_reference_with_candidate(
-        symbol, position, direction, current_sl, target_env, fetch=fetch)
+        symbol, position, direction, current_sl, target_env, fetch=recording_fetch)
     base["warnings"] = list(ref_warnings)
     # TP1 and YOLO read the SAME matched record (Issue #107); without one, TP1 is unknown. Issue #163: an
     # unverified record (no userTrades open time) may be a stale same-direction trade, so its TP1 is unknown too.
@@ -582,22 +666,30 @@ def update_position_to_structural_stop(symbol, target_env=None, dry_run=False, p
 
     # Issue #183: profit-lock settings; on a verified TP1 fill only, one 1m klines read (weight 1) of the forming 15m
     # candle gives the intrabar MFE (the closed 15m bars cover the rest). A failed read never blocks the trail.
-    exit_mgmt = user_profile.get_exit_management()
-    base["warnings"].extend(exit_mgmt["warnings"])
+    exit_mgmt = exit_management if exit_management is not None else user_profile.get_exit_management()
+    base["warnings"].extend(exit_mgmt.get("warnings") or [])
     intrabar_extreme = None
-    tp1_price = ref_rec.get("tp1_price") if (tp1_ok is True and isinstance(ref_rec, dict)) else None
-    if tp1_ok is True and exit_mgmt["profit_lock_enabled"] and exit_mgmt["lock_on_tp1"] and entry_ts is not None:
-        now_ms = int(time.time() * 1000)
-        start_ms = max(trade_excursion.first_post_entry_bar_ms(entry_ts), now_ms // (15 * 60_000) * (15 * 60_000))
+    tp1_price = None
+    tp1_order_id = ref_rec.get("tp1_order_id") if isinstance(ref_rec, dict) else None
+    if tp1_ok is True and tp1_order_id is not None:
+        if any(str(f.get("orderId")) == str(tp1_order_id) for f in user_trades_seen):
+            tp1_price = ref_rec.get("tp1_price")  # a manual partial close is not a TP1 fill (Issue #197)
+        else:  # e.g. the TP1 fill is older than the userTrades page read: the lock only reads lower (safe)
+            base["warnings"].append("tp1_fill_not_in_user_trades")
+    if (tp1_ok is True and exit_mgmt.get("profit_lock_enabled") and exit_mgmt.get("lock_on_tp1")
+            and entry_ts is not None):
         try:
+            now_ms = int(time.time() * 1000)
+            start_ms = _intrabar_start_ms(entry_ts, now_ms)
             bars = trade_excursion.fetch_klines_range(symbol, "1m", start_ms, limit=INTRABAR_KLINES_LIMIT,
                                                       target_env=target_env)
             closed_1m = [k for k in bars if float(k[0]) + trade_excursion.BAR_MS <= now_ms]  # drop the forming bar
             if closed_1m:
                 intrabar_extreme = (max(float(k[2]) for k in closed_1m) if is_long
                                     else min(float(k[3]) for k in closed_1m))
-        except Exception:
+        except Exception as e:
             base["warnings"].append("intrabar_unavailable")
+            base["intrabar_error"] = f"{type(e).__name__}: {e}"
 
     calc = calculate_structural_stop(symbol, direction, entry_p, current_sl_price=current_sl, target_env=target_env,
                                      planned_sl=planned_sl, entry_ts=entry_ts, tp1_filled=tp1_ok,
@@ -616,10 +708,14 @@ def update_position_to_structural_stop(symbol, target_env=None, dry_run=False, p
         lock_note = f" (profit lock {level} at MFE {lock['mfe_r']:.2f}R)"
 
     if calc.get("reason") == "trail_not_activated":
+        needs = {"r_only": f"+{TRAIL_ACTIVATION_R:g}R",
+                 "r_and_atr": f"+{TRAIL_ACTIVATION_R:g}R and +{TRAIL_ACTIVATION_ATR:g}x ATR_15m",
+                 "r_or_atr": f"+{TRAIL_ACTIVATION_R:g}R or +{TRAIL_ACTIVATION_ATR:g}x ATR_15m"}[
+                     _trail_activation_mode(exit_mgmt)]
         return keep("trail_not_activated",
                     f"Trailing not activated for {symbol}: planned SL kept (reference {planned_sl or 'none'} from "
-                    f"{reference_source}; needs +{TRAIL_ACTIVATION_R:g}R or +{TRAIL_ACTIVATION_ATR:g}x ATR_15m "
-                    f"on closed 15m bars since entry, or TP1 fill).")
+                    f"{reference_source}; needs {needs} on closed 15m bars since entry (+{TRAIL_ACTIVATION_ATR:g}x "
+                    f"ATR_15m without an R reference), or TP1 fill).")
 
     new_sl = calc["new_structural_sl"]
     base["structural_sl"] = new_sl
