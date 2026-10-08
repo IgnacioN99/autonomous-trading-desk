@@ -303,7 +303,8 @@ def _plain_decimal(value):
 
 def _mcp_json_dumps(obj):
     """json.dumps for the MCP gateway body that writes finite floats and Decimals as plain decimals (no exponent);
-    same separators as json.dumps and json.loads round-trips to the same values."""
+    same separators as json.dumps and json.loads round-trips to the same values. NaN / Infinity raise ValueError
+    (never sent: the gateway body must be valid JSON)."""
     if isinstance(obj, dict):
         return "{" + ", ".join(f"{json.dumps(str(k))}: {_mcp_json_dumps(v)}" for k, v in obj.items()) + "}"
     if isinstance(obj, (list, tuple)):
@@ -312,9 +313,11 @@ def _mcp_json_dumps(obj):
         return json.dumps(obj)
     if isinstance(obj, float) and math.isfinite(obj):
         return _plain_decimal(obj)
-    if isinstance(obj, Decimal) and obj.is_finite():
+    if isinstance(obj, Decimal):
+        if not obj.is_finite():
+            raise ValueError(f"Out of range Decimal value is not JSON compliant: {obj}")
         return _plain_decimal(obj)
-    return json.dumps(obj)
+    return json.dumps(obj, allow_nan=False)
 
 
 def call_binance_mcp(tool_name: str, args: dict = None, session_id: str = None):
@@ -347,12 +350,13 @@ def call_binance_mcp(tool_name: str, args: dict = None, session_id: str = None):
             "arguments": args or {}
         }
     }
-    req = urllib.request.Request(
-        "https://agent.binance.com/mcp/agentic",
-        headers=headers,
-        data=_mcp_json_dumps(payload).encode("utf-8")
-    )
     try:
+        # Inside the try: a non-finite number raises ValueError here and nothing is sent (issue #173).
+        req = urllib.request.Request(
+            "https://agent.binance.com/mcp/agentic",
+            headers=headers,
+            data=_mcp_json_dumps(payload).encode("utf-8")
+        )
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             if "error" in data:
@@ -935,7 +939,7 @@ def get_open_stop_orders_with_retry(symbol, exit_side, target_env=None, retry_de
 
 def _is_explicit_rejection(placement):
     """True when an order placement was explicitly rejected by Binance: no order id and a negative code other than
-    the "unknown error / execution status unknown" codes, after which the order may exist. Transport and MCP errors
+    the "unknown error / execution status unknown / server overloaded" codes, after which the order may exist. Transport and MCP errors
     without a code are not explicit rejections."""
     if not isinstance(placement, dict) or _order_id(placement) is not None:
         return False
@@ -943,7 +947,7 @@ def _is_explicit_rejection(placement):
         code = int(placement.get('code'))
     except (TypeError, ValueError):
         return False
-    return code < 0 and code not in (-1000, -1001, -1006, -1007)
+    return code < 0 and code not in (-1000, -1001, -1006, -1007, -1008)
 
 
 HEDGE_MODE_UNSUPPORTED = ("hedge mode (dualSidePosition=true) is not supported by the desk: reduce-only closes and "
@@ -1168,12 +1172,13 @@ def heal_orphan_position(position, target_env=None, close_on_failure=False, *, p
     """
     Places a verified emergency stop on a position that has none. The stop sits ORPHAN_HEAL_SL_DISTANCE away
     from the worse of entry/mark so it can never trigger on placement. planned_sl (the trade's planned SL, passed
-    only by close_position_market) replaces that anchor when it is tighter and not crossed (below mark for LONG,
+    only by close_position_market and heal_unknown_stop) replaces that anchor when it is tighter and not crossed (below mark for LONG,
     above for SHORT); it never loosens the stop. A rejected or unverified planned-SL stop is retried once at the
     anchor (sl_source "anchor_after_planned_rejected"). An explicit Binance rejection (_is_explicit_rejection) skips
     the verification wait. When the anchor is not verified either and the planned placement was not explicitly
     rejected, the planned stop is verified once more (late indexing): success then has sl_source
-    "planned_sl_late_indexed" and keeps planned_attempt / anchor_attempt. If it cannot be verified and
+    "planned_sl_late_indexed" and keeps planned_attempt / anchor_attempt; an anchor placement accepted with an id is
+    listed in redundant_stops (reduce-only/closePosition, never cancelled here). If it cannot be verified and
     close_on_failure=True, the position is closed with a reduce-only market order (fail-safe auto-destruct). A hedge-mode
     row (positionSide != BOTH) returns reason "hedge_mode_unsupported" without any order. Never opens or increases
     exposure.
@@ -1241,6 +1246,11 @@ def heal_orphan_position(position, target_env=None, close_on_failure=False, *, p
                                                         tick_size=filters.get('tickSize'), target_env=target_env)
             if verified:
                 out["anchor_attempt"] = {"sl_price": out["healed_sl_price"], "placement": out.get("placement")}
+                anchor_id = _order_id(out.get("placement")) if isinstance(out.get("placement"), dict) else None
+                if anchor_id is not None:
+                    # The anchor was accepted too (unverified, may exist): listed, never cancelled here.
+                    out["redundant_stops"] = [{"algo_id": anchor_id, "trigger_price": out["healed_sl_price"],
+                                               "sl_source": "anchor_after_planned_rejected"}]
                 out.update(verified=True, success=True, reason="healed", healed_sl_price=planned_price,
                            sl_source="planned_sl_late_indexed", new_stop=stop_summary(info),
                            placement=out["planned_attempt"]["placement"])
@@ -4444,7 +4454,8 @@ def audit_orphan_positions(target_env=None, auto_heal=False):
     If auto_heal=True, places an emergency Algo SL calculated via volatility/liquidation buffer.
     Stops are read with retries (get_open_stop_orders_with_retry; after one symbol's read fails persistently, later
     symbols get a single read so the hook's audit stays bounded). protection per position: "protected" | "orphan" |
-    "unknown" (every read failed: never healed, not counted as an orphan, counted in unknown_count). A hedge-mode
+    "unknown" (every read failed: never healed here, not counted as an orphan, counted in unknown_count; the guardian
+    heals one that stays UNKNOWN for STOP_UNKNOWN_ESCALATE_AFTER cycles via heal_unknown_stop). A hedge-mode
     account returns {"error", "hedge_mode": True}.
     """
     target_env = resolve_env(target_env)
@@ -4553,12 +4564,20 @@ def _read_open_position(symbol, target_env=None, is_long=None):
     return None, None
 
 
+def _qty_tolerance(symbol, target_env=None):
+    """Quantity match tolerance: max(1e-9, stepSize / 2) from get_symbol_filters; 1e-9 when the filters read fails."""
+    try:
+        return max(1e-9, float(get_symbol_filters(symbol, target_env=target_env)['stepSize']) / 2)
+    except Exception:
+        return 1e-9
+
+
 def _planned_sl_for_position(symbol, row, target_env=None):
     """sl_price of the latest trades_audit entry record that matches the live position (direction, env, entry within
     tolerance, total_qty >= |positionAmt|), else None. Never raises.
     With a matching record, a ratcheted stop (break-even / trailed) from logs/session_state.json replaces it when the
     state is valid, of the same env and not older than the record, the entry matches (symbol, direction, entry within
-    tolerance, qty >= |positionAmt|, sl_algo_verified) and its sl_price is tighter than the planned SL and not crossed
+    tolerance, qty >= |positionAmt| within _qty_tolerance, sl_algo_verified) and its sl_price is tighter than the planned SL and not crossed
     vs markPrice. The state's sl_price is any open algo trigger of the symbol, hence those guards. Limitation: the
     state reflects the last ledger sync only."""
     try:
@@ -4583,14 +4602,17 @@ def _planned_sl_for_position(symbol, row, target_env=None):
         live_entry = _to_float(row.get('entryPrice'))
         mark = _to_float(row.get('markPrice'))
         planned_f = _to_float(planned)
+        qty_tol = None
         for entry in state.get('active_positions') or []:
             if not isinstance(entry, dict) or str(entry.get('symbol', '')).upper() != str(symbol).upper() \
                     or str(entry.get('direction', '')).upper() != direction or entry.get('sl_algo_verified') is not True:
                 continue
+            if qty_tol is None:
+                qty_tol = _qty_tolerance(symbol, target_env)
             entry_p = _to_float(entry.get('entry_price'))
             if live_entry <= 0 or entry_p <= 0 \
                     or abs(entry_p - live_entry) / live_entry * 100 > pt.AUDIT_ENTRY_PRICE_TOLERANCE_PCT \
-                    or abs(_to_float(entry.get('qty'))) < abs(amt) - 1e-9:
+                    or abs(_to_float(entry.get('qty'))) < abs(amt) - qty_tol:
                 continue
             cand = float(entry.get('sl_price'))
             if cand > 0 and mark > 0 and (planned_f <= 0 or is_tighter_stop(cand, planned_f, is_long)) \
@@ -4692,6 +4714,46 @@ def _report_abort_failure(symbol, target_env, site, error):
         logger.error(f"abort failure report for {symbol} could not be filed: {e}")
 
 
+def heal_unknown_stop(symbol, position, target_env=None):
+    """Heal of a position whose stop read failed (issue #173: close_position_market, the guardian's persistent UNKNOWN
+    escalation, the SWING night cutoff). heal_orphan_position with close_on_failure=False and the planned SL of
+    _planned_sl_for_position; never closes and never raises. Returns {"result", "detail", "heal", "redundant_stops",
+    "note"}:
+      result "healed" -> an emergency stop was placed and verified; one more read lists any other protective stops in
+                         redundant_stops (never cancelled: the cancelled one could be the only real stop; all are
+                         reduce-only/closePosition and the next flat close cancels the leftovers) with a note;
+             "kept"   -> the placement got -4130: a closePosition stop already exists (note "stop inferred from -4130");
+             "failed" -> anything else (heal unverified or raised).
+    heal is the raw heal_orphan_position result ({"verified": False, "reason": "heal failed: ..."} on an exception)."""
+    try:
+        heal = heal_orphan_position(position, target_env=target_env, close_on_failure=False,
+                                    planned_sl=_planned_sl_for_position(symbol, position, target_env))
+    except Exception as e:
+        heal = {"verified": False, "reason": f"heal failed: {e}"}
+    out = {"result": "failed", "detail": f"heal not verified ({heal.get('reason')})", "heal": heal,
+           "redundant_stops": [], "note": None}
+    if heal.get("verified"):
+        out.update(result="healed", detail=f"verified emergency stop at {heal.get('healed_sl_price')}")
+        try:
+            exit_side = 'SELL' if _to_float(position.get('positionAmt')) > 0 else 'BUY'
+            after, after_err = get_open_stop_orders(symbol, exit_side, target_env=target_env)
+            healed = heal.get("new_stop") or {}
+            others = [s for s in after if (str(_order_id(s)) != str(healed.get("algo_id"))
+                                           if healed.get("algo_id") is not None
+                                           else _trigger_price(s) != healed.get("trigger_price"))] \
+                if after_err is None else []
+        except Exception:
+            others = []
+        if others:
+            out["redundant_stops"] = [stop_summary(s) for s in others]
+            out["note"] = ("heal stop placed next to existing stop(s) (pre-heal reads failed); all are "
+                           "reduce-only/closePosition and the next flat close cancels the leftovers")
+    elif _is_existing_close_position_stop_rejection(heal.get("placement")):
+        out.update(result="kept", detail="placement rejected -4130: a closePosition stop already exists",
+                   note="stop inferred from -4130")
+    return out
+
+
 def close_position_market(symbol, target_env=None):
     """
     Risk-reducing reduce-only MARKET close of the open position of symbol (same in PROD/TESTNET, KEYS/MCP).
@@ -4713,7 +4775,7 @@ def close_position_market(symbol, target_env=None):
                   "none"    -> a successful read showed no stop and the heal failed, stop_protected False;
                   "unknown" -> every read failed and the heal failed for another reason, stop_protected None.
     stop_protected is True / False / None; consumers MUST treat anything but True as unprotected (never test
-    `is False`). When every pre-heal read failed and the heal verified, one more read lists any other protective stops
+    `is False`). When every pre-heal read failed the heal is heal_unknown_stop; when it verified, one more read lists any other protective stops
     in redundant_stops with a stop_note: they are never cancelled here (the cancelled one could be the only real
     stop); all are reduce-only/closePosition and the next flat close cancels the leftovers.
     Early returns (only "error"; no report): no position, unreadable positionRisk, hedge mode ("hedge_mode": True).
@@ -4763,32 +4825,19 @@ def close_position_market(symbol, target_env=None):
     heal, note, redundant = None, None, None
     if stops:
         stop_source = "kept"
-    else:
+    elif stop_err is None:
         try:
             heal = heal_orphan_position(row, target_env=target_env, close_on_failure=False,
                                         planned_sl=_planned_sl_for_position(symbol, row, target_env))
         except Exception as e:
             heal = {"verified": False, "reason": f"heal failed: {e}"}
-        if heal.get("verified"):
-            stop_source = "healed"
-            if stop_err is not None:
-                # Every pre-heal read failed: the heal may sit next to an existing (e.g. quantity-based) stop.
-                after, after_err = get_open_stop_orders(symbol, exit_side, target_env=target_env)
-                healed = heal.get("new_stop") or {}
-                others = [s for s in after if (str(_order_id(s)) != str(healed.get("algo_id"))
-                                               if healed.get("algo_id") is not None
-                                               else _trigger_price(s) != healed.get("trigger_price"))] \
-                    if after_err is None else []
-                if others:
-                    redundant = [stop_summary(s) for s in others]
-                    note = ("heal stop placed next to existing stop(s) (pre-heal reads failed); all are "
-                            "reduce-only/closePosition and the next flat close cancels the leftovers")
-        elif stop_err is None:
-            stop_source = "none"
-        elif _is_existing_close_position_stop_rejection(heal.get("placement")):
-            stop_source, note = "kept", "stop inferred from -4130"
-        else:
-            stop_source = "unknown"
+        stop_source = "healed" if heal.get("verified") else "none"
+    else:
+        # Every read failed: the shared unknown-stop heal (-4130 = kept, redundant stops listed, never a close).
+        unknown = heal_unknown_stop(symbol, row, target_env=target_env)
+        heal, redundant = unknown["heal"], unknown["redundant_stops"] or None
+        stop_source = {"healed": "healed", "kept": "kept"}.get(unknown["result"], "unknown")
+        note = unknown.get("note")
     error = (f"Reduce-only MARKET close of {symbol} not confirmed flat after {attempts} attempt(s) "
              f"(last response: {res}); nothing cancelled; stop {stop_source}")
     if note:

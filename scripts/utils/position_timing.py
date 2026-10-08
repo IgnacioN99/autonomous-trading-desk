@@ -25,7 +25,7 @@ Dead alpha (assess_dead_alpha): held >= max_hours (default 4h) AND stagnant (mar
 |ROE| < 15%). An unknown holding time is verdict UNKNOWN: never dead alpha, never reported as 0.0h.
 "Stagnant" needs BOTH tests. ROE = price move x leverage L, so the effective price band is min(1.2%, 15%/L): the
 |ROE| < 15% test governs above 12.5x (15/1.2). Autonomous closes (guardian --close-dead-alpha, watchdog --auto-exit)
-follow dead_alpha_close_decision: DEAD_ALPHA verdict AND userTrades holding time AND the 15m range stall
+both call dead_alpha_close_decision directly: DEAD_ALPHA verdict AND userTrades holding time AND the 15m range stall
 (dynamic_exit_manager.check_dead_alpha_timeout status STALL_STATUS).
 resolve_entry_time_detailed also returns the userTrades diagnostics (user_trades_error, rate_limited).
 """

@@ -17,12 +17,17 @@ Usage:
   python3 scripts/loops/night_cutoff_loop.py [--env testnet|mainnet] [--auto-ratchet]
 
 run_night_cutoff returns {"close_failures": [symbols], "unprotected": [symbols], "stop_unknown": [symbols]} plus
-"read_error" when positionRisk cannot be read (orphan order cleanup is then skipped). stop_unknown: openAlgoOrders
-stayed unreadable after retries, so no heal or ratchet was attempted for that symbol (manual check); in
-ZERO_OVERNIGHT_RISK it is still closed at market (reduce-only, risk-reducing) and stays listed as stop_unknown. Exit
-status: 1 when a market close failed, a position remains without a verified stop, its stop state is unknown or
-positions could not be read, else 0 (a failed Break-Even ratchet does not change it). Any of those prints the
-"NIGHT CUTOFF INCOMPLETE" banner instead of the success banner.
+"read_error" when positionRisk cannot be read (orphan order cleanup is then skipped) and "stop_unknown_heals"
+[{"symbol", "result", "detail"}] when a SWING_STRUCTURAL_STOP position had an unknown stop. stop_unknown:
+openAlgoOrders stayed unreadable after retries, so no ratchet was attempted for that symbol (manual check); in
+ZERO_OVERNIGHT_RISK it is still closed at market (reduce-only, risk-reducing) and stays listed as stop_unknown; in
+SWING_STRUCTURAL_STOP it gets execute_futures_trade.heal_unknown_stop (never a close; -4130 = a stop exists = kept)
+and a CRITICAL/P0 report (issue #173), and stays listed as stop_unknown. Each position is processed in its own try
+(issue #173): an exception lists the symbol in close_failures (stage and error printed) and the next symbols are
+still processed; in ZERO_OVERNIGHT_RISK a position whose exception came before any close attempt gets one
+reduce-only close attempt. Exit status: 1 when a market close failed, a position remains without a verified stop,
+its stop state is unknown or positions could not be read, else 0 (a failed Break-Even ratchet does not change it).
+Any of those prints the "NIGHT CUTOFF INCOMPLETE" banner instead of the success banner.
 """
 
 import os
@@ -37,6 +42,173 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import execute_futures_trade as eft
 import dynamic_exit_manager as dem
 from utils.env_resolver import resolve_env
+
+
+def _report_swing_unknown_stop(target_env, sym, result, detail):
+    """Issue #173: CRITICAL/P0 issue for a SWING_STRUCTURAL_STOP position left open overnight with an unreadable
+    stop. Never raises (reporting must not stop the cutoff)."""
+    try:
+        import report_agent_issue
+        report_agent_issue.report_issue(
+            title=f"night_cutoff_loop: {sym} stop UNKNOWN at the SWING_STRUCTURAL_STOP cutoff",
+            error_detail=f"{sym} SWING cutoff stop UNKNOWN; heal {result}",
+            category="risk_gate", severity="CRITICAL", priority="P0",
+            agent_name="night_cutoff_loop",
+            affected_files="scripts/loops/night_cutoff_loop.py:_cutoff_position",
+            context=f"env={target_env}; symbol={sym}; openAlgoOrders unreadable after retries; heal result={result}; "
+                    f"detail: {detail}",
+            remediation="Check the position's stop on Binance now; protect it or close it with --close-position.")
+    except Exception as e:
+        print(f"     ⚠️  Unknown-stop report for {sym} could not be filed ({type(e).__name__}: {e})")
+
+
+def _close_at_market(sym, target_env, summary, progress, ok_message):
+    """Reduce-only market close of sym; a failure lists sym in close_failures."""
+    progress["close_attempted"] = True
+    progress["stage"] = "close"
+    close_res = eft.close_position_market(sym, target_env=target_env)
+    if close_res.get("success"):
+        print(ok_message)
+    else:
+        summary["close_failures"].append(sym)
+        print(f"     ❌ Failed to close {sym} at market: {close_res.get('error')}")
+
+
+def _cutoff_position(p, overnight_mode, auto_ratchet, target_env, summary, progress):
+    """Night cutoff of one live position. progress["stage"] / progress["close_attempted"] tell the caller where an
+    exception came from."""
+    progress["stage"] = "parse"
+    sym = p["symbol"]
+    amt = float(p["positionAmt"])
+    entry_p = float(p["entryPrice"])
+    mark_p = float(p["markPrice"])
+    unpnl = float(p.get("unRealizedProfit", 0))
+    margin = float(p.get("isolatedMargin", 0))
+    direction = "LONG" if amt > 0 else "SHORT"
+    roe_pct = (unpnl / margin * 100) if margin > 0 else 0.0
+
+    print(f"\n   • {sym} ({direction} {abs(amt):.3f} @ {entry_p:.5f})")
+    print(f"     Current Mark: {mark_p:.5f} | Floating PnL: ${unpnl:+.2f} USDT ({roe_pct:+.1f}% ROE)")
+
+    # Mode 1: CLOSE_ALL_AT_MARKET -> Close 100% of positions at market
+    if overnight_mode == "CLOSE_ALL_AT_MARKET":
+        print(f"     🚪 CLOSE_ALL_AT_MARKET mode: Closing {sym} at market to eliminate overnight exposure...")
+        _close_at_market(sym, target_env, summary, progress, f"     ✅ Position {sym} successfully closed at market.")
+        return
+
+    # For SWING_STRUCTURAL_STOP and ZERO_OVERNIGHT_RISK:
+    # First, verify active Stop Loss (retried: an unreadable listing is UNKNOWN, never "no stop")
+    progress["stage"] = "stop_read"
+    algos = None
+    for delay in (0.0,) + tuple(eft.STOP_VERIFY_RETRY_DELAYS):
+        if delay:
+            time.sleep(delay)
+        try:
+            algos = eft.send_signed_request("GET", "/fapi/v1/openAlgoOrders", {"symbol": sym},
+                                            target_env=target_env)
+        except Exception as e:
+            algos = {"error": str(e)}
+        if isinstance(algos, list):
+            break
+    if not isinstance(algos, list):
+        summary["stop_unknown"].append(sym)
+        print(f"     ❌ CRITICAL: {sym} stop state UNKNOWN (openAlgoOrders unreadable: {algos}). "
+              f"No ratchet attempted. Manual check required.")
+        progress["stage"] = "stop_unknown"
+        # Closing is risk-reducing, so ZERO_OVERNIGHT_RISK still closes the position (Break-Even unverifiable).
+        if overnight_mode == "ZERO_OVERNIGHT_RISK":
+            print(f"     🚪 ZERO_OVERNIGHT_RISK: closing {sym} at market (reduce-only) despite the unknown stop...")
+            _close_at_market(sym, target_env, summary, progress,
+                             f"     ✅ Position {sym} closed at market. Stop read still UNKNOWN: verify no stray orders.")
+        elif overnight_mode == "SWING_STRUCTURAL_STOP":
+            # Issue #173: the position stays open overnight, so heal (never close) and report CRITICAL/P0.
+            progress["stage"] = "stop_unknown_heal"
+            print(f"     🩹 SWING_STRUCTURAL_STOP: healing {sym} with a verified emergency stop (no close)...")
+            res = eft.heal_unknown_stop(sym, p, target_env=target_env)
+            summary.setdefault("stop_unknown_heals", []).append(
+                {"symbol": sym, "result": res.get("result"), "detail": res.get("detail")})
+            print(f"     {'✅' if res.get('result') in ('healed', 'kept') else '❌'} Unknown-stop heal of {sym}: "
+                  f"{res.get('result')} ({res.get('detail')})")
+            _report_swing_unknown_stop(target_env, sym, res.get("result"), res.get("detail"))
+        return
+    active_sl = [a for a in algos if a.get("orderType") in ["STOP_MARKET", "STOP"]]
+
+    if not active_sl:
+        progress["stage"] = "orphan_heal"
+        print(f"     🚨 DANGER: {sym} HAS NO ACTIVE STOP LOSS. Placing verified emergency Stop Loss...")
+        heal_res = eft.heal_orphan_position(p, target_env=target_env, close_on_failure=True)
+        if heal_res.get("closed"):
+            print(f"     🚪 Emergency stop could not be verified; {sym} closed at market (reduce-only).")
+            return
+        if not heal_res.get("success"):
+            summary["unprotected"].append(sym)
+            print(f"     ❌ CRITICAL: {sym} remains unprotected ({heal_res.get('reason')}). Manual action required.")
+            return
+        sl_price = float(heal_res["healed_sl_price"])
+        print(f"     ✅ Emergency Stop Loss verified at {sl_price}")
+    else:
+        sl_price = float(active_sl[0].get("triggerPrice", 0))
+        print(f"     🛡️ Confirmed active Stop Loss at: {sl_price:.5f}")
+
+    # Ratchet winning positions to True Net Break-Even (+0.2% fee buffer)
+    progress["stage"] = "breakeven"
+    ratcheted_to_be = False
+    fee_buffer = 0.002
+    target_be = entry_p * (1.0 + fee_buffer) if direction == "LONG" else entry_p * (1.0 - fee_buffer)
+    filters = eft.get_symbol_filters(sym, target_env=target_env)
+    be_rounded = eft.round_price(target_be, filters["tickSize"], filters["precision_price"])
+
+    is_already_at_be = (sl_price >= be_rounded) if direction == "LONG" else (sl_price <= be_rounded)
+    if is_already_at_be:
+        ratcheted_to_be = True
+
+    if roe_pct >= 5.0 and auto_ratchet and not is_already_at_be:
+        is_better = (be_rounded > sl_price) if direction == "LONG" else (be_rounded < sl_price)
+        if is_better:
+            print(f"     📈 Position in profit (+{roe_pct:.1f}% ROE). Ratcheting to True Net Break-Even...")
+            # End-of-day ratchet is explicit policy (AGENTS.md Layer 7), so it overrides the intraday
+            # TP1/2xATR anti-truncation rule; the move is still place-then-cancel and verified.
+            be_res = eft.move_sl_to_breakeven(sym, target_env=target_env, force=True)
+            if be_res.get("success"):
+                print(f"     ✅ SL Shielded to Break-Even at {be_rounded} (+0.2% fees covered). ZERO RISK.")
+                ratcheted_to_be = True
+            else:
+                print(f"     ⚠️  Warning tightening SL: {be_res.get('error') or be_res.get('reason')}")
+
+    # Mode 2: SWING_STRUCTURAL_STOP -> Allow positions with verified SL to remain open
+    if overnight_mode == "SWING_STRUCTURAL_STOP":
+        print(f"     🌊 SWING_STRUCTURAL_STOP mode: Position {sym} permitted overnight with verified SL at {sl_price:.5f}.")
+
+    # Mode 3: ZERO_OVERNIGHT_RISK -> Ratchet winning to True Net BE and close unhedged directional positions
+    elif overnight_mode == "ZERO_OVERNIGHT_RISK":
+        if not ratcheted_to_be:
+            print(f"     ⚠️ Position {sym} not at Break-Even (ROE: {roe_pct:.1f}%). ZERO_OVERNIGHT_RISK requires closing unhedged positions...")
+            _close_at_market(sym, target_env, summary, progress,
+                             f"     ✅ Unhedged position {sym} closed at market (Zero Overnight Risk guaranteed).")
+        else:
+            print(f"     🛡️ Position {sym} is safely locked at True Net Break-Even. Zero unhedged overnight risk.")
+
+
+def _position_failed(p, overnight_mode, target_env, summary, progress, exc):
+    """Issue #173: an exception while processing one position. The symbol is listed in close_failures (once); in
+    ZERO_OVERNIGHT_RISK, when no close was attempted yet, one reduce-only close is attempted in its own try."""
+    sym = p.get("symbol") if isinstance(p, dict) else None
+    label = sym or "<unknown symbol>"
+    if label not in summary["close_failures"]:
+        summary["close_failures"].append(label)
+    print(f"     ❌ CRITICAL: {label} processing failed at stage {progress.get('stage')}: {type(exc).__name__}: {exc}")
+    if overnight_mode != "ZERO_OVERNIGHT_RISK" or progress.get("close_attempted") or not sym:
+        return
+    print(f"     🚪 ZERO_OVERNIGHT_RISK: one reduce-only close attempt of {sym} after the failure...")
+    try:
+        close_res = eft.close_position_market(sym, target_env=target_env)
+    except Exception as e:
+        close_res = {"success": False, "error": f"{type(e).__name__}: {e}"}
+    if close_res.get("success"):
+        print(f"     ✅ Position {sym} closed at market after the failure.")
+    else:
+        print(f"     ❌ Failed to close {sym} at market: {close_res.get('error')}")
+
 
 def run_night_cutoff(target_env: str = None, auto_ratchet: bool = True, overnight_mode: str = None):
     target_env = resolve_env(target_env)
@@ -74,114 +246,11 @@ def run_night_cutoff(target_env: str = None, auto_ratchet: bool = True, overnigh
     else:
         print(f"🛡️  AUDITING {len(active)} LIVE POSITION(S) [Mode: {overnight_mode}]:")
         for p in active:
-            sym = p["symbol"]
-            amt = float(p["positionAmt"])
-            entry_p = float(p["entryPrice"])
-            mark_p = float(p["markPrice"])
-            unpnl = float(p.get("unRealizedProfit", 0))
-            margin = float(p.get("isolatedMargin", 0))
-            direction = "LONG" if amt > 0 else "SHORT"
-            roe_pct = (unpnl / margin * 100) if margin > 0 else 0.0
-
-            print(f"\n   • {sym} ({direction} {abs(amt):.3f} @ {entry_p:.5f})")
-            print(f"     Current Mark: {mark_p:.5f} | Floating PnL: ${unpnl:+.2f} USDT ({roe_pct:+.1f}% ROE)")
-
-            # Mode 1: CLOSE_ALL_AT_MARKET -> Close 100% of positions at market
-            if overnight_mode == "CLOSE_ALL_AT_MARKET":
-                print(f"     🚪 CLOSE_ALL_AT_MARKET mode: Closing {sym} at market to eliminate overnight exposure...")
-                close_res = eft.close_position_market(sym, target_env=target_env)
-                if close_res.get("success"):
-                    print(f"     ✅ Position {sym} successfully closed at market.")
-                else:
-                    summary["close_failures"].append(sym)
-                    print(f"     ❌ Failed to close {sym} at market: {close_res.get('error')}")
-                continue
-
-            # For SWING_STRUCTURAL_STOP and ZERO_OVERNIGHT_RISK:
-            # First, verify active Stop Loss (retried: an unreadable listing is UNKNOWN, never "no stop")
-            algos = None
-            for delay in (0.0,) + tuple(eft.STOP_VERIFY_RETRY_DELAYS):
-                if delay:
-                    time.sleep(delay)
-                try:
-                    algos = eft.send_signed_request("GET", "/fapi/v1/openAlgoOrders", {"symbol": sym},
-                                                    target_env=target_env)
-                except Exception as e:
-                    algos = {"error": str(e)}
-                if isinstance(algos, list):
-                    break
-            if not isinstance(algos, list):
-                summary["stop_unknown"].append(sym)
-                print(f"     ❌ CRITICAL: {sym} stop state UNKNOWN (openAlgoOrders unreadable: {algos}). "
-                      f"No heal or ratchet attempted. Manual check required.")
-                # Closing is risk-reducing, so ZERO_OVERNIGHT_RISK still closes the position (Break-Even unverifiable).
-                if overnight_mode == "ZERO_OVERNIGHT_RISK":
-                    print(f"     🚪 ZERO_OVERNIGHT_RISK: closing {sym} at market (reduce-only) despite the unknown stop...")
-                    close_res = eft.close_position_market(sym, target_env=target_env)
-                    if close_res.get("success"):
-                        print(f"     ✅ Position {sym} closed at market. Stop read still UNKNOWN: verify no stray orders.")
-                    else:
-                        summary["close_failures"].append(sym)
-                        print(f"     ❌ Failed to close {sym} at market: {close_res.get('error')}")
-                continue
-            active_sl = [a for a in algos if a.get("orderType") in ["STOP_MARKET", "STOP"]]
-
-            if not active_sl:
-                print(f"     🚨 DANGER: {sym} HAS NO ACTIVE STOP LOSS. Placing verified emergency Stop Loss...")
-                heal_res = eft.heal_orphan_position(p, target_env=target_env, close_on_failure=True)
-                if heal_res.get("closed"):
-                    print(f"     🚪 Emergency stop could not be verified; {sym} closed at market (reduce-only).")
-                    continue
-                if not heal_res.get("success"):
-                    summary["unprotected"].append(sym)
-                    print(f"     ❌ CRITICAL: {sym} remains unprotected ({heal_res.get('reason')}). Manual action required.")
-                    continue
-                sl_price = float(heal_res["healed_sl_price"])
-                print(f"     ✅ Emergency Stop Loss verified at {sl_price}")
-            else:
-                sl_price = float(active_sl[0].get("triggerPrice", 0))
-                print(f"     🛡️ Confirmed active Stop Loss at: {sl_price:.5f}")
-
-            # Ratchet winning positions to True Net Break-Even (+0.2% fee buffer)
-            ratcheted_to_be = False
-            fee_buffer = 0.002
-            target_be = entry_p * (1.0 + fee_buffer) if direction == "LONG" else entry_p * (1.0 - fee_buffer)
-            filters = eft.get_symbol_filters(sym, target_env=target_env)
-            be_rounded = eft.round_price(target_be, filters["tickSize"], filters["precision_price"])
-
-            is_already_at_be = (sl_price >= be_rounded) if direction == "LONG" else (sl_price <= be_rounded)
-            if is_already_at_be:
-                ratcheted_to_be = True
-
-            if roe_pct >= 5.0 and auto_ratchet and not is_already_at_be:
-                is_better = (be_rounded > sl_price) if direction == "LONG" else (be_rounded < sl_price)
-                if is_better:
-                    print(f"     📈 Position in profit (+{roe_pct:.1f}% ROE). Ratcheting to True Net Break-Even...")
-                    # End-of-day ratchet is explicit policy (AGENTS.md Layer 7), so it overrides the intraday
-                    # TP1/2xATR anti-truncation rule; the move is still place-then-cancel and verified.
-                    be_res = eft.move_sl_to_breakeven(sym, target_env=target_env, force=True)
-                    if be_res.get("success"):
-                        print(f"     ✅ SL Shielded to Break-Even at {be_rounded} (+0.2% fees covered). ZERO RISK.")
-                        ratcheted_to_be = True
-                    else:
-                        print(f"     ⚠️  Warning tightening SL: {be_res.get('error') or be_res.get('reason')}")
-
-            # Mode 2: SWING_STRUCTURAL_STOP -> Allow positions with verified SL to remain open
-            if overnight_mode == "SWING_STRUCTURAL_STOP":
-                print(f"     🌊 SWING_STRUCTURAL_STOP mode: Position {sym} permitted overnight with verified SL at {sl_price:.5f}.")
-
-            # Mode 3: ZERO_OVERNIGHT_RISK -> Ratchet winning to True Net BE and close unhedged directional positions
-            elif overnight_mode == "ZERO_OVERNIGHT_RISK":
-                if not ratcheted_to_be:
-                    print(f"     ⚠️ Position {sym} not at Break-Even (ROE: {roe_pct:.1f}%). ZERO_OVERNIGHT_RISK requires closing unhedged positions...")
-                    close_res = eft.close_position_market(sym, target_env=target_env)
-                    if close_res.get("success"):
-                        print(f"     ✅ Unhedged position {sym} closed at market (Zero Overnight Risk guaranteed).")
-                    else:
-                        summary["close_failures"].append(sym)
-                        print(f"     ❌ Failed to close {sym} at market: {close_res.get('error')}")
-                else:
-                    print(f"     🛡️ Position {sym} is safely locked at True Net Break-Even. Zero unhedged overnight risk.")
+            progress = {"stage": "parse", "close_attempted": False}
+            try:
+                _cutoff_position(p, overnight_mode, auto_ratchet, target_env, summary, progress)
+            except Exception as e:
+                _position_failed(p, overnight_mode, target_env, summary, progress, e)
 
     # 2. Cleanup orphan limit orders
     print("\n🧹 ORPHAN LIMIT ORDERS CLEANUP:")

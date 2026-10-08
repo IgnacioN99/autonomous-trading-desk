@@ -11,7 +11,9 @@ Issue #48: portfolio_exposure also carries resting_entries [{"symbol", "dir", "k
 logs/pending_entries.json records whose entry order still rests on openAlgoOrders / openOrders and whose symbol has
 no open position), resting_margin_usdt (sum of their margin_usdt) and delta_bias_incl_resting (delta_bias with each
 resting entry as a leg of its direction; "UNKNOWN" when the registry or an order listing cannot be read).
-delta_bias itself is unchanged. The state is only ever written atomically (issue #127): a failed write leaves the
+delta_bias itself is unchanged. Issue #173: audit_read_error (logs/trades_audit.jsonl exists but is unreadable:
+the exception text, else None) and audit_corrupt_lines (skipped non-JSON-object lines, else 0); the doctor warns on
+either. The state is only ever written atomically (issue #127): a failed write leaves the
 previous file. CLI exit code 1 when the state written is INVALID or the write failed, else 0.
 """
 
@@ -39,12 +41,14 @@ def get_start_of_day_utc() -> int:
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     return int(start.timestamp() * 1000)
 
-def _read_audit_records() -> List[dict]:
-    """Parsed dict lines of trades_audit.jsonl (AUDIT_LOG), read once per sync; [] when missing or unreadable, bad
-    lines skipped."""
-    records = []
+def _read_audit_records():
+    """(records, read_error, corrupt_lines) for trades_audit.jsonl (AUDIT_LOG), read once per sync. records: parsed
+    dict lines ([] when missing or unreadable). read_error: "<ExceptionType>: <text>" when the file exists but cannot
+    be read, else None. corrupt_lines: non-empty lines that are not JSON objects (skipped). Issue #173: both go into
+    the ledger as audit_read_error / audit_corrupt_lines."""
+    records, corrupt = [], 0
     if not os.path.exists(AUDIT_LOG):
-        return records
+        return records, None, 0
     try:
         with open(AUDIT_LOG, "r", encoding="utf-8") as f:
             for line in f:
@@ -54,12 +58,15 @@ def _read_audit_records() -> List[dict]:
                 try:
                     record = json.loads(line)
                 except ValueError:
+                    corrupt += 1
                     continue
                 if isinstance(record, dict):
                     records.append(record)
-    except Exception:
-        return []
-    return records
+                else:
+                    corrupt += 1
+    except Exception as e:
+        return [], f"{type(e).__name__}: {e}", 0
+    return records, None, corrupt
 
 
 def load_audit_metadata(target_env: str = None, records: List[dict] = None) -> Dict[str, dict]:
@@ -68,7 +75,7 @@ def load_audit_metadata(target_env: str = None, records: List[dict] = None) -> D
     meta = {}
     # Env aliases normalised on both sides ("mainnet" == "prod"), same as utils/position_timing (issue #92).
     norm_env = pt.norm_env(target_env)
-    for record in (_read_audit_records() if records is None else records):
+    for record in (_read_audit_records()[0] if records is None else records):
         try:
             rec_env = pt.norm_env(record.get("target_env"))
             if norm_env and rec_env and rec_env != norm_env:
@@ -197,7 +204,7 @@ def sync_session_state(target_env: str = None) -> dict:
         target_env = (os.environ.get("BINANCE_API_ENV") or cfg.get("BINANCE_API_ENV", "prod")).lower()
     target_env = resolve_env(target_env)  # "mainnet" -> "prod": one spelling in the ledger (issue #92)
     os.makedirs(LOGS_DIR, exist_ok=True)
-    records = _read_audit_records()   # one read of trades_audit.jsonl per sync (issue #138)
+    records, audit_read_error, audit_corrupt_lines = _read_audit_records()   # one read per sync (issue #138)
     audit_meta = load_audit_metadata(target_env, records=records)
     now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     now_ts = int(time.time())
@@ -391,6 +398,8 @@ def sync_session_state(target_env: str = None) -> dict:
         "last_updated_ts": now_ts,
         "last_updated_utc": now_utc,
         "target_env": target_env,
+        "audit_read_error": audit_read_error,
+        "audit_corrupt_lines": audit_corrupt_lines,
         "macro_btc": {
             "price_usdt": btc_price
         },
