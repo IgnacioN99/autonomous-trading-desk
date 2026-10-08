@@ -112,7 +112,8 @@ def offline(fake, workspace=None, profile=None):
              patch("execute_futures_trade.subprocess.run", side_effect=FileNotFoundError("binance-cli")), \
              patch("execute_futures_trade.time.sleep", return_value=None), \
              patch("execute_futures_trade._workspace_dir", return_value=ws), \
-             patch("user_profile.load_user_profile", return_value=dict(profile or PROFILE)):
+             patch("user_profile.load_user_profile", return_value=dict(profile or PROFILE)), \
+             patch("utils.trade_excursion.fetch_klines_range", return_value=[]):  # guardian excursion tracking (#182)
             yield ws
     finally:
         if own:
