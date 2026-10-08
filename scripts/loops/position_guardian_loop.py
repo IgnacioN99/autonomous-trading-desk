@@ -102,8 +102,11 @@ State file (logs/guardian_state.json):
       "trailing": {"success", "updated", "reason", "previous_sl", "new_sl"?, "planned_sl"?,
                    "activation_reason"?: "tp1_filled" | "r_multiple" | "atr_expansion" | null,
                    "reference_source"?: "trade_audit" | "current_stop", "message",
+                   "profit_lock"?: {"mfe_r", "mfe_source", "step_mfe_r", "lock_r", "lock_price",
+                                    "capped_by_price_floor", "binding"} | null,  # issue #183 R-step lock (dem)
                    "warnings"?: [str]} | null,  # "reference_unverified" (no userTrades open time),
-                                                  # "audit_unreadable", "audit_corrupt_lines:<n>", cancel errors
+                                                  # "audit_unreadable", "audit_corrupt_lines:<n>", cancel errors,
+                                                  # "intrabar_unavailable" (#183 1m read failed)
       "dead_alpha": {"status": "DEAD_ALPHA_STALLED" | "HEALTHY_MOMENTUM" | "STALLED_WITHIN_HORIZON" |
                                 "UNKNOWN_HOLDING_TIME" | "UNKNOWN", "range_pct", "recommendation", "message",
                      # only when the 15m stall fired:
@@ -129,7 +132,8 @@ State file (logs/guardian_state.json):
                                        # loss_cap_check / qty_check deferrals, loss_cap_drift, registry_lock,
                                        # deferral_report; printed, never errors (no effect on cycle_ok or liveness)
     "trail_warnings": [{"symbol", "warning"}]  # dem write-path warnings (issue #172): "stops_requery_failed:<err>",
-                                       # old-stop cancel errors; printed, never errors (no effect on cycle_ok)
+                                       # old-stop cancel errors, "intrabar_unavailable", exit_management profile
+                                       # warnings (#183); printed, never errors (no effect on cycle_ok)
   }
 
 Action record (also one JSON line in logs/guardian_actions.jsonl):
@@ -153,7 +157,8 @@ IP, shared with the executor and the scanners): GET /fapi/v2/positionRisk (all s
 protect_pending_entries (calls only for pending records); all-symbol GET /fapi/v1/openAlgoOrders and
 /fapi/v1/openOrders (find_unregistered_resting_entries, 40 each); per position: symbol openAlgoOrders twice (orphan
 audit + dem, 1 each), exchangeInfo (calculate_structural_stop, 1), 15m klines limit=99 and limit=10 (1 each),
-userTrades at most once (5), 1m klines from the next bar limit=99 (excursion tracking, 1; runs after all positions
+userTrades at most once (5), 1m klines limit=16 only after a verified TP1 fill (dem profit lock, issue #183, 1),
+1m klines from the next bar limit=99 (excursion tracking, 1; runs after all positions
 are protected, 2 s timeout; skipped when no bar has closed since the last read); per actual stop write: one more openAlgoOrders re-read, exchangeInfo, the POST, the
 verification reads and the DELETE (issue #172: when that re-read finds no stop, one symbol positionRisk read (5)
 first; a flat position gets no write). About 85 + ~11 per position per cycle: at the 60s default even 10 positions use
@@ -473,7 +478,7 @@ class GuardianCycle:
         self._audit_kinds.update(w for w in raw_warnings if isinstance(w, str) and w.startswith("audit_"))
         view["reference_unverified"] = "reference_unverified" in raw_warnings
         keys = ("success", "updated", "reason", "previous_sl", "new_sl", "new_stop", "planned_sl", "activation_reason",
-                "reference_source", "message", "error", "warnings")
+                "reference_source", "profit_lock", "message", "error", "warnings")
         view["trailing"] = {k: res.get(k) for k in keys if k in res}
         if "warnings" in view["trailing"]:
             warnings = list(raw_warnings)
