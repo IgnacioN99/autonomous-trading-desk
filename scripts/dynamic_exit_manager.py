@@ -7,7 +7,10 @@ preserving positive right-tail convexity and managing Alpha Decay (stalled momen
 Activation gate (Issue #95): the planned Stop Loss is left untouched until the trade has earned a trail:
 +1.0R of planned risk (TRAIL_ACTIVATION_R) or +2.0x ATR_15m (TRAIL_ACTIVATION_ATR) of favourable excursion
 since entry on CLOSED 15m candles, or a TP1 fill. Once active, the Chandelier stop is anchored to the extreme
-since entry (not the forming candle). YOLO positions are never trailed before TP1. TP1/TP2 are never re-based.
+since entry (not the forming candle). Before +2.0x ATR_15m MFE or a TP1 fill an activated trail may tighten up
+to one tick short of entry, never into the True Net BE dead zone (Issue #106). YOLO positions are never trailed
+before TP1; a YOLO position without a matching trades_audit record is never trailed (its TP1 fill is unknown).
+TP1/TP2 are never re-based.
 
 Stop updates are PLACE-THEN-CANCEL (execute_futures_trade.replace_protective_stop): the new stop is
 verified on /fapi/v1/openAlgoOrders before the old one is cancelled, stops only ever tighten, and any
@@ -23,11 +26,13 @@ import sys
 import json
 import time
 import urllib.request
+from decimal import Decimal
 
 # Ensure local path resolution
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import execute_futures_trade as eft
 from utils.env_resolver import resolve_env
+from utils import position_timing as pt
 
 BASE_FAPI = "https://fapi.binance.com"
 
@@ -36,6 +41,7 @@ BASE_FAPI = "https://fapi.binance.com"
 TRAIL_ACTIVATION_R = 1.0
 TRAIL_ACTIVATION_ATR = 2.0
 REFERENCE_ENTRY_TOLERANCE = 0.005  # trades_audit entry_price must be within 0.5% of the live entryPrice
+REFERENCE_OPEN_SLACK_SECONDS = 300  # a trades_audit record older than the userTrades open time - 300s is stale
 
 def fetch_json(url, timeout=6):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
@@ -106,7 +112,9 @@ def calculate_structural_stop(symbol, direction, entry_price, current_sl_price=0
       - Structural: last 15m swing low - 0.3x ATR (LONG) / swing high + 0.3x ATR (SHORT).
       - LONG candidate = max(structural, chandelier); SHORT = min(...).
       - RIGHT-TAIL PRESERVATION: True Net Break-Even (entry +/-0.2%) only after MFE >= 2.0x ATR_15m since entry
-        or after TP1 fill.
+        or after TP1 fill. Before that (an r_multiple activation) the candidate is capped one tick short of entry
+        (LONG <= entry - tick, SHORT >= entry + tick), never in the fee dead zone (Issue #106); a current stop
+        already at or past entry (e.g. after --move-breakeven) is kept.
       - Never loosens against current_sl_price; never closer than 0.5x ATR to price (mark_price if given, else
         the last closed close).
     Take-profit orders are never re-based: TP1/TP2 keep their original levels.
@@ -116,7 +124,7 @@ def calculate_structural_stop(symbol, direction, entry_price, current_sl_price=0
     if not filters:
         return None
 
-    k15m = get_klines_data(symbol, interval="15m", limit=100)
+    k15m = get_klines_data(symbol, interval="15m", limit=99)  # limit < 100: request weight 1 (Issue #108)
     if not k15m:
         return None
     closed = k15m[:-1]  # drop the forming candle
@@ -197,6 +205,7 @@ def calculate_structural_stop(symbol, direction, entry_price, current_sl_price=0
     if extreme is None:  # TP1 filled before any closed bar since entry: anchor on the last closed bar
         extreme = highs[-1] if is_long else lows[-1]
     be_allowed = tp1_filled is True or (atr_15m > 0 and mfe >= 2.0 * atr_15m)
+    tick = filters["tickSize"]
     swing_lows, swing_highs = find_recent_swings(highs, lows, window=2)
 
     if is_long:
@@ -205,9 +214,13 @@ def calculate_structural_stop(symbol, direction, entry_price, current_sl_price=0
         structural_level = recent_swing_low - (0.3 * atr_15m)
         candidate_stop = max(structural_level, chandelier_stop)
 
-        # Right-tail preservation: True Net Break-Even only after >= 2.0x ATR expansion since entry or TP1 fill
+        # Right-tail preservation: True Net Break-Even only after >= 2.0x ATR expansion since entry or TP1 fill;
+        # before that the stop stays at least one tick below entry (never in the fee dead zone, Issue #106).
         if be_allowed:
             candidate_stop = max(candidate_stop, entry_price * 1.002)
+        else:
+            candidate_stop = min(candidate_stop, eft.round_price(Decimal(str(entry_price)) - Decimal(str(tick)),
+                                                                 tick, filters["precision_price"]))
 
         # Do not allow stop loss to regress lower (unidirectional ratchet)
         if current_sl_price > 0 and candidate_stop <= current_sl_price:
@@ -223,6 +236,9 @@ def calculate_structural_stop(symbol, direction, entry_price, current_sl_price=0
 
         if be_allowed:
             candidate_stop = min(candidate_stop, entry_price * 0.998)
+        else:  # one tick above entry, rounded like every stop here (round_price), so still strictly above it
+            candidate_stop = max(candidate_stop, eft.round_price(Decimal(str(entry_price)) + Decimal(str(tick)),
+                                                                 tick, filters["precision_price"]))
 
         if current_sl_price > 0 and candidate_stop >= current_sl_price:
             candidate_stop = current_sl_price
@@ -242,15 +258,11 @@ def calculate_structural_stop(symbol, direction, entry_price, current_sl_price=0
     )
 
 
-def resolve_trade_reference(symbol, position, direction, current_sl, target_env):
-    """
-    Reference (planned) SL and entry time used by the trailing activation gate.
-    Primary: the latest logs/trades_audit.jsonl entry record for the symbol, accepted only when its direction
-    matches, its target_env (if present) matches and its entry_price is within 0.5% of the position's entryPrice.
-    Fallback: the current verified stop as planned SL and positionRisk updateTime as entry time.
-    Returns (planned_sl, entry_ts, reference_source).
-    """
+def _resolve_trade_reference_full(symbol, position, direction, current_sl, target_env):
+    """resolve_trade_reference plus the matched audit record (or None) and the warnings list. See
+    resolve_trade_reference for the rules."""
     entry_p = float(position.get("entryPrice") or 0)
+    warnings = []
 
     def _update_ts():
         try:
@@ -259,29 +271,69 @@ def resolve_trade_reference(symbol, position, direction, current_sl, target_env)
             ut = 0
         return ut / 1000.0 if ut > 0 else None
 
-    try:
-        rec = eft.latest_trade_audit_record(symbol)
-    except Exception:
-        rec = None
-    if isinstance(rec, dict) and entry_p > 0:
+    def _fallback():
+        return (current_sl if current_sl > 0 else None), _update_ts(), "current_stop", None, warnings
+
+    # Tail-bounded read (issue #94 reader); unreadable / corrupt files are reported, never silent (Issue #107.3).
+    path = os.path.join(eft._workspace_dir(), "logs", "trades_audit.jsonl")
+    records = []
+    if os.path.exists(path):
+        stats = {}
         try:
-            rec_entry = float(rec.get("entry_price") or 0)
-            rec_sl = float(rec.get("sl_price") or 0)
-        except (TypeError, ValueError):
-            rec_entry = rec_sl = 0.0
-        rec_env = rec.get("target_env")
-        if (str(rec.get("direction", "")).upper() == direction
-                and (not rec_env or rec_env == target_env)
-                and rec_entry > 0 and rec_sl > 0
-                and abs(rec_entry - entry_p) / entry_p <= REFERENCE_ENTRY_TOLERANCE):
-            try:
-                entry_ts = float(rec["timestamp"]) if rec.get("timestamp") else None
-            except (TypeError, ValueError):
-                entry_ts = None
-            if entry_ts is None:
-                entry_ts = _update_ts()
-            return rec_sl, entry_ts, "trade_audit"
-    return (current_sl if current_sl > 0 else None), _update_ts(), "current_stop"
+            records = eft.read_audit_tail(path, stats=stats)
+        except OSError:
+            warnings.append("audit_unreadable")
+            return _fallback()
+        if stats.get("malformed_lines"):
+            warnings.append(f"audit_corrupt_lines:{stats['malformed_lines']}")
+
+    # Latest entry record for symbol + direction + env (env aliases normalised like position_timing), then it
+    # must describe the CURRENT position: entry within tolerance and total_qty >= |positionAmt|.
+    rec = pt._latest_from_records(records, symbol, direction, target_env)
+    if not isinstance(rec, dict) or entry_p <= 0:
+        return _fallback()
+    try:
+        rec_entry = float(rec.get("entry_price") or 0)
+        rec_sl = float(rec.get("sl_price") or 0)
+    except (TypeError, ValueError):
+        rec_entry = rec_sl = 0.0
+    if (rec_entry <= 0 or rec_sl <= 0
+            or abs(rec_entry - entry_p) / entry_p > REFERENCE_ENTRY_TOLERANCE
+            or not pt.audit_record_matches_position(rec, entry_p, position.get("positionAmt"))):
+        return _fallback()
+    try:
+        entry_ts = float(rec["timestamp"]) if rec.get("timestamp") else None
+    except (TypeError, ValueError):
+        entry_ts = None
+
+    # Stale-record check against the position's real open time (Binance fills only, no audit fallback).
+    open_ts, source = pt.resolve_entry_time(symbol, direction, position.get("positionAmt"), target_env,
+                                            entry_price=entry_p, fetch=eft.send_signed_request)
+    if source == pt.SOURCE_USER_TRADES and open_ts:
+        if entry_ts is None or entry_ts < float(open_ts) - REFERENCE_OPEN_SLACK_SECONDS:
+            return _fallback()
+    else:
+        warnings.append("reference_unverified")
+    if entry_ts is None:
+        entry_ts = _update_ts()
+    return rec_sl, entry_ts, "trade_audit", rec, warnings
+
+
+def resolve_trade_reference(symbol, position, direction, current_sl, target_env):
+    """
+    Reference (planned) SL and entry time used by the trailing activation gate.
+    Primary: the latest logs/trades_audit.jsonl entry record (last AUDIT_TAIL_BYTES only) for the symbol AND the
+    same direction AND target_env (aliases normalised; a record without target_env matches), accepted only when
+    its sl_price is set, its entry_price is within 0.5% of the position's entryPrice and its total_qty >=
+    |positionAmt| (position_timing.audit_record_matches_position). Issue #107: when Binance fills (userTrades) give
+    the position's open time, a record older than open time - REFERENCE_OPEN_SLACK_SECONDS belongs to an earlier
+    trade and is rejected; when fills are unavailable (MCP, API error) the record is kept with the warning
+    "reference_unverified". An unreadable audit file gives "audit_unreadable", skipped malformed lines
+    "audit_corrupt_lines:<n>" (warnings only, never a blocking error).
+    Fallback: the current verified stop as planned SL and positionRisk updateTime as entry time.
+    Returns (planned_sl, entry_ts, reference_source).
+    """
+    return _resolve_trade_reference_full(symbol, position, direction, current_sl, target_env)[:3]
 
 
 def update_position_to_structural_stop(symbol, target_env=None, dry_run=False, position=None):
@@ -294,7 +346,11 @@ def update_position_to_structural_stop(symbol, target_env=None, dry_run=False, p
       - Never loosens: a stop is only replaced by one strictly closer to price in the favourable direction.
       - success=True only when the position ends with a verified stop (existing or new).
       - dry_run=True computes the decision but never sends a write request.
-      - YOLO positions are never trailed before TP1 fills (reason "yolo_before_tp1", no write).
+      - YOLO positions are never trailed before TP1 fills (reason "yolo_before_tp1", no write, with yolo_source).
+        TP1 is read from the matched trade reference only, so a YOLO position without a matching record is not
+        trailed.
+      - warnings (every result): trade-reference notices from resolve_trade_reference ("reference_unverified",
+        "audit_unreadable", "audit_corrupt_lines:<n>"), plus old-stop cancel errors when tightened.
       - Activation gate (Issue #95): the planned SL (latest matching trades_audit record, else the current stop)
         is kept until +1.0R or +2.0x ATR_15m since entry on closed 15m bars, or TP1 fill (reason
         "trail_not_activated", no write). Results carry activation_reason and reference_source.
@@ -341,14 +397,19 @@ def update_position_to_structural_stop(symbol, target_env=None, dry_run=False, p
 
     # Trade reference first: TP1 state is only trusted when the audit record belongs to THIS position (a stale
     # record from a previous trade must never report tp1_filled, skip the YOLO gate or allow the BE ratchet).
-    planned_sl, entry_ts, reference_source = resolve_trade_reference(symbol, position, direction, current_sl, target_env)
-    tp1_filled, _ = eft.detect_tp1_filled(symbol, abs(amt))
+    planned_sl, entry_ts, reference_source, ref_rec, ref_warnings = _resolve_trade_reference_full(
+        symbol, position, direction, current_sl, target_env)
+    base["warnings"] = list(ref_warnings)
+    # TP1 and YOLO read the SAME matched record (Issue #107); without one, TP1 is unknown.
+    tp1_filled, _ = eft.detect_tp1_filled(symbol, abs(amt), record=ref_rec) if ref_rec else (None, None)
     tp1_ok = tp1_filled if reference_source == "trade_audit" else None
 
     # YOLO: never trail before TP1 fills (right-tail preservation), whichever path calls this function.
-    yolo, _ = eft.detect_yolo_position(symbol, leverage=position.get("leverage"))
+    yolo, yolo_source = eft.detect_yolo_position(symbol, leverage=position.get("leverage"), record=ref_rec)
     if yolo and tp1_ok is not True:
-        return keep("yolo_before_tp1", "YOLO position: trailing deferred until TP1 fills (right-tail preservation).")
+        out = keep("yolo_before_tp1", "YOLO position: trailing deferred until TP1 fills (right-tail preservation).")
+        out["yolo_source"] = yolo_source
+        return out
 
     calc = calculate_structural_stop(symbol, direction, entry_p, current_sl_price=current_sl, target_env=target_env,
                                      planned_sl=planned_sl, entry_ts=entry_ts, tp1_filled=tp1_ok,
@@ -387,7 +448,8 @@ def update_position_to_structural_stop(symbol, target_env=None, dry_run=False, p
                + (f"Previous stop {current_sl} kept; nothing cancelled." if protected else "Position has NO verified stop."))
         return dict(base, success=False, reason="new_stop_unverified", error=msg, message=msg)
 
-    warnings = [f"Old stop {ce['algo_id']} could not be cancelled ({ce['error']})." for ce in rep["cancel_errors"]]
+    warnings = base["warnings"] + [f"Old stop {ce['algo_id']} could not be cancelled ({ce['error']})."
+                                   for ce in rep["cancel_errors"]]
     return dict(
         base,
         success=True,
@@ -478,7 +540,11 @@ def main(argv=None):
 
     target_env = resolve_env(args.env)
     if args.symbol:
-        res = update_position_to_structural_stop(args.symbol.upper(), target_env=target_env, dry_run=args.dry_run)
+        sym = args.symbol.upper()
+        try:
+            res = update_position_to_structural_stop(sym, target_env=target_env, dry_run=args.dry_run)
+        except Exception as e:  # same structured failure as audit_and_trail_all_positions (Issue #108)
+            res = {"symbol": sym, "success": False, "updated": False, "reason": "exception", "error": str(e), "message": f"Error: {e}"}
         audit = {"total_active": 1, "results": [res]}
     else:
         audit = audit_and_trail_all_positions(target_env=target_env, dry_run=args.dry_run)

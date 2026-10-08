@@ -61,6 +61,8 @@ Rigorously verify the following mathematical axioms in every code change:
    - On memecoins (15x), the SL only moves to BE after TP1 (+75% ROE) is confirmed filled.
    - In standard intraday, the SL only moves to True Net Break-Even after a minimum expansion of $+2.0 \times \text{ATR}_{15m}$ or a TP1 fill.
    - **True Net BE Buffer:** The Break-Even price MUST include the Binance taker roundtrip fee buffer (+0.2%), never the exact entry price (to avoid net losses from fee friction).
+   - **Trailing Activation Gate:** the planned SL is kept until **+1.0R** or **+2.0x ATR_15m** of favourable excursion since entry (closed 15m bars) or a TP1 fill; YOLO positions are never trailed before TP1. Before +2.0x ATR_15m or TP1 an activated trail stays at least one tick short of entry (never in the fee dead zone).
+   - **TPs never re-based:** trailing and break-even moves only touch the Stop Loss; TP1/TP2 keep their original levels.
 
 4. **Stat-Arb & Cointegration (Engine 2):**
    - Statistical pairs must pass the Engle-Granger test with MacKinnon (2010) critical values ($p < 0.05, t < -3.34$) over $\ge 1,000$ hourly bars.
