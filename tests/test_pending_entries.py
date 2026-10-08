@@ -200,7 +200,8 @@ class ExecutorHarness(unittest.TestCase):
              patch("execute_futures_trade.subprocess.run", side_effect=FileNotFoundError("binance-cli")), \
              patch("execute_futures_trade.verify_algo_stop_loss", return_value=(True, {"algoId": 9})), \
              patch("quant_risk_engine.get_account_equity", return_value=10000.0), \
-             patch("user_profile.load_user_profile", return_value=dict(EX_PROFILE)):
+             patch("user_profile.load_user_profile", return_value=dict(EX_PROFILE)), \
+             patch("report_agent_issue.report_issue") as self.report:   # issue #157: pre-arm anomalies are reported
             return eft.execute_complete_trade(**args)
 
 

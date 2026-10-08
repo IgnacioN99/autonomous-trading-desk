@@ -408,7 +408,8 @@ def partial_fill_execute(fx, grow_to=None, position_reads_fail=False):
          patch("execute_futures_trade.subprocess.run", side_effect=FileNotFoundError("binance-cli")), \
          patch("execute_futures_trade.time.sleep", return_value=None), \
          patch("quant_risk_engine.get_account_equity", return_value=10000.0), \
-         patch("user_profile.load_user_profile", return_value=dict(EX_PROFILE)):
+         patch("user_profile.load_user_profile", return_value=dict(EX_PROFILE)), \
+         patch("report_agent_issue.report_issue"):   # the abort paths may report (never filed from tests)
         res = eft.execute_complete_trade(symbol="SOLUSDT", direction="LONG", leverage=3, margin_usdt=10.0,
                                          sl_price=97.0, tp1_price=110.0, tp2_price=120.0, target_env="testnet",
                                          order_type="LIMIT", limit_price=98.767, bypass_eval_gate=True)

@@ -98,7 +98,10 @@ State file (logs/guardian_state.json):
       "error": str | null
     }],
     "actions": [ACTION, ...],
-    "errors": [{"symbol": str | null, "stage": str, "error": str}]
+    "errors": [{"symbol": str | null, "stage": str, "error": str}],
+    "pending_warnings": [{"key", "symbol", "stage", "warning"}]  # protect_pending_entries "warnings" (issue #156):
+                                       # loss_cap_check / qty_check deferrals, loss_cap_drift, registry_lock,
+                                       # deferral_report; printed, never errors (no effect on cycle_ok or liveness)
   }
 
 Action record (also one JSON line in logs/guardian_actions.jsonl):
@@ -245,6 +248,7 @@ class GuardianCycle:
             "positions": [],
             "actions": [],
             "errors": [],
+            "pending_warnings": [],
         }
 
     # -- bookkeeping -------------------------------------------------------
@@ -443,6 +447,11 @@ class GuardianCycle:
                         dict(a.get("detail") or {}, pending_entry_key=a.get("key")))
         for e in res.get("errors", []):
             self.error(e.get("symbol"), f"pending_{e.get('stage')}", e.get("error"))
+        for w in res.get("warnings") or []:
+            # Issue #156: deferrals, loss-cap drift and registry-lock notes are reported, never errors (no cycle_ok
+            # / check_guardian_alive effect).
+            self.state["pending_warnings"].append({"key": w.get("key"), "symbol": w.get("symbol"),
+                                                   "stage": w.get("stage"), "warning": str(w.get("warning"))})
         if not res.get("ok") and not res.get("errors"):
             self.error(None, "pending_entries", "protect_pending_entries reported failure")
 
@@ -590,6 +599,9 @@ def format_state(state):
         lines.append(f"  * action {a['type']} {a['symbol']} success={a['success']}{' (dry run)' if a['dry_run'] else ''}")
     for e in state["errors"]:
         lines.append(f"  ! {e['stage']} {e['symbol'] or ''}: {str(e['error']).splitlines()[0]}")
+    for w in state.get("pending_warnings") or []:
+        lines.append(f"  ~ warning {w.get('stage')} {w.get('symbol') or ''}: "
+                     f"{(str(w.get('warning')).splitlines() or [''])[0]}")
     if state.get("lock_warning"):
         lines.append(f"  ! lock: {state['lock_warning']}")
     return "\n".join(lines)

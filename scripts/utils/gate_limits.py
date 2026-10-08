@@ -14,6 +14,12 @@ YOLO_MAX_LOSS_MARGIN_FRACTION = 0.35
 # GATE 2 (PROD, YOLO branch): floor of the loss cap in USDT (cap = max(this, margin x fraction)).
 YOLO_MIN_LOSS_CAP_USDT = 3.75
 
+# Protect-pending loss-cap re-check (PROD, issue #156): a FILLED standard (non-YOLO) resting entry whose loss at SL
+# exceeds the live Gate 2 cap only because equity dropped after placement stays trusted (warning) while the loss is
+# <= min(the cap stored at registration, live cap x this tolerance). Bounds a forged stored cap; above it the record
+# is untrusted.
+PENDING_DRIFT_CAP_TOLERANCE = 1.2
+
 # GATE 3 (PROD): financial friction floor. TP1 must be at least this fraction (0.35%) from the effective entry,
 # on the profit side, or taker fees eat the edge.
 MIN_TP1_DISTANCE = 0.0035
