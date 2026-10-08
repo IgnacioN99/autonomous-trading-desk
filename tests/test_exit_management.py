@@ -192,6 +192,24 @@ class TestBreakEvenPlaceThenCancel(unittest.TestCase):
         self.assertEqual(res["new_stop"]["side"], "BUY")
         self.assertLess(fake.write_index("POST", ALGO_ENDPOINT)[0], fake.write_index("DELETE", ALGO_ENDPOINT)[0])
 
+    def test_forced_breakeven_places_stop_at_true_net_buffer(self):
+        # Long position: entry 100.0 -> True Net BE is 100.2 (+0.2% fee buffer)
+        fake_long = FakeExchange([long_position(entry="100.0", mark="105.0")], algos=[stop(501, 95.0)])
+        with offline(fake_long), patch("execute_futures_trade.get_atr_15m", return_value=2.0):
+            res_long = eft.move_sl_to_breakeven("BTCUSDT", target_env="testnet", force=True)
+        self.assertTrue(res_long["success"], res_long)
+        self.assertEqual(res_long["direction"], "LONG")
+        self.assertEqual(res_long["new_stop"]["trigger_price"], 100.2)
+
+        # Short position: entry 100.0 -> True Net BE is 99.8 (-0.2% fee buffer)
+        pos_short = long_position(amt="-5", entry="100.0", mark="90.0")
+        fake_short = FakeExchange([pos_short], algos=[stop(601, 105.0, side="BUY")])
+        with offline(fake_short), patch("execute_futures_trade.get_atr_15m", return_value=2.0):
+            res_short = eft.move_sl_to_breakeven("BTCUSDT", target_env="testnet", force=True)
+        self.assertTrue(res_short["success"], res_short)
+        self.assertEqual(res_short["direction"], "SHORT")
+        self.assertEqual(res_short["new_stop"]["trigger_price"], 99.8)
+
     def test_already_at_breakeven_is_never_loosened(self):
         fake = FakeExchange([long_position()], algos=[stop(501, 103.0)])
         with offline(fake):

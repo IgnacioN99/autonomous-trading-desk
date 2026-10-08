@@ -217,6 +217,10 @@ class TestEnforceEvaluationDossier(_TempWorkspace):
         for cand in ({"symbol": "PEPEUSDT", "direction": "LONG", "tier": "S", "is_yolo": True,
                       "requires_user_confirmation": False},
                      {"symbol": "PEPEUSDT", "direction": "LONG", "tier": "A", "is_yolo": "true"},
+                     {"symbol": "PEPEUSDT", "direction": "LONG", "tier": "S", "is_yolo": "1",
+                      "requires_user_confirmation": False},
+                     {"symbol": "PEPEUSDT", "direction": "LONG", "tier": "S", "is_yolo": "yes",
+                      "requires_user_confirmation": False},
                      {"symbol": "PEPEUSDT", "direction": "LONG", "tier": "YOLO Moonshot"}):
             with self.subTest(cand=cand):
                 self.write_subagent_dossier([cand])
@@ -239,10 +243,15 @@ class TestEnforceEvaluationDossier(_TempWorkspace):
         self.assertTrue(ok, reason)
 
     def test_prod_non_yolo_tier_s_fast_track_unchanged(self):
-        self.write_subagent_dossier([{"symbol": "SOLUSDT", "direction": "LONG", "tier": "S", "is_yolo": False,
-                                      "requires_user_confirmation": False}])
-        ok, reason, _ = eft.enforce_evaluation_dossier("SOLUSDT", "LONG", "prod", base_dir=self.root)
-        self.assertTrue(ok, reason)
+        for val in (False, "0", "no", "false", None):
+            with self.subTest(is_yolo=val):
+                cand = {"symbol": "SOLUSDT", "direction": "LONG", "tier": "S",
+                        "requires_user_confirmation": False}
+                if val is not None:
+                    cand["is_yolo"] = val
+                self.write_subagent_dossier([cand])
+                ok, reason, _ = eft.enforce_evaluation_dossier("SOLUSDT", "LONG", "prod", base_dir=self.root)
+                self.assertTrue(ok, reason)
 
     def test_testnet_without_dossier_rejected_with_bypass_hint(self):
         ok, reason, _ = eft.enforce_evaluation_dossier("SOLUSDT", "LONG", "testnet", base_dir=self.root)
