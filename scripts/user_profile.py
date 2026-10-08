@@ -239,8 +239,11 @@ def _offer_guardian_service():
             return
     except Exception:
         return
-    answer = input("\n6. Install the position guardian as a Windows background task "
-                   "(recommended for PROD resting entries)? [y/N]: ").strip().lower()
+    try:
+        answer = input("\n6. Install the position guardian as a Windows background task "
+                       "(recommended for PROD resting entries)? [y/N]: ").strip().lower()
+    except EOFError:  # closed stdin: no answer
+        answer = ""
     if answer not in ("y", "yes"):
         print("Skipped. Install it later with: python3 scripts/install_guardian_service.py --install")
         return

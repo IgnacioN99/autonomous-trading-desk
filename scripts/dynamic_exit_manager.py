@@ -8,13 +8,20 @@ Activation gate (Issue #95): the planned Stop Loss is left untouched until the t
 +1.0R of planned risk (TRAIL_ACTIVATION_R) or +2.0x ATR_15m (TRAIL_ACTIVATION_ATR) of favourable excursion
 since entry on CLOSED 15m candles, or a TP1 fill. Once active, the Chandelier stop is anchored to the extreme
 since entry (not the forming candle). Before +2.0x ATR_15m MFE or a TP1 fill an activated trail may tighten up
-to one tick short of entry, never into the True Net BE dead zone (Issue #106). YOLO positions are never trailed
-before TP1; a YOLO position without a matching trades_audit record is never trailed (its TP1 fill is unknown).
-TP1/TP2 are never re-based.
+to one tick short of entry, never into the True Net BE dead zone (Issue #106); this gives up profit protection on
+a fast reversal through entry (accepted to keep the stop out of the fee dead zone). YOLO positions are never
+trailed before TP1; a YOLO position without a matching trades_audit record is never trailed (its TP1 fill is
+unknown). TP1/TP2 are never re-based.
+
+TP1 trust (Issue #163): a TP1 fill counts only when the matched trades_audit record is verified against the
+Binance fills (userTrades open time). With "reference_unverified" (fills unavailable, e.g. MCP mode, where the
+gateway does not serve userTrades, so every position) TP1 is unknown: no TP1 activation, True Net BE only via
++2.0x ATR_15m, and a YOLO position is never trailed. The planned SL and entry time still come from the record.
 
 Stop updates are PLACE-THEN-CANCEL (execute_futures_trade.replace_protective_stop): the new stop is
 verified on /fapi/v1/openAlgoOrders before the old one is cancelled, stops only ever tighten, and any
-update whose resulting protection cannot be verified reports success=False.
+update whose resulting protection cannot be verified reports success=False. The current stops are re-read right
+before a write (Issue #167: a --once run and the loop cannot replace each other's fresher stop).
 
 Usage:
   python3 scripts/dynamic_exit_manager.py [--env prod|testnet] [--symbol BTCUSDT] [--dry-run] [--json]
@@ -258,9 +265,10 @@ def calculate_structural_stop(symbol, direction, entry_price, current_sl_price=0
     )
 
 
-def _resolve_trade_reference_full(symbol, position, direction, current_sl, target_env):
+def _resolve_trade_reference_full(symbol, position, direction, current_sl, target_env, *, fetch=None):
     """resolve_trade_reference plus the matched audit record (or None) and the warnings list. See
-    resolve_trade_reference for the rules."""
+    resolve_trade_reference for the rules. fetch: send_signed_request-like callable for the userTrades read (default
+    eft.send_signed_request, looked up at call time); userTrades is only read once a candidate record matched."""
     entry_p = float(position.get("entryPrice") or 0)
     warnings = []
 
@@ -308,7 +316,7 @@ def _resolve_trade_reference_full(symbol, position, direction, current_sl, targe
 
     # Stale-record check against the position's real open time (Binance fills only, no audit fallback).
     open_ts, source = pt.resolve_entry_time(symbol, direction, position.get("positionAmt"), target_env,
-                                            entry_price=entry_p, fetch=eft.send_signed_request)
+                                            entry_price=entry_p, fetch=fetch or eft.send_signed_request)
     if source == pt.SOURCE_USER_TRADES and open_ts:
         if entry_ts is None or entry_ts < float(open_ts) - REFERENCE_OPEN_SLACK_SECONDS:
             return _fallback()
@@ -336,26 +344,38 @@ def resolve_trade_reference(symbol, position, direction, current_sl, target_env)
     return _resolve_trade_reference_full(symbol, position, direction, current_sl, target_env)[:3]
 
 
-def update_position_to_structural_stop(symbol, target_env=None, dry_run=False, position=None):
+def update_position_to_structural_stop(symbol, target_env=None, dry_run=False, position=None, *, fetch=None):
     """
     Ratchets the Stop Loss of an open position to its structural level, strictly if it tightens risk.
 
     Guarantees:
       - PLACE-THEN-CANCEL: the new stop is placed and verified on /fapi/v1/openAlgoOrders before the old stop
         is cancelled; if it cannot be verified the old stop is kept and success is False.
+      - Re-read before replace (Issue #167): right before a write the stops are queried again; a read error keeps
+        everything (reason "stops_requery_failed"), a fresher stop already at or beyond the new level gives
+        "not_tighter", else the fresh stops are the ones replaced.
       - Never loosens: a stop is only replaced by one strictly closer to price in the favourable direction.
       - success=True only when the position ends with a verified stop (existing or new).
       - dry_run=True computes the decision but never sends a write request.
       - YOLO positions are never trailed before TP1 fills (reason "yolo_before_tp1", no write, with yolo_source).
         TP1 is read from the matched trade reference only, so a YOLO position without a matching record is not
-        trailed.
-      - warnings (every result): trade-reference notices from resolve_trade_reference ("reference_unverified",
-        "audit_unreadable", "audit_corrupt_lines:<n>"), plus old-stop cancel errors when tightened.
+        trailed; YOLO detection never falls back to the newest raw audit record (audit_fallback=False).
+      - TP1 counts only for a verified reference (Issue #163): with "reference_unverified" (no userTrades open time;
+        MCP mode: every position) tp1_filled is None, so no TP1 activation, no BE via TP1, no YOLO trail.
+      - is_yolo, yolo_source, tp1_filled (the trusted value): every result from the stop query on.
+      - warnings (every result after the stop query; the early returns position_query_failed / no_position /
+        orders_query_failed carry none): trade-reference notices from resolve_trade_reference
+        ("reference_unverified", "audit_unreadable", "audit_corrupt_lines:<n>"), plus old-stop cancel errors when
+        tightened.
       - Activation gate (Issue #95): the planned SL (latest matching trades_audit record, else the current stop)
         is kept until +1.0R or +2.0x ATR_15m since entry on closed 15m bars, or TP1 fill (reason
-        "trail_not_activated", no write). Results carry activation_reason and reference_source.
+        "trail_not_activated", no write). Results carry activation_reason and reference_source. Before +2.0x
+        ATR_15m MFE or a TP1 fill an activated trail stays one tick short of entry: it gives up profit protection
+        on a fast reversal through entry (accepted to keep the stop out of the fee dead zone).
       - Take-profit orders are never touched or re-based.
-    `position` (a positionRisk row) may be passed to avoid re-querying.
+    `position` (a positionRisk row) may be passed to avoid re-querying. `fetch` (send_signed_request-like) is used
+    for the userTrades read only (the guardian shares one read per symbol per cycle); no userTrades call is made
+    without a candidate audit record matching the position's entry price and size.
     """
     target_env = resolve_env(target_env)
     symbol = str(symbol).upper()
@@ -385,31 +405,33 @@ def update_position_to_structural_stop(symbol, target_env=None, dry_run=False, p
                     error=f"Cannot read current stops for {symbol} ({err}); nothing changed.")
     current = eft.tightest_stop(old_stops, is_long)
     current_sl = eft._trigger_price(current) if current else 0.0
-    protected = current_sl > 0
     base.update(previous_sl=current_sl, current_sl=current_sl)
 
     def keep(reason, message):
-        # No write: success mirrors whether an existing verified stop protects the position.
-        out = dict(base, success=protected, reason=reason, message=message)
-        if not protected:
+        # No write: success mirrors whether a verified stop (the latest read) protects the position.
+        protected_now = base["current_sl"] > 0
+        out = dict(base, success=protected_now, reason=reason, message=message)
+        if not protected_now:
             out["error"] = f"{message} Position has NO verified stop."
         return out
 
     # Trade reference first: TP1 state is only trusted when the audit record belongs to THIS position (a stale
     # record from a previous trade must never report tp1_filled, skip the YOLO gate or allow the BE ratchet).
     planned_sl, entry_ts, reference_source, ref_rec, ref_warnings = _resolve_trade_reference_full(
-        symbol, position, direction, current_sl, target_env)
+        symbol, position, direction, current_sl, target_env, fetch=fetch)
     base["warnings"] = list(ref_warnings)
-    # TP1 and YOLO read the SAME matched record (Issue #107); without one, TP1 is unknown.
+    # TP1 and YOLO read the SAME matched record (Issue #107); without one, TP1 is unknown. Issue #163: an
+    # unverified record (no userTrades open time) may be a stale same-direction trade, so its TP1 is unknown too.
     tp1_filled, _ = eft.detect_tp1_filled(symbol, abs(amt), record=ref_rec) if ref_rec else (None, None)
-    tp1_ok = tp1_filled if reference_source == "trade_audit" else None
+    tp1_ok = (tp1_filled if (reference_source == "trade_audit" and "reference_unverified" not in ref_warnings)
+              else None)
 
     # YOLO: never trail before TP1 fills (right-tail preservation), whichever path calls this function.
-    yolo, yolo_source = eft.detect_yolo_position(symbol, leverage=position.get("leverage"), record=ref_rec)
+    yolo, yolo_source = eft.detect_yolo_position(symbol, leverage=position.get("leverage"), record=ref_rec,
+                                                 audit_fallback=False)
+    base.update(is_yolo=bool(yolo), yolo_source=yolo_source, tp1_filled=tp1_ok)
     if yolo and tp1_ok is not True:
-        out = keep("yolo_before_tp1", "YOLO position: trailing deferred until TP1 fills (right-tail preservation).")
-        out["yolo_source"] = yolo_source
-        return out
+        return keep("yolo_before_tp1", "YOLO position: trailing deferred until TP1 fills (right-tail preservation).")
 
     calc = calculate_structural_stop(symbol, direction, entry_p, current_sl_price=current_sl, target_env=target_env,
                                      planned_sl=planned_sl, entry_ts=entry_ts, tp1_filled=tp1_ok,
@@ -440,12 +462,24 @@ def update_position_to_structural_stop(symbol, target_env=None, dry_run=False, p
         out["planned_sl"] = new_sl
         return out
 
+    # Issue #167: re-read the stops right before writing, so an overlapping --once run or loop that already
+    # tightened (or replaced) the stop is neither loosened nor left with a duplicate.
+    fresh, err = eft.get_open_stop_orders(symbol, exit_side, target_env=target_env)
+    if err:
+        return keep("stops_requery_failed",
+                    f"Cannot re-read current stops for {symbol} before replacing ({err}); nothing changed.")
+    fresh_sl = eft._trigger_price(eft.tightest_stop(fresh, is_long)) if fresh else 0.0
+    base["current_sl"] = fresh_sl
+    if not eft.is_tighter_stop(new_sl, fresh_sl, is_long):
+        return keep("not_tighter",
+                    f"Active stop ({fresh_sl}) is already optimal or tighter than structural level ({new_sl}). Preserved unchanged.")
+
     filters = eft.get_symbol_filters(symbol, target_env=target_env) or {}
-    rep = eft.replace_protective_stop(symbol, exit_side, new_sl, qty, old_stops, target_env=target_env,
+    rep = eft.replace_protective_stop(symbol, exit_side, new_sl, qty, fresh, target_env=target_env,
                                       tick_size=filters.get("tickSize"))
     if not rep["success"]:
         msg = (f"New structural stop {new_sl} for {symbol} could not be verified ({rep.get('placement')}). "
-               + (f"Previous stop {current_sl} kept; nothing cancelled." if protected else "Position has NO verified stop."))
+               + (f"Previous stop {fresh_sl} kept; nothing cancelled." if fresh_sl > 0 else "Position has NO verified stop."))
         return dict(base, success=False, reason="new_stop_unverified", error=msg, message=msg)
 
     warnings = base["warnings"] + [f"Old stop {ce['algo_id']} could not be cancelled ({ce['error']})."
