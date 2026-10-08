@@ -1800,8 +1800,98 @@ def enforce_evaluation_dossier(symbol, direction, target_env=None, bypass_eval_g
                 "YOLO entries are never fast-tracked and always require explicit user confirmation. "
                 "Re-run with confirmed=True / --confirmed after the user confirms."
             ), cand
+        # Issue #202: an uncalibrated Tier S score bucket asks the user like Tier A+/A (never a rejection with
+        # --confirmed). Same helper and message as the PreToolUse hook; read/parse problems mean uncalibrated.
+        if not confirmed:
+            calib_msg = _tier_s_calibration_message(cand, env, base_dir or find_workspace_root())
+            if calib_msg:
+                return False, (f"MECHANICAL HARD GATE REJECTION (Evaluation Gate, {label}): {str(symbol).upper()}: "
+                               f"{calib_msg}"), cand
 
     return True, reason, cand
+
+
+def _tier_s_calibration_message(cand, env, base_dir):
+    """utils.score_calibration.tier_s_confirmation_required with the profile; fails closed (asks the user)."""
+    try:
+        from utils import score_calibration as scal
+    except Exception as e:
+        return (f"Tier S score bucket not calibrated (calibration module unavailable: {type(e).__name__}): ask the "
+                "user and rerun with --confirmed.") if _tier_label_of(cand) == "S" else None
+    try:
+        import user_profile as up
+        prof = up.load_user_profile(base_dir=base_dir)
+    except Exception:
+        prof = {}  # missing keys fall back to the defaults (gate on)
+    try:
+        return scal.tier_s_confirmation_required(cand, env, prof, base_dir)
+    except Exception as e:  # fail closed: ask the user
+        return scal.confirmation_reason((cand or {}).get('score'), f"calibration check failed ({type(e).__name__})")
+
+
+def _tier_label_of(cand):
+    tokens = str((cand or {}).get('tier') or '').upper().replace('TIER', ' ').split()
+    return tokens[0] if tokens else None
+
+
+# Issue #202: score metadata on the entry audit record (audit only; never a gate input). Never named `provenance`
+# (stamp_trade_record owns that key).
+SCORE_AUDIT_KEYS = ('score', 'score_tier', 'score_components', 'score_source', 'score_missing_reason',
+                    'dossier_tier', 'dossier_score', 'dossier_sha256')
+
+
+def score_audit_fields(meta):
+    """The SCORE_AUDIT_KEYS of `meta`, None for each missing one (e.g. a pending record registered before #202)."""
+    meta = meta if isinstance(meta, dict) else {}
+    return {k: meta.get(k) for k in SCORE_AUDIT_KEYS}
+
+
+def read_radar_snapshot(symbol, direction, dossier_sha256=None):
+    """(row, None) or (None, reason): the radar row record_evaluation.py joined into latest_dossier.json
+    (`radar_snapshots["SYMBOL|DIRECTION"]`). Fails open: any problem is a reason, never an exception."""
+    try:
+        path = os.path.join(_workspace_dir(), 'logs', 'evaluations', 'latest_dossier.json')
+        if not os.path.exists(path):
+            return None, 'missing'
+        with open(path, 'r', encoding='utf-8') as f:
+            record = json.load(f)
+        prov = record.get('provenance') if isinstance(record.get('provenance'), dict) else {}
+        if dossier_sha256 and prov.get('sha256') != dossier_sha256:
+            return None, 'dossier_changed'
+        snaps = record.get('radar_snapshots')
+        if not isinstance(snaps, dict):
+            return None, 'missing'
+        entry = snaps.get(f"{str(symbol).upper()}|{str(direction).upper()}")
+        if not isinstance(entry, dict):
+            return None, 'no_match'
+        row = entry.get('radar_snapshot')
+        if not isinstance(row, dict):
+            return None, str(entry.get('radar_snapshot_reason') or 'no_match')
+        return row, None
+    except Exception:
+        return None, 'unreadable'
+
+
+def build_score_meta(cand, symbol, direction):
+    """SCORE_AUDIT_KEYS for the entry audit record from the dossier candidate (None when the gate returned none)
+    and its radar snapshot. Fails open to nulls plus score_missing_reason."""
+    meta = dict.fromkeys(SCORE_AUDIT_KEYS)
+    if not isinstance(cand, dict):
+        return meta
+    try:
+        meta.update(dossier_tier=cand.get('tier'), dossier_score=cand.get('score'),
+                    dossier_sha256=cand.get('dossier_sha256'))
+        row, reason = read_radar_snapshot(symbol, direction, meta['dossier_sha256'])
+        if row is None:
+            meta['score_missing_reason'] = reason
+        else:
+            score = row.get('confidence')
+            meta.update(score=int(score) if isinstance(score, (int, float)) and not isinstance(score, bool) else None,
+                        score_tier=row.get('tier'), score_components=row.get('score_components'),
+                        score_source='radar_snapshot')
+    except Exception as e:
+        meta['score_missing_reason'] = f"error ({type(e).__name__})"
+    return meta
 
 
 # -----------------------------------------------------------------------------
@@ -2001,11 +2091,12 @@ def update_pending_entries(mutate, base_dir=None):
 
 def register_resting_entry(kind, entry_id, symbol, direction, entry_side, exit_side, target_env, price, total_qty,
                            sl_price, tp1_price, tp2_price, leverage, is_yolo, margin_usdt, prearm=None,
-                           tick_size=None, step_size=None, gate2_loss_cap_usdt=None):
+                           tick_size=None, step_size=None, gate2_loss_cap_usdt=None, *, score_meta=None):
     """Records a resting entry in logs/pending_entries.json (schema v2; `prearm`: the prearm_resting_entry_stop
     fields; tick_size / step_size: the symbol filters used for rounding, stored when given for the half-tick
     registry match of Gate 1 and the total_qty check, issue #126; gate2_loss_cap_usdt: the Gate 2 loss cap at
-    placement, stored when positive, bounds the equity-drift tolerance of the protect-pending re-check, issue #156).
+    placement, stored when positive, bounds the equity-drift tolerance of the protect-pending re-check, issue #156;
+    score_meta: the SCORE_AUDIT_KEYS copied into the fill's audit record, issue #202).
     Returns (key, record); raises on failure."""
     now = int(time.time())
     key = pending_entry_key(target_env, symbol, entry_id)
@@ -2033,6 +2124,8 @@ def register_resting_entry(kind, entry_id, symbol, direction, entry_side, exit_s
         if _to_float(value) > 0:
             record[name] = _to_float(value)
     record.update(prearm or {})
+    if score_meta is not None:
+        record['score_meta'] = score_audit_fields(score_meta)
     update_pending_entries(lambda entries: entries.__setitem__(key, record))
     return key, record
 
@@ -3622,6 +3715,7 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out, run_ctx=None
             'target_env': target_env,
             'pending_entry_key': key,
         }
+        record.update(score_audit_fields(rec.get('score_meta')))
         record.update(fill_quality_fields(is_long, entry_px, target_p, tp1_p, tp2_p))
         try:
             append_trade_audit_record(record, rec.get('margin_usdt'))
@@ -3669,6 +3763,7 @@ def execute_complete_trade(
     )
     if not eval_ok:
         return {"success": False, "hard_gate_rejection": True, "evaluation_gate_rejection": True, "error": eval_reason}
+    score_meta = build_score_meta(_eval_cand, symbol, direction)  # audit only (issue #202)
 
     try:
         import quant_risk_engine as qre
@@ -3904,7 +3999,7 @@ def execute_complete_trade(
                 kind, entry_id, symbol, direction, entry_side, exit_side, target_env, price, total_qty,
                 sl_p, tp1_p, tp2_p, effective_leverage, is_yolo, margin_usdt, prearm=prearm,
                 tick_size=filters.get('tickSize'), step_size=filters.get('stepSize'),
-                gate2_loss_cap_usdt=placement_loss_cap())
+                gate2_loss_cap_usdt=placement_loss_cap(), score_meta=score_meta)
             return key, rec, None
         except Exception as e:
             cancelled, cancel_res = cancel_resting_entry(symbol, kind, entry_id, target_env=target_env)
@@ -4213,6 +4308,7 @@ def execute_complete_trade(
             'tp2_order_id': tp2_order.get('orderId') if isinstance(tp2_order, dict) else None,
             'target_env': target_env
         }
+        record.update(score_audit_fields(score_meta))
         append_trade_audit_record(record, margin_usdt)
 
         return {

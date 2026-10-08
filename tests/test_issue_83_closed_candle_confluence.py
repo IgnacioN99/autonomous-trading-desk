@@ -165,7 +165,8 @@ class TestMismatchSkipsAbsorptionBonus(unittest.TestCase):
     def test_control_matched_data_gets_the_bonus(self):
         for direction, absorption in (("LONG", "BULLISH_ABSORPTION"), ("SHORT", "BEARISH_ABSORPTION")):
             cand = self._enrich(direction, absorption, wick_candle_mismatch=False, taker_candle_matched=True)
-            self.assertEqual(cand["confidence"], 75, direction)
+            # 60 + 15 = 75, capped at 74: the row carries no tier_s_eligible flag (unconditional cap, #165)
+            self.assertEqual(cand["confidence"], 74, direction)
             self.assertNotIn(self.NOTE, cand["reasons"])
 
     def test_mismatch_removes_bonus_and_annotates(self):

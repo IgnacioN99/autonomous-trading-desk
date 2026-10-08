@@ -43,6 +43,11 @@ DEFAULT_PROFILE = {
     "max_open_positions": 3,           # Maximum concurrent active positions
     "operating_mode": "BALANCED_DELTA_NEUTRAL", # BALANCED_DELTA_NEUTRAL | CONSERVATIVE | AGGRESSIVE
     "autonomous_execution_tier_s": False, # Cold start: autonomous execution disabled by default; requires explicit opt-in
+    # Issue #202: autonomous Tier S only in a calibrated score bucket (n >= min trades resolved PROD trades with
+    # a 95% lower bound of mean net R > 0, logs/score_calibration.json); otherwise ask the user. Validated by
+    # utils.score_calibration.calibration_policy (bool; int >= 1; anything else = the default).
+    "require_calibrated_tier_s": True,
+    "tier_s_calibration_min_trades": 30,
     "yolo_slot_enabled": False,        # Barbell memecoin moonshot slot (10x-15x, $10 margin or 0.5% equity)
     "yolo_equity_pct": 0.005,          # 0.5% default margin for YOLO moonshots (e.g. $50 on $10k)
     "overnight_mode": "ZERO_OVERNIGHT_RISK", # ZERO_OVERNIGHT_RISK | CLOSE_ALL_AT_MARKET | SWING_STRUCTURAL_STOP

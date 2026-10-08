@@ -32,6 +32,7 @@ import datetime
 import glob
 import hashlib
 import json
+import math
 import os
 import re
 import time
@@ -603,8 +604,23 @@ def normalize_candidates(dossier: dict, pending_confirmation: bool = False) -> l
         c["direction"] = direction if direction in VALID_DIRECTIONS else None
         if pending_confirmation and "requires_user_confirmation" not in c:
             c["requires_user_confirmation"] = True
+        # Heuristic radar score (issue #202); `conviction_pct` is the legacy alias. Never a reason to reject.
+        c["score"] = normalize_score(cand.get("score") if cand.get("score") is not None else cand.get("conviction_pct"))
         out.append(c)
     return out
+
+
+def normalize_score(raw: Any) -> Optional[int]:
+    """Integer score in 0-100, else None (non-numeric, boolean, non-finite or out of range)."""
+    if isinstance(raw, bool):
+        return None
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(val) or val < 0 or val > 100:
+        return None
+    return int(round(val))
 
 
 def build_record_from_extraction(extracted: Dict[str, Any], recorded_at_ts: Optional[int] = None) -> Dict[str, Any]:
@@ -824,4 +840,8 @@ def validate_dossier_for_trade(
     if want and have and want != have:
         return False, f"Dossier approved {symbol} {have}, but the order is {want}.", None
 
+    if cand is not None:
+        # Audit metadata on a copy (issue #202): the stored/rebuilt record is never mutated
+        prov = record.get("provenance") if isinstance(record.get("provenance"), dict) else {}
+        cand = dict(cand, dossier_sha256=prov.get("sha256"))
     return True, "Dossier valid and approved.", cand

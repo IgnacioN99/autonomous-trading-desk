@@ -87,6 +87,17 @@ def auto_deploy_candidate(candidate, leverage: int, target_env: str) -> dict:
         ok, reason, _cand = eft.enforce_evaluation_dossier(
             candidate.symbol, candidate.direction, target_env=target_env, bypass_eval_gate=False, confirmed=False
         )
+        if not ok and _cand is not None:
+            # The dossier is valid but asks the user (Tier A+/A, YOLO or an uncalibrated Tier S bucket, issue #202):
+            # the gate returns the candidate only on these refusals.
+            emit_alert("AUTO_DEPLOY_BLOCKED_USER_CONFIRMATION_REQUIRED", {
+                "symbol": candidate.symbol,
+                "direction": candidate.direction,
+                "env": target_env,
+                "reason": reason,
+                "action": "Ask the user; deploy only after an explicit 'yes', with --confirmed.",
+            })
+            return {"deployed": False, "blocked": True, "reason": reason}
         if not ok:
             emit_alert("AUTO_DEPLOY_BLOCKED_NO_EVALUATOR_DOSSIER", {
                 "symbol": candidate.symbol,

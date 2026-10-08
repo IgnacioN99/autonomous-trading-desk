@@ -102,6 +102,13 @@ class _TempWorkspace(unittest.TestCase):
         self.dossier_path = os.path.join(self.root, "logs", "evaluations", "latest_dossier.json")
         self._env = patch.dict(os.environ, {"AGY_BRAIN_DIRS": self.brain})
         self._env.start()
+        # Issue #202: calibrated Tier S buckets (80-89, 90-95); candidates default to "score": 85
+        stats = {"n": 30, "wins": 15, "win_rate": 0.5, "expectancy_r_net": 0.25, "sd_r_net": 0.5,
+                 "lcb95_r_net": 0.0998, "mean_mfe_r": 1.0,
+                 "insufficient": False, "calibrated": True}
+        with open(os.path.join(self.root, "logs", "score_calibration.json"), "w", encoding="utf-8") as f:
+            json.dump({"schema_version": 1, "generated_at_ts": int(time.time()), "env": "PROD", "min_trades": 30,
+                       "trades": {}, "buckets": {"80-89": dict(stats), "90-95": dict(stats)}}, f)
 
     def tearDown(self):
         self._env.stop()
@@ -110,6 +117,7 @@ class _TempWorkspace(unittest.TestCase):
     def write_subagent_dossier(self, candidates, conv_id="abcdef12-3456-7890-abcd-ef1234567890", created=None):
         """Simulates the isolated_market_evaluator transcript + record_evaluation.py --from-subagent."""
         created = created or datetime.datetime.now(datetime.timezone.utc)
+        candidates = [dict({"score": 85}, **c) for c in candidates]
         tdir = os.path.join(self.brain, conv_id, ".system_generated", "logs")
         os.makedirs(tdir, exist_ok=True)
         block = json.dumps({"status": "APPROVED", "approved_candidates": candidates, "summary": "test"})
@@ -124,6 +132,9 @@ class _TempWorkspace(unittest.TestCase):
             for s in steps:
                 f.write(json.dumps(s) + "\n")
         record = dp.build_record_from_extraction(dp.extract_dossier_from_transcript(tpath))
+        # Issue #202: radar snapshots as record_evaluation.py joins them (confidence == dossier score)
+        record["radar_snapshots"] = {f"{c['symbol']}|{c['direction']}": {"radar_snapshot": {"confidence": c["score"]}}
+                                     for c in record["approved_candidates"] if c.get("score") is not None}
         with open(self.dossier_path, "w", encoding="utf-8") as f:
             json.dump(record, f)
         return record
@@ -369,6 +380,22 @@ class TestClimaxWatcherNeverSelfSignsInProd(_TempWorkspace):
         self.assertNotIn("--confirmed", cmd)
         self.assertNotIn("--bypass-eval-gate", cmd)
         self.assertIn("--sl-price", cmd)
+
+    def test_prod_auto_deploy_needing_confirmation_names_that_reason(self):
+        """Issue #202: an uncalibrated Tier S bucket (or A+/A) is a confirmation request, not a missing dossier."""
+        os.remove(os.path.join(self.root, "logs", "score_calibration.json"))
+        for cand, fragment in (({"tier": "S", "requires_user_confirmation": False}, "score bucket 80-89 not calibrated"),
+                               ({"tier": "A+", "requires_user_confirmation": True}, "pending explicit user confirmation")):
+            with self.subTest(tier=cand["tier"]):
+                self.write_subagent_dossier([dict({"symbol": "SOLUSDT", "direction": "LONG"}, **cand)])
+                with patch("execute_futures_trade.find_workspace_root", return_value=self.root), \
+                     patch.object(self.loop, "emit_alert") as mock_alert, \
+                     patch("subprocess.run") as mock_run:
+                    res = self.loop.auto_deploy_candidate(self._candidate(), 3, "prod")
+                self.assertTrue(res["blocked"])
+                mock_run.assert_not_called()
+                self.assertEqual(mock_alert.call_args[0][0], "AUTO_DEPLOY_BLOCKED_USER_CONFIRMATION_REQUIRED")
+                self.assertIn(fragment, mock_alert.call_args[0][1]["reason"])
 
     def test_testnet_keeps_legacy_confirmed_deploy(self):
         cmd = self.loop.build_deploy_command(self._candidate(), 3, "testnet", confirmed=True)
