@@ -1,192 +1,334 @@
 #!/usr/bin/env python3
 """
-trading_scorecard.py - Quantitative Scorecard and Strategy Meta-Improver.
-Statistical performance auditing and continuous parameter calibration.
+trading_scorecard.py - Quantitative Scorecard and Strategy Meta-Improver (issue #200).
 
-Rigorous evaluation based on empirical trade logs:
-Audits live trade history in logs/trades_audit.jsonl and logs/trade_insights.jsonl:
-1. Calculates global quantitative metrics: Win Rate, Profit Factor, realized vs theoretical R:R, Expected Value.
-2. Breaks down performance across Conviction Tiers (Tier S vs Tier A+ vs YOLO).
-3. Clusters loss causes into forensic root categories.
-4. Emits mathematical auto-calibration recommendations (ATR buffer adjustments, volume filters).
+Offline report: it never calls Binance and never rebuilds outcomes. Run scripts/trade_outcomes.py first.
+
+Source: logs/trade_outcomes.jsonl (or --outcomes PATH), one row per trade reconstructed from Binance fills. Only
+rows with status "closed" and env == --env are scored; rows without "env" (written before issue #200), other envs,
+open / fills_unavailable rows and rows without realized R are excluded and counted in "excluded".
+1. Metrics over the resolved trades: R basis = realized_r_net, else realized_r_gross (counted in
+   r_basis.gross_fallback); win rate (R > 0 over resolved n), profit factor and expectancy in R, average win / loss,
+   mean gross / net R; then USDT: gross = sum of the legs' realized_pnl, net = sum of realized_r_net x initial_risk x
+   filled_qty (null when any input is null).
+2. Tier breakdown (S, A+, A, YOLO, unknown): YOLO when is_yolo; else the tier of a matching approved candidate of
+   logs/evaluations/latest_dossier.json (same symbol + direction, entry fill within [timestamp_ts,
+   valid_until_ts + 90 min]); else unknown. Never inferred from leverage.
+3. Loss-cause clusters from logs/trade_insights.jsonl (env-agnostic).
+4. Meta-improver: below MIN_SAMPLE resolved trades only an insufficient-sample line; above it R-based lines only.
+5. Shadow desk counterfactual metrics (best effort; an error is reported, never raised).
+"source" reports the file's age and the env / since stamped in its rows; the human output warns when it is older
+than 24 h or its env differs from --env.
+
+Output: logs/trading_scorecard.json (or --out PATH); stdout = human report or, with --json, the same JSON.
+Exit 0 for any readable run, 2 on bad arguments.
 
 Usage:
-  python3 scripts/trading_scorecard.py [--json] [--out [path]]
+  python3 scripts/trading_scorecard.py [--env prod|testnet] [--json] [--out PATH] [--outcomes PATH]
 """
 
+import argparse
+import json
 import os
 import sys
-import json
 import time
-import math
-from typing import Dict, Any, List
 
-LOGS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
-AUDIT_LOG = os.path.join(LOGS_DIR, "trades_audit.jsonl")
-INSIGHTS_LOG = os.path.join(LOGS_DIR, "trade_insights.jsonl")
-SCORECARD_OUTPUT = os.path.join(LOGS_DIR, "trading_scorecard.json")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import execute_futures_trade as eft
+from utils.env_resolver import resolve_env
+from utils.position_timing import norm_env
 
-def load_audit_records() -> List[dict]:
-    if not os.path.exists(AUDIT_LOG):
+MIN_SAMPLE = 20
+STALE_SECONDS = 24 * 3600
+RESTING_FILL_SLACK_S = 5400  # resting entries may fill up to 90 min after the dossier expires
+TIERS = ("S", "A+", "A", "YOLO", "unknown")
+SCALING_MSG = "Robust parameters (Profit Factor > 1.8). System qualifies for gradual margin scaling."
+CLUSTER_MSG = ("Risk cluster: Multiple losses due to BTC downside correlation. "
+               "Enforce strict inviolable Delta-Neutral Hard Gate.")
+
+
+def _logs_dir():
+    return os.path.join(eft._workspace_dir(), "logs")
+
+
+def _num(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _read_jsonl(path):
+    """JSON-object lines of path ([] when missing); malformed lines are skipped."""
+    if not os.path.exists(path):
         return []
-    records = []
-    with open(AUDIT_LOG, "r", encoding="utf-8") as f:
+    out = []
+    with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
-            if line:
-                try:
-                    records.append(json.loads(line))
-                except Exception:
-                    continue
-    return records
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict):
+                out.append(rec)
+    return out
 
-def load_insights_records() -> List[dict]:
-    if not os.path.exists(INSIGHTS_LOG):
-        return []
+
+def load_insights_records() -> list:
     records = []
     superseded = set()
-    with open(INSIGHTS_LOG, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                try:
-                    obj = json.loads(line)
-                    if obj.get("superseded"):
-                        superseded.add(obj.get("id"))
-                    else:
-                        records.append(obj)
-                except Exception:
-                    continue
+    for obj in _read_jsonl(os.path.join(_logs_dir(), "trade_insights.jsonl")):
+        if obj.get("superseded"):
+            superseded.add(obj.get("id"))
+        else:
+            records.append(obj)
     return [r for r in records if r.get("id") not in superseded]
 
-def generate_scorecard() -> dict:
-    trades = load_audit_records()
+
+def _norm_tier(raw):
+    text = str(raw or "").upper().replace("TIER", " ")
+    tokens = text.split()
+    if "YOLO" in tokens:
+        return "YOLO"
+    if "A+" in tokens:
+        return "A+"
+    if "S" in tokens:
+        return "S"
+    if "A" in tokens:
+        return "A"
+    return "unknown"
+
+
+def load_dossier_candidates():
+    """(candidates, warning): approved candidates of latest_dossier.json with the dossier's validity window."""
+    path = os.path.join(_logs_dir(), "evaluations", "latest_dossier.json")
+    if not os.path.exists(path):
+        return [], None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            dossier = json.load(f)
+        start, until = _num(dossier.get("timestamp_ts")), _num(dossier.get("valid_until_ts"))
+        out = []
+        for c in dossier.get("approved_candidates") or []:
+            out.append({"symbol": str(c.get("symbol") or "").upper(), "direction": str(c.get("direction") or "").upper(),
+                        "tier": "YOLO" if c.get("is_yolo") is True else _norm_tier(c.get("tier")),
+                        "start": start, "until": until})
+        return out, None
+    except Exception as e:
+        return [], f"dossier unreadable ({type(e).__name__}: {e}): all tiers unknown"
+
+
+def trade_tier(row, candidates):
+    if row.get("is_yolo") is True:
+        return "YOLO"
+    entry_s = _num(row.get("entry_ts"))
+    if entry_s is None:
+        return "unknown"
+    entry_s /= 1000.0
+    symbol, direction = str(row.get("symbol") or "").upper(), str(row.get("direction") or "").upper()
+    for c in candidates:
+        if c["symbol"] != symbol or c["direction"] != direction or c["start"] is None or c["until"] is None:
+            continue
+        if c["start"] <= entry_s <= c["until"] + RESTING_FILL_SLACK_S:
+            return c["tier"]
+    return "unknown"
+
+
+def _r_value(row):
+    """(R, used_gross_fallback): realized_r_net, else realized_r_gross; (None, False) when both are null."""
+    net = _num(row.get("realized_r_net"))
+    if net is not None:
+        return net, False
+    gross = _num(row.get("realized_r_gross"))
+    return (gross, True) if gross is not None else (None, False)
+
+
+def _r_stats(values):
+    n = len(values)
+    wins = [v for v in values if v > 0]
+    losses = [v for v in values if v < 0]
+    pos, neg = sum(wins), sum(losses)
+    return {
+        "n": n, "wins": len(wins), "losses": len(losses),
+        "win_rate_pct": round(len(wins) / n * 100, 2) if n else None,
+        "profit_factor_r": round(pos / abs(neg), 4) if losses else None,
+        "expectancy_r": round(sum(values) / n, 4) if n else None,
+        "avg_win_r": round(pos / len(wins), 4) if wins else None,
+        "avg_loss_r": round(neg / len(losses), 4) if losses else None,
+    }
+
+
+def _mean(values):
+    values = [v for v in values if v is not None]
+    return round(sum(values) / len(values), 4) if values else None
+
+
+def _usdt(rows):
+    gross = net = 0.0
+    for row in rows:
+        legs = row.get("legs")
+        pnls = [_num(l.get("realized_pnl")) if isinstance(l, dict) else None for l in legs] if isinstance(legs, list) else [None]
+        if gross is not None:
+            gross = None if None in pnls or not pnls else gross + sum(pnls)
+        parts = [_num(row.get(k)) for k in ("realized_r_net", "initial_risk", "filled_qty")]
+        if net is not None:
+            net = None if None in parts else net + parts[0] * parts[1] * parts[2]
+    return (round(gross, 2) if gross is not None else None), (round(net, 2) if net is not None else None)
+
+
+def _source_info(path, rows, env, now):
+    exists = os.path.exists(path)
+    info = {"path": path, "exists": exists, "mtime_utc": None, "age_seconds": None,
+            "env_in_rows": sorted({norm_env(r.get("env")) for r in rows if norm_env(r.get("env"))}),
+            "since_in_rows": sorted({str(r.get("since")) for r in rows if r.get("since")})}
+    warnings = []
+    if exists:
+        mtime = os.path.getmtime(path)
+        info["mtime_utc"] = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(mtime))
+        info["age_seconds"] = int(now - mtime)
+        if info["age_seconds"] > STALE_SECONDS:
+            warnings.append(f"outcomes file is {info['age_seconds'] // 3600} h old: re-run trade_outcomes.py")
+    if rows and info["env_in_rows"] != [env]:
+        found = ", ".join(info["env_in_rows"]) or "none"
+        warnings.append(f"outcomes rows env ({found}) differs from --env {env}: re-run trade_outcomes.py --env {env}")
+    return info, warnings
+
+
+def _recommendations(n, expectancy, profit_factor, cause_clusters):
+    if n < MIN_SAMPLE:
+        return [f"Insufficient sample (n={n} < {MIN_SAMPLE} resolved trades): no parameter recommendation."]
+    recs = []
+    if expectancy is not None and expectancy < 0:
+        recs.append(f"Negative expectancy ({expectancy:+.4f}R/trade over {n}): review entries before scaling.")
+    elif expectancy is not None and expectancy > 0 and profit_factor is not None and profit_factor >= 1.8:
+        recs.append(SCALING_MSG)
+    if cause_clusters.get("BTC_DUMP_CORRELATION", 0) >= 2:
+        recs.append(CLUSTER_MSG)
+    return recs
+
+
+def _shadow():
+    try:
+        if not os.path.exists(os.path.join(_logs_dir(), "shadow_trades.jsonl")):
+            return {}
+        import shadow_tracker
+        return shadow_tracker.calculate_efficacy_metrics()
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def generate_scorecard(env, outcomes_path=None, now=None) -> dict:
+    now = time.time() if now is None else now
+    outcomes_path = outcomes_path or os.path.join(_logs_dir(), "trade_outcomes.jsonl")
+    rows = _read_jsonl(outcomes_path)
+    source, warnings = _source_info(outcomes_path, rows, env, now)
+
+    excluded = {"open": 0, "fills_unavailable": 0, "other_status": 0, "other_env": 0, "unknown_env": 0, "null_r": 0}
+    resolved, r_values, gross_fallback = [], [], 0
+    for row in rows:
+        row_env = norm_env(row.get("env"))
+        if row_env is None:
+            excluded["unknown_env"] += 1
+            continue
+        if row_env != env:
+            excluded["other_env"] += 1
+            continue
+        status = row.get("status")
+        if status != "closed":
+            excluded[status if status in ("open", "fills_unavailable") else "other_status"] += 1
+            continue
+        r, fallback = _r_value(row)
+        if r is None:
+            excluded["null_r"] += 1
+            continue
+        gross_fallback += fallback
+        resolved.append(row)
+        r_values.append(r)
+
+    candidates, dossier_warning = load_dossier_candidates()
+    if dossier_warning:
+        warnings.append(dossier_warning)
+    by_tier = {t: [] for t in TIERS}
+    for row, r in zip(resolved, r_values):
+        by_tier[trade_tier(row, candidates)].append(r)
+
+    stats = _r_stats(r_values)
+    gross_usdt, net_usdt = _usdt(resolved)
     insights = load_insights_records()
-
-    total_trades = len(trades)
-    wins = []
-    losses = []
-    tiers_data = {"Tier S": [], "Tier A+": [], "Tier A": [], "YOLO": [], "Other": []}
-
-    # Analyze closed trades
-    for t in trades:
-        pnl = t.get("realized_pnl_usdt")
-        if pnl is None:
-            pnl = t.get("unrealized_pnl_usdt", 0.0)
-
-        tier = t.get("tier", "Tier S" if t.get("leverage", 3) == 3 else "YOLO")
-        if "Tier S" in tier:
-            target_tier = "Tier S"
-        elif "A+" in tier:
-            target_tier = "Tier A+"
-        elif "Tier A" in tier:
-            target_tier = "Tier A"
-        elif t.get("leverage", 3) >= 10:
-            target_tier = "YOLO"
-        else:
-            target_tier = "Other"
-
-        t_summary = {
-            "symbol": t.get("symbol"),
-            "pnl": round(float(pnl), 2),
-            "leverage": t.get("leverage", 3),
-            "direction": t.get("direction")
-        }
-
-        tiers_data[target_tier].append(t_summary)
-        if pnl > 0:
-            wins.append(pnl)
-        elif pnl < 0:
-            losses.append(abs(pnl))
-
-    win_count = len(wins)
-    loss_count = len(losses)
-    win_rate = (win_count / total_trades * 100) if total_trades > 0 else 0.0
-
-    total_profit = sum(wins)
-    total_loss = sum(losses)
-    profit_factor = (total_profit / total_loss) if total_loss > 0 else (99.0 if total_profit > 0 else 0.0)
-    net_pnl = total_profit - total_loss
-    avg_win = (total_profit / win_count) if win_count > 0 else 0.0
-    avg_loss = (total_loss / loss_count) if loss_count > 0 else 0.0
-    ev = ((win_rate / 100.0) * avg_win) - (((100 - win_rate) / 100.0) * avg_loss)
-
-    # Root cause clustering from insights
     cause_clusters = {}
     for i in insights:
         cause = i.get("root_cause", "GENERAL")
         cause_clusters[cause] = cause_clusters.get(cause, 0) + 1
 
-    # Meta-Improver recommendations
-    recommendations = []
-    if total_trades < 5:
-        recommendations.append("Small statistical sample (n < 5 trades). Continue gathering executions for statistical significance.")
-    else:
-        if win_rate < 45.0:
-            recommendations.append("Low Win Rate (<45%). Recommend elevating institutional volume filter from 1.4x to 1.8x and requiring CVD confluence.")
-        if cause_clusters.get("BTC_DUMP_CORRELATION", 0) >= 2:
-            recommendations.append("Risk cluster: Multiple losses due to BTC downside correlation. Enforce strict inviolable Delta-Neutral Hard Gate.")
-        if profit_factor > 1.8 and win_rate >= 55.0:
-            recommendations.append("Robust parameters (Profit Factor > 1.8). System qualifies for gradual margin scaling.")
-
-    scorecard = {
-        "timestamp_utc": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
-        "sample_size": total_trades,
-        "performance": {
-            "total_trades": total_trades,
-            "wins": win_count,
-            "losses": loss_count,
-            "win_rate_pct": round(win_rate, 2),
-            "profit_factor": round(profit_factor, 2),
-            "net_pnl_usdt": round(net_pnl, 2),
-            "avg_win_usdt": round(avg_win, 2),
-            "avg_loss_usdt": round(avg_loss, 2),
-            "expected_value_per_trade": round(ev, 2)
-        },
-        "tiers_breakdown": {
-            k: {
-                "count": len(v),
-                "net_pnl": round(sum(x["pnl"] for x in v), 2),
-                "win_rate": round(len([x for x in v if x["pnl"] > 0]) / len(v) * 100, 1) if v else 0.0
-            } for k, v in tiers_data.items() if len(v) > 0
-        },
-        "loss_cause_clusters": cause_clusters,
-        "meta_improver_recommendations": recommendations,
-        "shadow_desk": (lambda: (__import__('shadow_tracker').calculate_efficacy_metrics() if os.path.exists(os.path.join(LOGS_DIR, "shadow_trades.jsonl")) else {}))()
+    n = len(resolved)
+    performance = dict(stats)
+    performance.update(
+        mean_realized_r_gross=_mean(_num(r.get("realized_r_gross")) for r in resolved),
+        mean_realized_r_net=_mean(_num(r.get("realized_r_net")) for r in resolved),
+        net_pnl_usdt_gross=gross_usdt, net_pnl_usdt_net=net_usdt)
+    return {
+        "timestamp_utc": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(now)),
+        "env": env,
+        "sample_size": n,
+        "source": source,
+        "excluded": excluded,
+        "r_basis": {"primary": "realized_r_net", "gross_fallback": gross_fallback},
+        "performance": performance,
+        "tiers_breakdown": {t: {k: v for k, v in _r_stats(vals).items() if k in ("n", "win_rate_pct", "expectancy_r")}
+                            for t, vals in by_tier.items()},
+        "insights": {"env_agnostic": True, "loss_cause_clusters": cause_clusters},
+        "recommendations": _recommendations(n, stats["expectancy_r"], stats["profit_factor_r"], cause_clusters),
+        "warnings": warnings,
+        "shadow": _shadow(),
     }
 
-    os.makedirs(LOGS_DIR, exist_ok=True)
-    with open(SCORECARD_OUTPUT, "w", encoding="utf-8") as f:
-        json.dump(scorecard, f, indent=2, ensure_ascii=False)
 
-    return scorecard
+def _fmt(value, spec, none="n/a"):
+    return none if value is None else format(value, spec)
+
 
 def format_scorecard_report(sc: dict) -> str:
     p = sc["performance"]
+    src = sc["source"]
     lines = []
     lines.append("=" * 70)
     lines.append("🏆 QUANTITATIVE TRADING SCORECARD & META-IMPROVER")
-    lines.append(f"Date: {sc['timestamp_utc']} | Sample: {sc['sample_size']} trades")
+    lines.append(f"Date: {sc['timestamp_utc']} | Env: {sc['env'].upper()} | Sample: {sc['sample_size']} resolved trades")
+    lines.append(f"Source: {src['path']} ({'age ' + str(src['age_seconds']) + ' s' if src['exists'] else 'missing'}"
+                 f"; since {', '.join(src['since_in_rows']) or 'n/a'})")
+    for w in sc.get("warnings", []):
+        lines.append(f"⚠️  WARNING: {w}")
+    ex = sc["excluded"]
+    lines.append("Excluded: " + ", ".join(f"{k}={v}" for k, v in ex.items())
+                 + f" | R basis: net (gross fallback {sc['r_basis']['gross_fallback']})")
     lines.append("=" * 70)
-    lines.append(f"• Win Rate: {p['win_rate_pct']:.1f}% ({p['wins']}W / {p['losses']}L)")
-    lines.append(f"• Profit Factor: {p['profit_factor']:.2f} | Net PnL: ${p['net_pnl_usdt']:+.2f} USDT")
-    lines.append(f"• Average Win: ${p['avg_win_usdt']:.2f} | Average Loss: ${p['avg_loss_usdt']:.2f}")
-    lines.append(f"• Expected Value (EV): ${p['expected_value_per_trade']:+.2f} USDT per trade")
+    lines.append(f"• Win Rate: {_fmt(p['win_rate_pct'], '.1f')}% ({p['wins']}W / {p['losses']}L)")
+    lines.append(f"• Expectancy: {_fmt(p['expectancy_r'], '+.4f')}R | Profit Factor: {_fmt(p['profit_factor_r'], '.2f')}")
+    lines.append(f"• Average Win: {_fmt(p['avg_win_r'], '+.4f')}R | Average Loss: {_fmt(p['avg_loss_r'], '+.4f')}R")
+    lines.append(f"• Mean R gross: {_fmt(p['mean_realized_r_gross'], '+.4f')} | Mean R net: {_fmt(p['mean_realized_r_net'], '+.4f')}")
+    lines.append(f"• Net PnL: gross {_fmt(p['net_pnl_usdt_gross'], '+.2f')} USDT | net {_fmt(p['net_pnl_usdt_net'], '+.2f')} USDT")
     lines.append("-" * 70)
     lines.append("📊 PERFORMANCE BY CONVICTION TIER:")
     for tier, stats in sc.get("tiers_breakdown", {}).items():
-        lines.append(f"  - {tier}: {stats['count']} trades | Win Rate: {stats['win_rate']}% | PnL: ${stats['net_pnl']:+.2f} USDT")
+        lines.append(f"  - {tier}: {stats['n']} trades | Win Rate: {_fmt(stats['win_rate_pct'], '.1f')}% | "
+                     f"Expectancy: {_fmt(stats['expectancy_r'], '+.4f')}R")
     lines.append("-" * 70)
-    lines.append("🔬 LOSS ROOT CAUSE CLUSTERS:")
-    for cause, cnt in sc.get("loss_cause_clusters", {}).items():
+    lines.append("🔬 LOSS ROOT CAUSE CLUSTERS (all envs):")
+    for cause, cnt in sc["insights"]["loss_cause_clusters"].items():
         lines.append(f"  - {cause}: {cnt} occurrence(s)")
     lines.append("-" * 70)
     lines.append("💡 META-IMPROVER RECOMMENDATIONS:")
-    for rec in sc.get("meta_improver_recommendations", []):
+    for rec in sc.get("recommendations", []):
         lines.append(f"  👉 {rec}")
-    
-    if sc.get("shadow_desk"):
-        sd = sc["shadow_desk"]
+
+    sd = sc.get("shadow")
+    if sd and "error" in sd:
+        lines.append("-" * 70)
+        lines.append(f"👻 SHADOW DESK unavailable: {sd['error']}")
+    elif sd:
         lines.append("-" * 70)
         lines.append("👻 SHADOW DESK — COUNTERFACTUAL FILTER EFFICACY:")
         lines.append(f"  • Monitored Setups: {sd.get('active_shadow_trades', 0)} active | {sd.get('total_resolved', 0)} resolved")
@@ -198,9 +340,30 @@ def format_scorecard_report(sc: dict) -> str:
     lines.append("=" * 70)
     return "\n".join(lines)
 
-if __name__ == "__main__":
-    sc = generate_scorecard()
-    if "--json" in sys.argv:
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Offline scorecard from logs/trade_outcomes.jsonl")
+    parser.add_argument("--env", choices=["prod", "testnet"], default=None, help="Defaults to utils.env_resolver.resolve_env()")
+    parser.add_argument("--json", action="store_true", dest="json_output", help="Print the scorecard as JSON")
+    parser.add_argument("--out", default=None, help="Scorecard JSON (default logs/trading_scorecard.json)")
+    parser.add_argument("--outcomes", default=None, help="Outcomes JSONL (default logs/trade_outcomes.jsonl)")
+    args = parser.parse_args(argv)
+    try:
+        env = resolve_env(args.env)
+    except ValueError as e:
+        print(f"Invalid environment: {e}", file=sys.stderr)
+        return 2
+    sc = generate_scorecard(env, args.outcomes)
+    out = args.out or os.path.join(_logs_dir(), "trading_scorecard.json")
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(sc, f, indent=2, ensure_ascii=False)
+    if args.json_output:
         print(json.dumps(sc, indent=2, ensure_ascii=False))
     else:
         print(format_scorecard_report(sc))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
