@@ -39,6 +39,7 @@ from test_exit_management import FakeExchange, offline, long_position, stop, wri
 from test_issue_106_exit_manager_hardening import long_record, UserTradesExchange, buy_fill
 from test_issue_163_167_guardian_followups import RereadExchange, corrupt_audit
 from test_position_guardian import HEALTHY
+from test_guardian_excursion import KlineSource
 from test_pending_entries import write_guardian_state
 
 USER_TRADES = "/fapi/v1/userTrades"
@@ -477,6 +478,40 @@ class TestEmptyRereadFlatPosition(unittest.TestCase):
         self.assertEqual([a["type"] for a in state["actions"]], [])
         self.assertEqual(fake.writes(), [])
         da.assert_not_called()
+
+    def test_position_closed_keeps_the_excursion_and_reports_last_stop_r(self):
+        # Round 3 (#182 interaction): no 1m klines read for the flattened position, its excursion keeps the last stop,
+        # and the next cycle's position_closed action reports a numeric last_stop_r.
+        ws = tempfile.mkdtemp()
+        log_dir = os.path.join(ws, "logs")
+        long_record(ws, sl_price=95.0, timestamp=int(time.time()) - 3600)
+
+        def run(fake, calc):
+            klines = KlineSource(lambda o: (100.5, 99.5))
+            with offline(fake, workspace=ws), \
+                 patch("utils.trade_excursion.fetch_klines_range", side_effect=klines), \
+                 patch("dynamic_exit_manager.calculate_structural_stop", return_value=calc), \
+                 patch("dynamic_exit_manager.check_dead_alpha_timeout", return_value=dict(HEALTHY)), \
+                 patch("report_agent_issue.report_issue"), contextlib.redirect_stderr(io.StringIO()):
+                return pgl.run_cycle("testnet", log_dir=log_dir), klines
+
+        state, _ = run(FakeExchange([long_position(mark="101.0")], algos=[stop(501, 95.0)]), None)
+        self.assertEqual(state["excursions"]["BTCUSDT|LONG"]["last_stop_price"], 95.0)
+
+        # Reads: 1 guardian orphan audit, 2 dem, 3 dem's re-read (stop triggered, position flat).
+        fake = EmptyRereadExchange([long_position(mark="101.0")], flat=True, at=3, algos=[stop(501, 95.0)])
+        state, klines = run(fake, structural(100.5))
+        view = state["positions"][0]
+        self.assertEqual(view["trailing"]["reason"], "position_closed")
+        self.assertEqual(view["stop_price"], 95.0, "the last stop read this cycle is kept")
+        self.assertEqual([c for c in klines.calls if c[0] == "BTCUSDT"], [])
+        self.assertEqual(state["excursions"]["BTCUSDT|LONG"]["last_stop_price"], 95.0)
+        self.assertEqual([a for a in state["actions"] if a["type"] == "position_closed"], [])
+
+        state, _ = run(FakeExchange([]), None)
+        closed = [a for a in state["actions"] if a["type"] == "position_closed"]
+        self.assertEqual(len(closed), 1)
+        self.assertEqual(closed[0]["detail"]["last_stop_r"], -1.0)  # (95 - 100) / 5
 
 
 # =============================================================================

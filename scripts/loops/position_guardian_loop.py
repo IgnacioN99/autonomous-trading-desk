@@ -31,7 +31,8 @@ Per cycle:
      stops the loop); issue #172: the change is judged against the process's last real-cycle value
      (AuditHealthMemory), so a TESTNET loop beside a live PROD loop reports once and a --dry-run state never
      suppresses the next real report. A stop that triggers between dem's reads ends as "position_closed" (flat,
-     protected, no write, no dead-alpha check).
+     protected, no write, no dead-alpha check, no excursion klines read; its excursion record is carried with the
+     last stop read, so the next cycle's position_closed action reports last_stop_r).
   4. Dead-alpha check: reported only; positions are closed (reduce-only) only with --close-dead-alpha.
      DEAD_ALPHA_STALLED requires BOTH the 15m range stall (last 6 closed 15m bars < 0.40%) AND the shared
      holding-time verdict also used by the doctor's watchdog (utils/position_timing.py: held >= 4h, mark within
@@ -487,8 +488,8 @@ class GuardianCycle:
                     self.state["trail_warnings"].append({"symbol": sym, "warning": str(w)})
         if res.get("reason") == "position_closed":
             # Issue #172: the stop triggered between dem's reads; the position is flat (no exposure, no write).
+            # stop_price keeps the last stop read this cycle (the next cycle's #182 position_closed reports it).
             view["size"] = 0.0
-            view["stop_price"] = None
             view["protected"] = True
         elif res.get("updated"):
             view["stop_price"] = res.get("new_sl")
@@ -635,6 +636,18 @@ class GuardianCycle:
         if key not in self.state["excursions"] and isinstance(prev, dict):
             self.state["excursions"][key] = dict(prev, last_seen_ts=self.state["timestamp"])
 
+    def _carry_excursion(self, view):
+        """Issue #172: a position flattened this cycle keeps its previous excursion record (no klines read); the last
+        stop read this cycle, when known, replaces last_stop_price."""
+        key = f"{view['symbol']}|{view['side']}"
+        prev = self._previous_excursions().get(key)
+        if key in self.state["excursions"] or not isinstance(prev, dict):
+            return
+        rec = dict(prev, last_seen_ts=self.state["timestamp"])
+        if view.get("stop_price") is not None:
+            rec["last_stop_price"] = view["stop_price"]
+        self.state["excursions"][key] = rec
+
     def _emit_position_closed(self, writes_state):
         """position_closed for every previous excursion whose symbol + side is no longer open (issue #182). Not after
         a positions_sync / position_parse failure (open positions unknown: the previous records are carried over)
@@ -733,6 +746,11 @@ class GuardianCycle:
         # Excursion tracking (data capture only) runs after every position went through its protective steps, so a
         # slow klines read can never delay another position's orphan heal or trail.
         for p, view in guarded:
+            if view["size"] == 0:
+                # Flattened this cycle (trailing position_closed or orphan close): no klines read; the stored record is
+                # carried so the next cycle's position_closed action reports its last stop (issue #172).
+                self._carry_excursion(view)
+                continue
             try:
                 self._track_excursion(p, view)
             except Exception as e:

@@ -365,7 +365,7 @@ def _position_is_flat(symbol, target_env):
         return False
     if not isinstance(rows, list) or not all(isinstance(r, dict) and r.get("symbol") for r in rows):
         return False
-    mine =[r for r in rows if str(r.get("symbol") or "").upper() == symbol]
+    mine = [r for r in rows if str(r.get("symbol") or "").upper() == symbol]
     if not mine:
         return False
     for r in mine:
@@ -517,7 +517,7 @@ def update_position_to_structural_stop(symbol, target_env=None, dry_run=False, p
         # read as "unprotected".
         return dict(base, success=True, reason="position_closed", current_sl=0.0,
                     message=f"{symbol} position closed (its stop triggered) before the trailing write; nothing placed.")
-    fresh_sl =eft._trigger_price(eft.tightest_stop(fresh, is_long)) if fresh else 0.0
+    fresh_sl = eft._trigger_price(eft.tightest_stop(fresh, is_long)) if fresh else 0.0
     base["current_sl"] = fresh_sl
     if not eft.is_tighter_stop(new_sl, fresh_sl, is_long):
         return keep("not_tighter",
