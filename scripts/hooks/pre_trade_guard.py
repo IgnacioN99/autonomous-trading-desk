@@ -65,6 +65,19 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    and //wsl$/<distro>/x are the Linux path /x (case-sensitive) when <distro> is WSL_DISTRO_NAME (case-insensitive;
    another or an unknown distro names another filesystem). With a native Linux cwd (/mnt/c/..., /home/...) or none,
    /c/x and //wsl.../x are Linux paths: not sanctioned (ask) (issue #110).
+   Read-only analysis scripts (READ_ONLY_SCRIPTS, issue #191: scripts/trade_outcomes.py, scripts/trading_scorecard.py,
+   scripts/exit_policy_sim.py; they place, change or cancel no order) are auto-allowed ("read-only analysis script")
+   only as the single sub-command of a flat line, run by their exact repo path (never a linked worktree copy)
+   through a bare interpreter name (python / python3[.x]; ./python3 or /tmp/python3 never count), with
+   the same prefix / metacharacter / redirect rules as above, only their own flags, and every --output / --out /
+   --outcomes value inside logs/ (lexically and by os.path.realpath); a write flag (--output / --out) must name the
+   script's own output (trade_outcomes.py: logs/trade_outcomes.jsonl, trading_scorecard.py:
+   logs/trading_scorecard.json, exit_policy_sim.py: logs/exit_policy_sim.json; never GROUND_TRUTH_FILES,
+   READ_ONLY_FOREIGN_OUTPUTS or logs/evaluations/). The ground-truth check (8) lets trade_outcomes.py name its own
+   ground-truth output logs/trade_outcomes.jsonl (its sole sanctioned writer); naming any other ground-truth file
+   (logs/score_calibration.json included: the scorecard writes it itself, never through --out), also through
+   --outcomes or a glob, stays denied (_names_only_own_ground_truth).
+   Anything else asks, as before; next to other sub-commands they are not safe.
 5. FAIL-CLOSED SESSION STATE & STALENESS CHECK (cache-based pre-check, defense in depth):
    logs/session_state.json must exist, be valid (is_valid=True) and NOT stale (<= 300s); its position count plus
    the same-env symbols of logs/pending_entries.json without an open position (issue #48; an unreadable or
@@ -642,6 +655,33 @@ RISK_REDUCING_SCRIPTS: Dict[str, Tuple[set, Dict[str, bool]]] = {
     "scripts/loops/climax_watcher_loop.py": (set(HELP_FLAGS), dict(HELP_FLAGS)),
     "scripts/user_profile.py": (set(HELP_FLAGS), dict(HELP_FLAGS)),
 }
+# Read-only analysis scripts (issue #191): offline reports that never place, change or cancel orders (trade_outcomes:
+# GET userTrades and public klines / exchangeInfo; the scorecard: local files; the simulator: public klines and
+# exchangeInfo). Each entry: ({allowed flag: takes a value}, {path flag: "write" | "read"}, its own outputs). A single
+# plain invocation by the exact repo path (never a linked worktree copy) with only these flags is auto-allowed when
+# every path flag resolves inside logs/ and every write flag names one of its own outputs
+READ_ONLY_SCRIPTS: Dict[str, Tuple[Dict[str, bool], Dict[str, str], Tuple[str, ...]]] = {
+    "scripts/trade_outcomes.py": (
+        {"--since": True, "--symbol": True, "--env": True, "--json": False, "--no-klines": False, "--output": True,
+         **HELP_FLAGS},
+        {"--output": "write"}, ("logs/trade_outcomes.jsonl",)),
+    "scripts/trading_scorecard.py": (
+        {"--env": True, "--json": False, "--out": True, "--outcomes": True, **HELP_FLAGS},
+        # Its --out is the scorecard report only: it also writes logs/score_calibration.json itself, never via --out
+        {"--out": "write", "--outcomes": "read"}, ("logs/trading_scorecard.json",)),
+    "scripts/exit_policy_sim.py": (
+        {"--env": True, "--outcomes": True, "--policies": True, "--horizon-hours": True, "--taker-fee": True,
+         "--maker-fee": True, "--trail-cadence": True, "--exact-entry-only": False, "--json": False, "--out": True,
+         **HELP_FLAGS},
+        {"--out": "write", "--outcomes": "read"}, ("logs/exit_policy_sim.json",)),
+}
+# logs/ files with another sanctioned writer: a read-only script's write flag may name none of them except its own
+# outputs (with GROUND_TRUTH_FILES: the desk's audit / brief / journal files and the read-only scripts' outputs)
+READ_ONLY_FOREIGN_OUTPUTS = ({"logs/trades_audit.jsonl", "logs/primed_brief.json", "logs/primed_brief_scores.json",
+                              "logs/guardian_actions.jsonl", "logs/trade_insights.jsonl", "logs/shadow_trades.jsonl",
+                              "logs/issues_backlog.jsonl"}
+                             | {p for _f, _p, outs in READ_ONLY_SCRIPTS.values() for p in outs})
+READ_ONLY_ALLOW_REASON = "Authorized as a read-only analysis script ({}): it places, changes or cancels no order."
 # Executor options that open (or shape the opening of) a position, matched with argparse's unique-prefix
 # abbreviations (--dir, --lev): an engine sub-command naming one is judged as a trade opening, never as an exit
 EXECUTOR_OPENING_OPTIONS = (
@@ -2488,34 +2528,45 @@ def _windows_side_cwd(cwd: str) -> bool:
 
 
 def _sanctioned_script(script: str, cwd: str, base_dir: str, in_wsl: bool,
-                       windows_cwd: Optional[bool] = None) -> Optional[str]:
-    """RISK_REDUCING_SCRIPTS key of a script operand, compared lexically (no filesystem check) with the sanctioned
-    repo paths under base_dir. A relative operand is joined with the cwd (else base_dir). Inside wsl.exe the Linux
+                       windows_cwd: Optional[bool] = None, keys=None, allow_worktree: bool = True) -> Optional[str]:
+    """RISK_REDUCING_SCRIPTS key (or one of keys) of a script operand, compared lexically (no filesystem check) with
+    the sanctioned repo paths under base_dir (and, when allow_worktree, of a linked worktree). A relative operand is
+    joined with the cwd (else base_dir). Inside wsl.exe the Linux
     path must be relative or absolute POSIX (/mnt/<drive>/... mapping to base_dir, or base_dir itself when the hook
     runs inside WSL); a Windows spelling or a backslash there names another file for Linux: None. windows_cwd (default
     _windows_side_cwd(cwd)): Git Bash /c/x spellings (script or cwd) are the C: drive only for a Windows-side cwd."""
+    keys = RISK_REDUCING_SCRIPTS if keys is None else keys
+    full = _script_host_path(script, cwd, base_dir, in_wsl, windows_cwd)
+    if not full:
+        return None
+    root = _lexical_host_path(base_dir)
+    for key in keys:
+        if full == _lexical_host_path(posixpath.join(root, key), git_bash=False):
+            return key
+    wt_rel = _linked_worktree_rel(full, base_dir) if allow_worktree else ""
+    if wt_rel in keys:
+        return wt_rel
+    return None
+
+
+def _script_host_path(script: str, cwd: str, base_dir: str, in_wsl: bool,
+                      windows_cwd: Optional[bool] = None) -> str:
+    """Lexical host path (_lexical_host_path) of a path operand for _sanctioned_script: "" when it cannot name a file
+    under base_dir (a Windows spelling inside wsl.exe, no base_dir)."""
     if not script or not base_dir:
-        return None
+        return ""
     if in_wsl and ("\\" in script or re.match(r"^[A-Za-z]:", script)):
-        return None
+        return ""
     if windows_cwd is None:
         windows_cwd = _windows_side_cwd(cwd)
     root = _lexical_host_path(base_dir)
     if not root:
-        return None
+        return ""
     if script.replace("\\", "/").startswith("/") or re.match(r"^[A-Za-z]:", script):
-        full = _lexical_host_path(script, git_bash=windows_cwd and not in_wsl)
-    else:
-        # The cwd is the session cwd (wsl.exe inherits it): Git Bash /c/x spellings map only from Windows
-        start = (_lexical_host_path(cwd, git_bash=windows_cwd) if cwd else "") or root
-        full = _lexical_host_path(posixpath.join(start, script.replace("\\", "/")), git_bash=False)
-    for key in RISK_REDUCING_SCRIPTS:
-        if full == _lexical_host_path(posixpath.join(root, key), git_bash=False):
-            return key
-    wt_rel = _linked_worktree_rel(full, base_dir)
-    if wt_rel in RISK_REDUCING_SCRIPTS:
-        return wt_rel
-    return None
+        return _lexical_host_path(script, git_bash=windows_cwd and not in_wsl)
+    # The cwd is the session cwd (wsl.exe inherits it): Git Bash /c/x spellings map only from Windows
+    start = (_lexical_host_path(cwd, git_bash=windows_cwd) if cwd else "") or root
+    return _lexical_host_path(posixpath.join(start, script.replace("\\", "/")), git_bash=False)
 
 
 def _risk_flags_allowed(key: str, args: List[str]) -> bool:
@@ -2574,6 +2625,87 @@ def _subcommand_is_risk_reducing(tokens: List[str], text: str, cwd: str = "", ba
         return False
     key = _sanctioned_script(toks[i], cwd, base_dir or find_workspace_root(), in_wsl, _windows_side_cwd(cwd))
     return bool(key) and _risk_flags_allowed(key, _plain_args(toks[i + 1:]))
+
+
+def _read_only_script_key(tokens: List[str], cwd: str = "", base_dir: str = "") -> Optional[str]:
+    """READ_ONLY_SCRIPTS key of the script a sub-command runs, by its exact repo path under base_dir (never a linked
+    worktree copy: unreviewed code), through a bare interpreter name (python, python3, python3.x[.exe]: never a path
+    such as ./python3 or /tmp/python3, which an agent could have written), else None."""
+    if not tokens:
+        return None
+    toks, i, in_wsl = _executed_script_at(tokens)
+    if i < 0:
+        return None
+    p = _program_index(toks)
+    interpreter = toks[p] if p < len(toks) else ""
+    if not (p < i and "/" not in interpreter and "\\" not in interpreter
+            and PYTHON_PROGRAM_RE.match(interpreter.lower())):
+        return None
+    return _sanctioned_script(toks[i], cwd, base_dir or find_workspace_root(), in_wsl, _windows_side_cwd(cwd),
+                              keys=READ_ONLY_SCRIPTS, allow_worktree=False)
+
+
+def _read_only_path_blocker(key: str, flag: str, value: str, cwd: str, base_dir: str, in_wsl: bool) -> Optional[str]:
+    """Why a path flag value of a read-only analysis script blocks the auto-allow: it must resolve inside logs/ (the
+    lexical path and the os.path.realpath of base_dir/<that path>, so a symlink cannot lead out) and a write flag
+    must name one of the script's own outputs (never another writer's file: GROUND_TRUTH_FILES,
+    READ_ONLY_FOREIGN_OUTPUTS, logs/evaluations/). None when it may."""
+    _allowed, path_flags, own = READ_ONLY_SCRIPTS[key]
+    if not value or SHELL_GLOB_RE.search(value) or "~" in value:
+        return f"{flag} {value!r} is not a plain path"
+    full = _script_host_path(value, cwd, base_dir, in_wsl)
+    root = _lexical_host_path(base_dir)
+    if not full or not root or not full.startswith(root.rstrip("/") + "/logs/"):
+        return f"{flag} {value!r} does not resolve inside logs/"
+    rel = full[len(root.rstrip("/")) + 1:]
+    real_logs = os.path.realpath(os.path.join(base_dir, "logs"))
+    real = os.path.realpath(os.path.join(base_dir, *rel.split("/")))
+    if os.path.commonpath([real_logs, real]) != real_logs or real == real_logs:
+        return f"{flag} {value!r} does not resolve inside logs/"
+    if path_flags[flag] != "write":
+        return None
+    real_rel = "logs/" + os.path.relpath(real, real_logs).replace(os.sep, "/")
+    foreign = (set(GROUND_TRUTH_FILES) | READ_ONLY_FOREIGN_OUTPUTS) - set(own)
+    for candidate in (rel, real_rel):
+        name = candidate.lower().rstrip(". ")
+        if ":" in candidate or EVALUATION_TRAIL_TARGET_RE.search(name) or name in foreign:
+            return f"{flag} {value!r} names a file another script writes"
+        if candidate not in own:
+            return f"{flag} {value!r} is not one of the script's own outputs ({', '.join(own)})"
+    return None
+
+
+def _read_only_blocker(key: str, tokens: List[str], cwd: str = "", base_dir: str = "") -> Optional[str]:
+    """Why a read-only analysis sub-command (READ_ONLY_SCRIPTS key) may not be auto-allowed, None when it may: the
+    risk-reducing blockers (_risk_auto_allow_blocker: shell metacharacters, redirects, wrappers, env assignments,
+    interpreter options), a flag outside the script's allowlist (abbreviations included), a value on a switch, a
+    missing value, a stray operand, or a path flag that fails _read_only_path_blocker."""
+    blocker = _risk_auto_allow_blocker(tokens)
+    if blocker:
+        return blocker
+    base_dir = base_dir or find_workspace_root()
+    toks, i, in_wsl = _executed_script_at(tokens)
+    allowed, path_flags, _own = READ_ONLY_SCRIPTS[key]
+    args = _plain_args(toks[i + 1:])
+    j = 0
+    while j < len(args):
+        name, eq, value = args[j].partition("=")
+        if name not in allowed:
+            return f"it passes {args[j]!r}, which is not one of the script's read-only flags"
+        if allowed[name]:
+            if not eq:
+                if j + 1 >= len(args) or args[j + 1].startswith("-"):
+                    return f"{name} has no value"
+                j += 1
+                value = args[j]
+            if name in path_flags:
+                why = _read_only_path_blocker(key, name, value, cwd, base_dir, in_wsl)
+                if why:
+                    return why
+        elif eq:
+            return f"{name} takes no value"
+        j += 1
+    return None
 
 
 def _is_redirect(tok: str) -> bool:
@@ -4062,6 +4194,22 @@ def _git_exec_config_writes(prog: str, args: List[str], redirects: List[str], cw
                for a in args)
 
 
+def _names_only_own_ground_truth(tokens: List[str], mentioned: List[str], info: dict, cwd: str,
+                                 base_dir: str) -> bool:
+    """True when a sub-command runs a READ_ONLY_SCRIPTS script by its exact repo path (never a linked worktree copy)
+    through a bare interpreter name (_read_only_script_key) and every ground-truth file it names is one of that
+    script's own outputs, of which it is the sole sanctioned writer (scripts/trade_outcomes.py ->
+    logs/trade_outcomes.jsonl; issue #191). Only RISK_ENV_ASSIGNMENTS may precede it. Any other program, interpreter
+    path, script or named protected file (another script's output, a glob reaching other files) keeps the
+    ground-truth denial. This exemption does not apply the risk-prefix blockers: a wrapped own-output call (e.g.
+    `sudo python3 scripts/trade_outcomes.py --output logs/trade_outcomes.jsonl`) drops from deny to ASK (never allow),
+    because the writer is still the sole sanctioned one and the read-only auto-allow keeps every blocker (PR #212)."""
+    if any(var not in RISK_ENV_ASSIGNMENTS for var, _value in info.get("assigns") or []):
+        return False
+    key = _read_only_script_key(tokens, cwd, base_dir)
+    return bool(key) and set(mentioned) <= set(READ_ONLY_SCRIPTS[key][2])
+
+
 def _ground_truth_writes(tokens: List[str], text: str, cwd: str = "", base_dir: str = "", depth: int = 0,
                          shell: str = "bash", cwd_unknown: bool = False, strict: bool = True,
                          written: frozenset = frozenset(), cwd_set: Tuple[str, ...] = ()) -> List[str]:
@@ -4109,7 +4257,8 @@ def _ground_truth_writes(tokens: List[str], text: str, cwd: str = "", base_dir: 
     mentioned = _ground_truth_named(text)
     for a in tokens:
         mentioned += _glob_ground_truth(_word_value(a))
-    if mentioned and not _ground_truth_read_only(prog, args, bool(info["assigns"]), frozenset(read_programs)):
+    if mentioned and not _ground_truth_read_only(prog, args, bool(info["assigns"]), frozenset(read_programs)) \
+            and not (not cwd_unknown and _names_only_own_ground_truth(tokens, mentioned, info, cwd, base_dir)):
         hits += mentioned
     # Git config / hook files written directly (a later git command runs them); git itself is left to the git
     # config key rules (git config -f .git/config <key> <value>)
@@ -5107,6 +5256,13 @@ def powershell_backstop(command_line: str, cwd: str, base_dir: str) -> Tuple[Opt
     if not (ground_truth or trail or logs_dir or harness or git_config or gate_program_write):
         return None, None
     construct = _powershell_write_construct(command_line, tokens)
+    if ground_truth and not construct and not trail:
+        # Issue #191: one statement running a read-only analysis script that names only its own ground-truth output
+        # (its sole sanctioned writer, _names_only_own_ground_truth); the analysis decides the rest
+        subs = [s for s in split_subcommands(command_line) if s]
+        if len(subs) == 1 and _names_only_own_ground_truth(subs[0], ground_truth, _command_start(subs[0])[1], cwd,
+                                                           base_dir):
+            ground_truth = []
     unlisted = None if construct else _powershell_unlisted_command(tokens)
     how = construct or (f"command '{unlisted}' outside the read-only cmdlets" if unlisted else None)
     suffix = (f" PowerShell {how} next to a protected path: only read-only cmdlets (Get-Content, Select-String, "
@@ -5252,12 +5408,14 @@ def _analyze_run_command(command_line: str, cwd: str, base_dir: str, shell: str 
     result: Dict[str, Any] = {
         "deny": None, "force_ask": None, "trading": [], "trading_tokens": [], "batch": [], "risk_reducing": False,
         "risk_blocker": None, "all_safe": True, "record_eval": None, "ask_reason": None,
+        "read_only_script": None, "read_only_blocker": None, "subcommands": 0,
     }
     if not command_line.strip():
         return result
 
     inline = _is_inline_code(command_line) or (shell == "powershell" and bool(PS_INLINE_CODE_RE.search(command_line)))
     subcommands = split_subcommands(command_line)
+    result["subcommands"] = sum(1 for s in subcommands if s)
 
     # 1. Evaluation trail is immutable for the agent (record_evaluation.py --from-subagent writes it itself)
     eval_check_cmd = _strip_git_message_data(command_line)
@@ -5378,6 +5536,15 @@ def _analyze_run_command(command_line: str, cwd: str, base_dir: str, shell: str 
             result["risk_blocker"] = result["risk_blocker"] or _risk_auto_allow_blocker(tokens)
             if _redirect_targets(tokens):
                 result["all_safe"] = False
+            continue
+        read_only_key = _read_only_script_key(tokens, cwd, base_dir)
+        if read_only_key:
+            # Auto-allowed only as the single sub-command of the line (_evaluate_shell_command); next to anything
+            # else it is not "safe" (normal permission policy, as before issue #191)
+            result["read_only_script"] = result["read_only_script"] or read_only_key
+            result["read_only_blocker"] = (result["read_only_blocker"]
+                                           or _read_only_blocker(read_only_key, tokens, cwd, base_dir))
+            result["all_safe"] = False
             continue
         if _is_trade_engine_invocation(tokens, text):
             unwrapped_list = _unwrap_subcommand(tokens)
@@ -6090,6 +6257,14 @@ def _evaluate_shell_command(command_line: str, cwd: str, base_dir: str, conversa
 
     if analysis["force_ask"]:
         return "force_ask", analysis["force_ask"]
+    read_only_key = analysis.get("read_only_script")
+    if read_only_key and analysis.get("subcommands") == 1 and not analysis["risk_reducing"] \
+            and not analysis["record_eval"]:
+        if analysis.get("read_only_blocker"):
+            return "ask", (f"Read-only analysis script ({read_only_key}), not auto-allowed because "
+                           f"{analysis['read_only_blocker']}: run it as one plain call with its own flags and paths "
+                           "inside logs/; user confirmation required.")
+        return "allow", READ_ONLY_ALLOW_REASON.format(read_only_key)
     if analysis["risk_reducing"] and analysis["all_safe"]:
         if analysis["risk_blocker"] == FORCED_BREAKEVEN_BLOCKER:
             return "ask", f"Forced break-even, not auto-allowed: {FORCED_BREAKEVEN_BLOCKER}; user confirmation required."

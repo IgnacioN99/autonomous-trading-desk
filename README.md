@@ -266,6 +266,7 @@ python3 scripts/loops/position_guardian_loop.py --once --env prod         # one 
 python3 scripts/loops/position_guardian_loop.py --interval 60 --env prod  # long-running (default interval 60s)
 python3 scripts/trade_outcomes.py --since 2026-10-01 --json               # read-only: exits, realized R, MFE per trade
 python3 scripts/trading_scorecard.py --env prod                           # offline: win rate / R / tiers from trade_outcomes.jsonl
+#   (reads the outcomes file by default; naming that ground-truth file via --outcomes is denied by the hook on purpose)
 python3 scripts/exit_policy_sim.py --env prod --json                      # offline: replay exit policies on closed trades (public klines; stops fill at the stop, no gap slippage; capture uses MFE over the whole horizon, not comparable to trade_outcomes)
 ```
 

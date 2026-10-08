@@ -44,6 +44,30 @@ def atomic_write_json(filepath: str, data: Any, indent: int = 2) -> bool:
                 pass
         raise IOError(f"Atomic write failure for {filepath}: {e}")
 
+
+def path_inside_dir(path: str, directory: str) -> bool:
+    """True when path is a file path strictly inside directory, lexically (os.path.abspath) and after resolving
+    symlinks (os.path.realpath), so a symlinked directory cannot lead out (issue #191: offline CLI --out / --output
+    restricted to logs/). Write such files with atomic_write_json (os.replace never writes through a hard link)."""
+    root, target = os.path.abspath(directory), os.path.abspath(path)
+    real_root, real_target = os.path.realpath(root), os.path.realpath(target)
+    try:
+        lexical = os.path.commonpath([root, target]) == root and target != root
+        resolved = os.path.commonpath([real_root, real_target]) == real_root and real_target != real_root
+    except ValueError:
+        return False
+    return lexical and resolved
+
+
+def same_file(a: str, b: str) -> bool:
+    """True when a and b name the same file: equal realpaths, or os.path.samefile (a hard link) when both exist."""
+    if os.path.realpath(a) == os.path.realpath(b):
+        return True
+    try:
+        return os.path.exists(a) and os.path.exists(b) and os.path.samefile(a, b)
+    except OSError:
+        return False
+
 def atomic_append_jsonl(filepath: str, record: Dict[str, Any]) -> bool:
     """
     Appends a record to a JSON Lines file safely and consistently.
