@@ -103,7 +103,8 @@ class _TempWorkspace(unittest.TestCase):
         self._env = patch.dict(os.environ, {"AGY_BRAIN_DIRS": self.brain})
         self._env.start()
         # Issue #202: calibrated Tier S buckets (80-89, 90-95); candidates default to "score": 85
-        stats = {"n": 30, "wins": 15, "win_rate": 0.5, "expectancy_r_net": 0.25, "mean_mfe_r": 1.0,
+        stats = {"n": 30, "wins": 15, "win_rate": 0.5, "expectancy_r_net": 0.25, "sd_r_net": 0.5,
+                 "lcb95_r_net": 0.0998, "mean_mfe_r": 1.0,
                  "insufficient": False, "calibrated": True}
         with open(os.path.join(self.root, "logs", "score_calibration.json"), "w", encoding="utf-8") as f:
             json.dump({"schema_version": 1, "generated_at_ts": int(time.time()), "env": "PROD", "min_trades": 30,

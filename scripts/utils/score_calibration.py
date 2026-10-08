@@ -4,7 +4,8 @@ score_calibration.py - Calibration of the heuristic radar score against resolved
 
 The radar `confidence` (copied into the dossier as `score`) is a heuristic point score, not a probability. This
 module buckets resolved trades by their dossier score and tells whether a bucket has earned autonomous Tier S
-execution: n >= min_trades resolved PROD trades with positive mean net R.
+execution: n >= min_trades resolved non-YOLO PROD trades whose one-sided 95% lower confidence bound of the mean net R
+(mean - 1.645 x sd / sqrt(n), sd with n-1) is above 0. Only the Tier S buckets 80-89 / 90-95 can clear a Tier S.
 
 Pure and network-free (stdlib only). Shared by scripts/trading_scorecard.py (the sole writer of the store),
 scripts/execute_futures_trade.py and scripts/hooks/pre_trade_guard.py (readers, through the same helpers and
@@ -42,6 +43,7 @@ def _label(lo: int, hi: int) -> str:
 
 
 BUCKET_LABELS = [_label(lo, hi) for lo, hi in BUCKETS]
+TIER_S_BUCKETS = ("80-89", "90-95")  # the only buckets that can clear an autonomous Tier S
 
 
 def _norm_env(env: Any) -> str:
@@ -84,6 +86,21 @@ def _mean(values: Iterable[Optional[float]]) -> Optional[float]:
     return round(sum(vals) / len(vals), 4) if vals else None
 
 
+LCB_Z = 1.645  # one-sided 95%
+
+
+def lower_confidence_bound(values) -> Tuple[Optional[float], Optional[float]]:
+    """(sd, lcb95): sample standard deviation (n-1) of the net R values and the one-sided 95% lower confidence
+    bound of their mean, mean - 1.645 * sd / sqrt(n). (None, None) when n < 2 (undefined sd: never calibrated)."""
+    vals = [v for v in values if v is not None]
+    n = len(vals)
+    if n < 2:
+        return None, None
+    mean = sum(vals) / n
+    sd = math.sqrt(sum((v - mean) ** 2 for v in vals) / (n - 1))
+    return round(sd, 4), round(mean - LCB_Z * sd / math.sqrt(n), 4)
+
+
 def build_calibration(rows: Iterable[dict], env: str = STORE_ENV, min_trades: int = DEFAULT_MIN_TRADES) -> dict:
     """Bucket table over the rows of `env` (the gate's env, PROD) that are closed with a non-null net R."""
     want = _norm_env(env)
@@ -111,14 +128,17 @@ def build_calibration(rows: Iterable[dict], env: str = STORE_ENV, min_trades: in
         n = len(items)
         wins = sum(1 for r, _, _ in items if r > 0)
         expectancy = _mean(r for r, _, _ in items)
+        sd, lcb = lower_confidence_bound([r for r, _, _ in items])
         buckets[label] = {
             "n": n, "wins": wins,
             "win_rate": round(wins / n, 4) if n else None,
             "expectancy_r_net": expectancy,
+            "sd_r_net": sd,
+            "lcb95_r_net": lcb,
             "mean_mfe_r": _mean(m for _, m, _ in items),
             "mean_radar_score": _mean(s for _, _, s in items),
             "insufficient": n < MIN_SAMPLE,
-            "calibrated": n >= min_trades and expectancy is not None and expectancy > 0,
+            "calibrated": n >= min_trades and lcb is not None and lcb > 0,
         }
     return {"env": str(env).upper(), "min_trades": min_trades, "buckets": buckets, "unscored": unscored,
             "out_of_range": out_of_range}
@@ -175,7 +195,7 @@ def load_calibration(base_dir: str) -> Optional[dict]:
 def bucket_is_calibrated(cal: Optional[dict], score: Any, env: str = STORE_ENV, now: Optional[float] = None,
                          max_age_s: int = MAX_AGE_S, min_trades: int = DEFAULT_MIN_TRADES) -> Tuple[bool, str]:
     """(True, reason) only when the store is a fresh store of `env` and the score's bucket has n >= min_trades
-    with positive net expectancy; (False, reason) otherwise (missing data always means not calibrated)."""
+    and lcb95_r_net > 0; (False, reason) otherwise (missing data always means not calibrated)."""
     if cal is None:
         return False, "calibration store missing or unreadable"
     gen = _num(cal.get("generated_at_ts")) if isinstance(cal, dict) else None
@@ -204,10 +224,11 @@ def bucket_is_calibrated(cal: Optional[dict], score: Any, env: str = STORE_ENV, 
     n = int(n)
     if n < min_trades:
         return False, f"n={n} < {min_trades}"
-    exp = _num(b.get("expectancy_r_net"))
-    if exp is None or exp <= 0:
-        return False, f"net expectancy {'n/a' if exp is None else format(exp, '+.4f') + 'R'} <= 0 over n={n}"
-    return True, f"bucket {label} calibrated (n={n}, net expectancy {exp:+.4f}R)"
+    lcb = _num(b.get("lcb95_r_net"))
+    if lcb is None or lcb <= 0:
+        return False, (f"net R lower 95% bound {'n/a' if lcb is None else format(lcb, '+.4f') + 'R'} <= 0 over "
+                       f"n={n}")
+    return True, f"bucket {label} calibrated (n={n}, net R lower 95% bound {lcb:+.4f}R)"
 
 
 def calibration_policy(profile: Any) -> Tuple[bool, int]:
@@ -247,11 +268,16 @@ def tier_s_confirmation_required(cand: Any, env: str, profile: Any, base_dir: st
         return None
     score = cand.get("score")
     try:
-        cal, load_reason = load_calibration_with_reason(base_dir)
-        if cal is None:
-            ok, reason = False, load_reason
+        label = bucket_for(score)
+        if label is not None and label not in TIER_S_BUCKETS:
+            # a Tier S label never borrows a lower bucket's calibration (PR #204 re-review)
+            ok, reason = False, f"tier_s_score_below_80 (score {_int_score(score)})"
         else:
-            ok, reason = bucket_is_calibrated(cal, score, STORE_ENV, now=now, min_trades=min_trades)
+            cal, load_reason = load_calibration_with_reason(base_dir)
+            if cal is None:
+                ok, reason = False, load_reason
+            else:
+                ok, reason = bucket_is_calibrated(cal, score, STORE_ENV, now=now, min_trades=min_trades)
         if ok:
             ok, reason = radar_snapshot_matches(cand, base_dir)
     except Exception as e:  # fail closed
@@ -265,14 +291,20 @@ DOSSIER_REL_PATH = os.path.join("logs", "evaluations", "latest_dossier.json")
 def radar_snapshot_matches(cand: dict, base_dir: str) -> Tuple[bool, str]:
     """(True, reason) only when the stored latest dossier record carries radar_snapshots["SYMBOL|DIRECTION"] (joined
     by record_evaluation.py from the brief's radar rows) whose `confidence` equals the dossier `score` exactly, so the
-    evaluator cannot pick a calibrated bucket by writing a different score. Any read problem is not a match."""
+    evaluator cannot pick a calibrated bucket by writing a different score. The record is bound to the dossier the
+    gate validated: its provenance sha256 must equal the candidate's `dossier_sha256` (else `dossier_changed`, as
+    in the executor's read_radar_snapshot). Any read problem is not a match."""
     key = f"{str(cand.get('symbol') or '').upper()}|{str(cand.get('direction') or '').upper()}"
     try:
         with open(os.path.join(base_dir, DOSSIER_REL_PATH), "r", encoding="utf-8") as f:
             record = json.load(f)
         snaps = record.get("radar_snapshots") if isinstance(record, dict) else None
+        prov = record.get("provenance") if isinstance(record, dict) else None
+        stored_sha = prov.get("sha256") if isinstance(prov, dict) else None
     except Exception:
         return False, "radar_snapshot_unreadable"
+    if not cand.get("dossier_sha256") or stored_sha != cand.get("dossier_sha256"):
+        return False, "dossier_changed"
     entry = snaps.get(key) if isinstance(snaps, dict) else None
     row = entry.get("radar_snapshot") if isinstance(entry, dict) else None
     if not isinstance(row, dict):

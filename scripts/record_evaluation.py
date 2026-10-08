@@ -92,10 +92,13 @@ RADAR_SNAPSHOT_WINDOW_S = 900  # the brief's radar scores must be at most 15 min
 
 
 def build_radar_snapshots(record: dict, base_dir: Optional[str] = None) -> Optional[dict]:
-    """Audit-only join of each approved candidate with the radar row that prime_evaluator_brief.py wrote to
+    """Join of each approved candidate with the radar row that prime_evaluator_brief.py wrote to
     logs/primed_brief_scores.json (issue #202). Keyed "SYMBOL|DIRECTION"; each value is {radar_snapshot,
     radar_snapshot_reason} with reason missing / unreadable / stale / no_match when the row is null. It is stored
-    outside the provenance sha256 (which hashes only the evaluator's <dossier_json>) and no gate reads it."""
+    outside the provenance sha256 (which hashes only the evaluator's <dossier_json>). Readers: the executor's audit
+    record, and the calibrated Tier S gate (utils.score_calibration.radar_snapshot_matches, in the executor and the
+    guard), which asks the user unless the snapshot confidence equals the dossier score and the record's sha256 is
+    the one the gate validated."""
     cands = [c for c in record.get("approved_candidates") or [] if isinstance(c, dict)]
     if str(record.get("status", "")).upper() != "APPROVED" or not cands:
         return None

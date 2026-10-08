@@ -33,11 +33,13 @@ import test_claude_code_support as tccs  # noqa: E402  (fixtures only)
 
 SESSION = tccs.SESSION
 GROUND_TRUTH = ("session_state.json", "guardian_state.json", "pending_entries.json", "hook_heartbeat.json",
-                "score_calibration.json", "trade_outcomes.jsonl", "trades_audit.jsonl")  # issue #202
+                "score_calibration.json", "trade_outcomes.jsonl", "trades_audit.jsonl",  # issue #202
+                "primed_brief.json", "primed_brief_scores.json")
 WRITERS = {"session_state.json": "sync_session_state.py", "guardian_state.json": "position_guardian_loop.py",
            "pending_entries.json": "execute_futures_trade.py", "hook_heartbeat.json": "pre_trade_guard.py",
            "score_calibration.json": "trading_scorecard.py", "trade_outcomes.jsonl": "trade_outcomes.py",
-           "trades_audit.jsonl": "execute_futures_trade.py"}
+           "trades_audit.jsonl": "execute_futures_trade.py", "primed_brief.json": "prime_evaluator_brief.py",
+           "primed_brief_scores.json": "prime_evaluator_brief.py"}
 
 
 def path_forms(rel_windows: str):

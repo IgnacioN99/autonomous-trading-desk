@@ -157,10 +157,12 @@ This configures:
 - Maximum margin ratio ceiling (`max_margin_ratio`, default 30% per trade).
 - Leverage (`leverage_standard`, `leverage_yolo`; desk ceiling 15x) and optional `yolo_margin_fixed`.
 - Autonomous Tier S execution (`autonomous_execution_tier_s`, off by default). With `require_calibrated_tier_s` (on by
-  default) an autonomous Tier S also needs a calibrated score bucket: at least `tier_s_calibration_min_trades` (default
-  30) resolved PROD trades with positive net expectancy in R, from `logs/score_calibration.json` (written only by
-  `python3 scripts/trading_scorecard.py`). Otherwise the user is asked and the order needs `--confirmed`. The radar
-  score is a heuristic, not a probability; until a bucket reaches 30 such trades every Tier S asks the user.
+  default) an autonomous Tier S also needs a calibrated Tier S score bucket (80-89 or 90-95): at least
+  `tier_s_calibration_min_trades` (default 30) resolved non-YOLO PROD trades whose one-sided 95% lower confidence
+  bound of the mean net R (mean - 1.645 x sd / sqrt(n)) is above 0, from `logs/score_calibration.json` (written only
+  by `python3 scripts/trading_scorecard.py`), and a dossier score equal to the radar snapshot's. Otherwise the user
+  is asked and the order needs `--confirmed`. The radar score is a heuristic, not a probability; until a bucket
+  qualifies every Tier S asks the user.
 - Maximum concurrent open positions (default: 3).
 - Overnight handling mode (`ZERO_OVERNIGHT_RISK`).
 - Taleb Barbell YOLO moonshot preference.
@@ -226,7 +228,7 @@ python3 scripts/broad_market_radar.py --json             # 80+ pair intraday scr
 python3 scripts/broad_yolo_scanner.py --json             # memecoin / YOLO moonshot screener
 python3 scripts/quant_risk_engine.py parity --json       # also: pairs, kelly
 python3 scripts/fetch_newsletters.py --format json       # research newsletters & catalysts
-python3 scripts/prime_evaluator_brief.py --json          # writes logs/primed_brief.json (add --out <path> for a copy)
+python3 scripts/prime_evaluator_brief.py --json          # writes the evaluator brief under logs/ (add --out <path> for a copy)
 ```
 
 Third-party Binance skills (under `.agents/skills/`) may be installed locally but are not part of the flow; agents must never use them to place orders, move funds or sign API requests.

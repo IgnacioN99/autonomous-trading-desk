@@ -101,7 +101,8 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    liveness, see 11) <- this hook itself (issue #73); logs/score_calibration.json (Tier S score calibration,
    issue #202) <- scripts/trading_scorecard.py; logs/trade_outcomes.jsonl (the store's only input) <-
    scripts/trade_outcomes.py; logs/trades_audit.jsonl (entry ledger, the outcomes' source) <-
-   scripts/execute_futures_trade.py. File tools targeting them are denied: relative, absolute and Windows paths, NTFS aliases
+   scripts/execute_futures_trade.py; logs/primed_brief.json and logs/primed_brief_scores.json (evaluator brief and
+   its radar scores) <- scripts/prime_evaluator_brief.py. File tools targeting them are denied: relative, absolute and Windows paths, NTFS aliases
    (trailing dot/space, ::$DATA streams) and targets whose os.path.realpath / samefile is a protected file
    (symlinked directory, hard link).
    Shell commands. The program of a sub-command is found past VAR=value / VAR+=value assignments, shell keywords
@@ -723,6 +724,8 @@ TRANSCRIPT_ROOT_OVERRIDE_RE = re.compile(
 # score_calibration.json decides whether an autonomous Tier S needs the user's confirmation (issue #202); a forged
 # calibrated bucket would skip it. trade_outcomes.jsonl is the only input the scorecard merges into that store, and
 # trades_audit.jsonl (the executor's entry ledger, also read by Gate 0A and the exit manager) is its source.
+# primed_brief.json (the evaluator's only input, read with the Read tool, which stays allowed) and
+# primed_brief_scores.json (the radar scores the recorder joins into the dossier for the calibrated-bucket gate).
 GROUND_TRUTH_FILES = {
     "logs/session_state.json": "`python3 scripts/sync_session_state.py`",
     "logs/guardian_state.json": "`python3 scripts/loops/position_guardian_loop.py`",
@@ -731,6 +734,8 @@ GROUND_TRUTH_FILES = {
     "logs/score_calibration.json": "`python3 scripts/trading_scorecard.py`",
     "logs/trade_outcomes.jsonl": "`python3 scripts/trade_outcomes.py`",
     "logs/trades_audit.jsonl": "`python3 scripts/execute_futures_trade.py` (entry audit records and failsafe-abort events)",
+    "logs/primed_brief.json": "`python3 scripts/prime_evaluator_brief.py`",
+    "logs/primed_brief_scores.json": "`python3 scripts/prime_evaluator_brief.py`",
 }
 GROUND_TRUTH_BASENAMES = {path.rsplit("/", 1)[-1].lower(): path for path in GROUND_TRUTH_FILES}
 GROUND_TRUTH_RE = re.compile("|".join(re.escape(n) for n in GROUND_TRUTH_BASENAMES), re.IGNORECASE)
@@ -1447,7 +1452,8 @@ def check_dossier(symbol: str, direction: Optional[str], env: str, base_dir: str
             f"Evaluator transcript does not approve {symbol} {direction or ''}".rstrip()
             + " (the recorded dossier differs from what the evaluator emitted)."
         ), None
-    cand = rebuilt_cand
+    # The validated provenance sha (issue #202): binds the radar snapshot the calibration gate reads to this dossier
+    cand = dict(rebuilt_cand, dossier_sha256=(rebuilt.get("provenance") or {}).get("sha256"))
 
     if conversation_id:
         parent = rebuilt.get("parent_conversation_id")

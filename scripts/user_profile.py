@@ -44,7 +44,7 @@ DEFAULT_PROFILE = {
     "operating_mode": "BALANCED_DELTA_NEUTRAL", # BALANCED_DELTA_NEUTRAL | CONSERVATIVE | AGGRESSIVE
     "autonomous_execution_tier_s": False, # Cold start: autonomous execution disabled by default; requires explicit opt-in
     # Issue #202: autonomous Tier S only in a calibrated score bucket (n >= min trades resolved PROD trades with
-    # positive net R, logs/score_calibration.json); otherwise ask the user. Validated by
+    # a 95% lower bound of mean net R > 0, logs/score_calibration.json); otherwise ask the user. Validated by
     # utils.score_calibration.calibration_policy (bool; int >= 1; anything else = the default).
     "require_calibrated_tier_s": True,
     "tier_s_calibration_min_trades": 30,

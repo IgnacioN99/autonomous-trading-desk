@@ -47,8 +47,9 @@ def setUpModule():
 def write_calibrated_store(root, now=None, env="PROD", n=30, expectancy=0.25):
     """Issue #202 fixture: a fresh logs/score_calibration.json whose Tier S buckets (80-89, 90-95) are calibrated
     (n trades with positive net expectancy), so the autonomous Tier S gate is exercised positively by default."""
-    stats = {"n": n, "wins": n // 2, "win_rate": 0.5, "expectancy_r_net": expectancy, "mean_mfe_r": 1.0,
-             "insufficient": n < 20, "calibrated": n >= 30 and expectancy > 0}
+    lcb = round(expectancy - 1.645 * 0.5 / n ** 0.5, 4)  # sd 0.5R: 30 trades at +0.25R give LCB95 ~ +0.10R
+    stats = {"n": n, "wins": n // 2, "win_rate": 0.5, "expectancy_r_net": expectancy, "sd_r_net": 0.5,
+             "lcb95_r_net": lcb, "mean_mfe_r": 1.0, "insufficient": n < 20, "calibrated": n >= 30 and lcb > 0}
     os.makedirs(os.path.join(root, "logs"), exist_ok=True)
     with open(os.path.join(root, "logs", "score_calibration.json"), "w", encoding="utf-8") as f:
         json.dump({"schema_version": 1, "generated_at_ts": int(now if now is not None else time.time()), "env": env,
@@ -504,9 +505,11 @@ class TestGroundTruthProtection(GuardHarness):
         "score_calibration.json": "scripts/trading_scorecard.py",  # issue #202
         "trade_outcomes.jsonl": "scripts/trade_outcomes.py",       # issue #202: the store's only input
         "trades_audit.jsonl": "scripts/execute_futures_trade.py",  # issue #202 (PR #204): the outcomes' source
+        "primed_brief.json": "scripts/prime_evaluator_brief.py",   # issue #202: the evaluator's input
+        "primed_brief_scores.json": "scripts/prime_evaluator_brief.py",
     }
     NEW_FILES = ("guardian_state.json", "pending_entries.json", "hook_heartbeat.json", "score_calibration.json",
-                 "trade_outcomes.jsonl", "trades_audit.jsonl")
+                 "trade_outcomes.jsonl", "trades_audit.jsonl", "primed_brief.json", "primed_brief_scores.json")
 
     def assertGroundTruthDenied(self, res, name, label=""):
         self.assertDenied(res, "Ground Truth Protection")

@@ -18,9 +18,10 @@ open / fills_unavailable rows and rows without realized R are excluded and count
 3. Score calibration (issue #202, PROD only, the gate's env): closed PROD rows with net R, bucketed by their dossier
    score (a heuristic, not a probability), merged by trade key into logs/score_calibration.json across runs (the CLI
    writes it on every run with PROD rows read from logs/trade_outcomes.jsonl, never from a custom --outcomes file;
-   this script is its sole writer). Per bucket n, win rate, net expectancy,
+   this script is its sole writer). Per bucket n, win rate, net expectancy, sd and lcb95 of net R,
    mean MFE, mean radar score, insufficient (n < MIN_SAMPLE) and calibrated (n >= profile
-   tier_s_calibration_min_trades with positive net expectancy); rows without a dossier score count as unscored.
+   tier_s_calibration_min_trades and lcb95 = mean - 1.645 x sd / sqrt(n) > 0); YOLO rows are excluded; rows without a
+   dossier score count as unscored.
 4. Loss-cause clusters from logs/trade_insights.jsonl (env-agnostic).
 5. Meta-improver: below MIN_SAMPLE resolved trades only an insufficient-sample line; above it R-based data notes only
    (never instructions: any change needs the user's explicit decision). The profit-factor note needs net R on every
@@ -252,7 +253,8 @@ def calibration_store(rows, now, min_trades):
 def _calibration_block(store, min_trades, written):
     cal = store if isinstance(store, dict) and isinstance(store.get("buckets"), dict) \
         else scal.build_calibration([], scal.STORE_ENV, min_trades)
-    keys = ("n", "wins", "win_rate", "expectancy_r_net", "mean_mfe_r", "mean_radar_score", "insufficient",
+    keys = ("n", "wins", "win_rate", "expectancy_r_net", "sd_r_net", "lcb95_r_net", "mean_mfe_r", "mean_radar_score",
+            "insufficient",
             "calibrated")
     return {
         "basis": "dossier_score", "note": "heuristic score, not a probability", "env": scal.STORE_ENV,
@@ -390,10 +392,12 @@ def format_scorecard_report(sc: dict) -> str:
             flag = "calibrated" if b["calibrated"] else ("insufficient" if b["insufficient"] else "not calibrated")
             win = _fmt(b["win_rate"] * 100 if b["win_rate"] is not None else None, ".1f")
             lines.append(f"  - {b['bucket']}: n={b['n']} | Win Rate: {win}% | Exp net: "
-                         f"{_fmt(b['expectancy_r_net'], '+.4f')}R | MFE: {_fmt(b['mean_mfe_r'], '.2f')}R | "
-                         f"radar score: {_fmt(b['mean_radar_score'], '.1f')} | {flag}")
+                         f"{_fmt(b['expectancy_r_net'], '+.4f')}R | lcb95: {_fmt(b['lcb95_r_net'], '+.4f')}R | "
+                         f"MFE: {_fmt(b['mean_mfe_r'], '.2f')}R | radar score: {_fmt(b['mean_radar_score'], '.1f')} | "
+                         f"calibrated: {'yes' if b['calibrated'] else 'no'} ({flag})")
         lines.append(f"  unscored: {cal['unscored']} | out of range: {cal['out_of_range']} | autonomous Tier S "
-                     f"needs n >= {cal['min_trades']} and net expectancy > 0")
+                     f"needs a Tier S bucket (80-89 / 90-95) with n >= {cal['min_trades']} and a one-sided 95% "
+                     "lower bound of mean net R > 0")
         lines.append("-" * 70)
     lines.append("🔬 LOSS ROOT CAUSE CLUSTERS (all envs):")
     for cause, cnt in sc["insights"]["loss_cause_clusters"].items():

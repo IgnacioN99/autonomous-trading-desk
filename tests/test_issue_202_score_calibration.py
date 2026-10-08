@@ -21,6 +21,7 @@ import datetime
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -547,6 +548,32 @@ class TestScoreCalibrationModule(_Workspace):
         cal.update(over)
         return cal
 
+    @staticmethod
+    def spread(mean, sd, n=30):
+        """n values with exactly this mean and sample sd (n-1): half at mean + a, half at mean - a."""
+        a = sd * ((n - 1) / n) ** 0.5
+        return [mean + a if i % 2 else mean - a for i in range(n)]
+
+    def test_lower_confidence_bound_decides_calibration(self):
+        for mean, sd, calibrated in ((0.2, 2.5, False), (0.8, 1.0, True)):
+            with self.subTest(mean=mean, sd=sd):
+                rows = [outcome(85, r, key=i) for i, r in enumerate(self.spread(mean, sd))]
+                store = scal.merge_store(None, rows, now=time.time())
+                b = store["buckets"]["80-89"]
+                self.assertAlmostEqual(b["expectancy_r_net"], mean, places=4)
+                self.assertAlmostEqual(b["sd_r_net"], sd, places=4)
+                self.assertAlmostEqual(b["lcb95_r_net"], round(mean - 1.645 * sd / 30 ** 0.5, 4), places=4)
+                self.assertEqual(b["calibrated"], calibrated)
+                ok, reason = scal.bucket_is_calibrated(store, 85, "PROD")
+                self.assertEqual(ok, calibrated, reason)
+                if not calibrated:
+                    self.assertIn("lower 95% bound -0.5508R <= 0 over n=30", reason)
+        self.assertEqual(scal.lower_confidence_bound([1.0]), (None, None))   # n < 2: undefined sd
+        one = scal.build_calibration([outcome(85, 5.0)], "PROD", min_trades=1)["buckets"]["80-89"]
+        self.assertEqual((one["lcb95_r_net"], one["calibrated"]), (None, False))
+        store = scal.merge_store(None, [outcome(85, 5.0)], now=time.time(), min_trades=1)
+        self.assertFalse(scal.bucket_is_calibrated(store, 85, "PROD", min_trades=1)[0])
+
     def test_yolo_rows_never_calibrate_tier_s(self):
         yolo = [dict(outcome(85, 1.0, key=i), is_yolo=True) for i in range(30)]
         self.assertEqual(scal.build_calibration(yolo, "PROD", 30)["buckets"]["80-89"]["n"], 0)
@@ -769,6 +796,54 @@ class TestGuardCalibrationGate(tgb.GuardHarness):
         self.assertEqual(self.deploy().get("decision"), "allow")
         self.assertTrue(eft.enforce_evaluation_dossier("BTCUSDT", "LONG", "prod", base_dir=self.root)[0])
 
+    def test_tier_s_label_needs_a_tier_s_bucket(self):
+        """A Tier S with score 70 never borrows a calibrated 65-74 bucket (executor and guard, same message)."""
+        stats = {"n": 40, "wins": 30, "win_rate": 0.75, "expectancy_r_net": 0.9, "sd_r_net": 0.5,
+                 "lcb95_r_net": 0.77, "insufficient": False, "calibrated": True}
+        with open(self.store_path(), "w", encoding="utf-8") as f:
+            json.dump({"generated_at_ts": int(time.time()), "env": "PROD",
+                       "buckets": {"65-74": stats, "80-89": stats, "90-95": stats}}, f)
+        self.write_provenance_dossier(extra={"score": 70})
+        res = self.deploy()
+        self.assertDenied(res, CALIB_GATE)
+        self.assertIn("Tier S score bucket 65-74 not calibrated (tier_s_score_below_80 (score 70))", res["reason"])
+        ok, ex_reason, _ = eft.enforce_evaluation_dossier("BTCUSDT", "LONG", "prod", base_dir=self.root)
+        self.assertFalse(ok)
+        self.assertIn(ex_reason.split("BTCUSDT: ", 1)[1], res["reason"])
+        self.assertEqual(self.deploy("--confirmed").get("decision"), "allow")
+        self.assertTrue(eft.enforce_evaluation_dossier("BTCUSDT", "LONG", "prod", base_dir=self.root,
+                                                       confirmed=True)[0])
+        self.write_provenance_dossier(extra={"score": 85})  # same store, Tier S bucket -> autonomous
+        self.assertEqual(self.deploy().get("decision"), "allow")
+
+    def test_snapshot_bound_to_the_validated_dossier_sha(self):
+        self.write_provenance_dossier()
+        real_check, real_validate = pre_trade_guard.check_dossier, eft.validate_dossier_for_trade
+
+        def guard_check(*a, **kw):
+            ok, reason, cand = real_check(*a, **kw)
+            return ok, reason, dict(cand, dossier_sha256="f" * 64) if cand else cand
+
+        def exec_validate(*a, **kw):
+            ok, reason, cand = real_validate(*a, **kw)
+            return ok, reason, dict(cand, dossier_sha256="f" * 64) if cand else cand
+
+        with patch.object(pre_trade_guard, "check_dossier", side_effect=guard_check):
+            res = self.deploy()
+        self.assertDenied(res, CALIB_GATE)
+        self.assertIn("80-89 not calibrated (dossier_changed)", res["reason"])
+        with patch.object(eft, "validate_dossier_for_trade", side_effect=exec_validate):
+            ok, ex_reason, _ = eft.enforce_evaluation_dossier("BTCUSDT", "LONG", "prod", base_dir=self.root)
+        self.assertFalse(ok)
+        self.assertIn(ex_reason.split("BTCUSDT: ", 1)[1], res["reason"])
+        # unpatched: the guard and the executor both carry the validated sha and match
+        self.assertEqual(self.deploy().get("decision"), "allow")
+        _, _, cand = eft.enforce_evaluation_dossier("BTCUSDT", "LONG", "prod", base_dir=self.root)
+        with open(self.dossier_path, encoding="utf-8") as f:
+            self.assertEqual(cand["dossier_sha256"], json.load(f)["provenance"]["sha256"])
+        self.assertEqual(scal.radar_snapshot_matches(dict(cand, dossier_sha256=None), self.root),
+                         (False, "dossier_changed"))
+
     def test_unreadable_dossier_record_is_not_a_match(self):
         cand = {"symbol": "BTCUSDT", "direction": "LONG", "score": 85}
         self.assertEqual(scal.radar_snapshot_matches(cand, os.path.join(self.root, "nowhere")),
@@ -789,7 +864,7 @@ class TestGuardCalibrationGate(tgb.GuardHarness):
 
     def test_score_reasons(self):
         for score, fragment in ((None, "no dossier score"), (50, "outside the calibration buckets"),
-                                (77, "n=0 < 30")):
+                                (77, "tier_s_score_below_80 (score 77)"), (96, "outside the calibration buckets")):
             with self.subTest(score=score):
                 extra = {"score": score} if score is not None else {"score": None}
                 self.write_provenance_dossier(extra=extra)
@@ -893,6 +968,46 @@ class TestCalibrationStoreGroundTruth(tgb.GuardHarness):
                   "python3 scripts/loops/position_guardian_loop.py --once"):
             self.assertNotIn("Ground Truth Protection", self.agy(self.cmd(c)).get("reason", ""), c)
 
+    def test_brief_files_are_ground_truth_but_readable(self):
+        for name in ("primed_brief.json", "primed_brief_scores.json"):
+            for c in (f"echo '{{}}' > logs/{name}", f"cp /tmp/forged.json logs/{name}", f"rm logs/{name}",
+                      f"python3 -c \"open('logs/{name}', 'w').write('{{}}')\""):
+                res = self.agy(self.cmd(c))
+                self.assertDenied(res, "Ground Truth Protection")
+                self.assertIn(f"logs/{name} may only be written by `python3 scripts/prime_evaluator_brief.py`",
+                              res["reason"], c)
+            self.assertDenied(self.agy({"toolCall": {"name": "write_to_file", "args": {
+                "TargetFile": f"logs/{name}", "CodeContent": "{}"}}}))
+            for c in (f"cat logs/{name}", f"python3 -m json.tool logs/{name}"):
+                self.assertNotEqual(self.agy(self.cmd(c)).get("decision"), "deny", c)
+            # Read tools (the evaluator reads the brief with view_file / Read)
+            self.assertNotEqual(self.agy({"toolCall": {"name": "view_file", "args": {
+                "AbsolutePath": os.path.join(self.root, "logs", name)}}}).get("decision"), "deny")
+            claude = self.run_guard({"tool_name": "Read", "tool_input": {"file_path": os.path.join(self.root, "logs",
+                                                                                                    name)}})
+            self.assertNotEqual(claude.get("__exit_code__"), 2, claude)
+        self.assertIn("logs/primed_brief.json", pre_trade_guard.GROUND_TRUTH_FILES)
+        self.assertIn("logs/primed_brief_scores.json", pre_trade_guard.GROUND_TRUTH_FILES)
+
+    def test_documented_brief_commands_not_denied(self):
+        """The clean-room flow as documented (CLAUDE.md, AGENTS.md, SKILL, README) still passes the guard."""
+        readme = TestPromptAndDocs.read("README.md")
+        documented = [l.strip() for l in readme.splitlines() if l.strip().startswith("python3 scripts/prime_evaluator")]
+        self.assertTrue(documented)
+        for c in documented + ["python3 scripts/prime_evaluator_brief.py", "python3 scripts/prime_evaluator_brief.py "
+                               "--env testnet", "python3 scripts/prime_evaluator_brief.py --json",
+                               "python3 scripts/record_evaluation.py --from-subagent abc",
+                               "python3 scripts/record_evaluation.py --from-claude-subagent a0123456789abcdef"]:
+            with self.subTest(command=c):
+                res = self.agy(self.cmd(c))
+                self.assertNotEqual(res.get("decision"), "deny", res)
+                self.assertNotIn("Ground Truth Protection", res.get("reason", ""))
+        for doc in ("CLAUDE.md", "AGENTS.md", os.path.join(".agents", "skills", "trade-execution-planner", "SKILL.md")):
+            for line in TestPromptAndDocs.read(doc).splitlines():
+                for cmd in re.findall(r"`(python3 scripts/[^`]+)`", line):
+                    if "primed_brief" in cmd:
+                        self.fail(f"{doc} documents a command naming a protected brief file: {cmd}")
+
     def test_suggested_report_issue_commands_are_not_denied(self):
         """Every report_issue.sh command the doctor suggests (placeholders filled) passes the guard and names no
         ground-truth file (issue #202 audit round 3)."""
@@ -952,6 +1067,9 @@ class TestScorecardCalibration(tsc.ScorecardBase):
         self.assertEqual(code, 0)
         self.assertIn("CALIBRATION BY SCORE BUCKET (dossier score; heuristic, not a probability", out)
         self.assertIn("PERFORMANCE BY TIER:", out)
+        self.assertIn("80-89: n=30 | Win Rate: 100.0% | Exp net: +0.5000R | lcb95: +0.5000R", out)
+        self.assertIn("calibrated: yes (calibrated)", out)
+        self.assertIn("55-64: n=0 | Win Rate: n/a% | Exp net: n/aR | lcb95: n/aR", out)
         self.assertNotIn("CONVICTION", out)
         with open(os.path.join(self.logs, "trading_scorecard.json"), encoding="utf-8") as f:
             block = json.load(f)["score_calibration"]
@@ -1062,7 +1180,9 @@ class TestPromptAndDocs(unittest.TestCase):
         for shot in ("FILUSDT Tier S, confidence 95 = score 95", "SOLUSDT Tier A+, confidence 70 = score 70",
                      "Tier A), confidence 60 = score 60"):
             self.assertIn(shot, text)
-        self.assertEqual(text.count('"score": '), 3)  # the three shot dossiers
+        self.assertEqual(text.count('"score": '), 4)  # the three shot dossiers + the contract's sample YOLO item
+        self.assertIn('"leverage": 5, "score": null, "is_yolo": true', text)
+        self.assertIn("stays the raw radar `confidence` even when RULE 3 downgrades the tier; never adjust it", text)
         self.assertNotIn("Maximum Conviction", text)
 
     def test_agents_md_and_docs(self):
