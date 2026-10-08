@@ -588,7 +588,8 @@ class TestUnregisteredRestingEntriesGate(ExecutorHarness):
                 self.assertIn(fragment, res["error"], entry)
             self.assertEqual(self.writes(), [], f"no margin/leverage/order write on rejection: {entry}")
             all_symbol_gets = [c[1] for c in self.calls if c[0] == "GET" and c[2] == {}]
-            self.assertEqual(all_symbol_gets, ["/fapi/v2/positionRisk", "/fapi/v1/openAlgoOrders", "/fapi/v1/openOrders"],
+            # Issue #160: order listings before positionRisk.
+            self.assertEqual(all_symbol_gets, ["/fapi/v1/openAlgoOrders", "/fapi/v1/openOrders", "/fapi/v2/positionRisk"],
                              "bounded: the three GETs of the live snapshot (issue #101), fetched once")
 
     def test_deleted_registry_with_resting_conditional_entry_rejects_every_entry(self):
