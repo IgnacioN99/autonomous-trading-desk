@@ -197,6 +197,12 @@ class TestTp1OrderIdProof(OndoUpdateBase):
                 self.assertEqual(lock["lock_r"], 0.0)
                 self.assertEqual(len([c for c in fake.calls if c[1] == USER_TRADES]), 1)
 
+    def test_missing_tp1_fill_is_reported(self):
+        res, _, _, _ = self._run(tp1_order_id=999)
+        self.assertIn("tp1_fill_not_in_user_trades", res.get("warnings") or [])
+        res, _, _, _ = self._run(tp1_order_id=2)
+        self.assertNotIn("tp1_fill_not_in_user_trades", res.get("warnings") or [])
+
     def test_string_order_ids_match(self):
         res, _, _, _ = self._run(tp1_order_id="2")
         self.assertEqual(res["profit_lock"]["mfe_source"], "tp1_price")

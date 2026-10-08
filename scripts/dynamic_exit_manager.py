@@ -671,9 +671,11 @@ def update_position_to_structural_stop(symbol, target_env=None, dry_run=False, p
     intrabar_extreme = None
     tp1_price = None
     tp1_order_id = ref_rec.get("tp1_order_id") if isinstance(ref_rec, dict) else None
-    if tp1_ok is True and tp1_order_id is not None and any(str(f.get("orderId")) == str(tp1_order_id)
-                                                          for f in user_trades_seen):
-        tp1_price = ref_rec.get("tp1_price")  # a manual partial close is not a TP1 fill (Issue #197)
+    if tp1_ok is True and tp1_order_id is not None:
+        if any(str(f.get("orderId")) == str(tp1_order_id) for f in user_trades_seen):
+            tp1_price = ref_rec.get("tp1_price")  # a manual partial close is not a TP1 fill (Issue #197)
+        else:  # e.g. the TP1 fill is older than the userTrades page read: the lock only reads lower (safe)
+            base["warnings"].append("tp1_fill_not_in_user_trades")
     if (tp1_ok is True and exit_mgmt.get("profit_lock_enabled") and exit_mgmt.get("lock_on_tp1")
             and entry_ts is not None):
         try:

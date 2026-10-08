@@ -1072,6 +1072,8 @@ def format_state(state):
     for w in state.get("trail_warnings") or []:
         lines.append(f"  ~ warning trailing {w.get('symbol') or ''}: "
                      f"{(str(w.get('warning')).splitlines() or [''])[0]}")
+    for w in state.get("exit_management_warnings") or []:  # persistent profile misconfiguration stays visible
+        lines.append(f"  ~ warning exit_management: {(str(w).splitlines() or [''])[0]}")
     for w in state.get("excursion_warnings") or []:
         lines.append(f"  ~ warning excursion {w.get('stage')} {w.get('symbol') or ''}: "
                      f"{(str(w.get('warning')).splitlines() or [''])[0]}")

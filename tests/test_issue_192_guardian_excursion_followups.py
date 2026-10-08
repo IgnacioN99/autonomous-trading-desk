@@ -277,3 +277,14 @@ class TestPriceSource(GuardianExcursionBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestFormatStateShowsProfileWarnings(unittest.TestCase):
+    """A persistent exit_management misconfiguration stays visible in the human summary (PR #211 review)."""
+
+    def test_exit_management_warnings_printed(self):
+        state = {"timestamp_utc": "2026-10-08 20:00:00 UTC", "env": "prod", "dry_run": False, "cycle_ok": True,
+                 "positions": [], "actions": [], "errors": [],
+                 "exit_management_warnings": ["exit_management.trail_activation invalid: defaults used"]}
+        out = pgl.format_state(state)
+        self.assertIn("warning exit_management: exit_management.trail_activation invalid", out)
