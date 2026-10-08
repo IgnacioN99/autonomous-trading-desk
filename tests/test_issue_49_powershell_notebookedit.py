@@ -32,9 +32,9 @@ import test_guard_bypasses as tgb  # noqa: E402  (fixtures only)
 import test_claude_code_support as tccs  # noqa: E402  (fixtures only)
 
 SESSION = tccs.SESSION
-GROUND_TRUTH = ("session_state.json", "guardian_state.json", "pending_entries.json")
+GROUND_TRUTH = ("session_state.json", "guardian_state.json", "pending_entries.json", "hook_heartbeat.json")
 WRITERS = {"session_state.json": "sync_session_state.py", "guardian_state.json": "position_guardian_loop.py",
-           "pending_entries.json": "execute_futures_trade.py"}
+           "pending_entries.json": "execute_futures_trade.py", "hook_heartbeat.json": "pre_trade_guard.py"}
 
 
 def path_forms(rel_windows: str):
