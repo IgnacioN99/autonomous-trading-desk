@@ -148,21 +148,45 @@ def trade_key(row: dict) -> str:
     return f"{str(row.get('symbol') or '').upper()}|{str(row.get('direction') or '').upper()}|{row.get('entry_ts')}"
 
 
-_STORE_FIELDS = ("symbol", "direction", "entry_ts", "env", "status", "is_yolo", "dossier_score", "score",
-                 "realized_r_net", "mfe_r")
+_STORE_FIELDS = ("symbol", "direction", "entry_ts", "audit_ts", "env", "status", "is_yolo", "dossier_score",
+                 "score", "realized_r_net", "mfe_r")
+LEGACY_ENTRY_SLACK_MS = 120 * 1000  # trade_outcomes.ENTRY_FILL_SLACK_MS: pre-#210 entry_ts = audit_ts*1000 - this
+
+
+def _same_trade(stored: dict, row: dict) -> bool:
+    """stored and row describe the same audit record (PR #212): same symbol + direction and the same audit_ts, or a
+    pre-#210 stored row (no audit_ts) whose legacy entry_ts was audit_ts*1000 - LEGACY_ENTRY_SLACK_MS."""
+    if (str(stored.get("symbol") or "").upper(), str(stored.get("direction") or "").upper()) != \
+            (str(row.get("symbol") or "").upper(), str(row.get("direction") or "").upper()):
+        return False
+    audit = _num(row.get("audit_ts"))
+    if audit is None:
+        return False
+    stored_audit = _num(stored.get("audit_ts"))
+    if stored_audit is not None:
+        return stored_audit == audit
+    return _num(stored.get("entry_ts")) == int(audit * 1000) - LEGACY_ENTRY_SLACK_MS
 
 
 def merge_store(existing: Optional[dict], rows: Iterable[dict], now: Optional[float] = None,
                 min_trades: int = DEFAULT_MIN_TRADES) -> dict:
     """New store: the existing `trades` map updated with this run's closed PROD rows (same key = same trade, the
-    newer row wins), then the buckets recomputed from the whole map."""
+    newer row wins), then the buckets recomputed from the whole map. PR #212: a closed row REPLACES any earlier key of
+    the same audit record (re-keyed entry_ts after better entry matching, or a pre-#210 legacy key), so one audit
+    record is counted at most once. Nothing is ever deleted otherwise: a `truncated` (degraded fills), open,
+    no_entry_fill or fills_unavailable row leaves the stored trades untouched, because dropping a stored loss could
+    lift a bucket over its calibration threshold (that would loosen the Tier S confirmation gate)."""
     trades = {}
     if isinstance(existing, dict) and isinstance(existing.get("trades"), dict):
         trades = {k: v for k, v in existing["trades"].items() if isinstance(v, dict)}
     for row in rows or []:
-        if (isinstance(row, dict) and _norm_env(row.get("env")) == "prod" and row.get("status") == "closed"
-                and row.get("is_yolo") is not True):
-            trades[trade_key(row)] = dict({k: row.get(k) for k in _STORE_FIELDS}, env="prod")
+        if (not isinstance(row, dict) or _norm_env(row.get("env")) != "prod" or row.get("is_yolo") is True
+                or row.get("status") != "closed" or row.get("truncated") is True):
+            continue
+        key = trade_key(row)
+        for old in [k for k, v in trades.items() if k != key and _same_trade(v, row)]:
+            del trades[old]  # same audit record under its previous key: replaced, not added
+        trades[key] = dict({k: row.get(k) for k in _STORE_FIELDS}, env="prod")
     store = build_calibration(trades.values(), STORE_ENV, min_trades)
     store.update(schema_version=SCHEMA_VERSION, generated_at_ts=int(time.time() if now is None else now),
                  trades=trades)

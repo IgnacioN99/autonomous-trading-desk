@@ -240,7 +240,7 @@ class TestSourceAndCli(ScorecardBase):
         alt = os.path.join(self.ws, "alt.jsonl")
         with open(alt, "w", encoding="utf-8") as f:
             f.write(json.dumps(row(net=1.0)) + "\n")
-        out_path = os.path.join(self.ws, "out", "sc.json")
+        out_path = os.path.join(self.logs, "out", "sc.json")  # --out must stay inside logs/ (issue #191)
         code, out = self.run_cli(["--outcomes", alt, "--out", out_path, "--json"])
         self.assertEqual((code, json.loads(out)["sample_size"]), (0, 1))
         self.assertTrue(os.path.exists(out_path))

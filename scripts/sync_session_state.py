@@ -17,7 +17,10 @@ either. Issue #160: portfolio_exposure.resting_mismatches lists same-env records
 open position (not counted; the doctor warns), and the order listings are read before positionRisk so an entry
 filling between the reads is double counted rather than missed. The state is only ever written atomically
 (issue #127): a failed write leaves the
-previous file. CLI exit code 1 when the state written is INVALID or the write failed, else 0.
+previous file. Issue #208: closed_today_summary counts trades, not fills (trade_outcomes.summarize_closed_today on
+the day's userTrades, pages of 1000 up to 10 pages, "truncated" when incomplete, and the audit records): closed_trades_count / wins / losses / scratches per trade,
+win_rate_pct = wins / closed_trades_count (scratches count in the denominator), realized_r_net (sum of per-trade R), partial_history (trades entered before today), fills_closed (fills with a
+realized PnL); the USDT figures stay sums over the fills. CLI exit code 1 when the state written is INVALID or the write failed, else 0.
 """
 
 import os
@@ -43,6 +46,54 @@ def get_start_of_day_utc() -> int:
     now = datetime.datetime.now(datetime.timezone.utc)
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     return int(start.timestamp() * 1000)
+
+DAY_FILLS_LIMIT = 1000
+DAY_FILLS_MAX_PAGES = 10
+DAY_FILLS_PAGE_SLEEP_SECONDS = 0.2  # between day-fill pages (only when a day needs more than one page)
+
+
+def fetch_day_fills(start_ms: int, target_env: str):
+    """(fills, truncated) of GET /fapi/v1/userTrades since start_ms (issue #208): pages of DAY_FILLS_LIMIT, each next
+    page from the last fill's time (inclusive, deduplicated by (symbol, id): ids are per symbol), until a page holds fewer than DAY_FILLS_LIMIT
+    rows; at most DAY_FILLS_MAX_PAGES pages. truncated: the cap was hit, a later page failed or brought no new fill
+    (the day's figures may then be incomplete). A failed first read returns its non-list reply (fills unreadable)."""
+    seen, params = {}, {"startTime": int(start_ms), "limit": DAY_FILLS_LIMIT}
+    for page in range(DAY_FILLS_MAX_PAGES):
+        if page:
+            time.sleep(DAY_FILLS_PAGE_SLEEP_SECONDS)  # PR #212 review: pace pages on the shared PROD IP
+        try:
+            res = eft.send_signed_request("GET", "/fapi/v1/userTrades", dict(params), target_env=target_env)
+        except Exception as e:  # PR #212 review: an exception reads as unreadable fills, never a crash of the sync
+            res = {"error": f"{type(e).__name__}: {e}"[:200]}
+        if not isinstance(res, list):
+            return (res, False) if page == 0 else (_sorted_fills(seen), True)
+        new = 0
+        for f in res:
+            key = (str(f.get("symbol") or "").upper(), str(f.get("id"))) if isinstance(f, dict) else None
+            if key and key not in seen:  # fill ids are per symbol: (symbol, id) identifies a fill
+                seen[key] = f
+                new += 1
+        if len(res) < DAY_FILLS_LIMIT:
+            return _sorted_fills(seen), False
+        if not new:
+            return _sorted_fills(seen), True  # a full page of one millisecond: cannot advance
+        params["startTime"] = max(params["startTime"],
+                                  max(int(_as_float(f.get("time"))) for f in res if isinstance(f, dict)))
+    return _sorted_fills(seen), True
+
+
+def _as_float(v) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _sorted_fills(seen: dict) -> List[dict]:
+    """Fills by (time, symbol, id); time and id numeric (a non-numeric value sorts as 0)."""
+    return sorted(seen.values(), key=lambda f: (_as_float(f.get("time")), str(f.get("symbol") or "").upper(),
+                                                _as_float(f.get("id"))))
+
 
 def _read_audit_records():
     """(records, read_error, corrupt_lines) for trades_audit.jsonl (AUDIT_LOG), read once per sync. records: parsed
@@ -122,7 +173,13 @@ def write_error_state(err_msg: str, now_ts: int, now_utc: str, target_env: str, 
             "closed_trades_count": 0,
             "wins": 0,
             "losses": 0,
+            "scratches": 0,
             "win_rate_pct": 0.0,
+            "realized_r_net": 0.0,
+            "partial_history": 0,
+            "fills_closed": 0,
+            "truncated": False,
+            "counted_by": "trades",
             "gross_realized_pnl_usdt": 0.0,
             "commissions_usdt": 0.0,
             "net_realized_pnl_usdt": 0.0
@@ -343,14 +400,14 @@ def sync_session_state(target_env: str = None) -> dict:
                 "type": o.get("type")
             })
 
-    # 5. Today's Trades & Realized PnL
+    # 5. Today's Trades & Realized PnL. USDT sums per fill; trade counts per trade (issue #208): the day's fills are
+    #    matched to the audit entries by trade_outcomes.summarize_closed_today (no extra request), so a TP1 partial
+    #    plus its runner is one trade, not two wins; fills_closed keeps the per-fill count.
     start_ms = get_start_of_day_utc()
-    trades_res = eft.send_signed_request("GET", "/fapi/v1/userTrades", {"startTime": start_ms, "limit": 100}, target_env=target_env)
+    trades_res, day_truncated = fetch_day_fills(start_ms, target_env)
     today_realized_pnl = 0.0
     today_commissions = 0.0
-    closed_trades_count = 0
-    wins_count = 0
-    losses_count = 0
+    fills_closed = 0
 
     if isinstance(trades_res, list):
         for t in trades_res:
@@ -359,11 +416,45 @@ def sync_session_state(target_env: str = None) -> dict:
             today_commissions += comm
             if pnl != 0:
                 today_realized_pnl += pnl
-                closed_trades_count += 1
-                if pnl > 0:
-                    wins_count += 1
-                else:
-                    losses_count += 1
+                fills_closed += 1
+
+    day = {"trades_closed": 0, "wins": 0, "losses": 0, "scratches": 0, "realized_r_net_sum": 0.0,
+           "partial_history": 0}
+    day_error = None
+    day_error_counts_kept = False  # True: per-trade counts kept, the error only names symbols left out of them
+    if isinstance(trades_res, list):
+        try:
+            import trade_outcomes
+            day = trade_outcomes.summarize_closed_today(
+                records, trades_res, start_ms, target_env,
+                open_positions={(p["symbol"].upper(), p["direction"]) for p in active_positions})
+        except Exception as e:
+            day_error = f"{type(e).__name__}: {e}"[:200]
+        # PR #212 review: never report "0 closed trades" after real exits. When the per-trade summary failed, the audit
+        # could not be read, or closing fills exist but no audit trade matched them (e.g. manual exits of positions
+        # missing from the audit), fall back to the legacy per-fill counts (counted_by "fills").
+        open_symbols = {str(p["symbol"]).upper() for p in active_positions}
+        flat_closing_fills = any(float(t.get("realizedPnl", 0)) != 0 and str(t.get("symbol") or "").upper()
+                                 not in open_symbols for t in trades_res)  # a TP1 partial of an open trade is not
+        if day_error is None and (audit_read_error or (day["trades_closed"] == 0 and flat_closing_fills)):
+            day_error = ("audit unreadable: per-trade counts unavailable" if audit_read_error
+                         else "closing fills without a matching audit trade")
+        audit_symbols = {str(r.get("symbol") or "").upper() for r in records if not r.get("event")}
+        unmatched_symbols = sorted({str(t.get("symbol") or "").upper() for t in trades_res
+                                    if float(t.get("realizedPnl", 0)) != 0
+                                    and str(t.get("symbol") or "").upper() not in open_symbols
+                                    and str(t.get("symbol") or "").upper() not in audit_symbols})
+        if day_error is None and unmatched_symbols:  # some symbols counted, others left out: say which (PR #212)
+            day_error = f"closing fills without an audit trade (not counted): {', '.join(unmatched_symbols)}"[:200]
+            day_error_counts_kept = True
+        if day_error is not None and not day_error_counts_kept:
+            wins_f = sum(1 for t in trades_res if float(t.get("realizedPnl", 0)) > 0)
+            losses_f = sum(1 for t in trades_res if float(t.get("realizedPnl", 0)) < 0)
+            day = {"trades_closed": wins_f + losses_f, "wins": wins_f, "losses": losses_f, "scratches": 0,
+                   "realized_r_net_sum": None, "partial_history": 0}
+    closed_trades_count = day["trades_closed"]
+    wins_count = day["wins"]
+    losses_count = day["losses"]
 
     net_realized_today = today_realized_pnl - today_commissions
     win_rate_today = (wins_count / closed_trades_count * 100) if closed_trades_count > 0 else 0.0
@@ -445,16 +536,33 @@ def sync_session_state(target_env: str = None) -> dict:
             "closed_trades_count": closed_trades_count,
             "wins": wins_count,
             "losses": losses_count,
+            "scratches": day["scratches"],
             "win_rate_pct": round(win_rate_today, 1),
+            "realized_r_net": day["realized_r_net_sum"],
+            "partial_history": day["partial_history"],
+            "fills_closed": fills_closed,
+            "truncated": day_truncated,
             "gross_realized_pnl_usdt": round(today_realized_pnl, 4),
             "commissions_usdt": round(today_commissions, 4),
             "net_realized_pnl_usdt": round(net_realized_today, 4)
         },
         "shadow_desk_summary": shadow_summary
     }
+    state["closed_today_summary"]["counted_by"] = ("unavailable" if not isinstance(trades_res, list)
+                                                   else "fills" if day_error and not day_error_counts_kept
+                                                   else "trades")
+    if not isinstance(trades_res, list):  # PR #212 review: an unreadable day-fill read is visible, never a silent 0
+        state["closed_today_summary"]["fills_error"] = str(trades_res)[:200]
+    if day_error:
+        state["closed_today_summary"]["trade_summary_error"] = day_error
 
     # Save to atomic file with kernel-level replace (no non-atomic fallback, issue #127)
     return _write_state(state)
+
+def _fmt_r(value):
+    """Signed R for the markdown summary; "n/a" when the per-trade summary failed (counted_by "fills")."""
+    return "n/a" if value is None else f"{value:+.2f}R"
+
 
 def format_markdown_summary(state: dict) -> str:
     """Generates a compact Markdown report for direct consumption by any agent."""
@@ -469,13 +577,18 @@ def format_markdown_summary(state: dict) -> str:
     exp = state["portfolio_exposure"]
     closed = state["closed_today_summary"]
     btc = state["macro_btc"]
+    partial_note = (f" | Entered before today: {closed['partial_history']}" if closed.get("partial_history") else "")
+    if closed.get("truncated"):
+        partial_note += " | ⚠️ day fills truncated (figures may be incomplete)"
 
     lines = [
         f"# 📡 SESSION & PORTFOLIO STATE ({state['last_updated_utc']})",
         f"**BTC:** ${btc['price_usdt']:,.2f} USDT | **Env:** {state['target_env'].upper()}",
         "",
         "### 📊 Today's Operating Balance",
-        f"* **Closed Trades Today:** {closed['closed_trades_count']} (Wins: {closed['wins']} | Losses: {closed['losses']} | Win Rate: {closed['win_rate_pct']}%)",
+        f"* **Closed Trades Today:** {closed['closed_trades_count']} (Wins: {closed['wins']} | Losses: {closed['losses']} | Scratches: {closed.get('scratches', 0)} | Win Rate: {closed['win_rate_pct']}%)"
+        f" | **Realized R (net):** {_fmt_r(closed.get('realized_r_net', 0.0))} | Closing fills: {closed.get('fills_closed', 0)}"
+        f"{partial_note}",
         f"* **Net Realized PnL Today:** **{'+' if closed['net_realized_pnl_usdt'] >= 0 else ''}{closed['net_realized_pnl_usdt']:.4f} USDT** (Commissions: -${closed['commissions_usdt']:.4f})",
         f"* **Total Floating PnL:** **{'+' if exp['total_floating_pnl_usdt'] >= 0 else ''}{exp['total_floating_pnl_usdt']:.4f} USDT**",
         "",

@@ -4,11 +4,16 @@ exit_policy_sim.py - Offline exit-policy simulator on the desk's real trade path
 
 Read-only and unsigned: it never places, changes or cancels orders and sends no signed request. Inputs are the closed
 rows of logs/trade_outcomes.jsonl (scripts/trade_outcomes.py) for --env, public klines
-(utils/trade_excursion.fetch_klines_range, 1m and 15m, paged 1500 per request, 6 s timeout) and one public
+(utils/trade_excursion.fetch_klines_range, 1m and 15m, paged 1000 per request (weight 5), 0.2 s between pages, HTTP
+429 retried up to 3 tries honouring Retry-After (418 / an over-cap Retry-After never), then "klines_error"; 6 s timeout) and one public
 GET /fapi/v1/exchangeInfo per run (tick size for the trail engine). A row needs initial_risk, entry_ts, entry_price,
-sl_price, tp1_price and tp2_price; others are counted under "skipped" by reason.
+sl_price, tp1_price and tp2_price; others are counted under "skipped" by reason ("no_entry_fill" rows, and
+"malformed" lines of the outcomes file, included).
 
-Replay (per trade, per policy, 1m resolution, from the first full 1m bar after entry to entry + --horizon-hours):
+Replay (per trade, per policy, 1m resolution, from the first full 1m bar after entry to entry + --horizon-hours; the
+entry price is the row's entry_vwap (where the position really started; initial_risk is the sized |audit entry - SL|), else entry_price, for every policy, fee and level;
+the trail engine therefore gets the VWAP entry, while the live guardian hands it the audit entry_price, so on a slipped
+entry the replayed break-even / profit-lock levels differ slightly from live):
   - Worst case first: a 1m bar touching the current stop (LONG low <= stop, SHORT high >= stop) exits the remaining
     size at the stop (taker), even when a TP level is inside the same bar. Stop exits fill AT the stop price, with no
     gap slippage past it (slightly optimistic).
@@ -28,14 +33,17 @@ Replay (per trade, per policy, 1m resolution, from the first full 1m bar after e
     tier by default), expressed in R: fee_rate x price / R per leg.
 Results are in-sample on a small sample (insufficient_sample below MIN_SAMPLE trades): use them to compare policies,
 not as a forecast. The "fidelity" block compares the "current" policy's simulated R with each row's realized_r_net,
-over all rows and over rows with an exact entry time only. A row with entry_commission_included false has an
-approximate entry_ts (trade_outcomes' audit timestamp - 120 s fallback): flagged entry_ts_approx, counted in the
-warnings, skipped with --exact-entry-only (reason "entry_ts_approx").
+over all rows and over rows with an exact entry time only. A row with entry_match "legacy" (or, without
+entry_match, entry_commission_included false) has an approximate entry_ts (trade_outcomes' audit timestamp - 120 s
+fallback): flagged entry_ts_approx, counted in the warnings, skipped with --exact-entry-only (reason
+"entry_ts_approx"). The warnings also carry the ranking caveat (policies are counterfactuals; promoting one to live
+settings requires a reviewed PR) and the auth_mode note (the replay assumes verified TP1, KEYS mode).
 Capture ratio = sum R / sum MFE_R, with MFE over the whole horizon (including after the exit): not comparable to
 trade_outcomes' capture_ratio (MFE up to the real exit). Per trade: atr_r (ATR_15m at entry / R) and lock_binding
 (the profit lock set the stop at least once).
 
-Output: logs/exit_policy_sim.json (--out PATH, rewritten atomically) and, with --json, the same object on stdout.
+Output: logs/exit_policy_sim.json (--out PATH: a file inside logs/, else exit 2 before any read; rewritten atomically)
+and, with --json, the same object on stdout.
 Exit code 0 when at least one trade was simulated, 1 when none, 2 on bad arguments.
 
 Usage:
@@ -57,13 +65,16 @@ import execute_futures_trade as eft
 import dynamic_exit_manager as dem
 import user_profile
 from decimal import Decimal
+from utils.atomic_writer import path_inside_dir
 from utils.env_resolver import resolve_env
 from utils import trade_excursion
 
 BAR_1M_MS = trade_excursion.BAR_MS
 BAR_15M_MS = 15 * BAR_1M_MS
 WARMUP_15M_BARS = 98  # closed 15m bars handed to the trail engine (+1 forming row = the live limit=99 read)
-KLINES_LIMIT = 1500
+KLINES_LIMIT = trade_excursion.KLINES_PAGE_LIMIT  # 1000, weight 5 per page
+KLINES_PAGE_SLEEP_SECONDS = trade_excursion.KLINES_PAGE_SLEEP_SECONDS
+KLINES_MAX_TRIES = trade_excursion.KLINES_MAX_TRIES  # per page on HTTP 429, honouring Retry-After (418 is never retried)
 KLINES_TIMEOUT_SECONDS = 6
 EXCHANGE_INFO_TIMEOUT_SECONDS = 6
 MIN_WARMUP_BARS = 15  # calculate_structural_stop needs at least 15 closed 15m bars
@@ -72,15 +83,30 @@ DEFAULT_TAKER_FEE = 0.0005
 DEFAULT_MAKER_FEE = 0.0002
 MIN_SAMPLE = 30
 IN_SAMPLE_NOTE = "Results are in-sample on the desk's own trades: compare policies, do not read them as a forecast."
+RANKING_NOTE = ("Ranking caveat: policies are counterfactuals; promoting one to live settings requires a reviewed PR "
+                "(tp2_2_5r is below 3:1 R:R, close_at_0_5r truncates the right tail).")
+AUTH_MODE_NOTE = ("auth_mode: the replay counts TP1 fills as verified (KEYS mode); in MCP mode the live guardian "
+                  "never verifies TP1, so post-TP1 trailing there differs from the simulation.")
 EXIT_KINDS = ("sl", "trail_stop", "be", "tp1+trail", "tp2", "capped", "target")
-SKIP_REASONS = ("other_env", "not_closed", "no_risk", "no_levels", "entry_ts_approx", "klines_error", "warmup_short",
-                "filters_error")
+SKIP_REASONS = ("other_env", "no_entry_fill", "not_closed", "no_risk", "no_levels", "entry_ts_approx",
+                "klines_error", "warmup_short", "filters_error", "malformed")
 TRAIL_CADENCES = ("1m", "15m")
 
 
 def entry_ts_approx(row):
-    """True when the row's entry_ts is trade_outcomes' fallback (audit timestamp - 120 s, no entry fill matched)."""
+    """True when the row's entry_ts is trade_outcomes' legacy fallback (audit timestamp - 120 s, no entry fill
+    matched): entry_match "legacy", or, for rows written before entry_match existed, entry_commission_included
+    false."""
+    if row.get("entry_match") is not None:
+        return row.get("entry_match") == "legacy"
     return row.get("entry_commission_included", True) is False
+
+
+def entry_basis(row):
+    """Replay entry price: the row's entry_vwap (VWAP of the matched entry fills; initial_risk stays the sized risk) when
+    present and > 0, else entry_price."""
+    vwap = _num(row.get("entry_vwap"))
+    return vwap if vwap and vwap > 0 else float(row["entry_price"])
 
 
 def _num(value, default=None):
@@ -127,9 +153,11 @@ def _logs_dir():
 
 
 def _read_jsonl(path):
+    """(JSON-object lines of path, malformed line count); ([], 0) when missing. A non-empty line that is not a JSON
+    object is malformed."""
     if not os.path.exists(path):
-        return []
-    out = []
+        return [], 0
+    out, malformed = [], 0
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -138,10 +166,13 @@ def _read_jsonl(path):
             try:
                 rec = json.loads(line)
             except ValueError:
+                malformed += 1
                 continue
             if isinstance(rec, dict):
                 out.append(rec)
-    return out
+            else:
+                malformed += 1
+    return out, malformed
 
 
 def select_rows(rows, env, exact_entry_only=False):
@@ -156,6 +187,8 @@ def select_rows(rows, env, exact_entry_only=False):
     for r in rows:
         if str(r.get("env") or "").strip().lower() != env:
             skip("other_env")
+        elif r.get("status") == "no_entry_fill":
+            skip("no_entry_fill")
         elif r.get("status") != "closed":
             skip("not_closed")
         elif not _num(r.get("initial_risk")) or _num(r.get("initial_risk")) <= 0:
@@ -173,23 +206,12 @@ def select_rows(rows, env, exact_entry_only=False):
 
 
 def fetch_range(symbol, interval, start_ms, end_ms, env):
-    """Raw klines of [start_ms, end_ms) in pages of KLINES_LIMIT (public endpoint). Raises on a failed read."""
+    """Raw klines of [start_ms, end_ms) in pages of KLINES_LIMIT (public endpoint), KLINES_PAGE_SLEEP_SECONDS apart,
+    through the shared trade_excursion.fetch_klines_pages (429 backoff, no retry on 418). Raises on a failed read."""
     step = BAR_15M_MS if interval == "15m" else BAR_1M_MS
-    out = []
-    start = int(start_ms)
-    while start < end_ms:
-        rows = trade_excursion.fetch_klines_range(symbol, interval, start, KLINES_LIMIT, env,
-                                                  timeout=KLINES_TIMEOUT_SECONDS)
-        last_open = None
-        for k in rows:
-            open_ms = int(k[0])
-            last_open = open_ms
-            if start <= open_ms < end_ms:
-                out.append(k)
-        if not rows or last_open is None or len(rows) < KLINES_LIMIT:
-            break
-        start = max(start, last_open) + step
-    return out
+    return trade_excursion.fetch_klines_pages(symbol, interval, start_ms, end_ms, env, step, limit=KLINES_LIMIT,
+                                              timeout=KLINES_TIMEOUT_SECONDS, page_sleep=KLINES_PAGE_SLEEP_SECONDS,
+                                              max_tries=KLINES_MAX_TRIES)
 
 
 def fetch_exchange_info(env):
@@ -278,7 +300,7 @@ def replay(row, path, policy, filters, env, taker_fee, maker_fee, trail_cadence=
     on 15m closes. Both also run it in the minute TP1 fills."""
     is_long = str(row["direction"]).upper() == "LONG"
     sign = 1.0 if is_long else -1.0
-    entry = float(row["entry_price"])
+    entry = entry_basis(row)
     risk = float(row["initial_risk"])
     planned_sl = float(row["sl_price"])
     entry_ts_s = path.entry_ms / 1000.0
@@ -426,13 +448,16 @@ def implied_fee_rate(rows):
 # ------------------------------------------------------------------------------------------------------------ run
 
 def simulate(rows_all, env, policy_names, horizon_hours, taker_fee, maker_fee, now_ms=None, *, trail_cadence="1m",
-             exact_entry_only=False):
+             exact_entry_only=False, malformed=0):
+    """malformed: malformed lines of the outcomes file (counted in skipped["malformed"] when > 0)."""
     started = time.monotonic()
     now_ms = int(time.time() * 1000) if now_ms is None else now_ms
     horizon_ms = int(horizon_hours * 3600 * 1000)
     registry = build_policies()
     rows, skipped = select_rows(rows_all, env, exact_entry_only=exact_entry_only)
-    warnings = [IN_SAMPLE_NOTE]
+    if malformed:
+        skipped["malformed"] = int(malformed)
+    warnings = [IN_SAMPLE_NOTE, RANKING_NOTE, AUTH_MODE_NOTE]
 
     filters_by_symbol = None
     if rows:
@@ -468,7 +493,7 @@ def simulate(rows_all, env, policy_names, horizon_hours, taker_fee, maker_fee, n
             skipped["warmup_short"] = skipped.get("warmup_short", 0) + 1
             continue
         is_long = str(row["direction"]).upper() == "LONG"
-        mfe_r = path.mfe_r(is_long, float(row["entry_price"]), float(row["initial_risk"]))
+        mfe_r = path.mfe_r(is_long, entry_basis(row), float(row["initial_risk"]))
         atr_r = path.atr_r(float(row["initial_risk"]))
         approx = entry_ts_approx(row)
         simulated.append(row)
@@ -565,11 +590,14 @@ def main(argv=None):
     except ValueError as e:
         print(f"exit_policy_sim: invalid environment: {e}", file=sys.stderr)
         return 2
-
-    rows = _read_jsonl(args.outcomes or os.path.join(_logs_dir(), "trade_outcomes.jsonl"))
-    result = simulate(rows, env, names, args.horizon_hours, args.taker_fee, args.maker_fee,
-                      trail_cadence=args.trail_cadence, exact_entry_only=args.exact_entry_only)
     out_path = args.out or os.path.join(_logs_dir(), "exit_policy_sim.json")
+    if not path_inside_dir(out_path, _logs_dir()):  # issue #191: before any read or request
+        print(f"exit_policy_sim: --out must be a file inside {_logs_dir()} (got {out_path!r})", file=sys.stderr)
+        return 2
+
+    rows, malformed = _read_jsonl(args.outcomes or os.path.join(_logs_dir(), "trade_outcomes.jsonl"))
+    result = simulate(rows, env, names, args.horizon_hours, args.taker_fee, args.maker_fee,
+                      trail_cadence=args.trail_cadence, exact_entry_only=args.exact_entry_only, malformed=malformed)
     _write_json_atomic(out_path, result)
 
     if args.json_output:
