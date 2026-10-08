@@ -60,8 +60,11 @@ transcript's agentType), `verify_review.py`, then `gh pr comment <n> --body-file
 Bash go through `scripts/hooks/issue_fixer_guard.py`: confined to the issue worktree, never the main checkout, and
 an allowlist with no git writes, gh, network or desk scripts),
 `issue_workspace.py review-context` + `issue_auditor` (read-only, up to 3 rounds), your own full-suite run, PR,
-`pr-review`, merge on green CI, follow-up issues and `issue_workspace.py cleanup`. The three agents run on opus
-and never use the internet; on Windows run the flow from WSL (the fixer's guard fails closed without `python3`).
+`pr-review`, merge on green CI, follow-up issues, `issue_workspace.py record-route` (appends to
+`logs/issue_routing.jsonl`) and `issue_workspace.py cleanup`. Model and effort are routed per call by the skill's
+route table (quick/build/deep via the Agent tool's `model`/`effort`); frontmatter `opus` is the fallback and agy
+stays on opus. The three agents never use the internet; on Windows run the flow from WSL (the fixer's guard fails
+closed without `python3`).
 
 ## Windows
 

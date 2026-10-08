@@ -335,7 +335,7 @@ Flow (all helpers are deterministic):
 Headless fallback without an interactive agy session (e.g. CI with `GEMINI_API_KEY`): `python3 scripts/ci/run_pr_audit.py origin/main logs/pr_review/report.md` builds one prompt from the same agent definitions.
 
 ### 8. Issue Workflow (Orchestrator + Subagents)
-Ask the agent to work an issue ("work issue 95") or run `/issue-orchestrator 95`. The [`issue-orchestrator` skill](.agents/skills/issue-orchestrator/SKILL.md) runs in the main session and drives three Opus subagents with minimal tools, none of which can use the internet:
+Ask the agent to work an issue ("work issue 95") or run `/issue-orchestrator 95`. The [`issue-orchestrator` skill](.agents/skills/issue-orchestrator/SKILL.md) runs in the main session and drives three subagents (model routed per issue: quick/build/deep) with minimal tools, none of which can use the internet. `issue_workspace.py init` triages the issue from its labels and title; in Claude Code the skill passes each role's model and effort per call (frontmatter `opus` is the fallback, and agy stays on opus), and `issue_workspace.py record-route <N>` appends the outcome to `logs/issue_routing.jsonl` in the main checkout before cleanup:
 
 | Subagent | Tools | Role |
 |---|---|---|
@@ -343,7 +343,7 @@ Ask the agent to work an issue ("work issue 95") or run `/issue-orchestrator 95`
 | `issue_fixer` | read, grep, list, edit, write, guarded shell | Implements the orchestrator's `design.md` with tests; its edits and Bash run through `scripts/hooks/issue_fixer_guard.py` (confined to the issue worktree, never the main checkout where the hooks live; allowlist: read-only git, unittest/compileall, tests; no commits, gh, network, installs or desk scripts) |
 | `issue_auditor` | read, grep, list | Audits the diff and the deterministic check results; `VERDICT: APPROVE` or `CHANGES_REQUESTED` (max 3 fixer rounds) |
 
-Flow: `python3 scripts/dev/issue_workspace.py init <N> --slug <slug>` (own worktree and `fix/issue-N-*` branch) → locator → design → fixer → `issue_workspace.py review-context <worktree>` + auditor → full suite by the orchestrator → commit, push, PR → `/pr-review` → merge on green CI → follow-up issues with severity/priority labels → `issue_workspace.py cleanup <N>`. Working files live in `<worktree>/logs/issue_work/` (gitignored).
+Flow: `python3 scripts/dev/issue_workspace.py init <N> --slug <slug>` (own worktree and `fix/issue-N-*` branch) → locator → design → fixer → `issue_workspace.py review-context <worktree>` + auditor → full suite by the orchestrator → commit, push, PR → `/pr-review` → merge on green CI → follow-up issues with severity/priority labels → `issue_workspace.py record-route <N> --from <file>` → `issue_workspace.py cleanup <N>`. Working files live in `<worktree>/logs/issue_work/` (gitignored).
 
 ---
 
