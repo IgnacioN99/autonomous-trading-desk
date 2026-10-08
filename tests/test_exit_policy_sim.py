@@ -445,3 +445,12 @@ class TestExchangeInfo(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestActivationPolicies(unittest.TestCase):
+    """PR #211 review: every trail_activation mode has a simulator policy."""
+
+    def test_activation_modes_are_simulated(self):
+        policies = eps.build_policies()
+        self.assertEqual(policies["legacy_r_or_atr"]["lock"]["trail_activation"], "r_or_atr")
+        self.assertEqual(policies["r_and_atr"]["lock"]["trail_activation"], "r_and_atr")

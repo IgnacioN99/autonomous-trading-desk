@@ -107,6 +107,7 @@ def build_policies():
     return {
         "current": dict(base),
         "legacy_r_or_atr": dict(base, lock=dict(lock, trail_activation="r_or_atr")),  # pre-#205 activation
+        "r_and_atr": dict(base, lock=dict(lock, trail_activation="r_and_atr")),  # +1R and +2x ATR_15m
         "current_no_lock": dict(base, lock={"profit_lock_enabled": False}),
         "tp2_2_5r": dict(base, tp2_r=2.5),
         "lock_gap_0_75": dict(base, lock=gap),

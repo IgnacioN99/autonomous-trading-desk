@@ -233,7 +233,8 @@ LEGACY_LOCK_FILE_NAME = "guardian_loop.lock"  # shared lock of loops started bef
 LOG_FILE_MAX_BYTES = 5 * 1024 * 1024
 LOG_FILE_BACKUPS = 3
 STOP_UNKNOWN_ESCALATE_AFTER = 3  # consecutive UNKNOWN stop reads before heal_unknown_stop + P0 report (issue #173)
-EXCURSION_PASS_BUDGET_SECONDS = 5  # issue #192: total time of the excursion pass; later positions are skipped
+EXCURSION_PASS_BUDGET_SECONDS = 5  # issue #192: checked before each klines read, so the real bound is ~budget + one 2 s
+# klines timeout (~7 s), far inside the liveness rule; total time of the excursion pass; later positions are skipped
 EXCURSION_FAIL_REPORT_AFTER = 10  # issue #192: consecutive tracker failures of one position before one report
 POSITION_CLOSED_DEDUPE_LINES = 500  # issue #192: guardian_actions.jsonl tail checked before a position_closed
 _UNRESOLVED = object()  # persist(): owner not resolved by the caller
@@ -984,6 +985,8 @@ def _report_audit_health(env, health, detail):
         print(f"guardian: trades_audit health report could not be filed ({type(e).__name__}: {e})", file=sys.stderr)
 
 
+# Dedupe scans only the last 500 lines of logs/guardian_actions.jsonl and ignores an unreadable file: after heavy
+# logging or a read error a duplicate position_closed is still possible (observation only, harmless).
 def _closed_key(env, symbol, side, entry_ts):
     """Issue #192 dedupe key of a position_closed record: (env, SYMBOL, SIDE, entry_ts as float or None)."""
     return (str(env or ""), str(symbol or "").upper(), str(side or "").upper(), _f(entry_ts, None))

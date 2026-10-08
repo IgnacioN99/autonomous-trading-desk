@@ -24,7 +24,8 @@ DEFAULT_HOSTS = {"prod": "https://fapi.binance.com", "testnet": "https://testnet
 # Issue #192: price source of the guardian's MFE / MAE: LAST-price 1m klines folded with the MARK price.
 PRICE_SOURCE = "last_1m+mark"
 
-_HOST_CACHE = None  # {env: (base_url, warning)} only while armed by reset_klines_host_cache() (guardian cycle)
+_HOST_CACHE = None  # {env: (base_url, warning)} only while armed by reset_klines_host_cache() (guardian cycle);
+# module-global, safe for the single-threaded guardian: a threaded caller needs its own cache
 
 
 def reset_klines_host_cache(enabled=True):
