@@ -4,7 +4,9 @@ trade_excursion.py - Maximum favourable / adverse excursion (MFE / MAE) of a liv
 
 Pure helpers shared by the position guardian (live tracking, scripts/loops/position_guardian_loop.py) and
 scripts/trade_outcomes.py (offline reconstruction). The only I/O is fetch_klines_range (public klines, one request),
-kept as a single function so tests patch trade_excursion.fetch_klines_range.
+kept as a single function so tests patch trade_excursion.fetch_klines_range. fetch_klines_pages (offline CLIs:
+trade_outcomes.py, exit_policy_sim.py) pages it: KLINES_PAGE_LIMIT 1000 bars (weight 5), KLINES_PAGE_SLEEP_SECONDS
+between pages, HTTP 429 / 418 retried up to KLINES_MAX_TRIES tries in total honouring Retry-After (issues #210 / #191).
 
 Units: entry_ts / now_ts in seconds; kline open/close times, mfe_ts, mae_ts and last_bar_open_ms in milliseconds.
 R multiples use the initial risk |entry - planned SL|: mfe_r >= 0, mae_r <= 0, None without a risk. Percent values
@@ -12,12 +14,19 @@ are signed like scripts/shadow_tracker.py (mfe_pct >= 0, mae_pct <= 0, percent o
 """
 
 import json
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
 BAR_MS = 60_000
 GUARDIAN_KLINES_LIMIT = 99  # weight 1 per request (Binance: limit in [1, 100) -> weight 1)
 KLINES_TIMEOUT_SECONDS = 2  # guardian excursion read: short, so a slow host never stalls the cycle
+KLINES_PAGE_LIMIT = 1000  # offline pages: weight 5 (1500 costs 10) on the PROD host shared with the guardian / executor
+KLINES_PAGE_SLEEP_SECONDS = 0.2  # pause between pages
+KLINES_MAX_TRIES = 3  # per page on HTTP 429 / 418
+KLINES_BACKOFF_SECONDS = 1.0  # wait without Retry-After: 1 s, 2 s
+KLINES_MAX_RETRY_AFTER_SECONDS = 60
 DEFAULT_HOSTS = {"prod": "https://fapi.binance.com", "testnet": "https://testnet.binancefuture.com"}
 
 
@@ -48,6 +57,58 @@ def fetch_klines_range(symbol, interval, start_ms, limit, target_env, timeout=No
     if not isinstance(data, list):
         raise ValueError(f"unexpected klines response: {str(data)[:160]}")
     return data
+
+
+def retry_after_seconds(err, attempt):
+    """Wait before retrying a rate-limited page: the Retry-After header (seconds, capped at
+    KLINES_MAX_RETRY_AFTER_SECONDS), else KLINES_BACKOFF_SECONDS x 2^attempt."""
+    try:
+        value = float((getattr(err, "headers", None) or {}).get("Retry-After"))
+        if value >= 0:
+            return min(value, KLINES_MAX_RETRY_AFTER_SECONDS)
+    except (TypeError, ValueError, AttributeError):
+        pass
+    return KLINES_BACKOFF_SECONDS * (2 ** attempt)
+
+
+def fetch_klines_page(symbol, interval, start_ms, limit, target_env, timeout=None, max_tries=None):
+    """One fetch_klines_range page; HTTP 429 / 418 is retried up to max_tries (default KLINES_MAX_TRIES) tries in
+    total, waiting retry_after_seconds, then raised like any other failed read."""
+    max_tries = KLINES_MAX_TRIES if max_tries is None else max_tries
+    for attempt in range(max_tries):
+        try:
+            return fetch_klines_range(symbol, interval, start_ms, limit, target_env, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            if e.code not in (429, 418) or attempt + 1 >= max_tries:
+                raise
+            time.sleep(retry_after_seconds(e, attempt))
+
+
+def fetch_klines_pages(symbol, interval, start_ms, end_ms, target_env, step_ms, limit=None, timeout=None,
+                       page_sleep=None, max_tries=None):
+    """Raw klines of [start_ms, end_ms) (open time) in pages of `limit` bars (default KLINES_PAGE_LIMIT), page_sleep
+    seconds apart (default KLINES_PAGE_SLEEP_SECONDS), each through fetch_klines_page; step_ms is the bar length.
+    Stops on a short or empty page. Raises on a failed read."""
+    limit = KLINES_PAGE_LIMIT if limit is None else limit
+    page_sleep = KLINES_PAGE_SLEEP_SECONDS if page_sleep is None else page_sleep
+    out = []
+    start = int(start_ms)
+    first = True
+    while start < end_ms:
+        if not first:
+            time.sleep(page_sleep)
+        first = False
+        rows = fetch_klines_page(symbol, interval, start, limit, target_env, timeout=timeout, max_tries=max_tries)
+        last_open = None
+        for k in rows:
+            open_ms = int(k[0])
+            last_open = open_ms
+            if start <= open_ms < end_ms:
+                out.append(k)
+        if not rows or last_open is None or len(rows) < limit:
+            break
+        start = max(start, last_open) + step_ms
+    return out
 
 
 def floor_minute_ms(ts_s):

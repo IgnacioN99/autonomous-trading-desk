@@ -42,6 +42,7 @@ from test_issue_95_trailing_activation import make_klines, flat_pre, market
 from test_issue_106_exit_manager_hardening import long_record, LONG_POST, LONG_FORMING
 
 H = 3600_000
+TAKER_FEE, MAKER_FEE = eps.DEFAULT_TAKER_FEE, eps.DEFAULT_MAKER_FEE
 TS = T0 // 1000 + 10  # audit write (s), 10 s after T0
 REAL_LOAD_FILTERS = to.load_filters  # OutcomesBase patches trade_outcomes.load_filters
 
@@ -216,6 +217,27 @@ class TestExitMinuteAndRequestCap(OutcomesBase):
         t = self.rows()[0]
         self.assertEqual(t["mfe_r"], 0.4)  # 102, not the 130 printed after the exit inside the exit minute
 
+    def test_klines_pages_of_1000_with_shared_429_backoff(self):
+        self.assertEqual(to.KLINES_LIMIT, 1000)
+        self.audit(entry_order_id=1)
+        fills = {"BTCUSDT": [fill(1, 1, "BUY", 100, 10, T0), fill(2, 9, "SELL", 101, 10, T0 + 2 * H)]}
+        inner = KlinesFake(lambda s, o: (102.0, 99.0))
+        calls = []
+
+        def flaky(*a, **k):
+            calls.append(a)
+            if len(calls) == 1:
+                raise urllib.error.HTTPError("u", 429, "limited", {"Retry-After": "2"}, None)
+            return inner(*a, **k)
+
+        with patch("utils.trade_excursion.time.sleep") as sleep:
+            self.run_cli(FakeFills(fills), [], klines=flaky)
+        t = self.rows()[0]
+        self.assertEqual(t["mfe_r"], 0.4)
+        self.assertNotIn("klines_error", t)
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [2.0])
+        self.assertEqual({c[3] for c in calls}, {1000})
+
     def test_split_cap_sets_truncated_and_a_warning(self):
         t_entry = T0 - 30_000
         fills = [fill(1, 1, "BUY", 100, 2500, t_entry)]
@@ -259,7 +281,7 @@ class TestSimRobustness(SimBase):
 
     def setUp(self):
         super().setUp()
-        sleep_patch = patch("exit_policy_sim.time.sleep")
+        sleep_patch = patch("utils.trade_excursion.time.sleep")
         self.sleep = sleep_patch.start()
         self.addCleanup(sleep_patch.stop)
 
@@ -320,6 +342,17 @@ class TestSimRobustness(SimBase):
         self.assertIn(eps.AUTH_MODE_NOTE, res["warnings"])
         self.assertIn("reviewed PR", eps.RANKING_NOTE)
         self.assertIn("KEYS", eps.AUTH_MODE_NOTE)
+
+    def test_replay_starts_from_entry_vwap_for_every_policy(self):
+        # Audit entry 100.0, matched fills VWAP 100.5, SL 99.0 -> initial_risk 1.5 (trade_outcomes' R basis).
+        row = outcome(entry_price=100.0, entry_vwap=100.5, initial_risk=1.5)
+        t, _ = self.one(row, [FLAT, (100.0, 98.9, 99.0)], "current")
+        self.assertAlmostEqual(t["r"], -1.0 - (TAKER_FEE * 100.5 + TAKER_FEE * 99.0) / 1.5, places=6)
+        # close_at_0_5r: target = 100.5 + 0.5 x 1.5 = 101.25 (100.75 from the audit entry would fill on 101.0)
+        t, _ = self.one(row, [FLAT, (101.0, 100.4, 100.9), (101.3, 100.9, 101.2)], "close_at_0_5r")
+        self.assertAlmostEqual(t["r"], 0.5 - (TAKER_FEE * 100.5 + MAKER_FEE * 101.25) / 1.5, places=6)
+        self.assertEqual(eps.entry_basis(outcome()), 100.0)  # no entry_vwap: the audit entry
+        self.assertEqual(eps.entry_basis(outcome(entry_vwap=None)), 100.0)
 
     def test_malformed_lines_are_counted(self):
         with open(os.path.join(self.logs, "trade_outcomes.jsonl"), "w", encoding="utf-8") as f:
@@ -405,9 +438,10 @@ class TestClosedTodaySummary(unittest.TestCase):
 class DayExchange:
     """Flat book; GET /fapi/v1/userTrades without a symbol returns the day's fills (records its params)."""
 
-    def __init__(self, day_fills):
+    def __init__(self, day_fills, error=None, error_pages=(1,)):
         self.day_fills = day_fills
         self.day_params = []
+        self.error, self.error_pages = error, set(error_pages)  # error payload on these page numbers (1-based)
 
     def __call__(self, method, endpoint, params=None, target_env=None, retry_count=0):
         params = dict(params or {})
@@ -419,7 +453,11 @@ class DayExchange:
             return []
         if endpoint == "/fapi/v1/userTrades" and "symbol" not in params:
             self.day_params.append(params)
-            return [dict(f) for f in self.day_fills]
+            if self.error is not None and len(self.day_params) in self.error_pages:
+                return dict(self.error)
+            rows = sorted((f for f in self.day_fills if f["time"] >= params["startTime"]),
+                          key=lambda f: (f["time"], f["id"]))
+            return [dict(f) for f in rows[:params["limit"]]]
         raise AssertionError(f"unexpected request {endpoint}")
 
 
@@ -460,9 +498,42 @@ class TestSyncClosedTodayKeys(unittest.TestCase):
         self.assertIn("Closed Trades Today:** 1 (Wins: 1 | Losses: 0 | Scratches: 0", md)
         self.assertIn("Realized R (net):** +1.08R", md)
         self.assertIn("Closing fills: 2", md)
+        self.assertFalse(c["truncated"])
         with patch.object(sss, "STATE_FILE", os.path.join(tempfile.mkdtemp(), "s.json")):
             err = sss.write_error_state("x", 0, "now", "prod", 0.0)
         self.assertEqual(sorted(err["closed_today_summary"]), sorted(c))
+
+    def day_fills(self, n, same_ms=False):
+        return [fill(100 + i, 900 + i, "SELL", 101, 1, DAY + 1000 + (0 if same_ms else 1000 * i), pnl=1.0)
+                for i in range(n)]
+
+    def test_day_fills_are_paged_until_a_short_page(self):
+        fake = DayExchange(self.day_fills(2500))
+        with patch("execute_futures_trade.send_signed_request", side_effect=fake):
+            fills, truncated = sss.fetch_day_fills(DAY, "prod")
+        self.assertEqual((len(fills), truncated, len(fake.day_params)), (2500, False, 3))
+        self.assertEqual([p["limit"] for p in fake.day_params], [1000] * 3)
+        self.assertEqual(fake.day_params[0]["startTime"], DAY)
+        self.assertEqual([f["id"] for f in fills], sorted(f["id"] for f in fills))
+        state = self.run_sync(DayExchange(self.day_fills(2500)))
+        self.assertEqual((state["closed_today_summary"]["fills_closed"], state["closed_today_summary"]["truncated"]),
+                         (2500, False))
+
+    def test_page_cap_same_millisecond_and_failed_page_set_truncated(self):
+        for fake, expected in ((DayExchange(self.day_fills(12000)), (1000 + 9 * 999, True, 10)),
+                               (DayExchange(self.day_fills(1500, same_ms=True)), (1000, True, 2)),
+                               (DayExchange(self.day_fills(2500), error={"code": -1003}, error_pages=(2,)),
+                                (1000, True, 2))):
+            with patch("execute_futures_trade.send_signed_request", side_effect=fake):
+                fills, truncated = sss.fetch_day_fills(DAY, "prod")
+            self.assertEqual((len(fills), truncated, len(fake.day_params)), expected)
+        with patch("execute_futures_trade.send_signed_request",
+                   side_effect=DayExchange([], error={"code": -1003, "msg": "x"})):
+            res, truncated = sss.fetch_day_fills(DAY, "prod")
+        self.assertEqual((res, truncated), ({"code": -1003, "msg": "x"}, False))  # first read failed: unreadable
+        state = self.run_sync(DayExchange(self.day_fills(12000)))
+        self.assertTrue(state["closed_today_summary"]["truncated"])
+        self.assertIn("day fills truncated", sss.format_markdown_summary(state))
 
 
 if __name__ == "__main__":

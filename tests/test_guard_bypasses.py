@@ -2795,13 +2795,14 @@ class TestReadOnlyAnalysisScripts(GuardHarness):
                   f"python3 {self.TO} --output logs/trade_outcomes.jsonl",
                   f"python3 {self.TO} --output=logs/trade_outcomes.jsonl",
                   f"python3 {self.TO} --output {os.path.join(self.root, 'logs', 'trade_outcomes.jsonl')}",
-                  f"python3 {self.SC} --json --out logs/trading_scorecard.json --outcomes logs/trade_outcomes.jsonl",
+                  f"python3 {self.SC} --json --out logs/trading_scorecard.json --outcomes logs/old/outcomes.jsonl",
                   f"python3 {self.SC} --out logs/score_calibration.json",
                   f"python3 {self.SIM} --env prod --policies current,close_at_0_5r --horizon-hours 24 "
                   f"--taker-fee 0.0005 --trail-cadence 15m --exact-entry-only --json --out logs/exit_policy_sim.json",
                   f"python3 {os.path.join(self.root, self.TO)} --json", f"python3 -u {self.TO} --help",
                   f"env BINANCE_API_ENV=prod python3 {self.TO} --json",
-                  f"wsl.exe -d Ubuntu -- python3 {self.SIM} --json"):
+                  f"wsl.exe -d Ubuntu -- python3 {self.SIM} --json",
+                  f"wsl.exe -d Ubuntu -- python3 {self.TO} --output logs/trade_outcomes.jsonl"):
             self.assertEqual(self.decisions(c), ("allow", "allow", "allow"), c)
         reason = self.agy(self.cmd(f"python3 {self.TO} --json")).get("reason", "")
         self.assertIn("read-only analysis script", reason)
@@ -2823,14 +2824,10 @@ class TestReadOnlyAnalysisScripts(GuardHarness):
         os.symlink(tempfile.gettempdir(), os.path.join(self.root, "logs", "escape"))
         for c in (f"python3 {self.TO} --output logs/o/x.jsonl", f"python3 {self.SIM} --out logs/sim_b.json",
                   f"python3 {self.TO} --output /tmp/x.jsonl", f"python3 {self.TO} --output ../x.jsonl",
-                  f"python3 {self.TO} --output logs/../x.jsonl", f"python3 {self.TO} --output logs/escape/x.jsonl", f"python3 {self.TO} --output 'logs/*.jsonl'",
+                  f"python3 {self.TO} --output logs/../x.jsonl", f"python3 {self.TO} --output logs/escape/x.jsonl",
                   f"python3 {self.TO} --output logs/trading_scorecard.json",
-                  f"python3 {self.TO} --output logs/trades_audit.jsonl",
-                  f"python3 {self.TO} --output logs/primed_brief.json",
-                  f"python3 {self.SC} --out logs/trade_outcomes.jsonl",
                   f"python3 {self.SC} --outcomes /tmp/forged.jsonl",
-                  f"python3 {self.SIM} --out logs/score_calibration.json",
-                  f"python3 {self.SIM} --out logs/trade_outcomes.jsonl.",
+                  f"python3 {self.SIM} --out logs/guardian_actions.jsonl",
                   f"python3 {self.SIM} --outcomes ../x.jsonl --json"):
             for label, decision in zip(("agy", "bash", "powershell"), self.decisions(c)):
                 self.assertEqual(decision, "ask", f"{label}: {c}")
@@ -2838,10 +2835,23 @@ class TestReadOnlyAnalysisScripts(GuardHarness):
         self.assertNotIn("allow", self.decisions(f"python3 {self.TO} --output logs"))
 
     def test_ground_truth_and_evaluation_targets_stay_denied(self):
+        # Another script's ground-truth file (also read through --outcomes, or reached by a glob) is denied: only
+        # its sole sanctioned writer may name it (issues #202 / #191)
         for c in (f"python3 {self.TO} --output logs/session_state.json",
                   f"python3 {self.SIM} --out logs/pending_entries.json",
-                  f"python3 {self.SC} --out logs/evaluations/latest_dossier.json"):
-            self.assertEqual(self.agy(self.cmd(c)).get("decision"), "deny", c)
+                  f"python3 {self.SC} --out logs/evaluations/latest_dossier.json",
+                  f"python3 {self.TO} --output 'logs/*.jsonl'",
+                  f"python3 {self.TO} --output logs/trades_audit.jsonl",
+                  f"python3 {self.TO} --output logs/primed_brief.json",
+                  f"python3 {self.TO} --output logs/score_calibration.json",
+                  f"python3 {self.SC} --out logs/trade_outcomes.jsonl",
+                  f"python3 {self.SC} --outcomes logs/trade_outcomes.jsonl",
+                  f"python3 {self.SIM} --out logs/score_calibration.json",
+                  f"python3 {self.SIM} --out logs/trade_outcomes.jsonl.",
+                  f"python3 scripts/trading_doctor.py --output logs/trade_outcomes.jsonl",
+                  f"python3 {self.TO} --output logs/trade_outcomes.jsonl > logs/trades_audit.jsonl",
+                  f"python3 {self.TO} --json && cp /tmp/x logs/trade_outcomes.jsonl"):
+            self.assertEqual(self.decisions(c), ("deny", "deny", "deny"), c)
 
 
 if __name__ == "__main__":

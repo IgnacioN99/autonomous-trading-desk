@@ -70,7 +70,10 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    only as the single sub-command of a flat line, run by their exact repo path (never a linked worktree copy), with
    the same prefix / metacharacter / redirect rules as above, only their own flags, and every --output / --out /
    --outcomes value inside logs/ (lexically and by os.path.realpath); a write flag (--output / --out) must name the
-   script's own output (never GROUND_TRUTH_FILES, READ_ONLY_FOREIGN_OUTPUTS or logs/evaluations/).
+   script's own output (never GROUND_TRUTH_FILES, READ_ONLY_FOREIGN_OUTPUTS or logs/evaluations/). The ground-truth
+   check (8) lets such a script name its own ground-truth output (it is the sole sanctioned writer:
+   trade_outcomes.py -> logs/trade_outcomes.jsonl, trading_scorecard.py -> logs/score_calibration.json); naming any
+   other ground-truth file, also through --outcomes or a glob, stays denied (_names_only_own_ground_truth).
    Anything else asks, as before; next to other sub-commands they are not safe.
 5. FAIL-CLOSED SESSION STATE & STALENESS CHECK (cache-based pre-check, defense in depth):
    logs/session_state.json must exist, be valid (is_valid=True) and NOT stale (<= 300s); its position count plus
@@ -4181,6 +4184,19 @@ def _git_exec_config_writes(prog: str, args: List[str], redirects: List[str], cw
                for a in args)
 
 
+def _names_only_own_ground_truth(tokens: List[str], mentioned: List[str], info: dict, cwd: str,
+                                 base_dir: str) -> bool:
+    """True when a sub-command runs a READ_ONLY_SCRIPTS script by its exact repo path (never a linked worktree copy)
+    and every ground-truth file it names is one of that script's own outputs, of which it is the sole sanctioned
+    writer (scripts/trade_outcomes.py -> logs/trade_outcomes.jsonl, scripts/trading_scorecard.py ->
+    logs/score_calibration.json; issue #191). Only RISK_ENV_ASSIGNMENTS may precede it. Any other program, script or
+    named protected file (another script's output, a glob reaching other files) keeps the ground-truth denial."""
+    if any(var not in RISK_ENV_ASSIGNMENTS for var, _value in info.get("assigns") or []):
+        return False
+    key = _read_only_script_key(tokens, cwd, base_dir)
+    return bool(key) and set(mentioned) <= set(READ_ONLY_SCRIPTS[key][2])
+
+
 def _ground_truth_writes(tokens: List[str], text: str, cwd: str = "", base_dir: str = "", depth: int = 0,
                          shell: str = "bash", cwd_unknown: bool = False, strict: bool = True,
                          written: frozenset = frozenset(), cwd_set: Tuple[str, ...] = ()) -> List[str]:
@@ -4228,7 +4244,8 @@ def _ground_truth_writes(tokens: List[str], text: str, cwd: str = "", base_dir: 
     mentioned = _ground_truth_named(text)
     for a in tokens:
         mentioned += _glob_ground_truth(_word_value(a))
-    if mentioned and not _ground_truth_read_only(prog, args, bool(info["assigns"]), frozenset(read_programs)):
+    if mentioned and not _ground_truth_read_only(prog, args, bool(info["assigns"]), frozenset(read_programs)) \
+            and not (not cwd_unknown and _names_only_own_ground_truth(tokens, mentioned, info, cwd, base_dir)):
         hits += mentioned
     # Git config / hook files written directly (a later git command runs them); git itself is left to the git
     # config key rules (git config -f .git/config <key> <value>)
@@ -5226,6 +5243,13 @@ def powershell_backstop(command_line: str, cwd: str, base_dir: str) -> Tuple[Opt
     if not (ground_truth or trail or logs_dir or harness or git_config or gate_program_write):
         return None, None
     construct = _powershell_write_construct(command_line, tokens)
+    if ground_truth and not construct and not trail:
+        # Issue #191: one statement running a read-only analysis script that names only its own ground-truth output
+        # (its sole sanctioned writer, _names_only_own_ground_truth); the analysis decides the rest
+        subs = [s for s in split_subcommands(command_line) if s]
+        if len(subs) == 1 and _names_only_own_ground_truth(subs[0], ground_truth, _command_start(subs[0])[1], cwd,
+                                                           base_dir):
+            ground_truth = []
     unlisted = None if construct else _powershell_unlisted_command(tokens)
     how = construct or (f"command '{unlisted}' outside the read-only cmdlets" if unlisted else None)
     suffix = (f" PowerShell {how} next to a protected path: only read-only cmdlets (Get-Content, Select-String, "

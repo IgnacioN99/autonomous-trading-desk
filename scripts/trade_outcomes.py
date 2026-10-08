@@ -4,7 +4,7 @@ trade_outcomes.py - Per-trade exits, realized R and MFE / MAE reconstructed from
 
 Read-only: it never places, changes or cancels orders. The only signed request is GET /fapi/v1/userTrades (through
 execute_futures_trade.send_signed_request, the executor's client path); MFE / MAE come from public 1m klines
-(utils/trade_excursion.fetch_klines_range).
+(utils/trade_excursion.fetch_klines_pages: pages of 1000, 0.2 s apart, HTTP 429 / 418 retried up to 3 tries).
 
 Inputs:
   - Entries: non-event records of logs/trades_audit.jsonl with entry_price, sl_price and total_qty, for --env (a
@@ -88,7 +88,7 @@ SCRATCH_R = 0.05  # closed-today summary: |R| below this is a scratch
 MAX_SPLIT_DEPTH = 12  # userTrades window halvings per 7-day window
 MAX_REQUESTS_PER_SYMBOL = 200
 QTY_TOLERANCE = 1e-6
-KLINES_LIMIT = 1500
+KLINES_LIMIT = trade_excursion.KLINES_PAGE_LIMIT  # 1000 (weight 5); pages paced and 429 / 418-retried there
 KLINES_TIMEOUT_SECONDS = 6  # offline CLI: longer than the guardian's 2 s
 DEFAULT_SINCE_DAYS = 7
 REASONS = ("TP1", "TP2", "SL", "TRAILED_STOP", "BREAKEVEN", "MANUAL_OR_OTHER")
@@ -376,21 +376,14 @@ def kline_excursion(symbol, direction, entry, risk, entry_ms, exit_ms, legs, env
             trough = adv
 
     start = trade_excursion.first_post_entry_bar_ms(entry_ms / 1000.0)
-    while start < exit_ms:
-        rows = trade_excursion.fetch_klines_range(symbol, "1m", start, KLINES_LIMIT, env,
-                                                  timeout=KLINES_TIMEOUT_SECONDS)
-        last_open = None
-        for k in rows:
-            open_ms = int(k[0])
-            last_open = open_ms
-            close_ms = int(k[6]) if len(k) > 6 else open_ms + trade_excursion.BAR_MS - 1
-            if open_ms < start or open_ms >= exit_ms or close_ms > exit_ms:
-                continue
-            high, low = float(k[2]), float(k[3])
-            fold(low if is_short else high, high if is_short else low, open_ms)
-        if not rows or last_open is None or len(rows) < KLINES_LIMIT:
-            break
-        start = max(start, last_open) + trade_excursion.BAR_MS
+    for k in trade_excursion.fetch_klines_pages(symbol, "1m", start, exit_ms, env, trade_excursion.BAR_MS,
+                                                limit=KLINES_LIMIT, timeout=KLINES_TIMEOUT_SECONDS):
+        open_ms = int(k[0])
+        close_ms = int(k[6]) if len(k) > 6 else open_ms + trade_excursion.BAR_MS - 1
+        if close_ms > exit_ms:
+            continue
+        high, low = float(k[2]), float(k[3])
+        fold(low if is_short else high, high if is_short else low, open_ms)
     for leg in legs:
         fold(leg["price"], leg["price"], leg["time"])
     high, low = (trough, peak) if is_short else (peak, trough)

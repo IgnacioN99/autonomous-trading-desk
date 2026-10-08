@@ -250,7 +250,7 @@ class TestKlineExcursion(OutcomesBase):
         self.assertEqual(t["mae_r"], -0.4)
         self.assertEqual(t["mfe_ts"], peak_bar)
         self.assertAlmostEqual(t["giveback_r"], 3.0 - t["realized_r_gross"], places=4)
-        self.assertEqual(klines.calls[0][1:4], ("1m", (T0 // MIN) * MIN + MIN, 1500))
+        self.assertEqual(klines.calls[0][1:4], ("1m", (T0 // MIN) * MIN + MIN, 1000))  # weight 5 pages
         self.assertEqual(set(klines.timeouts), {to.KLINES_TIMEOUT_SECONDS})  # offline CLI: the longer timeout
         s = json.loads(out)["summary"]
         self.assertAlmostEqual(s["capture_ratio"], round(t["realized_r_gross"] / 3.0, 4), places=4)

@@ -10,7 +10,8 @@ GET /fapi/v1/exchangeInfo per run (tick size for the trail engine). A row needs 
 sl_price, tp1_price and tp2_price; others are counted under "skipped" by reason ("no_entry_fill" rows, and
 "malformed" lines of the outcomes file, included).
 
-Replay (per trade, per policy, 1m resolution, from the first full 1m bar after entry to entry + --horizon-hours):
+Replay (per trade, per policy, 1m resolution, from the first full 1m bar after entry to entry + --horizon-hours; the
+entry price is the row's entry_vwap, the basis of its initial_risk, else entry_price, for every policy, fee and level):
   - Worst case first: a 1m bar touching the current stop (LONG low <= stop, SHORT high >= stop) exits the remaining
     size at the stop (taker), even when a TP level is inside the same bar. Stop exits fill AT the stop price, with no
     gap slippage past it (slightly optimistic).
@@ -52,7 +53,6 @@ import os
 import sys
 import tempfile
 import time
-import urllib.error
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -66,11 +66,9 @@ from utils import trade_excursion
 BAR_1M_MS = trade_excursion.BAR_MS
 BAR_15M_MS = 15 * BAR_1M_MS
 WARMUP_15M_BARS = 98  # closed 15m bars handed to the trail engine (+1 forming row = the live limit=99 read)
-KLINES_LIMIT = 1000  # weight 5 per page (1500 costs 10) on the PROD host shared with the guardian / executor
-KLINES_PAGE_SLEEP_SECONDS = 0.2  # pause between pages
-KLINES_MAX_TRIES = 3  # per page on HTTP 429 / 418, honouring Retry-After
-KLINES_BACKOFF_SECONDS = 1.0  # backoff without Retry-After: 1 s, 2 s
-KLINES_MAX_RETRY_AFTER_SECONDS = 60
+KLINES_LIMIT = trade_excursion.KLINES_PAGE_LIMIT  # 1000, weight 5 per page
+KLINES_PAGE_SLEEP_SECONDS = trade_excursion.KLINES_PAGE_SLEEP_SECONDS
+KLINES_MAX_TRIES = trade_excursion.KLINES_MAX_TRIES  # per page on HTTP 429 / 418, honouring Retry-After
 KLINES_TIMEOUT_SECONDS = 6
 EXCHANGE_INFO_TIMEOUT_SECONDS = 6
 MIN_WARMUP_BARS = 15  # calculate_structural_stop needs at least 15 closed 15m bars
@@ -96,6 +94,13 @@ def entry_ts_approx(row):
     if row.get("entry_match") is not None:
         return row.get("entry_match") == "legacy"
     return row.get("entry_commission_included", True) is False
+
+
+def entry_basis(row):
+    """Replay entry price: the row's entry_vwap (VWAP of the matched entry fills, the basis of its initial_risk) when
+    present and > 0, else entry_price."""
+    vwap = _num(row.get("entry_vwap"))
+    return vwap if vwap and vwap > 0 else float(row["entry_price"])
 
 
 def _num(value, default=None):
@@ -192,52 +197,13 @@ def select_rows(rows, env, exact_entry_only=False):
     return out, skipped
 
 
-def _retry_after_seconds(err, attempt):
-    """Wait before retrying a rate-limited page: the Retry-After header (seconds, capped), else 1 s, 2 s, ..."""
-    try:
-        value = float((getattr(err, "headers", None) or {}).get("Retry-After"))
-        if value >= 0:
-            return min(value, KLINES_MAX_RETRY_AFTER_SECONDS)
-    except (TypeError, ValueError, AttributeError):
-        pass
-    return KLINES_BACKOFF_SECONDS * (2 ** attempt)
-
-
-def _fetch_page(symbol, interval, start, env):
-    """One klines page; HTTP 429 / 418 is retried up to KLINES_MAX_TRIES tries in total (Retry-After honoured), then
-    raised like any other failed read."""
-    for attempt in range(KLINES_MAX_TRIES):
-        try:
-            return trade_excursion.fetch_klines_range(symbol, interval, start, KLINES_LIMIT, env,
-                                                      timeout=KLINES_TIMEOUT_SECONDS)
-        except urllib.error.HTTPError as e:
-            if e.code not in (429, 418) or attempt + 1 >= KLINES_MAX_TRIES:
-                raise
-            time.sleep(_retry_after_seconds(e, attempt))
-
-
 def fetch_range(symbol, interval, start_ms, end_ms, env):
-    """Raw klines of [start_ms, end_ms) in pages of KLINES_LIMIT (public endpoint), KLINES_PAGE_SLEEP_SECONDS apart.
-    Raises on a failed read (after the 429 / 418 backoff of _fetch_page)."""
+    """Raw klines of [start_ms, end_ms) in pages of KLINES_LIMIT (public endpoint), KLINES_PAGE_SLEEP_SECONDS apart,
+    through the shared trade_excursion.fetch_klines_pages (429 / 418 backoff). Raises on a failed read."""
     step = BAR_15M_MS if interval == "15m" else BAR_1M_MS
-    out = []
-    start = int(start_ms)
-    first = True
-    while start < end_ms:
-        if not first:
-            time.sleep(KLINES_PAGE_SLEEP_SECONDS)
-        first = False
-        rows = _fetch_page(symbol, interval, start, env)
-        last_open = None
-        for k in rows:
-            open_ms = int(k[0])
-            last_open = open_ms
-            if start <= open_ms < end_ms:
-                out.append(k)
-        if not rows or last_open is None or len(rows) < KLINES_LIMIT:
-            break
-        start = max(start, last_open) + step
-    return out
+    return trade_excursion.fetch_klines_pages(symbol, interval, start_ms, end_ms, env, step, limit=KLINES_LIMIT,
+                                              timeout=KLINES_TIMEOUT_SECONDS, page_sleep=KLINES_PAGE_SLEEP_SECONDS,
+                                              max_tries=KLINES_MAX_TRIES)
 
 
 def fetch_exchange_info(env):
@@ -326,7 +292,7 @@ def replay(row, path, policy, filters, env, taker_fee, maker_fee, trail_cadence=
     on 15m closes. Both also run it in the minute TP1 fills."""
     is_long = str(row["direction"]).upper() == "LONG"
     sign = 1.0 if is_long else -1.0
-    entry = float(row["entry_price"])
+    entry = entry_basis(row)
     risk = float(row["initial_risk"])
     planned_sl = float(row["sl_price"])
     entry_ts_s = path.entry_ms / 1000.0
@@ -519,7 +485,7 @@ def simulate(rows_all, env, policy_names, horizon_hours, taker_fee, maker_fee, n
             skipped["warmup_short"] = skipped.get("warmup_short", 0) + 1
             continue
         is_long = str(row["direction"]).upper() == "LONG"
-        mfe_r = path.mfe_r(is_long, float(row["entry_price"]), float(row["initial_risk"]))
+        mfe_r = path.mfe_r(is_long, entry_basis(row), float(row["initial_risk"]))
         atr_r = path.atr_r(float(row["initial_risk"]))
         approx = entry_ts_approx(row)
         simulated.append(row)

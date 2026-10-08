@@ -18,7 +18,7 @@ open position (not counted; the doctor warns), and the order listings are read b
 filling between the reads is double counted rather than missed. The state is only ever written atomically
 (issue #127): a failed write leaves the
 previous file. Issue #208: closed_today_summary counts trades, not fills (trade_outcomes.summarize_closed_today on
-the day's userTrades, limit 1000, and the audit records): closed_trades_count / wins / losses / scratches per trade,
+the day's userTrades, pages of 1000 up to 10 pages, "truncated" when incomplete, and the audit records): closed_trades_count / wins / losses / scratches per trade,
 realized_r_net (sum of per-trade R), partial_history (trades entered before today), fills_closed (fills with a
 realized PnL); the USDT figures stay sums over the fills. CLI exit code 1 when the state written is INVALID or the write failed, else 0.
 """
@@ -46,6 +46,46 @@ def get_start_of_day_utc() -> int:
     now = datetime.datetime.now(datetime.timezone.utc)
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     return int(start.timestamp() * 1000)
+
+DAY_FILLS_LIMIT = 1000
+DAY_FILLS_MAX_PAGES = 10
+
+
+def fetch_day_fills(start_ms: int, target_env: str):
+    """(fills, truncated) of GET /fapi/v1/userTrades since start_ms (issue #208): pages of DAY_FILLS_LIMIT, each next
+    page from the last fill's time (inclusive, deduplicated by id), until a page holds fewer than DAY_FILLS_LIMIT
+    rows; at most DAY_FILLS_MAX_PAGES pages. truncated: the cap was hit, a later page failed or brought no new fill
+    (the day's figures may then be incomplete). A failed first read returns its non-list reply (fills unreadable)."""
+    seen, params = {}, {"startTime": int(start_ms), "limit": DAY_FILLS_LIMIT}
+    for page in range(DAY_FILLS_MAX_PAGES):
+        res = eft.send_signed_request("GET", "/fapi/v1/userTrades", dict(params), target_env=target_env)
+        if not isinstance(res, list):
+            return (res, False) if page == 0 else (_sorted_fills(seen), True)
+        new = 0
+        for f in res:
+            if isinstance(f, dict) and str(f.get("id")) not in seen:
+                seen[str(f.get("id"))] = f
+                new += 1
+        if len(res) < DAY_FILLS_LIMIT:
+            return _sorted_fills(seen), False
+        if not new:
+            return _sorted_fills(seen), True  # a full page of one millisecond: cannot advance
+        params["startTime"] = max(params["startTime"],
+                                  max(int(_as_float(f.get("time"))) for f in res if isinstance(f, dict)))
+    return _sorted_fills(seen), True
+
+
+def _as_float(v) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _sorted_fills(seen: dict) -> List[dict]:
+    """Fills by (time, id), both numeric (a non-numeric value sorts as 0)."""
+    return sorted(seen.values(), key=lambda f: (_as_float(f.get("time")), _as_float(f.get("id"))))
+
 
 def _read_audit_records():
     """(records, read_error, corrupt_lines) for trades_audit.jsonl (AUDIT_LOG), read once per sync. records: parsed
@@ -130,6 +170,7 @@ def write_error_state(err_msg: str, now_ts: int, now_utc: str, target_env: str, 
             "realized_r_net": 0.0,
             "partial_history": 0,
             "fills_closed": 0,
+            "truncated": False,
             "gross_realized_pnl_usdt": 0.0,
             "commissions_usdt": 0.0,
             "net_realized_pnl_usdt": 0.0
@@ -354,7 +395,7 @@ def sync_session_state(target_env: str = None) -> dict:
     #    matched to the audit entries by trade_outcomes.summarize_closed_today (no extra request), so a TP1 partial
     #    plus its runner is one trade, not two wins; fills_closed keeps the per-fill count.
     start_ms = get_start_of_day_utc()
-    trades_res = eft.send_signed_request("GET", "/fapi/v1/userTrades", {"startTime": start_ms, "limit": 1000}, target_env=target_env)
+    trades_res, day_truncated = fetch_day_fills(start_ms, target_env)
     today_realized_pnl = 0.0
     today_commissions = 0.0
     fills_closed = 0
@@ -468,6 +509,7 @@ def sync_session_state(target_env: str = None) -> dict:
             "realized_r_net": day["realized_r_net_sum"],
             "partial_history": day["partial_history"],
             "fills_closed": fills_closed,
+            "truncated": day_truncated,
             "gross_realized_pnl_usdt": round(today_realized_pnl, 4),
             "commissions_usdt": round(today_commissions, 4),
             "net_realized_pnl_usdt": round(net_realized_today, 4)
@@ -494,6 +536,8 @@ def format_markdown_summary(state: dict) -> str:
     closed = state["closed_today_summary"]
     btc = state["macro_btc"]
     partial_note = (f" | Entered before today: {closed['partial_history']}" if closed.get("partial_history") else "")
+    if closed.get("truncated"):
+        partial_note += " | ⚠️ day fills truncated (figures may be incomplete)"
 
     lines = [
         f"# 📡 SESSION & PORTFOLIO STATE ({state['last_updated_utc']})",
