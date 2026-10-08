@@ -11,7 +11,8 @@ Verifies:
 5. Forensic Orphan Position Audit (Fail CLOSED if position lacks Stop Loss on ledger)
 6. State Ledger Freshness (session_state.json)
 7. Barbell YOLO scan health (logs/yolo_scan_health.json; WARN only, when yolo_slot_enabled)
-8. Python dependencies of the scanners (numpy, pydantic, statsmodels; WARN only)
+8. Position guardian loop liveness (check_guardian_alive; WARN only, with the install_guardian_service.py hint)
+9. Python dependencies of the scanners (numpy, pydantic, statsmodels; WARN only)
 
 Usage:
   python3 scripts/trading_doctor.py [--env testnet|mainnet] [--heal]
@@ -147,6 +148,26 @@ def check_yolo_scan_health(profile: dict) -> tuple:
                         "--severity MEDIUM --title \"YOLO scan UNAVAILABLE\" --repro \"<command> (exit <code>)\" "
                         "--output-file <file with the raw output>.")
     return "ok", f"YOLO scan healthy (last status {health.get('last_status', 'UNKNOWN')}, {count} consecutive UNAVAILABLE)."
+
+
+def check_guardian_service(target_env: str) -> tuple:
+    """WARN-only position guardian liveness (issue #55) from execute_futures_trade.check_guardian_alive (reads
+    logs/guardian_state.json; no subprocess). Returns (level, message) with level "ok" or "warn". Never critical:
+    only PROD resting entries need the guardian loop."""
+    alive, why = eft.check_guardian_alive(target_env)
+    if alive:
+        return "ok", f"Position guardian loop alive: {why}."
+    if is_prod_environment(target_env):
+        impact = "PROD resting STOP_MARKET/LIMIT entries are rejected without it"
+    else:
+        impact = "resting STOP_MARKET/LIMIT entries get their TPs (and unarmed SL) on fill only while it runs"
+    from utils import dossier_provenance as dp
+    if dp._is_wsl():
+        hint = f"Install it as a background service: python3 scripts/install_guardian_service.py --install --env {target_env}"
+    else:
+        hint = f"Start the loop: python3 scripts/loops/position_guardian_loop.py --interval 60 --env {target_env}"
+    return "warn", (f"Position guardian loop not alive ({why}). {impact}; MARKET entries do not need the guardian. "
+                    f"{hint}")
 
 
 DEPENDENCY_MODULES = ("numpy", "pydantic", "statsmodels")
@@ -577,7 +598,19 @@ def run_doctor(target_env: str = None, auto_heal: bool = False) -> int:
     elif level == "info":
         print(f"ℹ️  [YOLO_SCAN] {msg}")
 
-    # 5c. Python dependencies of the scanners (WARN only, never critical; issue #135)
+    # 5c. Position guardian loop liveness (WARN only, never critical; issue #55)
+    try:
+        level, msg = check_guardian_service(target_env)
+    except Exception as e:
+        level, msg = "warn", f"Position guardian liveness unreadable ({type(e).__name__})."
+    if level == "warn":
+        warnings.append(msg)
+        print(f"⚠️  [GUARDIAN] {msg}")
+    else:
+        ok_items.append(msg)
+        print(f"✅ [GUARDIAN] {msg}")
+
+    # 5d. Python dependencies of the scanners (WARN only, never critical; issue #135)
     level, msg = check_dependencies()
     if level == "warn":
         warnings.append(msg)

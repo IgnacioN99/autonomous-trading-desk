@@ -539,7 +539,8 @@ class TestTradingDoctorBlockingSensor(unittest.TestCase):
         ] if endpoint == "/fapi/v2/balance" else []
 
         # Profile is NOT completed (hook self-test stubbed: this test isolates the profile check)
-        with patch("user_profile.load_user_profile", return_value={"profile_completed": False}),              patch("trading_doctor.check_pretool_hook", return_value={"ok": True, "critical": [], "warnings": [], "info": []}):
+        with patch("user_profile.load_user_profile", return_value={"profile_completed": False}),              patch("trading_doctor.check_pretool_hook", return_value={"ok": True, "critical": [], "warnings": [], "info": []}), \
+             patch("trading_doctor.check_guardian_service", return_value=("ok", "guardian alive (stub)")):
             exit_code = trading_doctor.run_doctor(target_env="testnet")
             self.assertEqual(exit_code, 1, "Doctor must return 1 (Fail-Closed) when profile onboarding is not completed.")
 
@@ -559,7 +560,8 @@ class TestTradingDoctorBlockingSensor(unittest.TestCase):
 
         real_exists = os.path.exists
         with patch("user_profile.load_user_profile", return_value={"profile_completed": True, "risk_pct_equity": 0.005, "operating_mode": "BALANCED_DELTA_NEUTRAL"}), \
-             patch("os.path.exists", side_effect=lambda p: False if (".agents" in str(p) or ".claude" in str(p)) else real_exists(p)):
+             patch("os.path.exists", side_effect=lambda p: False if (".agents" in str(p) or ".claude" in str(p)) else real_exists(p)), \
+             patch("trading_doctor.check_guardian_service", return_value=("ok", "guardian alive (stub)")):
             exit_code = trading_doctor.run_doctor(target_env="testnet")
             self.assertEqual(exit_code, 1, "Doctor must return 1 (Fail-Closed) when PreToolUse hooks are unconfigured.")
 

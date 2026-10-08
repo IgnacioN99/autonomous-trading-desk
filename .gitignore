@@ -26,6 +26,9 @@ logs/*.json
 logs/*.jsonl
 logs/*.lock
 logs/*.md
+logs/*.log
+logs/*.log.*
+logs/guardian_task.xml
 logs/evaluations/*
 logs/pr_review/
 logs/issue_work/

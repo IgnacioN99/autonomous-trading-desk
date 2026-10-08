@@ -227,6 +227,29 @@ def interactive_terminal_onboarding():
     print(f"• Standard leverage: {current['leverage_standard']}x")
     print(f"• Tier S autonomous execution: {'ENABLED (Fast-Track)' if current.get('autonomous_execution_tier_s') else 'DISABLED (Requires human confirmation)'}")
     print("=" * 65)
+    _offer_guardian_service()
+
+
+def _offer_guardian_service():
+    """Issue #55: in WSL, offer to install the position guardian as a Windows Task Scheduler task. No profile key;
+    a failed install never affects the saved profile."""
+    try:
+        import install_guardian_service as isg
+        if not isg.is_wsl():
+            return
+    except Exception:
+        return
+    answer = input("\n6. Install the position guardian as a Windows background task "
+                   "(recommended for PROD resting entries)? [y/N]: ").strip().lower()
+    if answer not in ("y", "yes"):
+        print("Skipped. Install it later with: python3 scripts/install_guardian_service.py --install")
+        return
+    try:
+        rc = isg.install()
+    except Exception as e:
+        rc = f"{type(e).__name__}: {e}"
+    if rc != 0:
+        print(f"Guardian install did not complete ({rc}). Retry with: python3 scripts/install_guardian_service.py --install")
 
 if __name__ == "__main__":
     import argparse

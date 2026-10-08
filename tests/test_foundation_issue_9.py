@@ -283,7 +283,8 @@ class TestScriptsEnvResolverIntegration(unittest.TestCase):
         self.assertTrue(hasattr(trading_doctor, "resolve_env"))
         with patch("trading_doctor.resolve_env", return_value="testnet") as mock_resolve, \
              patch("execute_futures_trade.load_env", return_value={}), \
-             patch("execute_futures_trade.get_client_config", return_value=("key", "sec", "http://")):
+             patch("execute_futures_trade.get_client_config", return_value=("key", "sec", "http://")), \
+             patch("trading_doctor.check_guardian_service", return_value=("ok", "guardian alive (stub)")):
             trading_doctor.run_doctor(target_env="testnet")
             mock_resolve.assert_called_with("testnet")
 
