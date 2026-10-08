@@ -49,6 +49,7 @@ def get_start_of_day_utc() -> int:
 
 DAY_FILLS_LIMIT = 1000
 DAY_FILLS_MAX_PAGES = 10
+DAY_FILLS_PAGE_SLEEP_SECONDS = 0.2  # between day-fill pages (only when a day needs more than one page)
 
 
 def fetch_day_fills(start_ms: int, target_env: str):
@@ -58,7 +59,12 @@ def fetch_day_fills(start_ms: int, target_env: str):
     (the day's figures may then be incomplete). A failed first read returns its non-list reply (fills unreadable)."""
     seen, params = {}, {"startTime": int(start_ms), "limit": DAY_FILLS_LIMIT}
     for page in range(DAY_FILLS_MAX_PAGES):
-        res = eft.send_signed_request("GET", "/fapi/v1/userTrades", dict(params), target_env=target_env)
+        if page:
+            time.sleep(DAY_FILLS_PAGE_SLEEP_SECONDS)  # PR #212 review: pace pages on the shared PROD IP
+        try:
+            res = eft.send_signed_request("GET", "/fapi/v1/userTrades", dict(params), target_env=target_env)
+        except Exception as e:  # PR #212 review: an exception reads as unreadable fills, never a crash of the sync
+            res = {"error": f"{type(e).__name__}: {e}"[:200]}
         if not isinstance(res, list):
             return (res, False) if page == 0 else (_sorted_fills(seen), True)
         new = 0
@@ -415,6 +421,7 @@ def sync_session_state(target_env: str = None) -> dict:
     day = {"trades_closed": 0, "wins": 0, "losses": 0, "scratches": 0, "realized_r_net_sum": 0.0,
            "partial_history": 0}
     day_error = None
+    day_error_counts_kept = False  # True: per-trade counts kept, the error only names symbols left out of them
     if isinstance(trades_res, list):
         try:
             import trade_outcomes
@@ -432,7 +439,15 @@ def sync_session_state(target_env: str = None) -> dict:
         if day_error is None and (audit_read_error or (day["trades_closed"] == 0 and flat_closing_fills)):
             day_error = ("audit unreadable: per-trade counts unavailable" if audit_read_error
                          else "closing fills without a matching audit trade")
-        if day_error is not None:
+        audit_symbols = {str(r.get("symbol") or "").upper() for r in records if not r.get("event")}
+        unmatched_symbols = sorted({str(t.get("symbol") or "").upper() for t in trades_res
+                                    if float(t.get("realizedPnl", 0)) != 0
+                                    and str(t.get("symbol") or "").upper() not in open_symbols
+                                    and str(t.get("symbol") or "").upper() not in audit_symbols})
+        if day_error is None and unmatched_symbols:  # some symbols counted, others left out: say which (PR #212)
+            day_error = f"closing fills without an audit trade (not counted): {', '.join(unmatched_symbols)}"[:200]
+            day_error_counts_kept = True
+        if day_error is not None and not day_error_counts_kept:
             wins_f = sum(1 for t in trades_res if float(t.get("realizedPnl", 0)) > 0)
             losses_f = sum(1 for t in trades_res if float(t.get("realizedPnl", 0)) < 0)
             day = {"trades_closed": wins_f + losses_f, "wins": wins_f, "losses": losses_f, "scratches": 0,
@@ -534,7 +549,8 @@ def sync_session_state(target_env: str = None) -> dict:
         "shadow_desk_summary": shadow_summary
     }
     state["closed_today_summary"]["counted_by"] = ("unavailable" if not isinstance(trades_res, list)
-                                                   else "fills" if day_error else "trades")
+                                                   else "fills" if day_error and not day_error_counts_kept
+                                                   else "trades")
     if not isinstance(trades_res, list):  # PR #212 review: an unreadable day-fill read is visible, never a silent 0
         state["closed_today_summary"]["fills_error"] = str(trades_res)[:200]
     if day_error:

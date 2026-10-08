@@ -4,7 +4,7 @@ trade_outcomes.py - Per-trade exits, realized R and MFE / MAE reconstructed from
 
 Read-only: it never places, changes or cancels orders. The only signed request is GET /fapi/v1/userTrades (through
 execute_futures_trade.send_signed_request, the executor's client path); MFE / MAE come from public 1m klines
-(utils/trade_excursion.fetch_klines_pages: pages of 1000, 0.2 s apart, HTTP 429 / 418 retried up to 3 tries).
+(utils/trade_excursion.fetch_klines_pages: pages of 1000, 0.2 s apart, HTTP 429 retried up to 3 tries; 418 / an over-cap Retry-After never retried).
 
 Inputs:
   - Entries: non-event records of logs/trades_audit.jsonl with entry_price, sl_price and total_qty, for --env (a
@@ -105,7 +105,7 @@ def _rate_limit_kind(res):
         return "limit"
     return None
 QTY_TOLERANCE = 1e-6
-KLINES_LIMIT = trade_excursion.KLINES_PAGE_LIMIT  # 1000 (weight 5); pages paced and 429 / 418-retried there
+KLINES_LIMIT = trade_excursion.KLINES_PAGE_LIMIT  # 1000 (weight 5); pages paced and 429-retried there (418 never)
 KLINES_TIMEOUT_SECONDS = 6  # offline CLI: longer than the guardian's 2 s
 DEFAULT_SINCE_DAYS = 7
 REASONS = ("TP1", "TP2", "SL", "TRAILED_STOP", "BREAKEVEN", "MANUAL_OR_OTHER")

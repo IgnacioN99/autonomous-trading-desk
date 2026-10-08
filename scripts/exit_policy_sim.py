@@ -5,13 +5,13 @@ exit_policy_sim.py - Offline exit-policy simulator on the desk's real trade path
 Read-only and unsigned: it never places, changes or cancels orders and sends no signed request. Inputs are the closed
 rows of logs/trade_outcomes.jsonl (scripts/trade_outcomes.py) for --env, public klines
 (utils/trade_excursion.fetch_klines_range, 1m and 15m, paged 1000 per request (weight 5), 0.2 s between pages, HTTP
-429 / 418 retried up to 3 tries honouring Retry-After, then "klines_error"; 6 s timeout) and one public
+429 retried up to 3 tries honouring Retry-After (418 / an over-cap Retry-After never), then "klines_error"; 6 s timeout) and one public
 GET /fapi/v1/exchangeInfo per run (tick size for the trail engine). A row needs initial_risk, entry_ts, entry_price,
 sl_price, tp1_price and tp2_price; others are counted under "skipped" by reason ("no_entry_fill" rows, and
 "malformed" lines of the outcomes file, included).
 
 Replay (per trade, per policy, 1m resolution, from the first full 1m bar after entry to entry + --horizon-hours; the
-entry price is the row's entry_vwap, the basis of its initial_risk, else entry_price, for every policy, fee and level;
+entry price is the row's entry_vwap (where the position really started; initial_risk is the sized |audit entry - SL|), else entry_price, for every policy, fee and level;
 the trail engine therefore gets the VWAP entry, while the live guardian hands it the audit entry_price, so on a slipped
 entry the replayed break-even / profit-lock levels differ slightly from live):
   - Worst case first: a 1m bar touching the current stop (LONG low <= stop, SHORT high >= stop) exits the remaining
@@ -74,7 +74,7 @@ BAR_15M_MS = 15 * BAR_1M_MS
 WARMUP_15M_BARS = 98  # closed 15m bars handed to the trail engine (+1 forming row = the live limit=99 read)
 KLINES_LIMIT = trade_excursion.KLINES_PAGE_LIMIT  # 1000, weight 5 per page
 KLINES_PAGE_SLEEP_SECONDS = trade_excursion.KLINES_PAGE_SLEEP_SECONDS
-KLINES_MAX_TRIES = trade_excursion.KLINES_MAX_TRIES  # per page on HTTP 429 / 418, honouring Retry-After
+KLINES_MAX_TRIES = trade_excursion.KLINES_MAX_TRIES  # per page on HTTP 429, honouring Retry-After (418 is never retried)
 KLINES_TIMEOUT_SECONDS = 6
 EXCHANGE_INFO_TIMEOUT_SECONDS = 6
 MIN_WARMUP_BARS = 15  # calculate_structural_stop needs at least 15 closed 15m bars
@@ -103,7 +103,7 @@ def entry_ts_approx(row):
 
 
 def entry_basis(row):
-    """Replay entry price: the row's entry_vwap (VWAP of the matched entry fills, the basis of its initial_risk) when
+    """Replay entry price: the row's entry_vwap (VWAP of the matched entry fills; initial_risk stays the sized risk) when
     present and > 0, else entry_price."""
     vwap = _num(row.get("entry_vwap"))
     return vwap if vwap and vwap > 0 else float(row["entry_price"])
@@ -207,7 +207,7 @@ def select_rows(rows, env, exact_entry_only=False):
 
 def fetch_range(symbol, interval, start_ms, end_ms, env):
     """Raw klines of [start_ms, end_ms) in pages of KLINES_LIMIT (public endpoint), KLINES_PAGE_SLEEP_SECONDS apart,
-    through the shared trade_excursion.fetch_klines_pages (429 / 418 backoff). Raises on a failed read."""
+    through the shared trade_excursion.fetch_klines_pages (429 backoff, no retry on 418). Raises on a failed read."""
     step = BAR_15M_MS if interval == "15m" else BAR_1M_MS
     return trade_excursion.fetch_klines_pages(symbol, interval, start_ms, end_ms, env, step, limit=KLINES_LIMIT,
                                               timeout=KLINES_TIMEOUT_SECONDS, page_sleep=KLINES_PAGE_SLEEP_SECONDS,

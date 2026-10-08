@@ -40,6 +40,13 @@ REVIEWERS = {
             r"^scripts/.*risk.*\.py$",
             r"^scripts/.*volatility.*\.py$",
             r"^scripts/.*kelly.*\.py$",
+            # Exit engine and offline outcome analytics (PR #212 review): R maths, calibration, simulator
+            r"^scripts/dynamic_exit_manager\.py$",
+            r"^scripts/trade_outcomes\.py$",
+            r"^scripts/exit_policy_sim\.py$",
+            r"^scripts/trading_scorecard\.py$",
+            r"^scripts/utils/score_calibration\.py$",
+            r"^scripts/utils/trade_excursion\.py$",
         ],
     },
     "binance_microstructure": {
@@ -53,6 +60,9 @@ REVIEWERS = {
             r"^scripts/.*binance.*\.py$",
             r"^scripts/.*order.*\.py$",
             r"^scripts/.*doctor.*\.py$",
+            # Exchange reads / stop pricing (PR #212 review)
+            r"^scripts/dynamic_exit_manager\.py$",
+            r"^scripts/utils/trade_excursion\.py$",
         ],
     },
     "agentic_harness": {
@@ -70,6 +80,11 @@ REVIEWERS = {
             r"^scripts/report_issue\.sh$",
             r"^scripts/.*hook.*",
             r"^scripts/.*guard.*",
+            # Ground-truth writers / gate inputs of the outcome analytics (PR #212 review)
+            r"^scripts/trade_outcomes\.py$",
+            r"^scripts/trading_scorecard\.py$",
+            r"^scripts/utils/score_calibration\.py$",
+            r"^scripts/utils/atomic_writer\.py$",
         ],
     },
     "prompt_engineering": {

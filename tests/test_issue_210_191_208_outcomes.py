@@ -4,7 +4,7 @@ test_issue_210_191_208_outcomes.py - follow-ups of the trade reconstruction (iss
 
 #210: entry fills matched by side + qty + time window when the audit entry_order_id is the algoId of a STOP_MARKET
       entry (entry_match "side_qty_window"); "no_entry_fill" rows (no legs, never consume a later trade's fills: the
-      ENAUSDT case of #191); R basis = entry_vwap; simulator: KLINES_LIMIT 1000 pages with a pause, 429 / 418 backoff,
+      ENAUSDT case of #191); R = move from entry_vwap over the sized risk; simulator: KLINES_LIMIT 1000 pages with a pause, 429 / 418 backoff,
       skipped.malformed, no_entry_fill skip, entry_ts_approx from entry_match, ranking / auth_mode notes; the live
       trail caller never injects klines_15m / filters.
 #191: nearest-level leg labels (SL / BE overlap, BE slippage, tick-size tolerance), no post-exit print in the MFE,
@@ -388,7 +388,7 @@ class TestSimRobustness(SimBase):
         self.assertIn("KEYS", eps.AUTH_MODE_NOTE)
 
     def test_replay_starts_from_entry_vwap_for_every_policy(self):
-        # Audit entry 100.0, matched fills VWAP 100.5, SL 99.0 -> initial_risk 1.5 (trade_outcomes' R basis).
+        # Row given directly: replay starts at the VWAP 100.5 (trade_outcomes would emit initial_risk 1.0 = |100 - 99|).
         row = outcome(entry_price=100.0, entry_vwap=100.5, initial_risk=1.5)
         t, _ = self.one(row, [FLAT, (100.0, 98.9, 99.0)], "current")
         self.assertAlmostEqual(t["r"], -1.0 - (TAKER_FEE * 100.5 + TAKER_FEE * 99.0) / 1.5, places=6)
@@ -539,6 +539,29 @@ class TestSyncClosedTodayKeys(unittest.TestCase):
         self.assertEqual(c["counted_by"], "unavailable")
         self.assertIn("symbol required", c["fills_error"])
 
+    def test_partly_unmatched_symbols_are_named(self):
+        """PR #212 review: one symbol counted per trade, another flat symbol with closing fills and no audit trade:
+        the counts stay per trade and the left-out symbol is named."""
+        rec = dict(symbol="BTCUSDT", direction="LONG", entry_price=100.0, sl_price=95.0, total_qty=10.0,
+                   target_env="prod", timestamp=DAY // 1000 + 600, entry_order_id=1, tp1_order_id=2)
+        fills = [fill(1, 1, "BUY", 100, 10, DAY + 590_000, comm=0.5),
+                 fill(2, 2, "SELL", 109, 10, DAY + 590_000 + H, pnl=90.0, comm=0.1),
+                 dict(fill(9, 9, "SELL", 104, 7, DAY + 3 * H, pnl=28.0, comm=0.2), symbol="ETHUSDT")]
+        state = self.run_sync(DayExchange(fills), audit=[rec])
+        c = state["closed_today_summary"]
+        self.assertEqual((c["closed_trades_count"], c["counted_by"]), (1, "trades"))
+        self.assertIn("ETHUSDT", c["trade_summary_error"])
+
+    def test_day_fill_exception_reads_as_unavailable(self):
+        def boom(method, endpoint, params=None, target_env=None, retry_count=0):
+            if endpoint == "/fapi/v1/userTrades":
+                raise ConnectionError("reset")
+            return DayExchange([])(method, endpoint, params, target_env, retry_count)
+        state = self.run_sync(boom, audit=[])
+        c = state["closed_today_summary"]
+        self.assertEqual(c["counted_by"], "unavailable")
+        self.assertIn("ConnectionError", c["fills_error"])
+
     def test_unmatched_closing_fills_fall_back_to_fill_counts(self):
         """PR #212 review: closing fills of a flat symbol with no matching audit trade (e.g. a manual exit of a
         position missing from the audit) never read as 0 closed trades."""
@@ -673,13 +696,11 @@ class TestOfflineOutputPaths(ScorecardBase):
         self.assertEqual(os.listdir(outside), [])
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TestCalibrationStoreRekeying(unittest.TestCase):
     """PR #212 review (trading_risk): a re-keyed trade (better entry matching) is counted once in the Tier S
-    calibration store; a now-no_entry_fill or truncated row removes / skips it (fail-closed: n only shrinks)."""
+    calibration store (replaced, never added); open / no_entry_fill / fills_unavailable / truncated rows never delete."""
 
     AUDIT = 1791470000
 
@@ -731,7 +752,7 @@ class TestCalibrationStoreRekeying(unittest.TestCase):
         self.assertEqual(len(merged["trades"]), 3)
 
 
-class TestRealizedRBudget(unittest.TestCase):
+class TestRSizedRiskBasis(unittest.TestCase):
 
     def test_r_is_measured_on_the_sized_risk(self):
         """PR #212 review: R = real move from the fill basis over the risk the order was sized on (audit entry - SL),
@@ -792,3 +813,7 @@ class TestUserTradesPacing(unittest.TestCase):
         err, calls, _, _ = self.run_window([{"code": -1003, "msg": "Too many requests"}])
         self.assertIsNotNone(err)
         self.assertEqual(len(calls), to.USER_TRADES_MAX_TRIES)
+
+
+if __name__ == "__main__":
+    unittest.main()
