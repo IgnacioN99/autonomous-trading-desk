@@ -14,6 +14,7 @@ test_issue_192_guardian_excursion_followups.py - Guardian excursion tracking rob
 Hermetic: FakeExchange, temp log dirs, klines fetch patched, urlopen blocked, reporter mocked.
 """
 
+import contextlib
 import json
 import os
 import sys
@@ -107,6 +108,31 @@ class TestPositionClosedDedupe(GuardianExcursionBase):
         self.write_state(excursions={"BTCUSDT|LONG": rec})
         state = self.cycle(FakeExchange([], algos=[]))
         self.assertEqual(len(self.closed_actions(state)), 1)
+
+    def test_two_failing_trades_give_two_records(self):
+        # Two trades on BTCUSDT LONG whose tracking fails from first sight (minimal records, entry_ts = first sight)
+        # each close once: two position_closed lines, the second is not taken for a duplicate of the first.
+        long_record(self.ws, sl_price=95.0, timestamp=int(time.time()) - 3600)
+        failing = KlineSource(None, error=OSError("klines down"))
+        later = time.time() + 120
+
+        def trade(at=None):
+            ctx = patch("time.time", return_value=at) if at else contextlib.nullcontext()
+            with ctx:
+                opened = self.cycle(FakeExchange([long_position(mark="101.0")], algos=[stop(501, 95.0)]), failing)
+                closed = self.cycle(FakeExchange([], algos=[]))
+            return opened, closed
+
+        first_open, first_close = trade()
+        second_open, second_close = trade(later)
+        ts1 = first_open["excursions"]["BTCUSDT|LONG"]["entry_ts"]
+        ts2 = second_open["excursions"]["BTCUSDT|LONG"]["entry_ts"]
+        self.assertEqual((ts1, ts2), (first_open["timestamp"], second_open["timestamp"]))
+        self.assertNotEqual(ts1, ts2)
+        self.assertEqual(len(self.closed_actions(first_close)), 1)
+        self.assertEqual(len(self.closed_actions(second_close)), 1)
+        logged = [r for r in read_actions(self.log_dir) if r["type"] == "position_closed"]
+        self.assertEqual([r["detail"]["entry_ts"] for r in logged], [ts1, ts2])
 
     def test_tail_window(self):
         path = os.path.join(self.log_dir, "tail.txt")

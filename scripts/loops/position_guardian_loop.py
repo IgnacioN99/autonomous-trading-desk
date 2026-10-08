@@ -136,7 +136,8 @@ State file (logs/guardian_state.json):
       "price_source": "last_1m+mark",  # MFE / MAE fold LAST-price 1m klines plus the MARK price (issue #192)
       "fail_count": int, "reported": bool}},  # consecutive tracker failures (0 after a success); reported: the
                                        # EXCURSION_FAIL_REPORT_AFTER report was filed (a failing position without a
-                                       # record gets a minimal one: symbol, side, entry_price, seen times, partial)
+                                       # record gets a minimal one: symbol, side, entry_price, entry_ts = first
+                                       # sight, seen times, partial)
                                        # Closed 1m bars after the fill minute plus the mark price; carried over from
                                        # the previous state (reset on a new entry price, kept on a positions_sync
                                        # failure); a record whose position is gone becomes a position_closed action.
@@ -693,6 +694,7 @@ class GuardianCycle:
             rec = dict(prev, last_seen_ts=now_s)
         else:
             rec = {"symbol": view["symbol"], "side": view["side"], "entry_price": view["entry_price"],
+                   "entry_ts": now_s,  # tracked from first sight, like _track_excursion (position_closed dedupe key)
                    "first_seen_ts": now_s, "last_seen_ts": now_s, "partial": True,
                    "price_source": trade_excursion.PRICE_SOURCE}
         try:

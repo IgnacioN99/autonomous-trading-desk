@@ -43,12 +43,18 @@ def em(mode=None):
     return out
 
 
-def calc_for(post, forming, planned_sl, mode="r_only", current_sl=None, mark=None, exit_management="mode"):
+def mirror(bars):
+    """SHORT mirror around 100 of (high, low, close) bars."""
+    return [(200.0 - l, 200.0 - h, 200.0 - c) for (h, l, c) in bars]
+
+
+def calc_for(post, forming, planned_sl, mode="r_only", current_sl=None, mark=None, exit_management="mode",
+             direction="LONG"):
     klines, entry_ts = make_klines(flat_pre(), post, forming, time.time())
     cur = planned_sl if current_sl is None else current_sl
     with market(klines):
         calc = dem.calculate_structural_stop(
-            "BTCUSDT", "LONG", 100.0, current_sl_price=cur, target_env="testnet", planned_sl=planned_sl,
+            "BTCUSDT", direction, 100.0, current_sl_price=cur, target_env="testnet", planned_sl=planned_sl,
             entry_ts=entry_ts, tp1_filled=False, mark_price=mark or float(forming[2]),
             exit_management=em(mode) if exit_management == "mode" else exit_management, filters=dict(TICK_FILTERS))
     return calc, klines
@@ -74,6 +80,26 @@ class TestActivationModes(unittest.TestCase):
                 else:
                     self.assertTrue(calc["should_update"])
                     self.assertGreater(calc["new_structural_sl"], 95.2)
+
+    def test_short_wide_stop_atr_before_1r(self):
+        # SHORT mirror: R = 4.8 (SL 104.8), MFE 3.6 = 0.75R (low 96.4), 2x ATR_15m already reached.
+        expected = {"r_only": None, "r_and_atr": None, "r_or_atr": "atr_expansion"}
+        for mode, reason in expected.items():
+            with self.subTest(mode=mode):
+                calc, klines = calc_for(mirror(RUN_POST), mirror([RUN_FORMING])[0], 104.8, mode=mode,
+                                        direction="SHORT")
+                self.assertGreaterEqual(calc["mfe"], 2.0 * closed_atr(klines))
+                self.assertAlmostEqual(calc["initial_risk"], 4.8, places=9)
+                self.assertAlmostEqual(calc["mfe"] / calc["initial_risk"], 0.75, places=6)
+                self.assertEqual(calc["activation_reason"], reason)
+                if reason is None:
+                    self.assertEqual(calc["reason"], "trail_not_activated")
+                    self.assertFalse(calc["should_update"])
+                    self.assertEqual(calc["new_structural_sl"], 104.8)
+                    self.assertIsNone(calc["profit_lock"])
+                else:
+                    self.assertTrue(calc["should_update"])
+                    self.assertLess(calc["new_structural_sl"], 104.8)
 
     def test_r_and_atr_both_reached(self):
         # R = 2 (SL 98): MFE 1.8R and >= 2x ATR: every mode activates on r_multiple.

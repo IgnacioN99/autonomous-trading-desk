@@ -222,6 +222,27 @@ class TestRounding(unittest.TestCase):
         self.assertEqual(calc["activation_reason"], "r_multiple")
         self.assertEqual(calc["new_structural_sl"], 100.1)  # one tick above entry, never inside the dead zone
 
+    def test_short_one_tick_cap_with_off_grid_entry(self):
+        # Averaged fills: entry 100.05 is off the 0.1 grid. Pre-BE r_multiple (R = 1, MFE 1.25R < 2x ATR): the cap is
+        # entry + tick rounded UP (100.2), still strictly above entry (round_price gave 100.1).
+        from decimal import Decimal
+        from test_issue_106_exit_manager_hardening import SHORT_POST, SHORT_FORMING, TICK_FILTERS
+        from test_issue_95_trailing_activation import flat_pre, closed_atr
+        entry = 100.05
+        klines, entry_ts = make_klines(flat_pre(), SHORT_POST, SHORT_FORMING, time.time())
+        with market(klines):
+            calc = dem.calculate_structural_stop("BTCUSDT", "SHORT", entry, current_sl_price=101.05,
+                                                 target_env="testnet", planned_sl=101.05, entry_ts=entry_ts,
+                                                 tp1_filled=False, mark_price=99.0, exit_management=em(),
+                                                 filters=dict(TICK_FILTERS))
+        self.assertEqual(calc["activation_reason"], "r_multiple")
+        self.assertLess(calc["mfe"], 2.0 * closed_atr(klines))
+        cap = dem._round_stop(Decimal(str(entry)) + Decimal("0.1"), "SHORT", 0.1, 1)
+        self.assertEqual(cap, 100.2)
+        self.assertEqual(calc["new_structural_sl"], cap)
+        self.assertGreater(calc["new_structural_sl"], entry)
+        self.assertTrue(calc["should_update"])
+
     def test_binding_compares_tick_rounded_values(self):
         # +3.5R with a 3R -> +1R step: the chandelier sits just above the +1R lock (101.0) inside one 1.0 tick, so on
         # the tick the stop is the lock price (binding); with a 0.1 tick the trail is tighter (not binding).

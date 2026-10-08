@@ -386,7 +386,8 @@ def calculate_structural_stop(symbol, direction, entry_price, current_sl_price=0
 
         if be_allowed:
             candidate_stop = min(candidate_stop, entry_price * 0.998)
-        else:  # one tick above entry, rounded up like every SHORT stop here (_round_stop), so strictly above it
+        else:  # one tick above entry, rounded up like every SHORT stop here (_round_stop), so strictly above it; an
+            # off-grid entry (averaged fills, e.g. 100.05 + 0.1) rounds up to the next tick (100.2, not 100.1)
             candidate_stop = max(candidate_stop, _round_stop(Decimal(str(entry_price)) + Decimal(str(tick)), "SHORT",
                                                              tick, filters["precision_price"]))
 
