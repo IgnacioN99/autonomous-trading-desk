@@ -66,7 +66,9 @@ State file (logs/guardian_state.json):
       "is_yolo": bool, "yolo_source": str | null, "tp1_filled": bool | null,
       "trailing": {"success", "updated", "reason", "previous_sl", "new_sl"?, "planned_sl"?,
                    "activation_reason"?: "tp1_filled" | "r_multiple" | "atr_expansion" | null,
-                   "reference_source"?: "trade_audit" | "current_stop", "message"} | null,
+                   "reference_source"?: "trade_audit" | "current_stop", "message",
+                   "warnings"?: [str]} | null,  # "reference_unverified" (no userTrades open time),
+                                                  # "audit_unreadable", "audit_corrupt_lines:<n>", cancel errors
       "dead_alpha": {"status": "DEAD_ALPHA_STALLED" | "HEALTHY_MOMENTUM" | "STALLED_WITHIN_HORIZON" |
                                 "UNKNOWN_HOLDING_TIME" | "UNKNOWN", "range_pct", "recommendation", "message",
                      # only when the 15m stall fired:

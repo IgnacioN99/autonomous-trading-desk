@@ -996,12 +996,13 @@ def latest_trade_audit_record(symbol, base_dir=None):
     return None
 
 
-def detect_yolo_position(symbol, leverage=None, explicit=None, base_dir=None):
+def detect_yolo_position(symbol, leverage=None, explicit=None, base_dir=None, *, record=None):
     """
     Returns (is_yolo, source). A position is YOLO if any of:
       - explicit flag (can only mark a position as YOLO, never un-mark it),
       - the evaluation dossier candidate for the symbol has is_yolo,
-      - the latest trades_audit entry for the symbol has is_yolo,
+      - the latest trades_audit entry for the symbol has is_yolo (`record`, when given, is used instead of the
+        latest entry: the caller's already-matched trade reference),
       - leverage >= profile leverage_yolo, or leverage > profile leverage_standard (the executor refuses
         leverage above leverage_standard for non-YOLO trades).
     """
@@ -1015,7 +1016,7 @@ def detect_yolo_position(symbol, leverage=None, explicit=None, base_dir=None):
             return True, 'dossier_candidate'
     except Exception:
         pass
-    rec = latest_trade_audit_record(symbol, base)
+    rec = record if record is not None else latest_trade_audit_record(symbol, base)
     if rec and _truthy(rec.get('is_yolo')):
         return True, 'trade_audit'
     if leverage:
@@ -1035,12 +1036,13 @@ def detect_yolo_position(symbol, leverage=None, explicit=None, base_dir=None):
     return False, None
 
 
-def detect_tp1_filled(symbol, current_qty, base_dir=None):
+def detect_tp1_filled(symbol, current_qty, base_dir=None, *, record=None):
     """
     Returns (filled, source). TP1 is considered filled when the live position size has been reduced by at least
     half of the TP1 quantity recorded at entry in logs/trades_audit.jsonl. Returns (None, ...) when unknown.
+    `record`, when given, is used instead of the latest entry for the symbol (the caller's matched reference).
     """
-    rec = latest_trade_audit_record(symbol, base_dir)
+    rec = record if record is not None else latest_trade_audit_record(symbol, base_dir)
     if not rec:
         return None, 'no_audit_record'
     total = _to_float(rec.get('total_qty'))
@@ -2306,10 +2308,11 @@ def unregistered_entries_message(unknown, missing=False):
 AUDIT_TAIL_BYTES = 4 * 1024 * 1024   # issue #94: Gate 0A reads at most the last 4 MiB of logs/trades_audit.jsonl
 
 
-def read_audit_tail(path, max_bytes=None):
+def read_audit_tail(path, max_bytes=None, stats=None):
     """JSON-object records of the last `max_bytes` (AUDIT_TAIL_BYTES) of a JSONL file, in file order (issue #94).
     When the read starts after offset 0 its first, partial line is dropped; malformed lines are skipped. Raises
-    OSError when the file cannot be read."""
+    OSError when the file cannot be read. `stats` (optional dict) receives "malformed_lines": the number of
+    skipped non-blank lines that are not a JSON object (the dropped partial first line is not counted)."""
     max_bytes = AUDIT_TAIL_BYTES if max_bytes is None else max_bytes
     with open(path, 'rb') as f:
         f.seek(0, os.SEEK_END)
@@ -2323,6 +2326,7 @@ def read_audit_tail(path, max_bytes=None):
     if start > 0:
         lines = lines[1:]
     records = []
+    malformed = 0
     for raw in lines:
         raw = raw.strip()
         if not raw:
@@ -2330,9 +2334,14 @@ def read_audit_tail(path, max_bytes=None):
         try:
             r = json.loads(raw.decode('utf-8'))
         except (ValueError, TypeError, UnicodeDecodeError):
+            malformed += 1
             continue
         if isinstance(r, dict):
             records.append(r)
+        else:
+            malformed += 1
+    if stats is not None:
+        stats["malformed_lines"] = malformed
     return records
 
 
