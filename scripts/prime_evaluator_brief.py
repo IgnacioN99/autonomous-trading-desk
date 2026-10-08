@@ -352,6 +352,18 @@ def assemble_primed_brief(target_env: str = "prod", out_path: Optional[str] = No
     return brief
 
 
+_TIER_CODES = ("S", "A+", "A", "B+")
+
+
+def _tier_label(o: dict) -> str:
+    """Tier code for a brief row: a valid `tier_code` wins, else the code named by the `tier` label
+    ("Tier A+ (...)" -> "A+"), else "?" (issue #135)."""
+    if o.get("tier_code") in _TIER_CODES:
+        return o["tier_code"]
+    words = (o.get("tier") or "").split(" ")[:2]
+    return next((c for c in _TIER_CODES if words == ["Tier", c]), "?")
+
+
 def format_markdown_brief(brief: dict) -> str:
     p = brief["ground_truth_portfolio"]
     m = brief["macro_btc"]
@@ -398,7 +410,9 @@ def format_markdown_brief(brief: dict) -> str:
         lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- |")
         for o in opps:
             trig = o.get('trigger_price')
-            lines.append(f"| **{o.get('symbol')}** | {o.get('direction')} | {o.get('tier_code') if o.get('tier_code') in ('S', 'A+', 'A', 'B+') else next((c for c in ('S', 'A+', 'A', 'B+') if (o.get('tier') or '').split(' ')[:2] == ['Tier', c]), '?')} | {o.get('confidence')}% | {o.get('current_price')} | {trig if trig is not None else '-'} | {o.get('sl_price')} | {o.get('tp1_price')} / {o.get('tp2_price')} | {o.get('rr_ratio')}R | ${o.get('target_dollar_risk', default_risk)} | {'; '.join(o.get('reasons', [])[:2])} |")
+            # abs:unscored: the wick/taker candles did not match, so absorption gave no confluence (issue #135)
+            factors = (["abs:unscored"] if o.get('absorption_scored') is False else []) + o.get('reasons', [])[:2]
+            lines.append(f"| **{o.get('symbol')}** | {o.get('direction')} | {_tier_label(o)} | {o.get('confidence')}% | {o.get('current_price')} | {trig if trig is not None else '-'} | {o.get('sl_price')} | {o.get('tp1_price')} / {o.get('tp2_price')} | {o.get('rr_ratio')}R | ${o.get('target_dollar_risk', default_risk)} | {'; '.join(factors)} |")
     else:
         lines.append("*(No intraday setups passing institutional microstructure filter)*")
     lines.append("")

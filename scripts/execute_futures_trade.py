@@ -3412,6 +3412,11 @@ def execute_complete_trade(
         return {"success": False, "error": (f"Rounded TP1 {tp1_p} (from {tp1_price}) is not on the profit side of the "
                                             f"effective entry {effective_entry} for a {'LONG' if is_long else 'SHORT'}. "
                                             "Execution aborted (fail-closed).")}
+    # A wrong-side TP2 would rest as a reduce-only LIMIT that fills at once (issue #141).
+    if tp2_p <= 0 or (tp2_p <= effective_entry if is_long else tp2_p >= effective_entry):
+        return {"success": False, "error": (f"Rounded TP2 {tp2_p} (from {tp2_price}) is not on the profit side of the "
+                                            f"effective entry {effective_entry} for a {'LONG' if is_long else 'SHORT'}. "
+                                            "Execution aborted (fail-closed).")}
 
     # 1b. Pending resting entries (Issue #33, PROD): no new entry of any type on a symbol with a pending resting
     # entry (or an unreadable registry). An untriggered STOP_MARKET or a LIMIT entry rests on the book and gets its TPs
@@ -3509,6 +3514,12 @@ def execute_complete_trade(
             total_qty = bumped_qty
     if total_qty < filters['minQty']:
         return {"success": False, "error": f"Quantity {total_qty} lower than minimum allowed {filters['minQty']}"}
+    # Still below minNotional after the one-step bump: reject locally instead of a Binance -4164 (issue #141).
+    if total_qty * notional_ref < min_notional:
+        return {"success": False, "error": (f"Entry notional {total_qty * notional_ref:.4f} USDT ({total_qty} x "
+                                            f"{notional_ref}) is below the exchange minNotional {min_notional} USDT "
+                                            "after a one-step size bump. Increase the margin. Execution aborted "
+                                            "(fail-closed).")}
 
     # 4. MECHANICAL HARD GATES VERIFICATION (incl. liquidation gate with the confirmed effective leverage)
     liq_entry_price = effective_entry

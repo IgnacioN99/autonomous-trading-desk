@@ -2,6 +2,10 @@
 """
 intraday_radar.py - High-Confluence Intraday Scanner for Binance Futures.
 Specialized in 15m and 5m timeframes for bounded capital day trading and rotation.
+
+Wicks and volume come from the last CLOSED candle (klines[-2]). The trigger and the SL sit beyond the more extreme
+of that candle and the forming one, and `entry` is the trigger: risk_pct, TP1/TP2 and rr are measured from it
+(issue #133). `price` is informational.
 """
 
 import urllib.request
@@ -139,9 +143,11 @@ def analyze_symbol(symbol, interval="15m"):
     candle_low = lows[-1]
     candle_vol = volumes[-2]  # closed wick candle: the forming candle's volume is partial (issue #83)
 
-    # Candle range and wicks
-    total_range = candle_high - candle_low
-    if total_range <= 0:
+    # Closed wick candle: its wicks score the setup, so the zero-range guard checks it, not the forming candle
+    # (issue #133). Trigger and SL sit beyond the more extreme of the two candles.
+    wick_high = float(klines[-2][2])
+    wick_low = float(klines[-2][3])
+    if wick_high - wick_low <= 0:
         return None
 
     # Both wicks from the last CLOSED candle via the shared helper (klines[-1] is still forming; issue #85)
@@ -222,14 +228,16 @@ def analyze_symbol(symbol, interval="15m"):
 
     atr = calculate_atr(highs, lows, closes, period=14)
 
-    # Determine direction
+    # Determine direction. Every level is measured from the trigger, the effective entry (issue #133, as #86 in
+    # broad_market_radar); `price` stays informational. The trigger is beyond both the closed wick candle and the
+    # forming candle, so it is never crossed at scan time.
     if score_long >= 45 and score_long > score_short:
         direction = "LONG"
         confluence_score = min(score_long, 98)
         reasons = long_reasons
-        entry = current_price
-        trigger_entry = candle_high * 1.0005 # Trigger: break above absorption candle high
-        sl = candle_low - (1.3 * atr) # ATR anti-sweep buffer
+        trigger_entry = max(candle_high, wick_high) * 1.0005 # Trigger: break above the absorption candle high
+        entry = trigger_entry
+        sl = min(candle_low, wick_low) - (1.3 * atr) # ATR anti-sweep buffer beyond the closed wick
         risk_pct = ((entry - sl) / entry) * 100
         # Ensure minimum 1.0% technical buffer against micro-noise
         if risk_pct < 1.0:
@@ -243,9 +251,9 @@ def analyze_symbol(symbol, interval="15m"):
         direction = "SHORT"
         confluence_score = min(score_short, 98)
         reasons = short_reasons
-        entry = current_price
-        trigger_entry = candle_low * 0.9995 # Trigger: break below absorption candle low
-        sl = candle_high + (1.3 * atr) # ATR anti-sweep buffer
+        trigger_entry = min(candle_low, wick_low) * 0.9995 # Trigger: break below the absorption candle low
+        entry = trigger_entry
+        sl = max(candle_high, wick_high) + (1.3 * atr) # ATR anti-sweep buffer beyond the closed wick
         risk_pct = ((sl - entry) / entry) * 100
         if risk_pct < 1.0:
             sl = entry * 1.012
@@ -340,7 +348,7 @@ def main(argv=None):
             roe_est = round(item["risk_pct"] * item["rr"] * 3, 1) # at 3x
             trigger_str = f"{item['trigger']:.4f}" if item.get("trigger") else f"{item['entry']:.4f}"
             print(f"#{i} | {item['symbol']} - {item['direction']} | Confluence: {item['score']}% ({tier})")
-            print(f"   • Next-Candle Trigger: {trigger_str} | Market Price: {item['price']}")
+            print(f"   • Trigger (entry): {trigger_str} | Market Price: {item['price']}")
             print(f"   • Stop Loss (1.3x ATR Buffer): {item['sl']:.4f} (-{item['risk_pct']}%)")
             print(f"   • TP1 (EMA 20 / BE): {item['tp1']:.4f} | TP2 (Structural): {item['tp2']:.4f}")
             print(f"   • R:R Ratio: {item['rr']}:1 | Estimated ROE (3x): +{roe_est}%")

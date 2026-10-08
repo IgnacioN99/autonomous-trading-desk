@@ -6,6 +6,10 @@ by confidence tier: Tier S (Maximum), Tier A+ (High), Tier A (Strong), and Delta
 
 Read-only: uses public Binance Futures market data and never places orders.
 
+Levels are measured from the trigger (the effective entry); `trigger_distance_pct` is signed (> 0: the trigger is
+beyond the price in the trade direction). The enrichment never lifts a row to Tier S without institutional volume
+or a >= 60% wick (`tier_s_eligible`). Rows above the risk_pct ceiling are dropped with a stderr count.
+
 CLI:
     python3 scripts/broad_market_radar.py [--json] [--top N] [--interval 15m|5m|1h]
                                           [--universe N] [--env prod|testnet]
@@ -137,19 +141,18 @@ def analyze_single_symbol(symbol, interval=DEFAULT_INTERVAL):
     candle_low = lows[-1]
     candle_vol = volumes[-2]  # closed wick candle: the forming candle's volume is partial (issue #83)
 
-    total_range = candle_high - candle_low
-    if total_range <= 0:
-        return None
-
     # Absorption wicks: BOTH sides from the same, last CLOSED candle (klines[-1] is still forming, so its wicks
     # are not final). Never mix sides across candles: lower + upper must stay <= 100% of one range (issue #20).
     wick_kline = klines[-2]
-    wick_candle_open_time = int(wick_kline[0])
-    effective_lower_wick, effective_upper_wick = me.candle_wick_pcts(wick_kline)
     # The stop must sit beyond the wick that justifies the trade, not inside it: anchor on the more extreme of
     # the forming candle and the wick candle (issue #20).
     wick_high = float(wick_kline[2])
     wick_low = float(wick_kline[3])
+    # Zero-range guard on the candle the wicks come from, not on the forming one (issue #133)
+    if wick_high - wick_low <= 0:
+        return None
+    wick_candle_open_time = int(wick_kline[0])
+    effective_lower_wick, effective_upper_wick = me.candle_wick_pcts(wick_kline)
 
     rsi_15m = calculate_rsi(closes, period=14)
     emas = calculate_ema(closes, period=20)
@@ -264,12 +267,8 @@ def analyze_single_symbol(symbol, interval=DEFAULT_INTERVAL):
     else:
         return None
 
-    # FINANCIAL FRICTION FILTER (measured from the trigger):
-    # Roundtrip taker fee (0.10%) + conservative spread (0.03%) = 0.13%
-    # If distance to TP1 is less than 3.5x friction (< 0.45%), disqualify
-    expected_gain_tp1_pct = abs(tp1 - entry) / entry * 100
-    if expected_gain_tp1_pct < 0.50:
-        return None
+    # No radar friction filter (issue #141): with the risk floor and TP1 >= 1.8R, TP1 is always >= 2.52% from the
+    # trigger, so a 0.50% check could never reject. The binding checks are executor Gate 3 and evaluator K3.
 
     # CONVICTION QUALITY FILTER:
     # For Tier S (Maximum Institutional Conviction >= 80%), climax volume
@@ -298,7 +297,11 @@ def analyze_single_symbol(symbol, interval=DEFAULT_INTERVAL):
         "interval": interval,
         "price": current_price,
         "trigger": trigger,
-        "trigger_distance_pct": round(abs(trigger - current_price) / current_price * 100, 2),
+        # Signed (issue #140): > 0 means the trigger is beyond the price in the trade direction. The trigger comes
+        # from the forming high/low and high >= close >= low, so it is never crossed at scan time; crossing happens
+        # at execution time, where the executor gates use the current price.
+        "trigger_distance_pct": round((trigger - current_price if direction == "LONG" else current_price - trigger)
+                                      / current_price * 100, 2),
         "sl": sl,
         "tp1": tp1,
         "tp2": tp2,
@@ -310,6 +313,8 @@ def analyze_single_symbol(symbol, interval=DEFAULT_INTERVAL):
         "lower_wick": round(effective_lower_wick, 1),
         "upper_wick": round(effective_upper_wick, 1),
         "wick_candle_open_time": wick_candle_open_time,  # open time (ms) of the closed candle both wicks come from
+        # Exact (unrounded) volume-or-wick rule, re-applied after the microstructure enrichment (issue #134)
+        "tier_s_eligible": bool(has_volume_or_wick_climax),
         "reasons": reasons
     }
     # Issue #84: a stop this far from the trigger puts TP2 (4R) out of intraday reach. The row is flagged here and
@@ -338,15 +343,20 @@ def enrich_candidate_microstructure(cand):
     funding_rate = micro['funding_rate_pct']
     # Absorption is only scored when wick and taker data describe the wick candle (issue #83); a mismatch can
     # only remove the bonus, never add score.
-    absorption_scored = not (micro.get('wick_candle_mismatch') or micro.get('taker_candle_matched') is False)
+    # A missing flag counts as unmatched (fail closed, issue #135).
+    absorption_scored = not (micro.get('wick_candle_mismatch') or micro.get('taker_candle_matched') is not True)
     if not absorption_scored:
         reasons.append("🔬 ORDER FLOW: absorption not scored (wick/taker candle mismatch)")
+    # Each value is labelled with the candle it comes from (issue #135): the price change is the forming candle's,
+    # OI is the latest row, the taker ratio is the closed wick candle's.
+    flow_txt = (f"ΔP(forming)={micro.get('price_change_pct', 0.0):+.2f}%, OI(latest)={oi_pct:+.2f}%, "
+                f"Taker(closed)={t_ratio:.2f}")
 
     if direction == 'SHORT':
         # Strongly penalize if market is in active Long Build-Up (aggressive buying + rising OI)
         if regime == 'LONG_BUILDUP':
             score -= 30
-            reasons.append(f"⚠️ MACRO PENALTY: Active Long Build-up (Taker={t_ratio:.2f}, OI={oi_pct:+.2f}%)")
+            reasons.append(f"⚠️ MACRO PENALTY: Active Long Build-up ({flow_txt})")
         elif absorption == 'BEARISH_ABSORPTION' and absorption_scored:
             score += 15
             reasons.append(f"🔬 ORDER FLOW: {micro['absorption_desc']}")
@@ -362,7 +372,7 @@ def enrich_candidate_microstructure(cand):
         # Strongly penalize if market is in active Short Build-Up (aggressive selling + rising OI)
         if regime == 'SHORT_BUILDUP':
             score -= 30
-            reasons.append(f"⚠️ MACRO PENALTY: Active Short Build-up (Taker={t_ratio:.2f}, OI={oi_pct:+.2f}%)")
+            reasons.append(f"⚠️ MACRO PENALTY: Active Short Build-up ({flow_txt})")
         elif absorption == 'BULLISH_ABSORPTION' and absorption_scored:
             score += 15
             reasons.append(f"🔬 ORDER FLOW: {micro['absorption_desc']}")
@@ -374,6 +384,11 @@ def enrich_candidate_microstructure(cand):
             score -= 15
             reasons.append(f"⚠️ CROWDED: Excessive positive funding ({funding_rate:.4f}%)")
 
+    # Tier S still needs institutional volume or a >= 60% wick after the enrichment (issue #134): same cap as
+    # analyze_single_symbol. A missing flag is not eligible (fail closed).
+    if score >= 80 and cand.get('tier_s_eligible') is not True:
+        score = 74
+    cand['absorption_scored'] = absorption_scored
     cand['confidence'] = max(20, min(95, score))
     if cand['confidence'] >= 80:
         cand['tier'] = "Tier S (🔥 Maximum Microstructural Conviction)"
@@ -422,6 +437,10 @@ def scan_all_liquid_pairs(top_n=DEFAULT_UNIVERSE, interval=DEFAULT_INTERVAL):
 
     # Filter qualified candidates only (>= 55% confidence, risk_pct within the intraday ceiling, issue #84)
     qualified = [c for c in enriched_results if c['confidence'] >= 55 and not c.get('risk_pct_over_ceiling')]
+    over_ceiling = [c['symbol'] for c in enriched_results if c.get('risk_pct_over_ceiling')]
+    if over_ceiling:  # issue #141: tell "no setups" apart from "setups dropped by the ceiling"
+        print(f"Radar: dropped {len(over_ceiling)} row(s) with risk_pct above the {MAX_RISK_PCT}% intraday ceiling "
+              f"({', '.join(sorted(over_ceiling))}).", file=sys.stderr)
     qualified.sort(key=lambda x: x['confidence'], reverse=True)
     return qualified
 
@@ -478,7 +497,7 @@ def print_text_report(payload):
     for c in payload["candidates"]:
         m = c.get('micro') or {}
         print(f"• {c['tier']} | {c['symbol']} ({c['direction']}) -> {c['confidence']}%")
-        print(f"  Price: {c['price']} | Trigger (entry):{c['trigger']:.4f} | SL: {c['sl']:.4f} (-{c['risk_pct']}%) | "
+        print(f"  Price: {c['price']} | Trigger (entry): {c['trigger']:.4f} | SL: {c['sl']:.4f} (-{c['risk_pct']}%) | "
               f"TP1: {c['tp1']:.4f} | TP2: {c['tp2']:.4f} | R:R {c['rr']}:1 | "
               f"ROE est ({payload['leverage_standard']}x): +{c['roe_est_pct']}%")
         print(f"  Flow: Taker={m.get('taker_ratio', 1.0):.2f} | OI={m.get('oi_change_pct', 0.0):+.2f}% | "
