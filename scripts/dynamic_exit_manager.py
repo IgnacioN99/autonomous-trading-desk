@@ -145,7 +145,8 @@ def _lock_mfe(is_long, entry_price, closed_mfe, *, tp1_filled, exit_management, 
 
 def calculate_structural_stop(symbol, direction, entry_price, current_sl_price=0.0, target_env=None, *,
                               planned_sl=None, entry_ts=None, tp1_filled=None, mark_price=None,
-                              reference_source=None, intrabar_extreme=None, tp1_price=None, exit_management=None):
+                              reference_source=None, intrabar_extreme=None, tp1_price=None, exit_management=None,
+                              klines_15m=None, filters=None):
     """
     Calculates the dynamic Stop Loss preserving convexity (positive skewness), on CLOSED 15m candles only
     (the forming candle is dropped, so intrabar noise can neither activate nor anchor the trail).
@@ -179,13 +180,19 @@ def calculate_structural_stop(symbol, direction, entry_price, current_sl_price=0
       - Never loosens against current_sl_price; never closer than 0.5x ATR to price (mark_price if given, else
         the last closed close); this floor may cap the profit lock (capped_by_price_floor).
     Take-profit orders are never re-based: TP1/TP2 keep their original levels.
+
+    INJECTED DATA (Issue #182, offline replay in scripts/exit_policy_sim.py): klines_15m (raw 15m klines, last row =
+    the forming candle, like get_klines_data(symbol, "15m", limit=99)) and filters (a get_symbol_filters dict) skip
+    the corresponding read when given; None (live callers) reads them as before.
     """
     target_env = resolve_env(target_env)
-    filters = eft.get_symbol_filters(symbol, target_env=target_env)
+    if filters is None:
+        filters = eft.get_symbol_filters(symbol, target_env=target_env)
     if not filters:
         return None
 
-    k15m = get_klines_data(symbol, interval="15m", limit=99)  # limit < 100: request weight 1 (Issue #108)
+    k15m = (klines_15m if klines_15m is not None
+            else get_klines_data(symbol, interval="15m", limit=99))  # limit < 100: request weight 1 (Issue #108)
     if not k15m:
         return None
     closed = k15m[:-1]  # drop the forming candle
