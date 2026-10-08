@@ -282,6 +282,7 @@ def handle_post_trade_sync(payload: dict) -> dict:
         "order_placed": order_placed,
         "is_opening": is_opening,
         "synced": False,
+        "sync_rc": None,
         "audit_healed": False
     }
 
@@ -313,8 +314,9 @@ def handle_post_trade_sync(payload: dict) -> dict:
         try:
             proc = subprocess.run([sys.executable, sync_script, "--env", target_env], stdout=subprocess.DEVNULL,
                                   stderr=subprocess.DEVNULL, timeout=SYNC_TIMEOUT_S)
-            result["synced"] = True
+            result["synced"] = True   # sync attempted; its exit code is sync_rc (issue #160)
             rc = getattr(proc, "returncode", 0)
+            result["sync_rc"] = rc if isinstance(rc, int) and not isinstance(rc, bool) else None
             if isinstance(rc, int) and rc != 0:
                 # Issue #127: INVALID state written or write failed (exit 1). Warning only, never blocking.
                 sys.stderr.write(f"[POST-TRADE-SYNC WARNING] sync_session_state.py exited {proc.returncode}: "

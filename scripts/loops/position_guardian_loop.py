@@ -14,7 +14,8 @@ Per cycle:
   1. Sync open positions (GET /fapi/v2/positionRisk).
   2. Orphan audit: a position without a verified protective stop is auto-healed with a verified
      emergency stop (execute_futures_trade.heal_orphan_position); if the stop cannot be verified,
-     the position is closed with a reduce-only market order (fail-safe auto-destruct policy). An unreadable stop
+     the position is closed with a reduce-only market order (fail-safe auto-destruct policy; no second P0 when
+     step 0's failed crossed close already reported the symbol this cycle, issue #160). An unreadable stop
      listing is UNKNOWN (no action) until it persists STOP_UNKNOWN_ESCALATE_AFTER cycles (issue #173): then
      eft.heal_unknown_stop (no close) and a CRITICAL/P0 report (see stop_unknown_cycles).
   3. Structural trailing (dynamic_exit_manager.update_position_to_structural_stop): place-then-cancel,
@@ -231,6 +232,16 @@ def holding_verdict(p, view, target_env, now_ts=None, *, fetch=None):
     return res
 
 
+def _crossed_close_reported(action):
+    """Issue #160: True when a protect-pending action is a failed crossed close that filed a P0 (eft crossed_close:
+    not flat, no stop kept and no verified orphan-heal stop). A dry run has no "flat" key and never reports."""
+    if not isinstance(action, dict) or action.get("type") != "pending_sl_crossed_close" or action.get("success"):
+        return False
+    detail = action.get("detail") or {}
+    return (detail.get("flat") is False and not detail.get("kept_stops")
+            and not (detail.get("heal") or {}).get("success"))
+
+
 class GuardianCycle:
     def __init__(self, target_env, dry_run=False, close_dead_alpha=False, log_dir=None, mode="once", interval_seconds=None,
                  lock_warning=None):
@@ -241,6 +252,7 @@ class GuardianCycle:
         self._user_trades = {}  # (SYMBOL, limit) -> userTrades response, shared by trailing and dead alpha
         self._audit_kinds = set()  # dem's raw audit_* warnings of this cycle (issue #163 escalation)
         self._audit_resolved = False  # at least one trailing evaluation resolved the trade reference
+        self._crossed_close_reported = set()  # symbols whose failed crossed close filed a P0 this cycle (issue #160)
         self._previous = {}  # previous guardian_state.json of this env (read at the start of run())
         now = int(time.time())
         self.state = {
@@ -376,7 +388,9 @@ class GuardianCycle:
                                                     "message": "Unprotected position; would place a verified emergency stop."})
             self.error(sym, "orphan", "Position has no verified stop (dry run: not healed).")
             return "dry_run"
-        heal = eft.heal_orphan_position(p, target_env=self.env, close_on_failure=True)
+        # Issue #160: the heal and its close always run; only a second P0 for the same failure is skipped.
+        heal = eft.heal_orphan_position(p, target_env=self.env, close_on_failure=True,
+                                        report_failure=str(sym).upper() not in self._crossed_close_reported)
         detail = {k: heal.get(k) for k in ("reason", "verified", "healed_sl_price", "new_stop", "closed")}
         if heal.get("closed"):
             self.action(sym, "orphan_close", True, dict(detail, close_result=heal.get("close_result")))
@@ -493,6 +507,8 @@ class GuardianCycle:
         for a in res.get("actions", []):
             self.action(a.get("symbol"), a.get("type"), a.get("success"),
                         dict(a.get("detail") or {}, pending_entry_key=a.get("key")))
+            if _crossed_close_reported(a):
+                self._crossed_close_reported.add(str(a.get("symbol") or "").upper())
         for e in res.get("errors", []):
             self.error(e.get("symbol"), f"pending_{e.get('stage')}", e.get("error"))
         for w in res.get("warnings") or []:

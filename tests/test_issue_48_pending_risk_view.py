@@ -255,6 +255,9 @@ class TestSyncRestingEntries(unittest.TestCase):
         # filled 100 long + resting 1212 long / 147 short -> heavy long; the filled-only delta_bias is unchanged
         self.assertEqual(exp["delta_bias_incl_resting"], "LONG_HEAVY")
         self.assertEqual(exp["delta_bias"], "LONG_HEAVY")
+        # Issue #160: the two ignored records with no live match and no open position are listed as mismatches.
+        self.assertEqual(exp["resting_mismatches"], [{"symbol": "ADAUSDT", "entry_id": "7002", "side": "LONG"},
+                                                     {"symbol": "DOTUSDT", "entry_id": "7004", "side": "LONG"}])
         with open(self.state_path, "r", encoding="utf-8") as f:
             self.assertEqual(json.load(f)["portfolio_exposure"]["resting_entries"], exp["resting_entries"])
 

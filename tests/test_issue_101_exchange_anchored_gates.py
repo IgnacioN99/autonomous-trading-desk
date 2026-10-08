@@ -41,7 +41,7 @@ from utils import portfolio_exposure as pe
 from test_exit_management import FakeExchange, offline, long_position, stop, ALGO_ENDPOINT
 from test_pending_entries import make_record, write_registry, read_registry, entry_algo, write_guardian_state
 
-SNAPSHOT_ENDPOINTS = ("/fapi/v2/positionRisk", "/fapi/v1/openAlgoOrders", "/fapi/v1/openOrders")
+SNAPSHOT_ENDPOINTS = ("/fapi/v1/openAlgoOrders", "/fapi/v1/openOrders", "/fapi/v2/positionRisk")   # #160 order
 PROFILE = {"max_open_positions": 3, "yolo_slot_enabled": True, "leverage_standard": 3, "leverage_yolo": 15,
            "leverage_ceiling": 15, "risk_pct_equity": 0.005, "max_margin_ratio": 0.30}
 EX_FILTERS = {"stepSize": 0.001, "minQty": 0.001, "tickSize": 0.01, "precision_qty": 3, "precision_price": 2,

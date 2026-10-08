@@ -1168,7 +1168,7 @@ def get_atr_15m(symbol):
         return None
 
 
-def heal_orphan_position(position, target_env=None, close_on_failure=False, *, planned_sl=None):
+def heal_orphan_position(position, target_env=None, close_on_failure=False, *, planned_sl=None, report_failure=True):
     """
     Places a verified emergency stop on a position that has none. The stop sits ORPHAN_HEAL_SL_DISTANCE away
     from the worse of entry/mark so it can never trigger on placement. planned_sl (the trade's planned SL, passed
@@ -1181,7 +1181,9 @@ def heal_orphan_position(position, target_env=None, close_on_failure=False, *, p
     listed in redundant_stops (reduce-only/closePosition, never cancelled here). If it cannot be verified and
     close_on_failure=True, the position is closed with a reduce-only market order (fail-safe auto-destruct). A hedge-mode
     row (positionSide != BOTH) returns reason "hedge_mode_unsupported" without any order. Never opens or increases
-    exposure.
+    exposure. A heal-and-close failure files a CRITICAL/P0 report (_report_abort_failure) unless report_failure=False
+    (issue #160: the guardian passes it when this cycle's failed crossed close already reported the symbol); the heal
+    and the close run either way.
     """
     target_env = resolve_env(target_env)
     sym = position['symbol']
@@ -1265,7 +1267,7 @@ def heal_orphan_position(position, target_env=None, close_on_failure=False, *, p
         out["close_result"] = close_res
         out["success"] = out["closed"]
         out["reason"] = "closed_after_failed_heal" if out["closed"] else "heal_and_close_failed"
-        if not out["closed"]:
+        if not out["closed"] and report_failure:
             _report_abort_failure(sym, target_env, "heal_orphan_position",
                                   f"heal stop unverified and reduce-only close not confirmed ({close_res})")
     return out
@@ -1521,7 +1523,7 @@ def monetary_loss_cap(account_equity, prof, *, is_testnet, is_yolo, ref, total_q
 
 def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty, leverage, bypass_delta_gate=False, target_env=None, bypass_all_gates=False, is_yolo=False,
                            maint_margin_ratio=None, maint_amount=0.0, mmr_source=None, liq_entry_price=None, entry_price=None,
-                           live_snapshot=None):
+                           live_snapshot=None, exchange_ticks=None):
     """
     Mechanical Software Gates (Deterministic Precondition Validation).
     Verifies mathematical invariants and physically prevents execution if risk rules are violated.
@@ -1541,7 +1543,8 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
     (execute_complete_trade, no explicit --margin) is sized on the same min(wallet, wallet + uPnL), so open losses
     size the order down instead of making Gate 2 reject it; an explicit margin is the user's and is not re-sized.
     Gate 0A and Gate 1 read the registry captured in the snapshot (issue #127). TESTNET skips Gate 1 and keeps the
-    10000 fallback.
+    10000 fallback. `exchange_ticks` ({symbol: tickSize}, issue #160) caps the registry tick_size used to match
+    quantity-less resting orders to their records (record_price_tolerances).
     """
     ref = entry_price if entry_price else cur_price
     target_env = resolve_env(target_env)
@@ -1665,7 +1668,8 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
         resting = [dict(resting_entry_info(source, kind, o), executed_qty=o.get('executedQty'))
                    for source, kind, o in live_resting_opening_orders(live_snapshot)]
         try:
-            legs = resting_opening_legs(resting, records, price_tol_by_symbol=record_price_tolerances(records))
+            legs = resting_opening_legs(resting, records,
+                                        price_tol_by_symbol=record_price_tolerances(records, exchange_ticks))
         except ValueError as e:
             return False, (f"MECHANICAL HARD GATE REJECTION: FAIL-CLOSED — {e}. The delta-neutral gate cannot "
                            "measure the portfolio. Order blocked.")
@@ -1846,6 +1850,38 @@ def place_take_profit_orders(symbol, exit_side, tp1_price, tp2_price, tp1_qty, t
     return placed[0], placed[1]
 
 
+def find_resting_take_profits(symbol, exit_side, wanted, tick_size=None, exclude_ids=(), target_env=None):
+    """Issue #160 (read-only): reduce-only exit-side LIMIT orders already resting at the TP prices, so a record whose
+    TP ids were not persisted adopts them instead of placing duplicates. wanted: {name: price}; an order matches when
+    its price is within one tick (exact to 1e-9 relative without a tick); each order is adopted at most once and
+    exclude_ids are skipped. Returns ({name: orderId}, error_or_None); a failed GET /fapi/v1/openOrders?symbol= is
+    ({}, error)."""
+    try:
+        res = send_signed_request('GET', '/fapi/v1/openOrders', {'symbol': symbol}, target_env=target_env)
+    except Exception as e:
+        res = {"error": str(e)}
+    if not isinstance(res, list):
+        return {}, f"/fapi/v1/openOrders query for {symbol} failed: {res}"
+    used = {str(i) for i in exclude_ids or ()}
+    found = {}
+    for name, price in (wanted or {}).items():
+        price = _to_float(price)
+        if price <= 0:
+            continue
+        tol = _to_float(tick_size) * 1.01 if _to_float(tick_size) > 0 else abs(price) * 1e-9
+        for o in res:
+            if not isinstance(o, dict) or str(_order_id(o)) in used or _order_id(o) is None:
+                continue
+            if (str(o.get('symbol') or symbol).upper() == str(symbol).upper()
+                    and str(o.get('type') or '').upper() == 'LIMIT'
+                    and str(o.get('side') or '').upper() == str(exit_side).upper()
+                    and _truthy(o.get('reduceOnly')) and abs(_to_float(o.get('price')) - price) <= tol):
+                found[name] = _order_id(o)
+                used.add(str(_order_id(o)))
+                break
+    return found, None
+
+
 def append_trade_audit_record(record, margin_usdt):
     """Appends an entry record to logs/trades_audit.jsonl with canonical provenance (atomic append)."""
     log_dir = os.path.join(_workspace_dir(), 'logs')
@@ -1924,6 +1960,7 @@ def load_pending_entries(base_dir=None):
 
 
 PENDING_REGISTRY_LOCK_WAIT_S = 5.0
+PENDING_SAVE_RETRY_DELAYS_S = (0.5, 1.0)   # issue #160: 3 attempts of the TP ids / audit_done saves
 _registry_lock_state = threading.local()
 
 
@@ -2349,7 +2386,9 @@ def check_pending_entry_conflict(symbol, target_env):
 def fetch_live_gate_snapshot(target_env):
     """
     PROD gate inputs read from the exchange, fetched ONCE per order attempt (issue #101): three all-symbol GETs,
-    /fapi/v2/positionRisk, /fapi/v1/openAlgoOrders and /fapi/v1/openOrders. Gate 0A (max open positions), Gate 1
+    /fapi/v1/openAlgoOrders, /fapi/v1/openOrders, then /fapi/v2/positionRisk (issue #160: listings first, as in
+    _protect_pending_entry, so an entry filling between the reads is counted twice, the safe side, instead of
+    vanishing from both). Gate 0A (max open positions), Gate 1
     (delta-neutral, incl. resting opening orders), Gate 2 (unrealized PnL of the open positions, issue #119) and the
     unregistered-resting-entry check (1d) all read this snapshot, so editing or deleting
     logs/session_state.json / logs/pending_entries.json cannot make a gate pass that the live state would fail.
@@ -2362,8 +2401,8 @@ def fetch_live_gate_snapshot(target_env):
     (#46). A registry read error is kept in the capture (the gates fail closed on it as before). Read-only.
     """
     snap = {"env": target_env, "fetched_at": int(time.time()), "registry": load_pending_entries_status()}
-    for name, endpoint in (('positions', '/fapi/v2/positionRisk'), ('open_algo_orders', '/fapi/v1/openAlgoOrders'),
-                           ('open_orders', '/fapi/v1/openOrders')):
+    for name, endpoint in (('open_algo_orders', '/fapi/v1/openAlgoOrders'), ('open_orders', '/fapi/v1/openOrders'),
+                           ('positions', '/fapi/v2/positionRisk')):
         try:
             res = send_signed_request('GET', endpoint, target_env=target_env)
         except Exception as e:
@@ -2378,12 +2417,17 @@ def fetch_live_gate_snapshot(target_env):
     return snap, None
 
 
-def record_price_tolerances(records):
+def record_price_tolerances(records, exchange_ticks=None):
     """Issue #126: {symbol: half a tick} from the tick_size stored in registry records at registration (exchangeInfo
-    is not cached, so no extra read here). Records without a positive tick_size add nothing (exact match)."""
+    is not cached, so no extra read here). Records without a positive tick_size add nothing (exact match).
+    Issue #160: the registry is editable, so a record's tick_size is capped at the exchange tick of its symbol when
+    exchange_ticks ({symbol: tickSize}, filters already fetched by the caller) knows it."""
+    known = {str(s).upper(): _to_float(t) for s, t in (exchange_ticks or {}).items()}
     out = {}
     for r in records or []:
         tick = _to_float((r or {}).get('tick_size')) if isinstance(r, dict) else 0.0
+        if tick > 0 and known.get(str(r.get('symbol') or '').upper(), 0.0) > 0:
+            tick = min(tick, known[str(r.get('symbol') or '').upper()])
         if tick > 0:
             sym = str(r.get('symbol') or '').upper()
             out[sym] = min(out.get(sym, tick / 2.0), tick / 2.0)
@@ -2837,7 +2881,10 @@ def protect_pending_entries(target_env=None, dry_run=False, keys=None):
           existing stops; leftovers are cancelled only once flat. A failed close with no stop at all gets an
           orphan-heal stop (issue #39).
         Once the entry order is gone, TP1/TP2 are placed reduce-only from the ACTUAL position size (idempotent:
-        placed TP ids are saved first and only a missing TP is retried), an audit record is appended (with
+        placed TP ids are saved first and only a missing TP is retried; issue #160: that save and the audit_done save
+        retry a registry lock error, and a missing TP id first adopts a reduce-only exit-side LIMIT already resting
+        at its price, find_resting_take_profits; a failed read places as before with a "tp_reconcile" warning),
+        an audit record is appended (with
         realized_rr_tp2, tp1_distance_pct and fill_quality_flags, issue #39, log only) and the record dropped.
         A partially filled LIMIT keeps its record (remainder cancelled at expiry, TPs on a later run).
       - not filled and still open: cancelled once expires_at_ts is reached, else kept.
@@ -3074,6 +3121,18 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out, run_ctx=None
                         entries[key][k] = v
         if not dry_run:
             update_pending_entries(mutate)
+
+    def save_retrying(**fields):
+        """save() retried on PendingRegistryLockError after each PENDING_SAVE_RETRY_DELAYS_S delay (issue #160: the
+        TP ids and audit_done saves); the last failure is raised as before."""
+        for delay in PENDING_SAVE_RETRY_DELAYS_S + (None,):
+            try:
+                return save(**fields)
+            except PendingRegistryLockError as e:
+                if delay is None:
+                    raise
+                logger.warning(f"{sym} {key}: registry update {sorted(fields)} retried in {delay}s ({e})")
+                time.sleep(delay)
 
     def save_before_stop(**fields):
         """save() for the bookkeeping writes that run BEFORE the stop is placed/verified: a registry lock failure
@@ -3506,16 +3565,35 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out, run_ctx=None
             return act("pending_tp_placed", False, tp1_price=tp1_p, tp1_qty=tp1_qty, tp2_price=tp2_p, tp2_qty=tp2_qty,
                        quantity=qty, place_tp1=need1, place_tp2=need2, fill_quality_flags=fill_flags)
         retried = ids['tp1_order_id'] is not None or ids['tp2_order_id'] is not None
+        adopted = []
+        if need1 or need2:
+            # Issue #160: TP ids lost to a failed save must not mean duplicate TPs: adopt the reduce-only exit-side
+            # LIMIT orders already resting at the TP prices. A failed read places as before (never blocks protection).
+            wanted = {name: price for name, price, need in (('tp1_order_id', tp1_p, need1),
+                                                            ('tp2_order_id', tp2_p, need2)) if need}
+            found, read_err = find_resting_take_profits(sym, exit_side, wanted, tick,
+                                                        exclude_ids=[v for v in ids.values() if v is not None],
+                                                        target_env=target_env)
+            if read_err:
+                out.setdefault("warnings", []).append({"key": key, "symbol": sym, "stage": "tp_reconcile",
+                                                       "warning": f"{read_err}; TPs placed without the duplicate "
+                                                                  "check"})
+            for name, order_id in found.items():
+                ids[name] = order_id
+                adopted.append(name)
+            need1 = need1 and ids['tp1_order_id'] is None
+            need2 = need2 and ids['tp2_order_id'] is None
         o1, o2 = place_take_profit_orders(sym, exit_side, tp1_p, tp2_p, tp1_qty if need1 else 0, tp2_qty if need2 else 0,
                                           target_env=target_env)
         for name, order in (('tp1_order_id', o1), ('tp2_order_id', o2)):
             if isinstance(order, dict) and 'orderId' in order and not _is_api_error(order):
                 ids[name] = order['orderId']
         tp_ok = (tp1_qty <= 0 or ids['tp1_order_id'] is not None) and (tp2_qty <= 0 or ids['tp2_order_id'] is not None)
-        # Persist what was placed BEFORE anything else, so a later run never duplicates a TP.
-        save(tp1_qty=tp1_qty, tp2_qty=tp2_qty, tp_placed=tp_ok, **ids)
+        # Persist what was placed BEFORE anything else, so a later run never duplicates a TP (lock retried, #160).
+        save_retrying(tp1_qty=tp1_qty, tp2_qty=tp2_qty, tp_placed=tp_ok, **ids)
         act("pending_tp_placed", tp_ok, tp1_price=tp1_p, tp1_qty=tp1_qty, tp2_price=tp2_p, tp2_qty=tp2_qty, quantity=qty,
-            retried=retried, record_dropped=tp_ok, fill_quality_flags=fill_flags, **ids)
+            retried=retried, record_dropped=tp_ok, fill_quality_flags=fill_flags, **ids,
+            **({"adopted_existing": adopted} if adopted else {}))
         if not tp_ok:
             return fail("take_profit", f"TP placement failed for {sym} (tp1={o1}, tp2={o2}); SL is in place, only the "
                                        "missing TP is retried next run.")
@@ -3549,7 +3627,7 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out, run_ctx=None
             append_trade_audit_record(record, rec.get('margin_usdt'))
         except Exception as e:
             return fail("audit", f"Audit append failed ({e}); record kept, only the audit/drop is retried.")
-        save(audit_done=True)
+        save_retrying(audit_done=True)   # a lost flag would re-append the audit record next run (issue #160)
     return drop()
 
 
@@ -3793,7 +3871,8 @@ def execute_complete_trade(
         direction, cur_price, sl_p, tp1_p, total_qty, effective_leverage,
         bypass_delta_gate=bypass_delta_gate, target_env=target_env, is_yolo=is_yolo,
         maint_margin_ratio=mmr, maint_amount=maint_amount, mmr_source=mmr_source,
-        liq_entry_price=liq_entry_price, entry_price=effective_entry, live_snapshot=live_snapshot
+        liq_entry_price=liq_entry_price, entry_price=effective_entry, live_snapshot=live_snapshot,
+        exchange_ticks={symbol: filters.get('tickSize')}
     )
     if not gate_ok:
         return {"success": False, "hard_gate_rejection": True, "error": gate_err}
@@ -4699,7 +4778,9 @@ def _report_abort_failure(symbol, target_env, site, error):
     """CRITICAL/P0 issue (issue #40) for a fail-safe abort or close that did not end flat or protected: the
     pending_abort and crossed-close paths of --protect-pending, the inline partial-fill abort and the
     heal_orphan_position close. Never raises (reporting must not break the risk-reducing path). error_detail (hashed
-    into the 24h dedup fingerprint with the title) is stable per symbol + site; the full error goes into context."""
+    into the 24h dedup fingerprint with the title) is stable per symbol + site; the full error goes into context.
+    Issue #160: the fingerprint differs per site, so a guardian cycle whose failed crossed close already reported a
+    symbol heals it with heal_orphan_position(report_failure=False): one P0 per failure, the heal/close still run."""
     try:
         import report_agent_issue
         report_agent_issue.report_issue(
