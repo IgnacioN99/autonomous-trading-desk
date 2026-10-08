@@ -28,7 +28,10 @@ Per cycle:
      once per symbol per cycle (shared with step 4). "reference_unverified" is reported once per position (not
      repeated while the previous state already flags it). An unreadable / corrupt logs/trades_audit.jsonl
      (audit_health) files one issue per state change through report_agent_issue (never in --dry-run, never
-     stops the loop).
+     stops the loop); issue #172: the change is judged against the process's last real-cycle value
+     (AuditHealthMemory), so a TESTNET loop beside a live PROD loop reports once and a --dry-run state never
+     suppresses the next real report. A stop that triggers between dem's reads ends as "position_closed" (flat,
+     protected, no write, no dead-alpha check).
   4. Dead-alpha check: reported only; positions are closed (reduce-only) only with --close-dead-alpha.
      DEAD_ALPHA_STALLED requires BOTH the 15m range stall (last 6 closed 15m bars < 0.40%) AND the shared
      holding-time verdict also used by the doctor's watchdog (utils/position_timing.py: held >= 4h, mark within
@@ -110,6 +113,8 @@ State file (logs/guardian_state.json):
     "pending_warnings": [{"key", "symbol", "stage", "warning"}]  # protect_pending_entries "warnings" (issue #156):
                                        # loss_cap_check / qty_check deferrals, loss_cap_drift, registry_lock,
                                        # deferral_report; printed, never errors (no effect on cycle_ok or liveness)
+    "trail_warnings": [{"symbol", "warning"}]  # dem write-path warnings (issue #172): "stops_requery_failed:<err>",
+                                       # old-stop cancel errors; printed, never errors (no effect on cycle_ok)
   }
 
 Action record (also one JSON line in logs/guardian_actions.jsonl):
@@ -129,7 +134,8 @@ protect_pending_entries (calls only for pending records); all-symbol GET /fapi/v
 /fapi/v1/openOrders (find_unregistered_resting_entries, 40 each); per position: symbol openAlgoOrders twice (orphan
 audit + dem, 1 each), exchangeInfo (calculate_structural_stop, 1), 15m klines limit=99 and limit=10 (1 each),
 userTrades at most once (5); per actual stop write: one more openAlgoOrders re-read, exchangeInfo, the POST, the
-verification reads and the DELETE. About 85 + ~10 per position per cycle: at the 60s default even 10 positions use
+verification reads and the DELETE (issue #172: when that re-read finds no stop, one symbol positionRisk read (5)
+first; a flat position gets no write). About 85 + ~10 per position per cycle: at the 60s default even 10 positions use
 well under 10% of the per-minute limit.
 
 Scheduling: on Windows (WSL) install it as a Task Scheduler task that starts the loop at logon and restarts it on
@@ -242,10 +248,23 @@ def _crossed_close_reported(action):
             and not (detail.get("heal") or {}).get("success"))
 
 
+class AuditHealthMemory:
+    """Issue #172: audit_health baseline kept in the guardian process across cycles (created by _run_main). It is
+    initialised once from the previous state file (None when that state came from a --dry-run cycle, which never
+    reports) and then only advanced by real cycles that evaluated the trades_audit health, so a TESTNET loop whose
+    state is never persisted beside a live PROD loop reports once, and a --dry-run cycle never suppresses the next
+    real report."""
+
+    def __init__(self):
+        self.initialised = False
+        self.health = None
+
+
 class GuardianCycle:
     def __init__(self, target_env, dry_run=False, close_dead_alpha=False, log_dir=None, mode="once", interval_seconds=None,
-                 lock_warning=None):
+                 lock_warning=None, memory=None):
         self.env = target_env
+        self.memory = memory  # AuditHealthMemory or None (None: compare against the previous state file only)
         self.dry_run = bool(dry_run)
         self.close_dead_alpha = bool(close_dead_alpha)
         self.log_dir = log_dir or DEFAULT_LOG_DIR
@@ -270,6 +289,7 @@ class GuardianCycle:
             "actions": [],
             "errors": [],
             "pending_warnings": [],
+            "trail_warnings": [],
         }
 
     # -- bookkeeping -------------------------------------------------------
@@ -376,6 +396,8 @@ class GuardianCycle:
 
         # 2. Structural trailing (dem defers YOLO positions until TP1 and reports is_yolo / tp1_filled)
         self._trail(p, view)
+        if (view.get("trailing") or {}).get("reason") == "position_closed":
+            return  # flat now: nothing left to check for dead alpha
 
         # 3. Dead alpha (report only unless --close-dead-alpha)
         self._dead_alpha(p, view)
@@ -434,7 +456,17 @@ class GuardianCycle:
                 # Reported once per position: already flagged in the previous cycle's state.
                 warnings = [w for w in warnings if w != "reference_unverified"]
             view["trailing"]["warnings"] = warnings
-        if res.get("updated"):
+            # Issue #172: write-path notices (stops_requery_failed, old-stop cancel errors) are also listed at state
+            # level and printed; the reference / audit notices have their own reporting above and in finish().
+            for w in warnings:
+                if not (isinstance(w, str) and (w == "reference_unverified" or w.startswith("audit_"))):
+                    self.state["trail_warnings"].append({"symbol": sym, "warning": str(w)})
+        if res.get("reason") == "position_closed":
+            # Issue #172: the stop triggered between dem's reads; the position is flat (no exposure, no write).
+            view["size"] = 0.0
+            view["stop_price"] = None
+            view["protected"] = True
+        elif res.get("updated"):
             view["stop_price"] = res.get("new_sl")
             self.action(sym, "trail_stop", True, view["trailing"])
         elif res.get("reason") == "dry_run":
@@ -573,8 +605,17 @@ class GuardianCycle:
         health = self._audit_health(previous_health)
         self.state["audit_health"] = health
         self.persist()
-        if health in ("unreadable", "corrupt") and health != previous_health and not self.dry_run:
+        baseline = previous_health
+        if self.memory is not None:
+            # Issue #172: compare against this process's memory (initialised once from the state file).
+            if not self.memory.initialised:
+                self.memory.health = None if self._previous.get("dry_run") else previous_health
+                self.memory.initialised = True
+            baseline = self.memory.health
+        if health in ("unreadable", "corrupt") and health != baseline and not self.dry_run:
             _report_audit_health(self.env, health, sorted(self._audit_kinds))
+        if self.memory is not None and not self.dry_run and (self._audit_kinds or self._audit_resolved):
+            self.memory.health = health
         return self.state
 
     def _audit_health(self, previous_health):
@@ -665,10 +706,11 @@ def _report_unknown_stop(env, symbol, cycles, result, detail):
 
 
 def run_cycle(target_env=None, dry_run=False, close_dead_alpha=False, log_dir=None, mode="once", interval_seconds=None,
-              lock_warning=None):
+              lock_warning=None, memory=None):
     target_env = resolve_env(target_env)
     return GuardianCycle(target_env, dry_run=dry_run, close_dead_alpha=close_dead_alpha, log_dir=log_dir,
-                         mode=mode, interval_seconds=interval_seconds, lock_warning=lock_warning).run()
+                         mode=mode, interval_seconds=interval_seconds, lock_warning=lock_warning,
+                         memory=memory).run()
 
 
 def format_state(state):
@@ -686,6 +728,9 @@ def format_state(state):
         lines.append(f"  ! {e['stage']} {e['symbol'] or ''}: {str(e['error']).splitlines()[0]}")
     for w in state.get("pending_warnings") or []:
         lines.append(f"  ~ warning {w.get('stage')} {w.get('symbol') or ''}: "
+                     f"{(str(w.get('warning')).splitlines() or [''])[0]}")
+    for w in state.get("trail_warnings") or []:
+        lines.append(f"  ~ warning trailing {w.get('symbol') or ''}: "
                      f"{(str(w.get('warning')).splitlines() or [''])[0]}")
     if state.get("lock_warning"):
         lines.append(f"  ! lock: {state['lock_warning']}")
@@ -952,12 +997,13 @@ def _run_main(args, target_env, lock_warning=None):
         print(f"guardian: WARNING --interval {interval}s exceeds {eft.GUARDIAN_MAX_INTERVAL_FOR_RESTING}s: PROD resting "
               f"STOP_MARKET/LIMIT entries will be rejected while this loop runs (use --interval "
               f"{DEFAULT_INTERVAL_SECONDS})", file=sys.stderr, flush=True)
+    memory = AuditHealthMemory()  # issue #172: audit_health report baseline shared by this process's cycles
 
     def one_cycle():
         try:
             state = run_cycle(target_env, dry_run=args.dry_run, close_dead_alpha=args.close_dead_alpha,
                               mode=mode, interval_seconds=None if args.once else interval,
-                              lock_warning=lock_warning)
+                              lock_warning=lock_warning, memory=memory)
         except Exception as e:  # never let a cycle crash the loop
             print(f"guardian: cycle failed: {e}", file=sys.stderr)
             return False

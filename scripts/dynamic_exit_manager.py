@@ -269,8 +269,18 @@ def _resolve_trade_reference_full(symbol, position, direction, current_sl, targe
     """resolve_trade_reference plus the matched audit record (or None) and the warnings list. See
     resolve_trade_reference for the rules. fetch: send_signed_request-like callable for the userTrades read (default
     eft.send_signed_request, looked up at call time); userTrades is only read once a candidate record matched."""
+    return _resolve_trade_reference_with_candidate(symbol, position, direction, current_sl, target_env,
+                                                   fetch=fetch)[:5]
+
+
+def _resolve_trade_reference_with_candidate(symbol, position, direction, current_sl, target_env, *, fetch=None):
+    """_resolve_trade_reference_full plus the candidate record: the newest same symbol / direction / env entry record,
+    whether it matched the position or not (None when the audit file is missing or unreadable, or when userTrades
+    proves the record older than the position, i.e. an earlier trade). Issue #172: the
+    YOLO gate reads its is_yolo when no record matched."""
     entry_p = float(position.get("entryPrice") or 0)
     warnings = []
+    rec = None
 
     def _update_ts():
         try:
@@ -280,7 +290,7 @@ def _resolve_trade_reference_full(symbol, position, direction, current_sl, targe
         return ut / 1000.0 if ut > 0 else None
 
     def _fallback():
-        return (current_sl if current_sl > 0 else None), _update_ts(), "current_stop", None, warnings
+        return (current_sl if current_sl > 0 else None), _update_ts(), "current_stop", None, warnings, rec
 
     # Tail-bounded read (issue #94 reader); unreadable / corrupt files are reported, never silent (Issue #107.3).
     path = os.path.join(eft._workspace_dir(), "logs", "trades_audit.jsonl")
@@ -319,12 +329,12 @@ def _resolve_trade_reference_full(symbol, position, direction, current_sl, targe
                                             entry_price=entry_p, fetch=fetch or eft.send_signed_request)
     if source == pt.SOURCE_USER_TRADES and open_ts:
         if entry_ts is None or entry_ts < float(open_ts) - REFERENCE_OPEN_SLACK_SECONDS:
-            return _fallback()
+            return _fallback()[:5] + (None,)  # proven to belong to an earlier trade: not a YOLO candidate either
     else:
         warnings.append("reference_unverified")
     if entry_ts is None:
         entry_ts = _update_ts()
-    return rec_sl, entry_ts, "trade_audit", rec, warnings
+    return rec_sl, entry_ts, "trade_audit", rec, warnings, rec
 
 
 def resolve_trade_reference(symbol, position, direction, current_sl, target_env):
@@ -344,6 +354,29 @@ def resolve_trade_reference(symbol, position, direction, current_sl, target_env)
     return _resolve_trade_reference_full(symbol, position, direction, current_sl, target_env)[:3]
 
 
+def _position_is_flat(symbol, target_env):
+    """True only when a fresh GET /fapi/v2/positionRisk for `symbol` reads, has at least one row for the symbol, and
+    every such row carries a parsable positionAmt of zero. A read error, an empty list, a row without a symbol, no row
+    for the symbol, a missing or non-numeric positionAmt or any other unexpected payload gives False (the caller
+    re-protects)."""
+    try:
+        rows = eft.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol}, target_env=target_env)
+    except Exception:
+        return False
+    if not isinstance(rows, list) or not all(isinstance(r, dict) and r.get("symbol") for r in rows):
+        return False
+    mine =[r for r in rows if str(r.get("symbol") or "").upper() == symbol]
+    if not mine:
+        return False
+    for r in mine:
+        try:
+            if float(r["positionAmt"]) != 0:
+                return False
+        except (KeyError, TypeError, ValueError):
+            return False
+    return True
+
+
 def update_position_to_structural_stop(symbol, target_env=None, dry_run=False, position=None, *, fetch=None):
     """
     Ratchets the Stop Loss of an open position to its structural level, strictly if it tightens risk.
@@ -352,14 +385,19 @@ def update_position_to_structural_stop(symbol, target_env=None, dry_run=False, p
       - PLACE-THEN-CANCEL: the new stop is placed and verified on /fapi/v1/openAlgoOrders before the old stop
         is cancelled; if it cannot be verified the old stop is kept and success is False.
       - Re-read before replace (Issue #167): right before a write the stops are queried again; a read error keeps
-        everything (reason "stops_requery_failed"), a fresher stop already at or beyond the new level gives
-        "not_tighter", else the fresh stops are the ones replaced.
+        everything (reason "stops_requery_failed", plus a "stops_requery_failed:<error>" warning, issue #172), a
+        fresher stop already at or beyond the new level gives "not_tighter", else the fresh stops are the ones
+        replaced. Issue #172: an empty re-read re-queries positionRisk for the symbol (weight 5, only on this path);
+        a flat position gives success=True, reason "position_closed" and no write; a read error or a still-open
+        position is re-protected.
       - Never loosens: a stop is only replaced by one strictly closer to price in the favourable direction.
       - success=True only when the position ends with a verified stop (existing or new).
       - dry_run=True computes the decision but never sends a write request.
       - YOLO positions are never trailed before TP1 fills (reason "yolo_before_tp1", no write, with yolo_source).
         TP1 is read from the matched trade reference only, so a YOLO position without a matching record is not
-        trailed; YOLO detection never falls back to the newest raw audit record (audit_fallback=False).
+        trailed; YOLO detection never falls back to the newest raw audit record (audit_fallback=False). Issue #172:
+        with no matched record, the newest same symbol / direction / env record's is_yolo still marks the position
+        YOLO (yolo_source "trade_audit_unmatched"; a false positive only keeps the planned SL).
       - TP1 counts only for a verified reference (Issue #163): with "reference_unverified" (no userTrades open time;
         MCP mode: every position) tp1_filled is None, so no TP1 activation, no BE via TP1, no YOLO trail.
       - is_yolo, yolo_source, tp1_filled (the trusted value): every result from the stop query on.
@@ -417,7 +455,7 @@ def update_position_to_structural_stop(symbol, target_env=None, dry_run=False, p
 
     # Trade reference first: TP1 state is only trusted when the audit record belongs to THIS position (a stale
     # record from a previous trade must never report tp1_filled, skip the YOLO gate or allow the BE ratchet).
-    planned_sl, entry_ts, reference_source, ref_rec, ref_warnings = _resolve_trade_reference_full(
+    planned_sl, entry_ts, reference_source, ref_rec, ref_warnings, candidate = _resolve_trade_reference_with_candidate(
         symbol, position, direction, current_sl, target_env, fetch=fetch)
     base["warnings"] = list(ref_warnings)
     # TP1 and YOLO read the SAME matched record (Issue #107); without one, TP1 is unknown. Issue #163: an
@@ -429,6 +467,10 @@ def update_position_to_structural_stop(symbol, target_env=None, dry_run=False, p
     # YOLO: never trail before TP1 fills (right-tail preservation), whichever path calls this function.
     yolo, yolo_source = eft.detect_yolo_position(symbol, leverage=position.get("leverage"), record=ref_rec,
                                                  audit_fallback=False)
+    if not yolo and ref_rec is None and isinstance(candidate, dict) and eft._truthy(candidate.get("is_yolo")):
+        # Issue #172: no matched record (slipped fill, qty mismatch) but the newest same symbol / direction / env
+        # record is YOLO. A false positive only keeps the planned SL.
+        yolo, yolo_source = True, "trade_audit_unmatched"
     base.update(is_yolo=bool(yolo), yolo_source=yolo_source, tp1_filled=tp1_ok)
     if yolo and tp1_ok is not True:
         return keep("yolo_before_tp1", "YOLO position: trailing deferred until TP1 fills (right-tail preservation).")
@@ -466,9 +508,16 @@ def update_position_to_structural_stop(symbol, target_env=None, dry_run=False, p
     # tightened (or replaced) the stop is neither loosened nor left with a duplicate.
     fresh, err = eft.get_open_stop_orders(symbol, exit_side, target_env=target_env)
     if err:
+        # Issue #172: success stays True (the first read's stop still protects) but the failure is visible.
+        base["warnings"].append(f"stops_requery_failed:{err}")
         return keep("stops_requery_failed",
                     f"Cannot re-read current stops for {symbol} before replacing ({err}); nothing changed.")
-    fresh_sl = eft._trigger_price(eft.tightest_stop(fresh, is_long)) if fresh else 0.0
+    if not fresh and _position_is_flat(symbol, target_env):
+        # Issue #172: the stop vanished because it triggered; placing a new one on a flat position would fail and
+        # read as "unprotected".
+        return dict(base, success=True, reason="position_closed", current_sl=0.0,
+                    message=f"{symbol} position closed (its stop triggered) before the trailing write; nothing placed.")
+    fresh_sl =eft._trigger_price(eft.tightest_stop(fresh, is_long)) if fresh else 0.0
     base["current_sl"] = fresh_sl
     if not eft.is_tighter_stop(new_sl, fresh_sl, is_long):
         return keep("not_tighter",
