@@ -16,9 +16,12 @@ Night Desk Operating Rules:
 Usage:
   python3 scripts/loops/night_cutoff_loop.py [--env testnet|mainnet] [--auto-ratchet]
 
-run_night_cutoff returns {"close_failures": [symbols], "unprotected": [symbols]} plus "read_error" when positionRisk
-cannot be read (orphan order cleanup is then skipped). Exit status: 1 when a market close failed, a position remains
-without a verified stop or positions could not be read, else 0 (a failed Break-Even ratchet does not change it).
+run_night_cutoff returns {"close_failures": [symbols], "unprotected": [symbols], "stop_unknown": [symbols]} plus
+"read_error" when positionRisk cannot be read (orphan order cleanup is then skipped). stop_unknown: openAlgoOrders
+stayed unreadable after retries, so no heal, ratchet or close was attempted for that symbol (manual check). Exit
+status: 1 when a market close failed, a position remains without a verified stop, its stop state is unknown or
+positions could not be read, else 0 (a failed Break-Even ratchet does not change it). Any of those prints the
+"NIGHT CUTOFF INCOMPLETE" banner instead of the success banner.
 """
 
 import os
@@ -54,7 +57,7 @@ def run_night_cutoff(target_env: str = None, auto_ratchet: bool = True, overnigh
     print("=" * 70)
 
     # 1. Fetch active positions from Binance
-    summary = {"close_failures": [], "unprotected": []}
+    summary = {"close_failures": [], "unprotected": [], "stop_unknown": []}
     try:
         pos_res = eft.send_signed_request("GET", "/fapi/v2/positionRisk", target_env=target_env)
     except Exception as e:
@@ -94,9 +97,24 @@ def run_night_cutoff(target_env: str = None, auto_ratchet: bool = True, overnigh
                 continue
 
             # For SWING_STRUCTURAL_STOP and ZERO_OVERNIGHT_RISK:
-            # First, verify active Stop Loss
-            algos = eft.send_signed_request("GET", "/fapi/v1/openAlgoOrders", {"symbol": sym}, target_env=target_env)
-            active_sl = [a for a in algos if a.get("orderType") in ["STOP_MARKET", "STOP"]] if isinstance(algos, list) else []
+            # First, verify active Stop Loss (retried: an unreadable listing is UNKNOWN, never "no stop")
+            algos = None
+            for delay in (0.0,) + tuple(eft.STOP_VERIFY_RETRY_DELAYS):
+                if delay:
+                    time.sleep(delay)
+                try:
+                    algos = eft.send_signed_request("GET", "/fapi/v1/openAlgoOrders", {"symbol": sym},
+                                                    target_env=target_env)
+                except Exception as e:
+                    algos = {"error": str(e)}
+                if isinstance(algos, list):
+                    break
+            if not isinstance(algos, list):
+                summary["stop_unknown"].append(sym)
+                print(f"     ❌ CRITICAL: {sym} stop state UNKNOWN (openAlgoOrders unreadable: {algos}). "
+                      f"No heal, ratchet or close attempted. Manual check required.")
+                continue
+            active_sl = [a for a in algos if a.get("orderType") in ["STOP_MARKET", "STOP"]]
 
             if not active_sl:
                 print(f"     🚨 DANGER: {sym} HAS NO ACTIVE STOP LOSS. Placing verified emergency Stop Loss...")
@@ -205,13 +223,22 @@ def run_night_cutoff(target_env: str = None, auto_ratchet: bool = True, overnigh
         print("✅ session_state.json updated with nightly cutoff state.")
 
     print("\n" + "=" * 70)
-    print("🌙 NIGHT CUTOFF COMPLETED. DESK IN SECURE OVERNIGHT MODE.")
+    problems = []
+    if summary.get("read_error"):
+        problems.append(f"read_error: {summary['read_error']}")
+    for key in ("close_failures", "unprotected", "stop_unknown"):
+        if summary[key]:
+            problems.append(f"{key}: {summary[key]}")
+    if problems:
+        print(f"🚨 NIGHT CUTOFF INCOMPLETE: overnight risk NOT verified ({'; '.join(problems)}). Manual action required.")
+    else:
+        print("🌙 NIGHT CUTOFF COMPLETED. DESK IN SECURE OVERNIGHT MODE.")
     print("=" * 70)
     return summary
 
 def main(argv=None) -> int:
-    """CLI entry point. Exit status 1 when a close failed, a position remains unprotected or positions could not be
-    read, else 0."""
+    """CLI entry point. Exit status 1 when a close failed, a position remains unprotected, its stop state is unknown or
+    positions could not be read, else 0."""
     default_env = resolve_env()
     parser = argparse.ArgumentParser(description="Night Cutoff Loop - Zero Overnight Risk")
     parser.add_argument("--env", default=default_env, help="Target execution environment (prod/testnet)")
@@ -220,7 +247,8 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     summary = run_night_cutoff(target_env=args.env, auto_ratchet=args.auto_ratchet, overnight_mode=args.overnight_mode)
-    return 1 if summary["close_failures"] or summary["unprotected"] or summary.get("read_error") else 0
+    return 1 if summary["close_failures"] or summary["unprotected"] or summary["stop_unknown"] \
+        or summary.get("read_error") else 0
 
 if __name__ == "__main__":
     sys.exit(main())

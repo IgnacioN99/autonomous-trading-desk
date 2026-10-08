@@ -327,7 +327,8 @@ class TestWatchdogHoldingTime(unittest.TestCase):
 
     def test_auto_exit_closes_user_trades_source(self):
         fake = FillsExchange([row("BTCUSDT")], fills={"BTCUSDT": [fill("BUY", 1, int(time.time()) - 6 * HOUR)]})
-        with offline(fake), patch("execute_futures_trade.close_position_market", return_value={"success": True}) as mc:
+        with offline(fake), patch("execute_futures_trade.close_position_market", return_value={"success": True}) as mc, \
+                patch("dynamic_exit_manager.check_dead_alpha_timeout", return_value=dict(STALLED)):  # issue #138
             rep = quiet(tdw.audit_dead_alpha, target_env="testnet", auto_exit=True)
         mc.assert_called_once_with("BTCUSDT", target_env="testnet")
         self.assertEqual(rep["positions"][0]["action_taken"], "AUTO_EXIT_CLOSED")

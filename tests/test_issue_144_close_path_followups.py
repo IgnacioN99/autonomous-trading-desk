@@ -39,7 +39,7 @@ import report_agent_issue
 from test_exit_management import FakeExchange, offline, long_position, stop, write_audit, ALGO_ENDPOINT
 from test_issue_137_close_keeps_stop import (CloseExchange, keys_env, posts_of, REJECT_2022, REJECT_1001,
                                              FAILED_CLOSE, ORDER_ENDPOINT)
-from test_issue_92_holding_time import FillsExchange, fill, row, HOUR
+from test_issue_92_holding_time import FillsExchange, fill, row, HOUR, STALLED
 from test_pending_entries import make_record, write_registry
 
 ALGO_READ = "/fapi/v1/openAlgoOrders"
@@ -79,6 +79,7 @@ class TestWatchdogExitStatus(unittest.TestCase):
     def run_main(self, close_result, argv=("--env", "testnet", "--auto-exit")):
         out = io.StringIO()
         with offline(self.overdue_fake()), \
+                patch("dynamic_exit_manager.check_dead_alpha_timeout", return_value=dict(STALLED)), \
                 patch("execute_futures_trade.close_position_market", return_value=close_result), \
                 contextlib.redirect_stdout(out):
             code = tdw.main(list(argv))
@@ -149,7 +150,7 @@ class TestNightCutoffExitStatus(unittest.TestCase):
     def test_failed_close_all_exits_1(self):
         code, summary = self.run_main("CLOSE_ALL_AT_MARKET", night_send([SOL]), close_result=dict(FAILED_CLOSE))
         self.assertEqual(code, 1)
-        self.assertEqual(summary, {"close_failures": ["SOLUSDT"], "unprotected": []})
+        self.assertEqual(summary, {"close_failures": ["SOLUSDT"], "unprotected": [], "stop_unknown": []})
 
     def test_failed_zero_overnight_close_exits_1(self):
         code, summary = self.run_main("ZERO_OVERNIGHT_RISK", night_send([SOL], [SOL_STOP]),
@@ -161,13 +162,13 @@ class TestNightCutoffExitStatus(unittest.TestCase):
         heal = {"success": False, "closed": False, "reason": "heal_and_close_failed"}
         code, summary = self.run_main("SWING_STRUCTURAL_STOP", night_send([SOL]), heal_result=heal)
         self.assertEqual(code, 1)
-        self.assertEqual(summary, {"close_failures": [], "unprotected": ["SOLUSDT"]})
+        self.assertEqual(summary, {"close_failures": [], "unprotected": ["SOLUSDT"], "stop_unknown": []})
 
     def test_closed_after_failed_heal_is_not_a_failure(self):
         heal = {"success": True, "closed": True, "reason": "closed_after_failed_heal"}
         code, summary = self.run_main("SWING_STRUCTURAL_STOP", night_send([SOL]), heal_result=heal)
         self.assertEqual(code, 0)
-        self.assertEqual(summary, {"close_failures": [], "unprotected": []})
+        self.assertEqual(summary, {"close_failures": [], "unprotected": [], "stop_unknown": []})
 
     def test_clean_runs_exit_0(self):
         code, _ = self.run_main("CLOSE_ALL_AT_MARKET", night_send([SOL]), close_result={"success": True})
@@ -175,7 +176,7 @@ class TestNightCutoffExitStatus(unittest.TestCase):
         code, _ = self.run_main("ZERO_OVERNIGHT_RISK", night_send([SOL], [SOL_STOP]), close_result={"success": True})
         self.assertEqual(code, 0)
         code, summary = self.run_main("ZERO_OVERNIGHT_RISK", night_send([]))
-        self.assertEqual((code, summary), (0, {"close_failures": [], "unprotected": []}))
+        self.assertEqual((code, summary), (0, {"close_failures": [], "unprotected": [], "stop_unknown": []}))
 
 
 # =============================================================================

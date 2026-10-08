@@ -249,7 +249,11 @@ python3 scripts/execute_futures_trade.py --close-position --symbol BTCUSDT  # re
 python3 scripts/execute_futures_trade.py --audit-orphans                    # or --auto-heal
 ```
 
-Structural trailing stops, dead-alpha checks and the orphan audit run in the background **position guardian** (`scripts/loops/position_guardian_loop.py`). It never opens positions; state lives in `logs/guardian_state.json`. Dead alpha means held ≥ 4h, mark within 1.2% of entry and |ROE| < 15% (`scripts/utils/position_timing.py`, shared with the doctor's `trading_drift_watchdog.py`); the guardian also requires the 15m range stall (< 0.40% over the last 6 bars). Holding time comes from Binance fills, then a `logs/trades_audit.jsonl` record matching the live entry price (±0.5%) and size; when neither resolves it is UNKNOWN and the position is never flagged or closed. Dead-alpha positions are only reported unless `--close-dead-alpha`, which closes only when the holding time comes from Binance fills:
+Structural trailing stops, dead-alpha checks and the orphan audit run in the background **position guardian** (`scripts/loops/position_guardian_loop.py`). It never opens positions; state lives in `logs/guardian_state.json`. Dead alpha (`scripts/utils/position_timing.py`, shared with the doctor's `trading_drift_watchdog.py`):
+- **Rule:** held ≥ 4h AND stagnant (mark within 1.2% of entry AND |ROE| < 15%; both tests are required).
+- **Which threshold governs:** at leverage L the price band is min(1.2%, 15%/L), so the ROE test governs above 12.5x.
+- **Holding time:** Binance fills, then a `logs/trades_audit.jsonl` record matching the live entry price (±0.5%) and size; when neither resolves it is UNKNOWN and the position is never flagged or closed.
+- **Autonomous closes** (guardian `--close-dead-alpha`, watchdog `--auto-exit`) also require the 15m range stall (< 0.40% over the last 6 bars) and close only when the holding time comes from Binance fills; otherwise dead-alpha positions are only reported:
 ```bash
 python3 scripts/loops/position_guardian_loop.py --once --dry-run --json   # report only
 python3 scripts/loops/position_guardian_loop.py --once --env prod         # one protective cycle
