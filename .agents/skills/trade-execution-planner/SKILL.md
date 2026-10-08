@@ -20,7 +20,7 @@ Activate whenever the user:
 - Wants execution parameters for Binance Futures and synchronization with Notion.
 
 ## Phase 1: Grounded Research & Market Screening
-1. Consult quantitative research notebooks (configured via `config/user_context.json` or local research files in `research/`) for mathematical rules on candlestick absorption wicks, Spot CVD divergence, Open Interest washouts, and Kelly / Volatility Parity sizing.
+1. **Deterministic Fast-Path:** All quantitative principles (absorption wicks, Spot CVD divergence, Open Interest washouts, Kelly Criterion and Volatility Parity sizing) are already hard-coded into the Python execution harness. Do NOT call `view_file` on `research/`, `SKILL.md`, or `agent.md` files during scans; trigger the mechanical pipeline directly (`python3 scripts/prime_evaluator_brief.py`).
 2. Ingest fresh newsletters & macro catalysts: run `python3 scripts/fetch_newsletters.py --format json` (reads folder from `config/user_context.json`, `NEWSLETTERS_FOLDER` env var, or `--folder`) to ingest research feeds (Glassnode, Blockworks, etc.) and reject late-stage euphoria or avoid entering right before scheduled high-impact events.
 3. Screen top liquid Binance Futures pairs (RSI, distance to 24h lows/highs, volume wicks, EMA 20/50) with the native read-only CLI scanners documented in the `market-radar` skill (`.agents/skills/market-radar/SKILL.md`): `python3 scripts/broad_market_radar.py --json`, `python3 scripts/broad_yolo_scanner.py --json` and `python3 scripts/quant_risk_engine.py {parity,pairs,kelly} --json`. These are the only screening path; third-party Binance skills are not part of this flow and must never be used to place orders, move funds or sign API requests.
 
