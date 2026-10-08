@@ -83,7 +83,7 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    are denied, and so are agent-set transcript-root overrides (AGY_BRAIN_DIRS / CLAUDE_PROJECTS_DIRS);
    harness files (incl. .claude/agents/) and the gate modules (scripts/utils/gate_limits.py,
    scripts/execute_futures_trade.py, scripts/utils/portfolio_exposure.py, scripts/utils/env_resolver.py,
-   scripts/user_profile.py; issue #79) require explicit confirmation (force_ask) from the file tools and from shell
+   scripts/user_profile.py; issue #79; scripts/utils/score_calibration.py, issue #202) require explicit confirmation (force_ask) from the file tools and from shell
    writes (redirect target, cp / mv / tee / rm, sed -i / perl -i, git checkout / restore, inline code that writes,
    PowerShell write cmdlets); running the executor or user_profile.py is never a write. So do file-tool writes to
    git config / hook files (GIT_EXEC_CONFIG_PATH_RE, see 8). File-tool content with trading primitives outside
@@ -98,7 +98,9 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    attestation for resting entries) <- scripts/loops/position_guardian_loop.py; logs/pending_entries.json
    (resting-entry registry / post-fill protection; also counted by this hook's max-open-positions pre-check, see 5)
    <- scripts/execute_futures_trade.py (registration and --protect-pending); logs/hook_heartbeat.json (hook
-   liveness, see 11) <- this hook itself (issue #73). File tools targeting them are denied: relative, absolute and Windows paths, NTFS aliases
+   liveness, see 11) <- this hook itself (issue #73); logs/score_calibration.json (Tier S score calibration,
+   issue #202) <- scripts/trading_scorecard.py; logs/trade_outcomes.jsonl (the store's only input) <-
+   scripts/trade_outcomes.py. File tools targeting them are denied: relative, absolute and Windows paths, NTFS aliases
    (trailing dot/space, ::$DATA streams) and targets whose os.path.realpath / samefile is a protected file
    (symlinked directory, hard link).
    Shell commands. The program of a sub-command is found past VAR=value / VAR+=value assignments, shell keywords
@@ -353,6 +355,11 @@ try:
     from utils import dossier_provenance as dp
 except ImportError:  # pragma: no cover - fail closed below when the module is missing
     dp = None
+
+try:
+    from utils import score_calibration as scal  # stdlib-only, reads the local store (issue #202)
+except ImportError:  # pragma: no cover - fail closed: an unconfirmed Tier S asks the user
+    scal = None
 
 try:
     from utils.atomic_writer import atomic_write_json
@@ -712,11 +719,15 @@ TRANSCRIPT_ROOT_OVERRIDE_RE = re.compile(
 # entries listed without a quantity (Gate 1, issue #119); the hook's own max-open-positions pre-check counts its
 # same-env symbols (issue #48). hook_heartbeat.json is this guard's liveness attestation (issue #73): the guard
 # refreshes it from Python on every live invocation (_write_heartbeat); a forged one would make the hooks look alive.
+# score_calibration.json decides whether an autonomous Tier S needs the user's confirmation (issue #202); a forged
+# calibrated bucket would skip it. trade_outcomes.jsonl is the only input the scorecard merges into that store.
 GROUND_TRUTH_FILES = {
     "logs/session_state.json": "`python3 scripts/sync_session_state.py`",
     "logs/guardian_state.json": "`python3 scripts/loops/position_guardian_loop.py`",
     "logs/pending_entries.json": "`python3 scripts/execute_futures_trade.py` (resting-entry registration and --protect-pending)",
     "logs/hook_heartbeat.json": "`scripts/hooks/pre_trade_guard.py` itself (refreshed on every live hook invocation)",
+    "logs/score_calibration.json": "`python3 scripts/trading_scorecard.py`",
+    "logs/trade_outcomes.jsonl": "`python3 scripts/trade_outcomes.py`",
 }
 GROUND_TRUTH_BASENAMES = {path.rsplit("/", 1)[-1].lower(): path for path in GROUND_TRUTH_FILES}
 GROUND_TRUTH_RE = re.compile("|".join(re.escape(n) for n in GROUND_TRUTH_BASENAMES), re.IGNORECASE)
@@ -907,7 +918,7 @@ HARNESS_PATH_CMD_RE = re.compile(
     r"\.agents[\\/]+agents[\\/]|\.claude[\\/]+agents[\\/]|\.claude[\\/]+settings|config[\\/]+user_profile\.json|"
     r"scripts[\\/]+report_issue\.sh|"
     # Gate modules never run as programs (issue #79): path and bare basename
-    r"(?<![\w-])(?:gate_limits|portfolio_exposure|env_resolver)\.py",
+    r"(?<![\w-])(?:gate_limits|portfolio_exposure|env_resolver|score_calibration)\.py",
     re.IGNORECASE,
 )
 # Gate modules that are also run as programs (issue #79): only a write target counts, never the program being run
@@ -1007,6 +1018,8 @@ HARNESS_FILES = {
     # Gate modules (issue #79): PROD gate values, gate classification, env resolution, leverage ceiling
     "scripts/utils/gate_limits.py", "scripts/execute_futures_trade.py", "scripts/utils/portfolio_exposure.py",
     "scripts/utils/env_resolver.py", "scripts/user_profile.py",
+    # Issue #202: decides when an autonomous Tier S needs the user's confirmation
+    "scripts/utils/score_calibration.py",
 }
 HARNESS_DIRS = ("scripts/hooks/", ".agents/agents/", ".claude/agents/")
 BRAIN_PATH_RE = re.compile(r"(?:^|/)\.gemini/[^/]+/brain(?:/|$)", re.IGNORECASE)
@@ -5702,6 +5715,18 @@ def evaluate_file_write(target: str, content: str, base_dir: str) -> Tuple[str, 
 # =============================================================================
 # Trade gates (opening orders through the sanctioned choke point)
 # =============================================================================
+def _tier_s_calibration_message(cand: dict, env: str, user_prof: dict, base_dir: str,
+                                now_ts: Optional[int] = None) -> Optional[str]:
+    """utils.score_calibration.tier_s_confirmation_required (issue #202); fails closed (asks) when unavailable."""
+    if scal is None:
+        tokens = str(cand.get("tier") or "").upper().replace("TIER", " ").split()
+        if tokens and tokens[0] == "S":
+            return ("Tier S score bucket not calibrated (calibration module unavailable): ask the user and rerun "
+                    "with --confirmed.")
+        return None
+    return scal.tier_s_confirmation_required(cand, env, user_prof, base_dir, now=now_ts)
+
+
 def _pending_entry_symbols(base_dir: str, env: str) -> Tuple[set, Optional[str]]:
     """(symbols, error) of the logs/pending_entries.json records whose target_env is env (issue #48; stdlib json,
     no network, no executor import). A missing file is no symbols; an unreadable or malformed file (root or
@@ -5872,6 +5897,15 @@ def evaluate_trade_opening(cmd: str, args: dict, mcp_args: dict, base_dir: str,
                 "user confirmation in PROD.\n"
                 + CONFIRM_RE_RUN_HINT
             )
+        # Issue #202: an uncalibrated Tier S score bucket asks the user like Tier A+/A (mirror of the executor;
+        # same helper and message; local store only, no network). Never a rejection once --confirmed.
+        if is_prod and isinstance(cand, dict) and not is_confirmed:
+            calib_msg = _tier_s_calibration_message(cand, env, user_prof, base_dir, now_ts)
+            if calib_msg:
+                return "deny", (
+                    f"🚨 BLOCKED BY PRE-TOOL-USE HOOK (Uncalibrated Tier S Score): {target_sym}: {calib_msg}\n"
+                    + CONFIRM_RE_RUN_HINT
+                )
 
     # GATE 2: DELTA-NEUTRAL & SESSION STATE AUDIT (cache-based pre-check, docstring 5: no network in the hook; the
     # executor re-reads the exchange and its live-anchored gates are authoritative)

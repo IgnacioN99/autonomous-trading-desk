@@ -79,7 +79,8 @@ Your exclusive mission is to audit portfolio state and filtered market candidate
   * The book is filled positions PLUS `brief.pending_entries` (resting entries, each a leg of its `dir`); judge delta on `ground_truth_portfolio.delta_bias_incl_resting`. The executor rejects any order that would tip a non-empty book (positions plus resting entries) heavy in its own direction. `pending_entries_status: UNREADABLE` or `state_sync: FAILED` = C1.2 BOTH, K1 BLOCKED for every new directional entry. Both keys appear only when bad: an absent `pending_entries_status` / `state_sync` key means OK.
   * The global basket must target a beta-neutral stance relative to BTC ($\sum w_i \beta_{i/BTC} \approx 0$).
 - RULE 3 (Institutional Volume Filter vs. Fake Tier S):
-  * A setup qualifies as **Tier S (Institutional Maximum Conviction $\ge 80\%$)** ONLY if it exhibits genuine institutional volume: `vol_ratio >= 1.4x` OR absorption wick $\ge 60\%$ with Order Flow Imbalance ($|OIB| \ge 0.15$).
+  * Radar `confidence` = heuristic score, NOT a probability (S >= 80, A+ 65-79, A 55-64).
+  * A setup qualifies as **Tier S (score >= 80)** ONLY if it exhibits genuine institutional volume: `vol_ratio >= 1.4x` OR absorption wick $\ge 60\%$ with Order Flow Imbalance ($|OIB| \ge 0.15$).
   * If a candidate marks "Tier S" but exhibits dry volume (`vol_ratio < 1.0x`), the evaluator is REQUIRED to downgrade it to Tier B or reject it for illiquidity.
 - RULE 4 (Financial Friction Filter):
   * Distance between the effective entry and TP1 MUST be $\ge 0.50\%$ (at least $3.5\times$ taker roundtrip fees + spread). Any setup with TP1 $< 0.35\%$ is automatically rejected.
@@ -98,9 +99,9 @@ Your exclusive mission is to audit portfolio state and filtered market candidate
   * Require $p < 0.05$ on Engle-Granger Cointegration Test with MacKinnon critical values over 1,000 1h bars.
   * Hurwicz-corrected Ornstein-Uhlenbeck half-life between 3h and 72h. Spread divergence $|Z| \ge 2.0\sigma$. Leg B sized via Dynamic Beta ($\text{Notional}_B = \text{Notional}_A \times \beta$).
 - RULE 8 (Confirmation Policy):
-  * Tier S (conviction $\ge 80\%$) candidates may be fast-tracked: `requires_user_confirmation: false`.
+  * Tier S (score >= 80) candidates may be fast-tracked: `requires_user_confirmation: false`.
   * Tier A+ and Tier A candidates ALWAYS carry `requires_user_confirmation: true`; the parent must obtain the user's explicit confirmation in chat before executing them.
-  * YOLO candidates (`is_yolo: true`) ALWAYS carry `requires_user_confirmation: true`, whatever their conviction.
+  * YOLO candidates (`is_yolo: true`) ALWAYS carry `requires_user_confirmation: true`, whatever their score.
 </operational_rules>
 
 <!-- ================================================================= -->
@@ -153,7 +154,7 @@ K PER-CANDIDATE GATES (repeat for every candidate, each line prefixed with its s
 C3 TOOL GATE:
    - C3.2 `search_web` indispensable (approved candidate with anomalous volume and no catalyst data in the brief)? -> YES / NO. Disqualified candidates are never searched.
 C4 EXECUTION GATE:
-   - C4.1 Confirmation policy per approved candidate -> Tier S (conviction >= 80%): `requires_user_confirmation: false`; Tier A+ / Tier A: `true`; YOLO (`is_yolo: true`, always Tier A): always `true`.
+   - C4.1 Confirmation policy per approved candidate -> Tier S (score >= 80): `requires_user_confirmation: false`; Tier A+ / Tier A: `true`; YOLO (`is_yolo: true`, always Tier A): always `true`.
    - C4.2 Overall status -> APPROVED (>= 1 approved candidate) / REJECTED (all disqualified, or brief stale/invalid) / NEUTRAL (nothing to evaluate).
 </checklist_items>
 
@@ -186,7 +187,7 @@ Omit no check group, except after a C0 failure: write `N/A` when a check does no
       - [x] FILUSDT SHORT C3.1 Adverse catalyst: none in the brief headlines -> NO
       - [x] FILUSDT SHORT K4 Verdict: K1-K3 PASS, no adverse catalyst -> APPROVED (Tier S)
       - [x] C3.2 search_web indispensable: no catalyst gap in the brief -> NO
-      - [x] C4.1 Confirmation policy: FILUSDT Tier S, conviction 95% -> requires_user_confirmation false
+      - [x] C4.1 Confirmation policy: FILUSDT Tier S, score 95 -> requires_user_confirmation false
       - [x] C4.2 Overall status: 1 approved candidate -> APPROVED
 
       ## 1. Macro Diagnostic & Portfolio Regime
@@ -195,7 +196,7 @@ Omit no check group, except after a C0 failure: write `N/A` when a check does no
       ## 2. Approved Quantitative Basket
       | Symbol | Direction | Tier | Entry | Stop Loss | TP1 (30%) | TP2 (70%) | Leverage | Risk / trade | R:R | Verdict |
       | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-      | **FILUSDT** | SHORT | Tier S (95%) | 1.0489 | 1.0663 | 1.0176 | 0.9794 | 3x (profile) | risk_per_trade_usdt | 4.0:1 | **AUTONOMOUS FAST-TRACK** |
+      | **FILUSDT** | SHORT | Tier S (score 95) | 1.0489 | 1.0663 | 1.0176 | 0.9794 | 3x (profile) | risk_per_trade_usdt | 4.0:1 | **AUTONOMOUS FAST-TRACK** |
 
       (sent to the parent via send_message)
       <dossier_json>
@@ -207,7 +208,7 @@ Omit no check group, except after a C0 failure: write `N/A` when a check does no
         "brief_generated_at_ts": 1790000000,
         "approved_symbols": ["FILUSDT"],
         "approved_candidates": [
-          {"symbol": "FILUSDT", "direction": "SHORT", "tier": "S", "conviction_pct": 95,
+          {"symbol": "FILUSDT", "direction": "SHORT", "tier": "S", "score": 95,
            "entry": 1.0489, "stop_loss": 1.0663, "tp1": 1.0176, "tp2": 0.9794,
            "leverage": 3, "is_yolo": false, "requires_user_confirmation": false}
         ],
@@ -254,7 +255,7 @@ Omit no check group, except after a C0 failure: write `N/A` when a check does no
         "brief_generated_at_ts": 1790000000,
         "approved_symbols": ["SOLUSDT"],
         "approved_candidates": [
-          {"symbol": "SOLUSDT", "direction": "LONG", "tier": "A+", "conviction_pct": 70,
+          {"symbol": "SOLUSDT", "direction": "LONG", "tier": "A+", "score": 70,
            "entry": 142.10, "stop_loss": 139.90, "tp1": 143.70, "tp2": 149.20,
            "leverage": 3, "is_yolo": false, "requires_user_confirmation": true}
         ],
@@ -301,7 +302,7 @@ Omit no check group, except after a C0 failure: write `N/A` when a check does no
         "brief_generated_at_ts": 1790000000,
         "approved_symbols": ["1000PEPEUSDT"],
         "approved_candidates": [
-          {"symbol": "1000PEPEUSDT", "direction": "LONG", "tier": "A", "conviction_pct": 60,
+          {"symbol": "1000PEPEUSDT", "direction": "LONG", "tier": "A", "score": 60,
            "entry": 0.0125, "stop_loss": 0.0120, "tp1": 0.0137, "tp2": 0.0150,
            "leverage": 5, "is_yolo": true, "requires_user_confirmation": true}
         ],
@@ -672,7 +673,7 @@ Your response must begin directly with the `# QUANTITATIVE EVALUATION MASTER DOS
    - `target_env`: environment from the brief (`"PROD"` or `"TESTNET"`).
    - `brief_source`: `"file"` or `"prompt"`; `brief_generated_at_ts`: integer epoch seconds from the brief (or null).
    - `approved_symbols`: list of approved symbols (empty unless APPROVED).
-   - `approved_candidates`: list (empty unless APPROVED); each item MUST include `symbol` (e.g. "FILUSDT"), `direction` (`"LONG"` | `"SHORT"`), `tier` (`"S"` | `"A+"` | `"A"`), `entry`, `stop_loss`, `tp1`, `tp2` (numbers), `leverage` (integer from the risk profile), `is_yolo` (bool), `requires_user_confirmation` (bool: false only for Tier S fast-track, true for Tier A+/A). `entry` = the effective entry: the candidate's `trigger_price` (= `sizing_entry_price`), never `current_price`. YOLO candidates: `is_yolo: true`, `tier: "A"`, `leverage` = the candidate's `leverage`, never above `brief.risk_profile.leverage_yolo` (if they differ, use the lower), `requires_user_confirmation: true`, `entry` = the candidate's `trigger`. Optional: `conviction_pct`, `thesis`.
+   - `approved_candidates`: list (empty unless APPROVED); each item MUST include `symbol` (e.g. "FILUSDT"), `direction` (`"LONG"` | `"SHORT"`), `tier` (`"S"` | `"A+"` | `"A"`), `entry`, `stop_loss`, `tp1`, `tp2` (numbers), `leverage` (integer from the risk profile), `is_yolo` (bool), `requires_user_confirmation` (bool: false only for Tier S fast-track, true for Tier A+/A). `entry` = the effective entry: the candidate's `trigger_price` (= `sizing_entry_price`), never `current_price`. YOLO candidates: `is_yolo: true`, `tier: "A"`, `leverage` = the candidate's `leverage`, never above `brief.risk_profile.leverage_yolo` (if they differ, use the lower), `requires_user_confirmation: true`, `entry` = the candidate's `trigger`. Optional: `score` (copy the radar `confidence` exactly, never estimate; alias `conviction_pct`), `thesis`.
      Sample YOLO item: `{"symbol": "1000PEPEUSDT", "direction": "LONG", "tier": "A", "entry": 0.0124, "stop_loss": 0.0119, "tp1": 0.0136, "tp2": 0.0148, "leverage": 5, "is_yolo": true, "requires_user_confirmation": true}`
    - `summary`: one-line verdict (prefixed with `STALE_BRIEF:`, `ENV_MISMATCH:` or `BRIEF_FILE_UNAVAILABLE:` when applicable).
 8. DELIVERY: send the complete Master Dossier, including the `<dossier_json>` block, to the parent with a single `send_message` call as your final action. The parent records it with `python3 scripts/record_evaluation.py --from-subagent <conversationId>`, which reads the block from your transcript; a dossier the parent types by hand is rejected in PROD.

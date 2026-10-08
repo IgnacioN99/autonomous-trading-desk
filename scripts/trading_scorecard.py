@@ -11,17 +11,26 @@ open / fills_unavailable rows and rows without realized R are excluded and count
    r_basis.gross_fallback); win rate (R > 0 over resolved n), profit factor and expectancy in R, average win / loss,
    mean gross / net R; then USDT: gross = sum of the legs' realized_pnl, net = sum of realized_r_net x initial_risk x
    filled_qty (null when any input is null).
-2. Tier breakdown (S, A+, A, YOLO, unknown): YOLO when is_yolo; else the tier of a matching approved candidate of
-   logs/evaluations/latest_dossier.json (same symbol + direction, entry fill within [timestamp_ts,
-   valid_until_ts + 90 min]); else unknown. Never inferred from leverage.
-3. Loss-cause clusters from logs/trade_insights.jsonl (env-agnostic).
-4. Meta-improver: below MIN_SAMPLE resolved trades only an insufficient-sample line; above it R-based lines only.
-5. Shadow desk counterfactual metrics (best effort; an error is reported, never raised).
+2. Tier breakdown (S, A+, A, YOLO, unknown): YOLO when is_yolo; else the dossier_tier persisted in the row (issue
+   #202); else the tier of a matching approved candidate of logs/evaluations/latest_dossier.json (same symbol +
+   direction, entry fill within [timestamp_ts, valid_until_ts + 90 min]; fallback for older trades); else unknown.
+   Never inferred from leverage.
+3. Score calibration (issue #202, PROD only, the gate's env): closed PROD rows with net R, bucketed by their dossier
+   score (a heuristic, not a probability), merged by trade key into logs/score_calibration.json across runs (the CLI
+   writes it on every run with PROD rows read from logs/trade_outcomes.jsonl, never from a custom --outcomes file;
+   this script is its sole writer). Per bucket n, win rate, net expectancy,
+   mean MFE, mean radar score, insufficient (n < MIN_SAMPLE) and calibrated (n >= profile
+   tier_s_calibration_min_trades with positive net expectancy); rows without a dossier score count as unscored.
+4. Loss-cause clusters from logs/trade_insights.jsonl (env-agnostic).
+5. Meta-improver: below MIN_SAMPLE resolved trades only an insufficient-sample line; above it R-based data notes only
+   (never instructions: any change needs the user's explicit decision). The profit-factor note needs net R on every
+   resolved row (no gross fallback).
+6. Shadow desk counterfactual metrics (best effort; an error is reported, never raised).
 "source" reports the file's age and the env / since stamped in its rows; the human output warns when it is older
 than 24 h or its env differs from --env.
 
-Output: logs/trading_scorecard.json (or --out PATH); stdout = human report or, with --json, the same JSON.
-Exit 0 for any readable run, 2 on bad arguments.
+Output: logs/trading_scorecard.json (or --out PATH) and logs/score_calibration.json; stdout = human report or, with
+--json, the same JSON. Exit 0 for any readable run, 2 on bad arguments.
 
 Usage:
   python3 scripts/trading_scorecard.py [--env prod|testnet] [--json] [--out PATH] [--outcomes PATH]
@@ -34,21 +43,29 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import execute_futures_trade as eft
+from utils.atomic_writer import atomic_write_json
 from utils.env_resolver import resolve_env
 from utils.position_timing import norm_env
+from utils import score_calibration as scal
 
 MIN_SAMPLE = 20
 STALE_SECONDS = 24 * 3600
 RESTING_FILL_SLACK_S = 5400  # resting entries may fill up to 90 min after the dossier expires
 TIERS = ("S", "A+", "A", "YOLO", "unknown")
-SCALING_MSG = "Robust parameters (Profit Factor > 1.8). System qualifies for gradual margin scaling."
-CLUSTER_MSG = ("Risk cluster: Multiple losses due to BTC downside correlation. "
-               "Enforce strict inviolable Delta-Neutral Hard Gate.")
+# Non-authoritative data notes (PR #203 review): never instructions to an agent
+SCALING_MSG = ("Data note: profit factor ≥ 1.8 with positive net expectancy over {n} trades. "
+               "Any margin change needs the user's explicit decision.")
+CLUSTER_MSG = ("Data note: {count} loss lessons tagged BTC_DUMP_CORRELATION (BTC downside correlation). "
+               "Any gate change needs the user's explicit decision.")
+
+
+def _workspace_dir():
+    """Repository root (scripts/..); tests patch it. No executor import (PR #203 review)."""
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _logs_dir():
-    return os.path.join(eft._workspace_dir(), "logs")
+    return os.path.join(_workspace_dir(), "logs")
 
 
 def _num(value):
@@ -124,6 +141,9 @@ def load_dossier_candidates():
 def trade_tier(row, candidates):
     if row.get("is_yolo") is True:
         return "YOLO"
+    persisted = _norm_tier(row.get("dossier_tier")) if row.get("dossier_tier") else "unknown"
+    if persisted != "unknown":
+        return persisted  # issue #202: the audit record's own dossier tier beats the latest_dossier join
     entry_s = _num(row.get("entry_ts"))
     if entry_s is None:
         return "unknown"
@@ -197,17 +217,51 @@ def _source_info(path, rows, env, now):
     return info, warnings
 
 
-def _recommendations(n, expectancy, profit_factor, cause_clusters):
+def _recommendations(n, expectancy, profit_factor, cause_clusters, gross_fallback=0):
     if n < MIN_SAMPLE:
         return [f"Insufficient sample (n={n} < {MIN_SAMPLE} resolved trades): no parameter recommendation."]
     recs = []
     if expectancy is not None and expectancy < 0:
         recs.append(f"Negative expectancy ({expectancy:+.4f}R/trade over {n}): review entries before scaling.")
-    elif expectancy is not None and expectancy > 0 and profit_factor is not None and profit_factor >= 1.8:
-        recs.append(SCALING_MSG)
+    elif (expectancy is not None and expectancy > 0 and profit_factor is not None and profit_factor >= 1.8
+          and not gross_fallback):  # only over net R: a gross-fallback row would overstate the edge
+        recs.append(SCALING_MSG.format(n=n))
     if cause_clusters.get("BTC_DUMP_CORRELATION", 0) >= 2:
-        recs.append(CLUSTER_MSG)
+        recs.append(CLUSTER_MSG.format(count=cause_clusters["BTC_DUMP_CORRELATION"]))
     return recs
+
+
+def _min_trades():
+    try:
+        import user_profile as up
+        return scal.calibration_policy(up.load_user_profile(base_dir=_workspace_dir()))[1]
+    except Exception:
+        return scal.DEFAULT_MIN_TRADES
+
+
+def calibration_store(rows, now, min_trades):
+    """(store, has_prod_rows): the existing logs/score_calibration.json merged with this run's closed PROD rows.
+    Without PROD rows the existing store is returned unchanged (None when missing or unreadable)."""
+    existing = scal.load_calibration(_workspace_dir())
+    prod_rows = [r for r in rows if norm_env(r.get("env")) == "prod"]
+    if not prod_rows:
+        return existing, False
+    return scal.merge_store(existing, prod_rows, now, min_trades), True
+
+
+def _calibration_block(store, min_trades, written):
+    cal = store if isinstance(store, dict) and isinstance(store.get("buckets"), dict) \
+        else scal.build_calibration([], scal.STORE_ENV, min_trades)
+    keys = ("n", "wins", "win_rate", "expectancy_r_net", "mean_mfe_r", "mean_radar_score", "insufficient",
+            "calibrated")
+    return {
+        "basis": "dossier_score", "note": "heuristic score, not a probability", "env": scal.STORE_ENV,
+        "store": scal.STORE_REL_PATH, "store_written": written, "generated_at_ts": cal.get("generated_at_ts"),
+        "min_trades": min_trades, "min_sample": MIN_SAMPLE,
+        "buckets": [dict({"bucket": label}, **{k: (cal["buckets"].get(label) or {}).get(k) for k in keys})
+                    for label in scal.BUCKET_LABELS],
+        "unscored": cal.get("unscored", 0), "out_of_range": cal.get("out_of_range", 0),
+    }
 
 
 def _shadow():
@@ -220,7 +274,9 @@ def _shadow():
         return {"error": f"{type(e).__name__}: {e}"}
 
 
-def generate_scorecard(env, outcomes_path=None, now=None) -> dict:
+def generate_scorecard(env, outcomes_path=None, now=None, write_calibration=False) -> dict:
+    """write_calibration (the CLI): persist the merged logs/score_calibration.json when the run has PROD rows and
+    the outcomes file is the workspace's logs/trade_outcomes.jsonl (never a custom --outcomes path)."""
     now = time.time() if now is None else now
     outcomes_path = outcomes_path or os.path.join(_logs_dir(), "trade_outcomes.jsonl")
     rows = _read_jsonl(outcomes_path)
@@ -263,6 +319,15 @@ def generate_scorecard(env, outcomes_path=None, now=None) -> dict:
         cause = i.get("root_cause", "GENERAL")
         cause_clusters[cause] = cause_clusters.get(cause, 0) + 1
 
+    min_trades = _min_trades()
+    store, has_prod = calibration_store(rows, now, min_trades)
+    written = False
+    # Only the guard-protected logs/trade_outcomes.jsonl may feed the store (a PROD gate input): any other
+    # --outcomes file is reported but never persisted (issue #202 audit).
+    canonical = os.path.realpath(os.path.join(_logs_dir(), "trade_outcomes.jsonl"))
+    if write_calibration and has_prod and os.path.realpath(outcomes_path) == canonical:
+        written = bool(atomic_write_json(scal.store_path(_workspace_dir()), store))
+
     n = len(resolved)
     performance = dict(stats)
     performance.update(
@@ -279,8 +344,10 @@ def generate_scorecard(env, outcomes_path=None, now=None) -> dict:
         "performance": performance,
         "tiers_breakdown": {t: {k: v for k, v in _r_stats(vals).items() if k in ("n", "win_rate_pct", "expectancy_r")}
                             for t, vals in by_tier.items()},
+        "score_calibration": _calibration_block(store, min_trades, written),
         "insights": {"env_agnostic": True, "loss_cause_clusters": cause_clusters},
-        "recommendations": _recommendations(n, stats["expectancy_r"], stats["profit_factor_r"], cause_clusters),
+        "recommendations": _recommendations(n, stats["expectancy_r"], stats["profit_factor_r"], cause_clusters,
+                                            gross_fallback),
         "warnings": warnings,
         "shadow": _shadow(),
     }
@@ -311,11 +378,23 @@ def format_scorecard_report(sc: dict) -> str:
     lines.append(f"• Mean R gross: {_fmt(p['mean_realized_r_gross'], '+.4f')} | Mean R net: {_fmt(p['mean_realized_r_net'], '+.4f')}")
     lines.append(f"• Net PnL: gross {_fmt(p['net_pnl_usdt_gross'], '+.2f')} USDT | net {_fmt(p['net_pnl_usdt_net'], '+.2f')} USDT")
     lines.append("-" * 70)
-    lines.append("📊 PERFORMANCE BY CONVICTION TIER:")
+    lines.append("📊 PERFORMANCE BY TIER:")
     for tier, stats in sc.get("tiers_breakdown", {}).items():
         lines.append(f"  - {tier}: {stats['n']} trades | Win Rate: {_fmt(stats['win_rate_pct'], '.1f')}% | "
                      f"Expectancy: {_fmt(stats['expectancy_r'], '+.4f')}R")
     lines.append("-" * 70)
+    cal = sc.get("score_calibration")
+    if cal:
+        lines.append("🎯 CALIBRATION BY SCORE BUCKET (dossier score; heuristic, not a probability; PROD):")
+        for b in cal["buckets"]:
+            flag = "calibrated" if b["calibrated"] else ("insufficient" if b["insufficient"] else "not calibrated")
+            win = _fmt(b["win_rate"] * 100 if b["win_rate"] is not None else None, ".1f")
+            lines.append(f"  - {b['bucket']}: n={b['n']} | Win Rate: {win}% | Exp net: "
+                         f"{_fmt(b['expectancy_r_net'], '+.4f')}R | MFE: {_fmt(b['mean_mfe_r'], '.2f')}R | "
+                         f"radar score: {_fmt(b['mean_radar_score'], '.1f')} | {flag}")
+        lines.append(f"  unscored: {cal['unscored']} | out of range: {cal['out_of_range']} | autonomous Tier S "
+                     f"needs n >= {cal['min_trades']} and net expectancy > 0")
+        lines.append("-" * 70)
     lines.append("🔬 LOSS ROOT CAUSE CLUSTERS (all envs):")
     for cause, cnt in sc["insights"]["loss_cause_clusters"].items():
         lines.append(f"  - {cause}: {cnt} occurrence(s)")
@@ -353,7 +432,7 @@ def main(argv=None):
     except ValueError as e:
         print(f"Invalid environment: {e}", file=sys.stderr)
         return 2
-    sc = generate_scorecard(env, args.outcomes)
+    sc = generate_scorecard(env, args.outcomes, write_calibration=True)
     out = args.out or os.path.join(_logs_dir(), "trading_scorecard.json")
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     with open(out, "w", encoding="utf-8") as f:

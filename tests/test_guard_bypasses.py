@@ -44,6 +44,18 @@ def setUpModule():
     os.environ.update(OFFLINE_ENV)
 
 
+def write_calibrated_store(root, now=None, env="PROD", n=30, expectancy=0.25):
+    """Issue #202 fixture: a fresh logs/score_calibration.json whose Tier S buckets (80-89, 90-95) are calibrated
+    (n trades with positive net expectancy), so the autonomous Tier S gate is exercised positively by default."""
+    stats = {"n": n, "wins": n // 2, "win_rate": 0.5, "expectancy_r_net": expectancy, "mean_mfe_r": 1.0,
+             "insufficient": n < 20, "calibrated": n >= 30 and expectancy > 0}
+    os.makedirs(os.path.join(root, "logs"), exist_ok=True)
+    with open(os.path.join(root, "logs", "score_calibration.json"), "w", encoding="utf-8") as f:
+        json.dump({"schema_version": 1, "generated_at_ts": int(now if now is not None else time.time()), "env": env,
+                   "min_trades": 30, "trades": {}, "unscored": 0, "out_of_range": 0,
+                   "buckets": {"80-89": dict(stats), "90-95": dict(stats)}}, f)
+
+
 class GuardHarness(unittest.TestCase):
     """Isolated workspace (temp dir) with profile, fresh session state and a fake Antigravity brain."""
 
@@ -62,6 +74,7 @@ class GuardHarness(unittest.TestCase):
                        "max_open_positions": 5, "autonomous_execution_tier_s": True}, f)
         self.dossier_path = os.path.join(self.root, "logs", "evaluations", "latest_dossier.json")
         self.write_session_state()
+        write_calibrated_store(self.root)  # issue #202: Tier S fixtures below carry "score": 85
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -89,7 +102,7 @@ class GuardHarness(unittest.TestCase):
         conv_dir = os.path.join(self.brain, EVALUATOR_CONV_ID, ".system_generated", "logs")
         os.makedirs(conv_dir, exist_ok=True)
         created = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        cand = {"symbol": symbol, "direction": direction, "tier": "Tier S", "leverage": 3}
+        cand = {"symbol": symbol, "direction": direction, "tier": "Tier S", "leverage": 3, "score": 85}
         cand.update(extra or {})
         block = json.dumps({"status": "APPROVED", "summary": "test", "approved_candidates": [cand]})
         steps = [
@@ -403,7 +416,7 @@ class TestDossierProvenance(GuardHarness):
         created = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         block = json.dumps({"status": "APPROVED", "target_env": "PROD", "summary": "test",
                             "approved_candidates": [{"symbol": "BTCUSDT", "direction": "LONG", "tier": "Tier S",
-                                                     "leverage": 3}]})
+                                                     "leverage": 3, "score": 85}]})
         message = "Master Dossier — régimen σ\n" * 30 + f"<dossier_json>\n{block}\n</dossier_json>"
         encoded = json.dumps(message, ensure_ascii=False)
         removed = len(encoded.encode("utf-8")) - len(encoded[:50].encode("utf-8"))
@@ -479,8 +492,11 @@ class TestGroundTruthProtection(GuardHarness):
         "guardian_state.json": "scripts/loops/position_guardian_loop.py",
         "pending_entries.json": "scripts/execute_futures_trade.py",
         "hook_heartbeat.json": "scripts/hooks/pre_trade_guard.py",
+        "score_calibration.json": "scripts/trading_scorecard.py",  # issue #202
+        "trade_outcomes.jsonl": "scripts/trade_outcomes.py",       # issue #202: the store's only input
     }
-    NEW_FILES = ("guardian_state.json", "pending_entries.json", "hook_heartbeat.json")
+    NEW_FILES = ("guardian_state.json", "pending_entries.json", "hook_heartbeat.json", "score_calibration.json",
+                 "trade_outcomes.jsonl")
 
     def assertGroundTruthDenied(self, res, name, label=""):
         self.assertDenied(res, "Ground Truth Protection")

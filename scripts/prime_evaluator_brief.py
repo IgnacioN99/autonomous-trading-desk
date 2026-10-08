@@ -327,7 +327,7 @@ def assemble_primed_brief(target_env: str = "prod", out_path: Optional[str] = No
             "btc_price": state.get("macro_btc", {}).get("price_usdt", 0.0),
             "allows_alt_shorts": True
         }),
-        "filtered_opportunities": screening.get("top_candidates", []),
+        "filtered_opportunities": [_brief_opportunity(o) for o in screening.get("top_candidates", [])],
         "stat_arb_pairs": screening.get("actionable_stat_arb", []),
         "funding_arbitrage_desk": screening.get("top_funding_arbitrage", []),
         "yolo_slot": yolo_slot,
@@ -348,8 +348,38 @@ def assemble_primed_brief(target_env: str = "prod", out_path: Optional[str] = No
     _write_json(BRIEF_FILE, brief)
     if out_path and os.path.abspath(out_path) != os.path.abspath(BRIEF_FILE):
         _write_json(out_path, brief)
+    _write_scores_sidecar(screening, yolo_slot, generated_at_ts, target_env)
 
     return brief
+
+
+# Audit-only fields (issue #202): kept out of the evaluator's brief (token budget) and written to the sidecar.
+_SIDECAR_ONLY_KEYS = ("score_components", "tier_s_eligible")
+
+
+def _brief_opportunity(o: Any) -> Any:
+    return {k: v for k, v in o.items() if k not in _SIDECAR_ONLY_KEYS} if isinstance(o, dict) else o
+
+
+def scores_sidecar_path() -> str:
+    """logs/primed_brief_scores.json, next to BRIEF_FILE (so tests that redirect the brief redirect it too)."""
+    return os.path.join(os.path.dirname(os.path.abspath(BRIEF_FILE)), "primed_brief_scores.json")
+
+
+def _write_scores_sidecar(screening: Any, yolo_slot: dict, generated_at_ts: int, target_env: str) -> None:
+    """Radar score, tier and components of every candidate in the brief (issue #202). Read only by
+    record_evaluation.py for the audit trail, never by the evaluator or a gate. Fail-open: the brief is unaffected."""
+    try:
+        cands = list(screening.get("top_candidates") or []) if isinstance(screening, dict) else []
+        cands += [dict(c, direction=c.get("direction") or "LONG") for c in (yolo_slot.get("candidates") or [])]
+        rows = [{"symbol": c.get("symbol"), "direction": c.get("direction"), "confidence": c.get("confidence"),
+                 "tier": c.get("tier"), "tier_s_eligible": c.get("tier_s_eligible"),
+                 "score_components": c.get("score_components"), "reasons": c.get("reasons")}
+                for c in cands if isinstance(c, dict) and c.get("symbol")]
+        _write_json(scores_sidecar_path(), {"generated_at_ts": generated_at_ts, "env": str(target_env).upper(),
+                                            "rows": rows})
+    except Exception as e:
+        print(f"Radar score sidecar not written ({type(e).__name__})", file=sys.stderr)
 
 
 _TIER_CODES = ("S", "A+", "A", "B+")
@@ -406,13 +436,13 @@ def format_markdown_brief(brief: dict) -> str:
     default_risk = risk_usdt if risk_usdt is not None else "?"
     lines.append(f"### 🎯 Filtered Technical Setups ({len(opps)})")
     if opps:
-        lines.append("| Symbol | Dir | Tier | Conf | Price | Trigger | SL | TP1 / TP2 | R:R | Risk $ | Confluences |")
+        lines.append("| Symbol | Dir | Tier | Score | Price | Trigger | SL | TP1 / TP2 | R:R | Risk $ | Confluences |")
         lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- |")
         for o in opps:
             trig = o.get('trigger_price')
             # abs:unscored: the wick/taker candles did not match, so absorption gave no confluence (issue #135)
             factors = (["abs:unscored"] if o.get('absorption_scored') is False else []) + o.get('reasons', [])[:2]
-            lines.append(f"| **{o.get('symbol')}** | {o.get('direction')} | {_tier_label(o)} | {o.get('confidence')}% | {o.get('current_price')} | {trig if trig is not None else '-'} | {o.get('sl_price')} | {o.get('tp1_price')} / {o.get('tp2_price')} | {o.get('rr_ratio')}R | ${o.get('target_dollar_risk', default_risk)} | {'; '.join(factors)} |")
+            lines.append(f"| **{o.get('symbol')}** | {o.get('direction')} | {_tier_label(o)} | score {o.get('confidence')} | {o.get('current_price')} | {trig if trig is not None else '-'} | {o.get('sl_price')} | {o.get('tp1_price')} / {o.get('tp2_price')} | {o.get('rr_ratio')}R | ${o.get('target_dollar_risk', default_risk)} | {'; '.join(factors)} |")
     else:
         lines.append("*(No intraday setups passing institutional microstructure filter)*")
     lines.append("")

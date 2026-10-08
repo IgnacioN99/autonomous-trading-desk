@@ -120,6 +120,15 @@ def tier_code(confidence):
         return "A"
     return "B+"
 
+def _add_cap_component(components, final_score):
+    """Books the cap/floor adjustment so that sum(components) == final_score (issue #202). The 95 and 74 caps
+    are negative points under `cap`; the enrichment's floor of 20 is positive points under `floor`."""
+    delta = int(final_score) - sum(components.values())
+    if delta < 0:
+        components["cap"] = components.get("cap", 0) + delta
+    elif delta > 0:
+        components["floor"] = components.get("floor", 0) + delta
+
 def analyze_single_symbol(symbol, interval=DEFAULT_INTERVAL):
     try:
         klines = fetch_klines(symbol, interval=interval, limit=55)
@@ -170,34 +179,45 @@ def analyze_single_symbol(symbol, interval=DEFAULT_INTERVAL):
     score_short = 0
     long_reasons = []
     short_reasons = []
+    # Structured points per factor (issue #202): sum(score_components) == confidence, caps included
+    long_points = {}
+    short_points = {}
 
     # 1. RSI Scoring
     if rsi_15m < 28:
         score_long += 35
+        long_points["rsi"] = 35
         long_reasons.append(f"RSI {interval} extreme oversold ({rsi_15m:.1f})")
     elif rsi_15m < 35:
         score_long += 25
+        long_points["rsi"] = 25
         long_reasons.append(f"RSI {interval} oversold ({rsi_15m:.1f})")
     elif rsi_15m > 74:
         score_short += 35
+        short_points["rsi"] = 35
         short_reasons.append(f"RSI {interval} extreme overbought ({rsi_15m:.1f})")
     elif rsi_15m > 66:
         score_short += 25
+        short_points["rsi"] = 25
         short_reasons.append(f"RSI {interval} overbought ({rsi_15m:.1f})")
 
     # 2. Institutional Absorption Wicks
     if effective_lower_wick >= 50:
         score_long += 35
+        long_points["wick"] = 35
         long_reasons.append(f"Massive buyer absorption wick ({effective_lower_wick:.0f}%)")
     elif effective_lower_wick >= 30:
         score_long += 20
+        long_points["wick"] = 20
         long_reasons.append(f"Support rejection ({effective_lower_wick:.0f}% lower wick)")
 
     if effective_upper_wick >= 50:
         score_short += 35
+        short_points["wick"] = 35
         short_reasons.append(f"Massive seller absorption wick ({effective_upper_wick:.0f}%)")
     elif effective_upper_wick >= 30:
         score_short += 20
+        short_points["wick"] = 20
         short_reasons.append(f"Resistance rejection ({effective_upper_wick:.0f}% upper wick)")
 
     # 3. Volume Climax
@@ -207,31 +227,42 @@ def analyze_single_symbol(symbol, interval=DEFAULT_INTERVAL):
         if score_long >= score_short:
             score_long += pts
             long_reasons.append(r_txt)
+            long_points["volume"] = pts
         else:
             score_short += pts
             short_reasons.append(r_txt)
+            short_points["volume"] = pts
     elif vol_ratio >= 1.3:
         pts = 10
+        r_txt = f"Volume expansion {vol_ratio:.1f}x average"
         if score_long >= score_short:
             score_long += pts
+            long_reasons.append(r_txt)
+            long_points["volume"] = pts
         else:
             score_short += pts
+            short_reasons.append(r_txt)
+            short_points["volume"] = pts
 
     # 4. Liquidity Sweeps
     if current_price <= recent_low * 1.012:
         score_long += 15
+        long_points["sweep"] = 15
         long_reasons.append("Liquidity sweep at local lows")
     if current_price >= recent_high * 0.988:
         score_short += 15
+        short_points["sweep"] = 15
         short_reasons.append("Liquidity sweep at local highs")
 
     # 5. Elastic Distance to EMA 20 (Mean Reversion)
     dist_to_ema = ((ema20 - current_price) / current_price) * 100
     if dist_to_ema > 1.8:
         score_long += 10
+        long_points["ema_stretch"] = 10
         long_reasons.append(f"Discount vs EMA 20 ({dist_to_ema:+.1f}%)")
     elif dist_to_ema < -1.8:
         score_short += 10
+        short_points["ema_stretch"] = 10
         short_reasons.append(f"Overextension vs EMA 20 ({dist_to_ema:+.1f}%)")
 
     # Determine Direction. Every level is measured from the effective entry, the breakout trigger the order enters
@@ -240,6 +271,7 @@ def analyze_single_symbol(symbol, interval=DEFAULT_INTERVAL):
         direction = "LONG"
         confidence = min(score_long, 95)
         reasons = long_reasons
+        score_components = dict(long_points)
         trigger = candle_high * 1.0005
         entry = trigger
         sl = min(candle_low, wick_low) - (1.3 * atr)
@@ -254,6 +286,7 @@ def analyze_single_symbol(symbol, interval=DEFAULT_INTERVAL):
         direction = "SHORT"
         confidence = min(score_short, 95)
         reasons = short_reasons
+        score_components = dict(short_points)
         trigger = candle_low * 0.9995
         entry = trigger
         sl = max(candle_high, wick_high) + (1.3 * atr)
@@ -270,19 +303,20 @@ def analyze_single_symbol(symbol, interval=DEFAULT_INTERVAL):
     # No radar friction filter (issue #141): with the risk floor and TP1 >= 1.8R, TP1 is always >= 2.52% from the
     # trigger, so a 0.50% check could never reject. The binding checks are executor Gate 3 and evaluator K3.
 
-    # CONVICTION QUALITY FILTER:
-    # For Tier S (Maximum Institutional Conviction >= 80%), climax volume
+    # SCORE QUALITY FILTER:
+    # For Tier S (heuristic score >= 80, not a probability), climax volume
     # (vol_ratio >= 1.4x) or massive absorption wick (>= 60%) is MANDATORY.
     # Without institutional volume or wick footprint, cannot qualify as Tier S by RSI alone.
     has_volume_or_wick_climax = (vol_ratio >= 1.4) or (effective_lower_wick >= 60 if direction == "LONG" else effective_upper_wick >= 60)
-    if confidence >= 80 and not has_volume_or_wick_climax:
-        confidence = 74 # Downgraded to Tier A+ due to lack of institutional volume
+    if not has_volume_or_wick_climax:
+        confidence = min(confidence, 74)  # issue #165: ineligible rows stay inside the A+ band (no 75-79 gap)
+    _add_cap_component(score_components, confidence)
 
     # Assign Tier
     if confidence >= 80:
-        tier = "Tier S (🔥 Maximum Institutional Conviction)"
+        tier = "Tier S (🔥 Top Score, heuristic)"
     elif confidence >= 65:
-        tier = "Tier A+ (High Conviction)"
+        tier = "Tier A+ (High Score)"
     elif confidence >= 55:
         tier = "Tier A (Strong Confluence)"
     else:
@@ -315,6 +349,7 @@ def analyze_single_symbol(symbol, interval=DEFAULT_INTERVAL):
         "wick_candle_open_time": wick_candle_open_time,  # open time (ms) of the closed candle both wicks come from
         # Exact (unrounded) volume-or-wick rule, re-applied after the microstructure enrichment (issue #134)
         "tier_s_eligible": bool(has_volume_or_wick_climax),
+        "score_components": score_components,
         "reasons": reasons
     }
     # Issue #84: a stop this far from the trigger puts TP2 (4R) out of intraday reach. The row is flagged here and
@@ -335,6 +370,12 @@ def enrich_candidate_microstructure(cand):
     score = cand['confidence']
     direction = cand['direction']
     reasons = cand['reasons']
+    # Rows built without components (legacy callers) start from one `base` entry, so the sum rule still holds
+    comps = dict(cand.get('score_components') or {"base": int(score)})
+
+    def add(key, pts):
+        comps[key] = comps.get(key, 0) + pts
+        return pts
 
     regime = micro['regime']
     absorption = micro['absorption']
@@ -355,49 +396,52 @@ def enrich_candidate_microstructure(cand):
     if direction == 'SHORT':
         # Strongly penalize if market is in active Long Build-Up (aggressive buying + rising OI)
         if regime == 'LONG_BUILDUP':
-            score -= 30
+            score += add("flow_penalty", -30)
             reasons.append(f"⚠️ MACRO PENALTY: Active Long Build-up ({flow_txt})")
         elif absorption == 'BEARISH_ABSORPTION' and absorption_scored:
-            score += 15
+            score += add("absorption", 15)
             reasons.append(f"🔬 ORDER FLOW: {micro['absorption_desc']}")
         elif regime == 'SHORT_SQUEEZE':
-            score += 10
+            score += add("flow_regime", 10)
             reasons.append(f"🔬 ORDER FLOW: {micro['regime_desc']}")
         # Penalize if funding rate is deeply negative (crowded short)
         if funding_rate < -0.015:
-            score -= 15
+            score += add("funding", -15)
             reasons.append(f"⚠️ CROWDED: Negative funding ({funding_rate:.4f}%)")
 
     elif direction == 'LONG':
         # Strongly penalize if market is in active Short Build-Up (aggressive selling + rising OI)
         if regime == 'SHORT_BUILDUP':
-            score -= 30
+            score += add("flow_penalty", -30)
             reasons.append(f"⚠️ MACRO PENALTY: Active Short Build-up ({flow_txt})")
         elif absorption == 'BULLISH_ABSORPTION' and absorption_scored:
-            score += 15
+            score += add("absorption", 15)
             reasons.append(f"🔬 ORDER FLOW: {micro['absorption_desc']}")
         elif regime == 'LONG_BUILDUP':
-            score += 10
+            score += add("flow_regime", 10)
             reasons.append(f"🔬 ORDER FLOW: {micro['regime_desc']}")
         # Penalize if funding rate is excessively positive (crowded long)
         if funding_rate > 0.035:
-            score -= 15
+            score += add("funding", -15)
             reasons.append(f"⚠️ CROWDED: Excessive positive funding ({funding_rate:.4f}%)")
 
     # Tier S still needs institutional volume or a >= 60% wick after the enrichment (issue #134): same cap as
-    # analyze_single_symbol. A missing flag is not eligible (fail closed).
-    if score >= 80 and cand.get('tier_s_eligible') is not True:
-        score = 74
+    # analyze_single_symbol, unconditional since #165 (75-79 never stays on an ineligible row). A missing flag is
+    # not eligible (fail closed).
+    if cand.get('tier_s_eligible') is not True:
+        score = min(score, 74)
     cand['absorption_scored'] = absorption_scored
     cand['confidence'] = max(20, min(95, score))
+    _add_cap_component(comps, cand['confidence'])
+    cand['score_components'] = comps
     if cand['confidence'] >= 80:
-        cand['tier'] = "Tier S (🔥 Maximum Microstructural Conviction)"
+        cand['tier'] = "Tier S (🔥 Top Score, order flow confirmed)"
     elif cand['confidence'] >= 65:
-        cand['tier'] = "Tier A+ (High Confirmed Conviction)"
+        cand['tier'] = "Tier A+ (High Confirmed Score)"
     elif cand['confidence'] >= 55:
         cand['tier'] = "Tier A (Strong Confluence / Hedge)"
     else:
-        cand['tier'] = "Disqualified (<55%)"
+        cand['tier'] = "Disqualified (score < 55)"
     cand['tier_code'] = tier_code(cand['confidence']) if cand['confidence'] >= 55 else "DISQUALIFIED"
     return cand
 
@@ -496,7 +540,7 @@ def print_text_report(payload):
           f"{payload['qualified_count']}\n")
     for c in payload["candidates"]:
         m = c.get('micro') or {}
-        print(f"• {c['tier']} | {c['symbol']} ({c['direction']}) -> {c['confidence']}%")
+        print(f"• {c['tier']} | {c['symbol']} ({c['direction']}) -> score {c['confidence']} (heuristic, not a probability)")
         print(f"  Price: {c['price']} | Trigger (entry): {c['trigger']:.4f} | SL: {c['sl']:.4f} (-{c['risk_pct']}%) | "
               f"TP1: {c['tp1']:.4f} | TP2: {c['tp2']:.4f} | R:R {c['rr']}:1 | "
               f"ROE est ({payload['leverage_standard']}x): +{c['roe_est_pct']}%")

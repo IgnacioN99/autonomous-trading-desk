@@ -460,7 +460,8 @@ class TestGuardWithClaudeDossier(tgb.GuardHarness):
         os.environ[dp.CLAUDE_PROJECTS_ENV] = self.projects  # restored by GuardHarness' patch.dict
 
     def write_claude_dossier(self, symbol="BTCUSDT", direction="LONG", agent_type=dp.EVALUATOR_NAME, extra=None):
-        cand = {"symbol": symbol, "direction": direction, "tier": "S", "leverage": 3}
+        # "score": 85 lies in the calibrated fixture bucket written by GuardHarness (issue #202)
+        cand = {"symbol": symbol, "direction": direction, "tier": "S", "leverage": 3, "score": 85}
         cand.update(extra or {})  # optional candidate overrides (is_yolo, tier, requires_user_confirmation, ...)
         block = json.dumps({"status": "APPROVED", "target_env": "PROD", "summary": "test",
                             "approved_candidates": [cand]})

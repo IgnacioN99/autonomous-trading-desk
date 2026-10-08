@@ -156,7 +156,11 @@ This configures:
 - Risk percentage per trade (`risk_pct_equity`, default 0.5% of equity on Stop Loss).
 - Maximum margin ratio ceiling (`max_margin_ratio`, default 30% per trade).
 - Leverage (`leverage_standard`, `leverage_yolo`; desk ceiling 15x) and optional `yolo_margin_fixed`.
-- Autonomous Tier S execution (`autonomous_execution_tier_s`, off by default).
+- Autonomous Tier S execution (`autonomous_execution_tier_s`, off by default). With `require_calibrated_tier_s` (on by
+  default) an autonomous Tier S also needs a calibrated score bucket: at least `tier_s_calibration_min_trades` (default
+  30) resolved PROD trades with positive net expectancy in R, from `logs/score_calibration.json` (written only by
+  `python3 scripts/trading_scorecard.py`). Otherwise the user is asked and the order needs `--confirmed`. The radar
+  score is a heuristic, not a probability; until a bucket reaches 30 such trades every Tier S asks the user.
 - Maximum concurrent open positions (default: 3).
 - Overnight handling mode (`ZERO_OVERNIGHT_RISK`).
 - Taleb Barbell YOLO moonshot preference.
@@ -235,7 +239,7 @@ Every new trade goes through the evaluator subagent; the dossier is never writte
    ```bash
    python3 scripts/record_evaluation.py --from-subagent <conversationId>
    ```
-   The recorder prints approved symbols, directions, `requires_user_confirmation` flags and the validity window (20 min from evaluation). Tier A/A+ candidates require explicit user confirmation.
+   The recorder prints approved symbols, directions, `requires_user_confirmation` flags and the validity window (20 min from evaluation). Tier A/A+ candidates, and Tier S candidates whose score bucket is not calibrated, require explicit user confirmation.
 4. Execute through `python3 scripts/execute_futures_trade.py` only (the single choke point).
 
 In TESTNET, the legacy manual recorder (`--env testnet --symbols ... --directions ...`) remains available for experiments; it is refused in PROD.
