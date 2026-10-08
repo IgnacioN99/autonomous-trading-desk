@@ -2514,7 +2514,8 @@ def check_resting_entry_gates(symbol, target_env):
             f"CONDITIONAL ENTRY REJECTED: FAIL-CLOSED — the position guardian is not alive ({why}). A resting entry "
             "gets its TPs (and its Stop Loss unless pre-armed) on fill and its stop verified by the guardian; start "
             "the guardian first: "
-            f"`python3 scripts/loops/position_guardian_loop.py --interval 60 --env {target_env}`."
+            f"`python3 scripts/loops/position_guardian_loop.py --interval 60 --env {target_env}`, or install it as a "
+            f"background service: `python3 scripts/install_guardian_service.py --install --env {target_env}`."
         )
     try:
         pos_res = send_signed_request('GET', '/fapi/v2/positionRisk', {'symbol': symbol}, target_env=target_env)

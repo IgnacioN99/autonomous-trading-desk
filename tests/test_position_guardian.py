@@ -231,6 +231,7 @@ class TestGuardianFailSafe(unittest.TestCase):
             if calls["n"] >= 2:
                 raise KeyboardInterrupt
         with patch.object(pgl, "run_cycle", side_effect=cycle), patch("position_guardian_loop.time.sleep", side_effect=stop_after_two), \
+             patch.object(pgl, "DEFAULT_LOG_DIR", tempfile.mkdtemp()), \
              contextlib.redirect_stderr(io.StringIO()):
             code, _ = run_main(["--interval", "10", "--env", "testnet"])
         self.assertEqual(code, 0)

@@ -44,8 +44,13 @@ Safety:
 
 Usage:
   python3 scripts/loops/position_guardian_loop.py --once [--env prod|testnet] [--dry-run] [--json]
-  python3 scripts/loops/position_guardian_loop.py [--interval 300] [--env prod|testnet] [--close-dead-alpha]
-  (PROD resting STOP_MARKET / LIMIT entries require a running loop with --interval <= 120, e.g. --interval 60)
+  python3 scripts/loops/position_guardian_loop.py [--interval 60] [--env prod|testnet] [--close-dead-alpha]
+      [--log-file logs/guardian.log]
+  (PROD resting STOP_MARKET / LIMIT entries require a running loop with --interval <= 120; the default interval is
+  execute_futures_trade.GUARDIAN_MAX_INTERVAL_FOR_RESTING // 2 = 60s and a larger one prints a warning at start)
+  --log-file tees everything printed to a rotating file (5 MiB x 3 backups, UTF-8; relative to the repo root).
+  Loop mode (not --once, not --dry-run) holds a non-blocking lock on logs/guardian_loop.lock: a second loop prints
+  "another guardian loop is already running; exiting" and exits 0 (so a supervisor does not restart it).
 
 Exit code (--once): 0 when the cycle completed without errors and every position ends protected, else 1.
 
@@ -88,13 +93,9 @@ Action record (also one JSON line in logs/guardian_actions.jsonl):
 A --once run does not overwrite the state of a live loop (mode "loop", fresh by check_guardian_alive's age rule):
 it prints its result and appends its actions only (issue #40).
 
-Scheduling (generic examples; run from the repository root):
-  PROD with resting entries: a long-running loop, e.g. a systemd service with Restart=on-failure and
-    WorkingDirectory=<repo>
-    ExecStart=/usr/bin/env python3 scripts/loops/position_guardian_loop.py --interval 60 --env prod
-  (only a loop with --interval <= 120 counts as a live guardian; cron --once runs never do).
-  Without resting entries a cron job running one cycle per run also works:
-    */5 * * * * cd <repo> && python3 scripts/loops/position_guardian_loop.py --once >> logs/guardian_cron.log 2>&1
+Scheduling: on Windows (WSL) install it as a Task Scheduler task that starts the loop at logon and restarts it on
+failure: python3 scripts/install_guardian_service.py --install --env prod (--status, --uninstall, --dry-run).
+Only a loop with --interval <= 120 counts as a live guardian; --once runs never do.
 """
 
 import os
@@ -103,7 +104,19 @@ import time
 import json
 import datetime
 import argparse
+import errno
+import logging
+import logging.handlers
 import traceback
+
+try:
+    import fcntl  # POSIX
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
+try:
+    import msvcrt  # Windows
+except ImportError:
+    msvcrt = None
 
 # Ensure local path resolution (scripts/)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -114,11 +127,14 @@ from utils.atomic_writer import atomic_write_json, atomic_append_jsonl
 from utils import position_timing as pt
 
 SCHEMA_VERSION = 1
-DEFAULT_INTERVAL_SECONDS = 300
+DEFAULT_INTERVAL_SECONDS = eft.GUARDIAN_MAX_INTERVAL_FOR_RESTING // 2
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DEFAULT_LOG_DIR = os.path.join(BASE_DIR, "logs")
 STATE_FILE_NAME = "guardian_state.json"
 ACTIONS_FILE_NAME = "guardian_actions.jsonl"
+LOCK_FILE_NAME = "guardian_loop.lock"
+LOG_FILE_MAX_BYTES = 5 * 1024 * 1024
+LOG_FILE_BACKUPS = 3
 
 
 def _f(value, default=0.0):
@@ -454,6 +470,137 @@ def format_state(state):
     return "\n".join(lines)
 
 
+class _TeeStream:
+    """Writes to the wrapped stream and sends every complete line to a file logger (--log-file). Logging is
+    best-effort: a failure (or a re-entrant write while logging) never reaches the wrapped stream's caller."""
+
+    def __init__(self, stream, logger):
+        self._stream = stream
+        self._logger = logger
+        self._buf = ""
+        self._logging = False
+
+    def _log(self, line):
+        if self._logging:
+            return
+        self._logging = True
+        try:
+            self._logger.info(line)
+        except Exception:
+            pass
+        finally:
+            self._logging = False
+
+    def write(self, text):
+        self._stream.write(text)
+        if self._logging:  # e.g. a logging error report written to this stream
+            return len(text)
+        self._buf += text
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            self._log(line)
+        return len(text)
+
+    def flush(self):
+        if self._buf and not self._logging:
+            line, self._buf = self._buf, ""
+            self._log(line)
+        self._stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+class _GuardianLogHandler(logging.handlers.RotatingFileHandler):
+    """RotatingFileHandler whose errors (rollover rename blocked, disk full) go as one line to the raw stderr saved
+    before the tee was installed, never back into the tee."""
+
+    def __init__(self, *args, error_stream=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._error_stream = error_stream
+        self._error_reported = False
+
+    def handleError(self, record):
+        if self._error_reported:
+            return
+        self._error_reported = True
+        try:
+            err = sys.exc_info()[1]
+            stream = self._error_stream or sys.__stderr__
+            stream.write(f"guardian: --log-file write failed ({type(err).__name__}: {err}); the loop keeps running, "
+                         "further log errors are not reported\n")
+            stream.flush()
+        except Exception:
+            pass
+
+
+def _open_log_file(path, error_stream=None):
+    """File-only logger with a rotating handler (LOG_FILE_MAX_BYTES x LOG_FILE_BACKUPS, UTF-8); a relative path
+    resolves against the repo root. Handler errors go to error_stream (the raw stderr)."""
+    if not os.path.isabs(path):
+        path = os.path.join(BASE_DIR, path)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    handler = _GuardianLogHandler(path, maxBytes=LOG_FILE_MAX_BYTES, backupCount=LOG_FILE_BACKUPS, encoding="utf-8",
+                                  error_stream=error_stream)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    logger = logging.Logger("position_guardian_loop.log_file")  # not registered globally: no handler build-up
+    logger.addHandler(handler)
+    return logger, handler
+
+
+_LOCK_HELD_ERRNOS = {errno.EWOULDBLOCK, errno.EAGAIN}
+_MSVCRT_LOCK_HELD_ERRNOS = {errno.EACCES, getattr(errno, "EDEADLOCK", errno.EDEADLK)}
+
+
+def _acquire_loop_lock(log_dir):
+    """Non-blocking exclusive lock on <log_dir>/guardian_loop.lock (flock on POSIX, msvcrt.locking on Windows).
+    Returns (held_by_other, fh); fh stays open while the loop runs. Only "already locked" (EWOULDBLOCK/EAGAIN, or
+    EACCES/EDEADLOCK from msvcrt) means another loop holds it. Any other error (open failure, ENOLCK, EOPNOTSUPP)
+    prints one stderr line and the loop runs unlocked: the lock never stops the guardian."""
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        fh = open(os.path.join(log_dir, LOCK_FILE_NAME), "a+")
+    except OSError as e:
+        print(f"guardian: cannot open {LOCK_FILE_NAME} ({e}); running without the single-instance lock",
+              file=sys.stderr)
+        return False, None
+    try:
+        if fcntl is not None:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        elif msvcrt is not None:
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        return False, fh
+    except OSError as e:
+        held_errnos = _LOCK_HELD_ERRNOS if fcntl is not None else _MSVCRT_LOCK_HELD_ERRNOS
+        try:
+            fh.close()
+        except OSError:
+            pass
+        if e.errno in held_errnos:
+            return True, None
+        print(f"guardian: cannot lock {LOCK_FILE_NAME} ({e}); running without the single-instance lock",
+              file=sys.stderr)
+        return False, None
+
+
+def _release_loop_lock(fh):
+    if fh is None:
+        return
+    try:
+        if fcntl is not None:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        elif msvcrt is not None:
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass
+    try:
+        fh.close()
+    except OSError:
+        pass
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Position guardian: orphan heal, structural trailing, dead-alpha report")
     parser.add_argument("--once", action="store_true", help="Run a single cycle and exit")
@@ -462,6 +609,8 @@ def main(argv=None):
     parser.add_argument("--dry-run", action="store_true", dest="dry_run", help="Compute decisions but never send write requests")
     parser.add_argument("--close-dead-alpha", action="store_true", dest="close_dead_alpha", help="Close (reduce-only) positions flagged as dead alpha")
     parser.add_argument("--json", action="store_true", dest="json_output", help="Print the cycle state as JSON")
+    parser.add_argument("--log-file", dest="log_file", default=None,
+                        help="Also write everything printed to this rotating log file (relative to the repo root)")
     args = parser.parse_args(argv)
 
     try:
@@ -470,8 +619,42 @@ def main(argv=None):
         print(json.dumps({"success": False, "error": f"Invalid environment: {e}"}))
         return 1
 
+    lock_fh = None
+    if not args.once and not args.dry_run:
+        held_by_other, lock_fh = _acquire_loop_lock(DEFAULT_LOG_DIR)
+        if held_by_other:
+            message = "another guardian loop is already running; exiting"
+            print(json.dumps({"success": True, "already_running": True, "message": message})
+                  if args.json_output else message, flush=True)
+            return 0
+
+    saved_streams = (sys.stdout, sys.stderr)
+    handler = None
+    try:
+        if args.log_file:
+            logger, handler = _open_log_file(args.log_file, error_stream=saved_streams[1])
+            sys.stdout = _TeeStream(sys.stdout, logger)
+            sys.stderr = _TeeStream(sys.stderr, logger)
+        return _run_main(args, target_env)
+    finally:
+        if handler is not None:
+            for stream in (sys.stdout, sys.stderr):
+                try:
+                    stream.flush()
+                except Exception:
+                    pass
+            sys.stdout, sys.stderr = saved_streams
+            handler.close()
+        _release_loop_lock(lock_fh)
+
+
+def _run_main(args, target_env):
     interval = max(int(args.interval), 10)
     mode = "once" if args.once else "loop"
+    if not args.once and interval > eft.GUARDIAN_MAX_INTERVAL_FOR_RESTING:
+        print(f"guardian: WARNING --interval {interval}s exceeds {eft.GUARDIAN_MAX_INTERVAL_FOR_RESTING}s: PROD resting "
+              f"STOP_MARKET/LIMIT entries will be rejected while this loop runs (use --interval "
+              f"{DEFAULT_INTERVAL_SECONDS})", file=sys.stderr, flush=True)
 
     def one_cycle():
         try:

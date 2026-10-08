@@ -451,6 +451,7 @@ class TestDoctorTemporalAudit(unittest.TestCase):
              patch("user_profile.load_user_profile", return_value=dict(DOCTOR_PROFILE)), \
              patch("trading_doctor.check_pretool_hook", return_value={"ok": True, "critical": [], "warnings": [], "info": []}), \
              patch("shadow_tracker.calculate_efficacy_metrics", side_effect=RuntimeError("skip")), \
+             patch("trading_doctor.check_guardian_service", return_value=("ok", "guardian alive (stub)")), \
              patch.object(sss, "STATE_FILE", self.state_file), \
              patch("sync_session_state.sync_session_state", sync), \
              patch("trading_drift_watchdog.audit_dead_alpha", watchdog), \

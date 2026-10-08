@@ -629,6 +629,7 @@ class TestDoctorYoloScanCheck(_HealthFileTest):
              patch("trading_doctor.check_pretool_hook",
                    return_value={"ok": True, "critical": [], "warnings": [], "info": []}), \
              patch("shadow_tracker.calculate_efficacy_metrics", side_effect=RuntimeError("skip")), \
+             patch("trading_doctor.check_guardian_service", return_value=("ok", "guardian alive (stub)")), \
              contextlib.redirect_stdout(out):
             mock_urlopen.return_value.__enter__.return_value = mock_resp
             code = trading_doctor.run_doctor(target_env="testnet")

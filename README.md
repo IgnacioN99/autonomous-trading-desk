@@ -253,27 +253,22 @@ Structural trailing stops, dead-alpha checks and the orphan audit run in the bac
 ```bash
 python3 scripts/loops/position_guardian_loop.py --once --dry-run --json   # report only
 python3 scripts/loops/position_guardian_loop.py --once --env prod         # one protective cycle
-python3 scripts/loops/position_guardian_loop.py --interval 300 --env prod # long-running
+python3 scripts/loops/position_guardian_loop.py --interval 60 --env prod  # long-running (default interval 60s)
 ```
 
-Schedule it outside the agent session as a long-running loop. PROD resting entries (untriggered `STOP_MARKET`, `LIMIT`) require a live loop with `--interval` <= 120 s whose last cycle had no position-sync or pending-entry errors; a `--once` run never counts as live and does not overwrite a live loop's `logs/guardian_state.json`. A systemd user service (use `--interval 60` when you place resting entries):
-```ini
-# ~/.config/systemd/user/position-guardian.service
-[Unit]
-Description=Trading desk position guardian
+Run it outside the agent session as a background service. PROD resting entries (untriggered `STOP_MARKET`, `LIMIT`) require a live loop with `--interval` <= 120 s whose last cycle had no position-sync or pending-entry errors; a `--once` run never counts as live and does not overwrite a live loop's `logs/guardian_state.json`. Only one loop runs at a time (`logs/guardian_loop.lock`): a second one exits 0. MARKET entries do not need the guardian for fill protection.
 
-[Service]
-WorkingDirectory=/path/to/repo
-ExecStart=/usr/bin/env python3 scripts/loops/position_guardian_loop.py --interval 60 --env prod
-Restart=on-failure
+#### Background guardian (Windows/WSL)
+`scripts/install_guardian_service.py` registers the Task Scheduler task `\TradingDesk\PositionGuardian`. At logon it runs `wsl.exe -d <distro> --cd <repo> -- python3 scripts/loops/position_guardian_loop.py --interval 60 --env <env> --log-file logs/guardian.log`, restarts it 1 min after a failure and also starts it every 5 min (while a loop runs, Task Scheduler ignores the extra start and the loop's lock makes any second instance exit 0, so this only revives a loop that died). The task opens a `wsl.exe` console window: closing it stops the guardian until the next 5-min trigger. It runs as your user without a stored password, and no credentials go into the task: they keep loading from the repo `.env`. Run it from WSL:
+```bash
+python3 scripts/install_guardian_service.py --install --env prod --dry-run   # print the task XML and commands only
+python3 scripts/install_guardian_service.py --install --env prod             # register and start the task
+python3 scripts/install_guardian_service.py --status --env prod [--json]     # task status + guardian liveness
+python3 scripts/install_guardian_service.py --uninstall                      # stop and remove the task
+```
+The loop logs to `logs/guardian.log` (rotated at 5 MiB, 3 backups). `python3 scripts/trading_doctor.py` warns with the install command when no live loop is found, and onboarding (`python3 scripts/user_profile.py --setup`) offers the install. Manual check after installing: kill the guardian's python process in WSL (`pkill -f position_guardian_loop.py`) and confirm that Task Scheduler restarts it within about 1 minute, or at the latest at the next 5-min trigger (`--status`, or the task's history).
 
-[Install]
-WantedBy=default.target
-```
-Enable it with `systemctl --user enable --now position-guardian.service`. Without resting entries, a cron job (`crontab -e`) running one cycle per run also works:
-```cron
-*/5 * * * * cd /path/to/repo && python3 scripts/loops/position_guardian_loop.py --once --env prod >> logs/guardian.log 2>&1
-```
+Linux and macOS are not supported by the installer yet. On Linux you can run the same loop under your own supervisor, e.g. `python3 scripts/loops/position_guardian_loop.py --interval 60 --env prod --log-file logs/guardian.log` (unsupported setup).
 
 ### 5. Migration from the `crypto_radar` MCP server
 The `crypto_radar` MCP server (`scripts/radar_mcp_server.py`) has been retired. Scans are now CLI scripts (`--json`), execution and position management go through `scripts/execute_futures_trade.py`, and trailing / dead-alpha / orphan checks run in the position guardian loop. The pre-trade guard denies any remaining `crypto_radar` tool call. If you registered the server outside this repository, remove it:
