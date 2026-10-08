@@ -67,13 +67,16 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    /c/x and //wsl.../x are Linux paths: not sanctioned (ask) (issue #110).
    Read-only analysis scripts (READ_ONLY_SCRIPTS, issue #191: scripts/trade_outcomes.py, scripts/trading_scorecard.py,
    scripts/exit_policy_sim.py; they place, change or cancel no order) are auto-allowed ("read-only analysis script")
-   only as the single sub-command of a flat line, run by their exact repo path (never a linked worktree copy), with
+   only as the single sub-command of a flat line, run by their exact repo path (never a linked worktree copy)
+   through a bare interpreter name (python / python3[.x]; ./python3 or /tmp/python3 never count), with
    the same prefix / metacharacter / redirect rules as above, only their own flags, and every --output / --out /
    --outcomes value inside logs/ (lexically and by os.path.realpath); a write flag (--output / --out) must name the
-   script's own output (never GROUND_TRUTH_FILES, READ_ONLY_FOREIGN_OUTPUTS or logs/evaluations/). The ground-truth
-   check (8) lets such a script name its own ground-truth output (it is the sole sanctioned writer:
-   trade_outcomes.py -> logs/trade_outcomes.jsonl, trading_scorecard.py -> logs/score_calibration.json); naming any
-   other ground-truth file, also through --outcomes or a glob, stays denied (_names_only_own_ground_truth).
+   script's own output (trade_outcomes.py: logs/trade_outcomes.jsonl, trading_scorecard.py:
+   logs/trading_scorecard.json, exit_policy_sim.py: logs/exit_policy_sim.json; never GROUND_TRUTH_FILES,
+   READ_ONLY_FOREIGN_OUTPUTS or logs/evaluations/). The ground-truth check (8) lets trade_outcomes.py name its own
+   ground-truth output logs/trade_outcomes.jsonl (its sole sanctioned writer); naming any other ground-truth file
+   (logs/score_calibration.json included: the scorecard writes it itself, never through --out), also through
+   --outcomes or a glob, stays denied (_names_only_own_ground_truth).
    Anything else asks, as before; next to other sub-commands they are not safe.
 5. FAIL-CLOSED SESSION STATE & STALENESS CHECK (cache-based pre-check, defense in depth):
    logs/session_state.json must exist, be valid (is_valid=True) and NOT stale (<= 300s); its position count plus
@@ -664,7 +667,8 @@ READ_ONLY_SCRIPTS: Dict[str, Tuple[Dict[str, bool], Dict[str, str], Tuple[str, .
         {"--output": "write"}, ("logs/trade_outcomes.jsonl",)),
     "scripts/trading_scorecard.py": (
         {"--env": True, "--json": False, "--out": True, "--outcomes": True, **HELP_FLAGS},
-        {"--out": "write", "--outcomes": "read"}, ("logs/trading_scorecard.json", "logs/score_calibration.json")),
+        # Its --out is the scorecard report only: it also writes logs/score_calibration.json itself, never via --out
+        {"--out": "write", "--outcomes": "read"}, ("logs/trading_scorecard.json",)),
     "scripts/exit_policy_sim.py": (
         {"--env": True, "--outcomes": True, "--policies": True, "--horizon-hours": True, "--taker-fee": True,
          "--maker-fee": True, "--trail-cadence": True, "--exact-entry-only": False, "--json": False, "--out": True,
@@ -2625,11 +2629,17 @@ def _subcommand_is_risk_reducing(tokens: List[str], text: str, cwd: str = "", ba
 
 def _read_only_script_key(tokens: List[str], cwd: str = "", base_dir: str = "") -> Optional[str]:
     """READ_ONLY_SCRIPTS key of the script a sub-command runs, by its exact repo path under base_dir (never a linked
-    worktree copy: unreviewed code), else None."""
+    worktree copy: unreviewed code), through a bare interpreter name (python, python3, python3.x[.exe]: never a path
+    such as ./python3 or /tmp/python3, which an agent could have written), else None."""
     if not tokens:
         return None
     toks, i, in_wsl = _executed_script_at(tokens)
     if i < 0:
+        return None
+    p = _program_index(toks)
+    interpreter = toks[p] if p < len(toks) else ""
+    if not (p < i and "/" not in interpreter and "\\" not in interpreter
+            and PYTHON_PROGRAM_RE.match(interpreter.lower())):
         return None
     return _sanctioned_script(toks[i], cwd, base_dir or find_workspace_root(), in_wsl, _windows_side_cwd(cwd),
                               keys=READ_ONLY_SCRIPTS, allow_worktree=False)
@@ -4187,10 +4197,11 @@ def _git_exec_config_writes(prog: str, args: List[str], redirects: List[str], cw
 def _names_only_own_ground_truth(tokens: List[str], mentioned: List[str], info: dict, cwd: str,
                                  base_dir: str) -> bool:
     """True when a sub-command runs a READ_ONLY_SCRIPTS script by its exact repo path (never a linked worktree copy)
-    and every ground-truth file it names is one of that script's own outputs, of which it is the sole sanctioned
-    writer (scripts/trade_outcomes.py -> logs/trade_outcomes.jsonl, scripts/trading_scorecard.py ->
-    logs/score_calibration.json; issue #191). Only RISK_ENV_ASSIGNMENTS may precede it. Any other program, script or
-    named protected file (another script's output, a glob reaching other files) keeps the ground-truth denial."""
+    through a bare interpreter name (_read_only_script_key) and every ground-truth file it names is one of that
+    script's own outputs, of which it is the sole sanctioned writer (scripts/trade_outcomes.py ->
+    logs/trade_outcomes.jsonl; issue #191). Only RISK_ENV_ASSIGNMENTS may precede it. Any other program, interpreter
+    path, script or named protected file (another script's output, a glob reaching other files) keeps the
+    ground-truth denial."""
     if any(var not in RISK_ENV_ASSIGNMENTS for var, _value in info.get("assigns") or []):
         return False
     key = _read_only_script_key(tokens, cwd, base_dir)

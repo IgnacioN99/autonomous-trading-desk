@@ -40,6 +40,8 @@ from test_exit_policy_sim import SimBase, Market, MultiMarket, outcome, FLAT
 from test_exit_management import FakeExchange, offline, long_position, stop
 from test_issue_95_trailing_activation import make_klines, flat_pre, market
 from test_issue_106_exit_manager_hardening import long_record, LONG_POST, LONG_FORMING
+import trading_scorecard as sc
+from test_trading_scorecard import ScorecardBase, row as sc_row
 
 H = 3600_000
 TAKER_FEE, MAKER_FEE = eps.DEFAULT_TAKER_FEE, eps.DEFAULT_MAKER_FEE
@@ -134,6 +136,39 @@ class TestEntryMatching(OutcomesBase):
         first, second = self.rows()
         self.assertEqual((first["status"], [l["order_id"] for l in first["legs"]]), ("open", [9]))
         self.assertEqual(second["status"], "no_entry_fill")
+
+    def test_side_qty_assignment_is_global_not_greedy(self):
+        # R1 written at T, R2 at T + 30 s, same qty. R1's child fill at T - 50 s, R2's at T + 20 s: greedy oldest-first
+        # would give R1 the T + 20 s fill (closer) and leave R2 without one (its window starts at T).
+        self.audit(entry_order_id=9001, timestamp=TS)
+        self.audit(entry_order_id=9002, timestamp=TS + 30)
+        fills = {"BTCUSDT": [fill(1, 71, "BUY", 100, 10, TS * 1000 - 50_000),
+                             fill(2, 72, "BUY", 100, 10, TS * 1000 + 20_000)]}
+        self.run_cli(FakeFills(fills), ["--no-klines"])
+        first, second = sorted(self.rows(), key=lambda t: t["entry_ts"])
+        self.assertEqual((first["entry_match"], first["entry_ts"]), ("side_qty_window", TS * 1000 - 50_000))
+        self.assertEqual((second["entry_match"], second["entry_ts"]), ("side_qty_window", TS * 1000 + 20_000))
+        recs = [dict(symbol="BTCUSDT", direction="LONG", total_qty=10.0, timestamp=TS, entry_order_id=9001),
+                dict(symbol="BTCUSDT", direction="LONG", total_qty=10.0, timestamp=TS + 30, entry_order_id=9002)]
+        matches, foreign = to.match_entries(recs, fills["BTCUSDT"])
+        self.assertEqual([[f["orderId"] for f in m["fills"]] for m in matches], [[71], [72]])
+        self.assertEqual((foreign[0], foreign[1]), ({"72", "9002"}, {"71", "9001"}))
+        # Equal distance: the older record wins
+        tie = [fill(3, 73, "BUY", 100, 10, (TS + 15) * 1000)]
+        matches, _ = to.match_entries(recs, tie)
+        self.assertEqual([m["match"] for m in matches], ["side_qty_window", "no_entry_fill"])
+
+    def test_zero_pnl_tp_fill_of_another_record_is_never_an_entry(self):
+        # A SHORT's TP1 BUY (orderId 300) closing exactly at its entry (realizedPnl 0) with the LONG's qty, 20 s
+        # before the LONG's write: not the LONG's entry.
+        self.audit(direction="SHORT", sl_price=105.0, entry_order_id=1, tp1_order_id=300, timestamp=TS - 3600)
+        self.audit(entry_order_id=9001, timestamp=TS)
+        fills = {"BTCUSDT": [fill(1, 1, "SELL", 100, 10, (TS - 3600) * 1000 - 5000),
+                             fill(2, 300, "BUY", 100, 10, TS * 1000 - 20_000, pnl=0.0)]}
+        self.run_cli(FakeFills(fills), ["--no-klines"])
+        by = {t["direction"]: t for t in self.rows()}
+        self.assertEqual(by["LONG"]["status"], "no_entry_fill")
+        self.assertEqual([l["order_id"] for l in by["SHORT"]["legs"]], [300])
 
     def test_entry_vwap_is_the_r_basis(self):
         # Entry fills 100 x 5 and 102 x 5 (VWAP 101, audit entry 100), SL 95, exit 107: R = 6 / 6 = 1.0.
@@ -418,6 +453,16 @@ class TestClosedTodaySummary(unittest.TestCase):
         self.assertEqual((s["trades_closed"], s["wins"], s["losses"], s["scratches"]), (2, 0, 1, 1))
         self.assertEqual(s["fills_closed"], 3)
 
+    def test_two_overnight_records_same_direction_count_once(self):
+        # Two LONG records written before today (no fill in the window): only the newest takes today's legs.
+        recs = [self.rec(timestamp=DAY // 1000 - 7200, entry_order_id=1),
+                self.rec(timestamp=DAY // 1000 - 3600, entry_order_id=5)]
+        today = [fill(2, 9, "SELL", 105, 10, DAY + H, pnl=50.0)]
+        s = to.summarize_closed_today(recs, today, DAY, "prod")
+        self.assertEqual((s["trades_closed"], s["wins"], s["partial_history"]), (1, 1, 1))
+        matches, _ = to.match_entries(recs, today, window_start_ms=DAY)
+        self.assertEqual([m["match"] for m in matches], ["partial_history", "partial_history"])
+
     def test_overnight_entry_counts_with_partial_history(self):
         yesterday = DAY // 1000 - 3600
         # Closed today in full by today's fills (entry fill yesterday, outside the fetched window)
@@ -519,6 +564,17 @@ class TestSyncClosedTodayKeys(unittest.TestCase):
         self.assertEqual((state["closed_today_summary"]["fills_closed"], state["closed_today_summary"]["truncated"]),
                          (2500, False))
 
+    def test_same_fill_id_on_two_symbols_is_kept_twice(self):
+        # userTrades ids are per symbol: BTC id 7 and ETH id 7 are two fills
+        fills = [fill(7, 1, "SELL", 101, 1, DAY + 1000, pnl=1.0, symbol="BTCUSDT"),
+                 fill(7, 2, "SELL", 51, 1, DAY + 1000, pnl=-1.0, symbol="ETHUSDT")]
+        fake = DayExchange(fills)
+        with patch("execute_futures_trade.send_signed_request", side_effect=fake):
+            got, truncated = sss.fetch_day_fills(DAY, "prod")
+        self.assertEqual(sorted((f["symbol"], f["id"]) for f in got), [("BTCUSDT", 7), ("ETHUSDT", 7)])
+        self.assertFalse(truncated)
+        self.assertEqual(self.run_sync(DayExchange(fills))["closed_today_summary"]["fills_closed"], 2)
+
     def test_page_cap_same_millisecond_and_failed_page_set_truncated(self):
         for fake, expected in ((DayExchange(self.day_fills(12000)), (1000 + 9 * 999, True, 10)),
                                (DayExchange(self.day_fills(1500, same_ms=True)), (1000, True, 2)),
@@ -534,6 +590,45 @@ class TestSyncClosedTodayKeys(unittest.TestCase):
         state = self.run_sync(DayExchange(self.day_fills(12000)))
         self.assertTrue(state["closed_today_summary"]["truncated"])
         self.assertIn("day fills truncated", sss.format_markdown_summary(state))
+
+
+# ================================================================================ #191 offline CLI output paths
+class TestOfflineOutputPaths(ScorecardBase):
+
+    def test_scorecard_out_inside_logs_never_the_store_never_through_a_hard_link(self):
+        self.write_outcomes([sc_row()])
+        sentinel = os.path.join(self.ws, "sentinel.json")
+        with open(sentinel, "w", encoding="utf-8") as f:
+            f.write('{"keep": true}')
+        report = os.path.join(self.logs, "trading_scorecard.json")
+        os.link(sentinel, report)  # a hard link planted at the report path
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(sc.main(["--env", "prod", "--json"]), 0)
+        with open(sentinel, encoding="utf-8") as f:
+            self.assertEqual(f.read(), '{"keep": true}')
+        with open(report, encoding="utf-8") as f:
+            self.assertIn("sample_size", json.load(f))
+        store = os.path.join(self.ws, "logs", "score_calibration.json")
+        with open(store, "w", encoding="utf-8") as f:
+            f.write('{"store": 1}')
+        outside = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outside, True)
+        for out in (store, os.path.join(outside, "sc.json"), os.path.join(self.logs, "..", "sc.json")):
+            with self.subTest(out), contextlib.redirect_stderr(io.StringIO()), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(sc.main(["--env", "prod", "--out", out]), 2)
+        with open(store, encoding="utf-8") as f:
+            self.assertEqual(f.read(), '{"store": 1}')  # refused before the run wrote anything
+        self.assertEqual(os.listdir(outside), [])
+
+    def test_sim_out_must_stay_inside_logs(self):
+        outside = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outside, True)
+        with patch("execute_futures_trade._workspace_dir", return_value=self.ws), \
+                patch("utils.trade_excursion.fetch_klines_range", side_effect=AssertionError("klines read")), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(eps.main(["--env", "prod", "--out", os.path.join(outside, "x.json")]), 2)
+        self.assertEqual(os.listdir(outside), [])
 
 
 if __name__ == "__main__":

@@ -19,7 +19,7 @@ filling between the reads is double counted rather than missed. The state is onl
 (issue #127): a failed write leaves the
 previous file. Issue #208: closed_today_summary counts trades, not fills (trade_outcomes.summarize_closed_today on
 the day's userTrades, pages of 1000 up to 10 pages, "truncated" when incomplete, and the audit records): closed_trades_count / wins / losses / scratches per trade,
-realized_r_net (sum of per-trade R), partial_history (trades entered before today), fills_closed (fills with a
+win_rate_pct = wins / closed_trades_count (scratches count in the denominator), realized_r_net (sum of per-trade R), partial_history (trades entered before today), fills_closed (fills with a
 realized PnL); the USDT figures stay sums over the fills. CLI exit code 1 when the state written is INVALID or the write failed, else 0.
 """
 
@@ -53,7 +53,7 @@ DAY_FILLS_MAX_PAGES = 10
 
 def fetch_day_fills(start_ms: int, target_env: str):
     """(fills, truncated) of GET /fapi/v1/userTrades since start_ms (issue #208): pages of DAY_FILLS_LIMIT, each next
-    page from the last fill's time (inclusive, deduplicated by id), until a page holds fewer than DAY_FILLS_LIMIT
+    page from the last fill's time (inclusive, deduplicated by (symbol, id): ids are per symbol), until a page holds fewer than DAY_FILLS_LIMIT
     rows; at most DAY_FILLS_MAX_PAGES pages. truncated: the cap was hit, a later page failed or brought no new fill
     (the day's figures may then be incomplete). A failed first read returns its non-list reply (fills unreadable)."""
     seen, params = {}, {"startTime": int(start_ms), "limit": DAY_FILLS_LIMIT}
@@ -63,8 +63,9 @@ def fetch_day_fills(start_ms: int, target_env: str):
             return (res, False) if page == 0 else (_sorted_fills(seen), True)
         new = 0
         for f in res:
-            if isinstance(f, dict) and str(f.get("id")) not in seen:
-                seen[str(f.get("id"))] = f
+            key = (str(f.get("symbol") or "").upper(), str(f.get("id"))) if isinstance(f, dict) else None
+            if key and key not in seen:  # fill ids are per symbol: (symbol, id) identifies a fill
+                seen[key] = f
                 new += 1
         if len(res) < DAY_FILLS_LIMIT:
             return _sorted_fills(seen), False
@@ -83,8 +84,9 @@ def _as_float(v) -> float:
 
 
 def _sorted_fills(seen: dict) -> List[dict]:
-    """Fills by (time, id), both numeric (a non-numeric value sorts as 0)."""
-    return sorted(seen.values(), key=lambda f: (_as_float(f.get("time")), _as_float(f.get("id"))))
+    """Fills by (time, symbol, id); time and id numeric (a non-numeric value sorts as 0)."""
+    return sorted(seen.values(), key=lambda f: (_as_float(f.get("time")), str(f.get("symbol") or "").upper(),
+                                                _as_float(f.get("id"))))
 
 
 def _read_audit_records():

@@ -30,8 +30,10 @@ open / fills_unavailable rows and rows without realized R are excluded and count
 "source" reports the file's age and the env / since stamped in its rows; the human output warns when it is older
 than 24 h or its env differs from --env.
 
-Output: logs/trading_scorecard.json (or --out PATH) and logs/score_calibration.json; stdout = human report or, with
---json, the same JSON. Exit 0 for any readable run, 2 on bad arguments.
+Output: logs/trading_scorecard.json (or --out PATH: a file inside logs/ other than the calibration store, else exit 2
+before anything is written; written atomically, never through a hard link) and logs/score_calibration.json; stdout =
+human report or, with --json, the same JSON. win_rate_pct = trades with R > 0 over every resolved trade: scratches
+(R = 0, and near-zero R) count in the denominator as non-wins. Exit 0 for any readable run, 1 when the report cannot be written, 2 on bad arguments.
 
 Usage:
   python3 scripts/trading_scorecard.py [--env prod|testnet] [--json] [--out PATH] [--outcomes PATH]
@@ -44,7 +46,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from utils.atomic_writer import atomic_write_json
+from utils.atomic_writer import atomic_write_json, path_inside_dir, same_file
 from utils.env_resolver import resolve_env
 from utils.position_timing import norm_env
 from utils import score_calibration as scal
@@ -436,11 +438,18 @@ def main(argv=None):
     except ValueError as e:
         print(f"Invalid environment: {e}", file=sys.stderr)
         return 2
-    sc = generate_scorecard(env, args.outcomes, write_calibration=True)
     out = args.out or os.path.join(_logs_dir(), "trading_scorecard.json")
-    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
-    with open(out, "w", encoding="utf-8") as f:
-        json.dump(sc, f, indent=2, ensure_ascii=False)
+    # Issue #191: the report stays inside logs/ and never replaces the calibration store this run writes itself
+    if not path_inside_dir(out, _logs_dir()) or same_file(out, scal.store_path(_workspace_dir())):
+        print(f"trading_scorecard: --out must be a file inside {_logs_dir()} other than "
+              f"{scal.STORE_REL_PATH} (got {out!r})", file=sys.stderr)
+        return 2
+    sc = generate_scorecard(env, args.outcomes, write_calibration=True)
+    try:
+        atomic_write_json(out, sc)  # temp file + os.replace: never writes through a hard link
+    except Exception as e:
+        print(f"trading_scorecard: {out} NOT written ({type(e).__name__}: {e})", file=sys.stderr)
+        return 1
     if args.json_output:
         print(json.dumps(sc, indent=2, ensure_ascii=False))
     else:

@@ -2796,7 +2796,7 @@ class TestReadOnlyAnalysisScripts(GuardHarness):
                   f"python3 {self.TO} --output=logs/trade_outcomes.jsonl",
                   f"python3 {self.TO} --output {os.path.join(self.root, 'logs', 'trade_outcomes.jsonl')}",
                   f"python3 {self.SC} --json --out logs/trading_scorecard.json --outcomes logs/old/outcomes.jsonl",
-                  f"python3 {self.SC} --out logs/score_calibration.json",
+                  f"python3 {self.SC} --out logs/trading_scorecard.json",
                   f"python3 {self.SIM} --env prod --policies current,close_at_0_5r --horizon-hours 24 "
                   f"--taker-fee 0.0005 --trail-cadence 15m --exact-entry-only --json --out logs/exit_policy_sim.json",
                   f"python3 {os.path.join(self.root, self.TO)} --json", f"python3 -u {self.TO} --help",
@@ -2819,11 +2819,28 @@ class TestReadOnlyAnalysisScripts(GuardHarness):
                   f"python3 scripts/trading_doctor.py --heal && python3 {self.TO} --output /tmp/x.jsonl"):
             for label, decision in zip(("agy", "bash", "powershell"), self.decisions(c)):
                 self.assertEqual(decision, "ask", f"{label}: {c}")
+        # Two own-output calls chained: each sub-command is exempt from the ground-truth denial, so the Bash line
+        # asks (never an auto-allow); PowerShell's backstop exempts a single statement only, so it stays denied
+        own = f"python3 {self.TO} --output logs/trade_outcomes.jsonl"
+        c = f"{own} && {own}"
+        self.assertEqual(self.decisions(c), ("ask", "ask", "deny"))
+
+    def test_interpreter_must_be_a_bare_python_name(self):
+        # An agent-made ./python3 or /tmp/python3 could forge the file: never exempt, never auto-allowed
+        for interp in ("./python3", "/tmp/python3", "bin/python3", "/tmp/bin/python"):
+            self.assertEqual(self.decisions(f"{interp} {self.TO} --output logs/trade_outcomes.jsonl"),
+                             ("deny", "deny", "deny"), interp)
+            for label, decision in zip(("agy", "bash", "powershell"), self.decisions(f"{interp} {self.TO} --json")):
+                self.assertEqual(decision, "ask", f"{label}: {interp}")
+        self.assertEqual(self.decisions(f"python {self.TO} --json"), ("allow", "allow", "allow"))
+        self.assertEqual(self.decisions(f"python3.12 {self.TO} --json"), ("allow", "allow", "allow"))
 
     def test_paths_outside_logs_or_foreign_outputs_ask(self):
         os.symlink(tempfile.gettempdir(), os.path.join(self.root, "logs", "escape"))
         for c in (f"python3 {self.TO} --output logs/o/x.jsonl", f"python3 {self.SIM} --out logs/sim_b.json",
                   f"python3 {self.TO} --output /tmp/x.jsonl", f"python3 {self.TO} --output ../x.jsonl",
+                  # own basename outside logs/: not a ground-truth path, so ask (not deny)
+                  f"python3 {self.TO} --output /tmp/trade_outcomes.jsonl",
                   f"python3 {self.TO} --output logs/../x.jsonl", f"python3 {self.TO} --output logs/escape/x.jsonl",
                   f"python3 {self.TO} --output logs/trading_scorecard.json",
                   f"python3 {self.SC} --outcomes /tmp/forged.jsonl",
@@ -2844,6 +2861,8 @@ class TestReadOnlyAnalysisScripts(GuardHarness):
                   f"python3 {self.TO} --output logs/trades_audit.jsonl",
                   f"python3 {self.TO} --output logs/primed_brief.json",
                   f"python3 {self.TO} --output logs/score_calibration.json",
+                  # the scorecard writes the calibration store itself; --out naming it would overwrite the store
+                  f"python3 {self.SC} --out logs/score_calibration.json",
                   f"python3 {self.SC} --out logs/trade_outcomes.jsonl",
                   f"python3 {self.SC} --outcomes logs/trade_outcomes.jsonl",
                   f"python3 {self.SIM} --out logs/score_calibration.json",

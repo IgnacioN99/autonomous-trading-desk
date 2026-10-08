@@ -24,8 +24,10 @@ Entry fills (entry_match), in order: (a) "order_id": the fills of entry_order_id
 has an entry_order_id that no fill carries, e.g. a STOP_MARKET entry whose audit stores the algoId while userTrades
 reports the child orderId): the entry-side, zero-realizedPnl fills grouped by orderId whose group qty matches
 total_qty (1e-6 relative, or one stepSize) and whose first fill lies in [max(previous same-symbol audit timestamp,
-timestamp - 90 min), timestamp + 60 s], the group closest in time to the audit timestamp, never an order already
-matched to another record; (c) else status "no_entry_fill" (no legs, filled_qty null, excluded from the summary;
+timestamp - 90 min), timestamp + 60 s], never an order that is any record's entry_order_id / tp1_order_id /
+tp2_order_id; assigned globally per symbol by ascending distance to the audit timestamp (older record wins a tie),
+each group and record at most once (a close exactly at the entry price by a manual or stop order of the same qty has
+zero realized PnL too and can still be taken); (c) else status "no_entry_fill" (no legs, filled_qty null, excluded from the summary;
 such a record consumes no fill and still bounds earlier same-direction trades at its timestamp - 120 s); (d) a
 record without entry_order_id keeps the legacy entry time, audit timestamp - 120 s ("legacy"). Matched entry orders
 are never exit legs of another trade. Closing fills (side opposite to the entry, same positionSide or BOTH, at or
@@ -33,7 +35,8 @@ after the entry fill, before the next audit entry of the same symbol + direction
 filled_qty is closed (1e-6 relative; a fill shared by two trades is split); otherwise the trade stays "open".
 filled_qty = the matched entry fills' qty when found, else the audit total_qty (a partly filled, then cancelled
 LIMIT entry closes on what filled). entry_vwap = VWAP of the matched entry fills (null without them); the R basis is
-entry_vwap when present, else the audit entry_price. Leg reasons: orderId == tp1_order_id -> TP1, == tp2_order_id
+entry_vwap when present, else the audit entry_price (exit_policy_sim replays from it too, while the live guardian's
+trail engine uses the audit entry_price). Leg reasons: orderId == tp1_order_id -> TP1, == tp2_order_id
 -> TP2; else the nearest of these levels within its tolerance: sl_price and each trail_stop new_sl placed between
 entry and the fill (max(0.3% of the price, 2 x tickSize)) -> SL / TRAILED_STOP, True Net BE entry x (1 + 0.002)
 (LONG; 1 - 0.002 SHORT; +/- 0.15 % of the price) -> BREAKEVEN; else MANUAL_OR_OTHER (stop fills are market child
@@ -259,27 +262,52 @@ def match_entry(rec, fills, prev_ts=None, taken=(), step=None, window_start_ms=N
     belong to other records; step: the symbol's stepSize (qty tolerance) when known. window_start_ms: start of the
     fetched fills when they may not reach back to this entry (closed-today summary): an unmatched record whose match
     window starts before it is "partial_history" (entry_ms = window_start_ms), not "no_entry_fill"."""
-    oid = rec.get("entry_order_id")
-    direction = str(rec.get("direction")).upper()
-    side = _entry_side(direction)
+    direct = _direct_match(rec, fills, window_start_ms)
+    if direct:
+        return direct
+    candidates = sorted(_side_qty_candidates(rec, fills, prev_ts, taken, step), key=lambda c: c[:2])
+    if candidates:
+        return {"entry_ms": candidates[0][1], "fills": candidates[0][3], "match": "side_qty_window"}
+    return _no_match(rec, prev_ts, window_start_ms)
+
+
+def _match_window(rec, prev_ts):
+    """(lo, hi, ts_ms) of the side + qty match window of an audit record (ms)."""
     ts_ms = int(_num(rec.get("timestamp"), 0) * 1000)
-    legacy_ms = ts_ms - ENTRY_FILL_SLACK_MS
-    fills = fills or []
+    lo = ts_ms - ENTRY_MATCH_LOOKBACK_MS
+    if prev_ts is not None:
+        lo = max(lo, int(_num(prev_ts, 0) * 1000))
+    return lo, ts_ms + ENTRY_MATCH_AHEAD_MS, ts_ms
+
+
+def _direct_match(rec, fills, window_start_ms=None):
+    """Rules (d) (no entry_order_id: "legacy", or "partial_history" before window_start_ms) and (a) ("order_id"), else
+    None (the record needs the side + qty match)."""
+    oid = rec.get("entry_order_id")
+    side = _entry_side(str(rec.get("direction")).upper())
+    legacy_ms = int(_num(rec.get("timestamp"), 0) * 1000) - ENTRY_FILL_SLACK_MS
     if oid is None or str(oid) == "":
         if window_start_ms is not None and legacy_ms < window_start_ms:
             return {"entry_ms": int(window_start_ms), "fills": [], "match": "partial_history"}
         return {"entry_ms": legacy_ms, "fills": [], "match": "legacy"}
-    matched = [f for f in fills if str(f.get("orderId")) == str(oid) and f.get("side") == side]
+    matched = [f for f in fills or [] if str(f.get("orderId")) == str(oid) and f.get("side") == side]
     if matched:
         return {"entry_ms": min(_fill_ms(f) for f in matched), "fills": matched, "match": "order_id"}
-    lo = ts_ms - ENTRY_MATCH_LOOKBACK_MS
-    if prev_ts is not None:
-        lo = max(lo, int(_num(prev_ts, 0) * 1000))
-    hi = ts_ms + ENTRY_MATCH_AHEAD_MS
+    return None
+
+
+def _side_qty_candidates(rec, fills, prev_ts=None, taken=(), step=None):
+    """Rule (b) candidates of a record: [(|first - audit ts|, first fill ms, orderId, fills)] of the entry-side,
+    zero-realizedPnl fill groups (by orderId, not in taken) whose qty matches total_qty and whose first fill is in the
+    match window. A close exactly at the entry price (zero realized PnL) by a manual or stop order of the same qty
+    can still pass this filter; TP orders of audit records are excluded through taken (match_entries)."""
+    direction = str(rec.get("direction")).upper()
+    side = _entry_side(direction)
+    lo, hi, ts_ms = _match_window(rec, prev_ts)
     total = _num(rec.get("total_qty"), 0.0)
     tol = max(total * QTY_TOLERANCE, _num(step, 0.0) or 0.0) * (1 + 1e-9)
     groups = {}
-    for f in fills:
+    for f in fills or []:
         if f.get("side") != side or str(f.get("positionSide") or "BOTH").upper() not in ("BOTH", direction):
             continue
         if _num(f.get("realizedPnl"), 0.0) != 0:
@@ -287,32 +315,48 @@ def match_entry(rec, fills, prev_ts=None, taken=(), step=None, window_start_ms=N
         o = str(f.get("orderId"))
         if o not in taken:
             groups.setdefault(o, []).append(f)
-    best = None
-    for g in groups.values():
+    out = []
+    for o, g in groups.items():
         first = min(_fill_ms(f) for f in g)
-        if not lo <= first <= hi or abs(sum(_num(f.get("qty"), 0.0) for f in g) - total) > tol:
-            continue
-        key = (abs(first - ts_ms), first)
-        if best is None or key < best[0]:
-            best = (key, first, g)
-    if best:
-        return {"entry_ms": best[1], "fills": best[2], "match": "side_qty_window"}
+        if lo <= first <= hi and abs(sum(_num(f.get("qty"), 0.0) for f in g) - total) <= tol:
+            out.append((abs(first - ts_ms), first, o, g))
+    return out
+
+
+def _no_match(rec, prev_ts, window_start_ms=None):
+    """Rule (c): "no_entry_fill" (entry_ms = audit timestamp - 120 s), or "partial_history" when the match window
+    starts before window_start_ms (the fetched fills may not reach the entry)."""
+    lo, _hi, ts_ms = _match_window(rec, prev_ts)
     if window_start_ms is not None and lo < window_start_ms:
         return {"entry_ms": int(window_start_ms), "fills": [], "match": "partial_history"}
-    return {"entry_ms": legacy_ms, "fills": [], "match": "no_entry_fill"}
+    return {"entry_ms": ts_ms - ENTRY_FILL_SLACK_MS, "fills": [], "match": "no_entry_fill"}
 
 
 def match_entries(recs, fills, step=None, window_start_ms=None):
-    """(matches, foreign) for one symbol's records (oldest first): matches[i] = match_entry of recs[i] (each record's
-    side + qty match excludes the orders of every audit entry_order_id and of earlier matches), foreign[i] = orderIds
-    (str) of the other records' entries (entry_order_id and matched orders), never exit legs of recs[i]."""
-    taken = {str(r.get("entry_order_id")) for r in recs if r.get("entry_order_id") not in (None, "")}
-    matches = []
+    """(matches, foreign) for one symbol's records (oldest first). matches[i]: rules (d) / (a) per record; rule (b)
+    as one global assignment: every (record, fill group) candidate, by ascending |first fill - audit ts| (the older
+    record wins a tie), each group and each record used at most once; groups of any record's entry_order_id,
+    tp1_order_id or tp2_order_id are never candidates. foreign[i] = orderIds (str) of the other records' entries
+    (entry_order_id and matched orders), never exit legs of recs[i]."""
+    entry_ids = {str(r.get("entry_order_id")) for r in recs if r.get("entry_order_id") not in (None, "")}
+    tp_ids = {str(r.get(k)) for r in recs for k in ("tp1_order_id", "tp2_order_id") if r.get(k) not in (None, "")}
+    excluded = entry_ids | tp_ids
+    matches = [_direct_match(r, fills, window_start_ms) for r in recs]
+    prev = [_num(recs[i - 1].get("timestamp")) if i > 0 else None for i in range(len(recs))]
+    candidates = []
     for i, r in enumerate(recs):
-        prev_ts = _num(recs[i - 1].get("timestamp")) if i > 0 else None
-        m = match_entry(r, fills, prev_ts=prev_ts, taken=taken, step=step, window_start_ms=window_start_ms)
-        taken |= {str(f.get("orderId")) for f in m["fills"]}
-        matches.append(m)
+        if matches[i] is None:
+            for dist, first, oid, group in _side_qty_candidates(r, fills, prev[i], excluded, step):
+                candidates.append((dist, _num(r.get("timestamp"), 0), i, first, oid, group))
+    used = set()
+    for dist, _ts, i, first, oid, group in sorted(candidates, key=lambda c: c[:4]):
+        if matches[i] is None and oid not in used:
+            matches[i] = {"entry_ms": first, "fills": group, "match": "side_qty_window"}
+            used.add(oid)
+    for i, r in enumerate(recs):
+        if matches[i] is None:
+            matches[i] = _no_match(r, prev[i], window_start_ms)
+    taken = entry_ids | used
     foreign = []
     for r, m in zip(recs, matches):
         own = {str(f.get("orderId")) for f in m["fills"]} | {str(r.get("entry_order_id"))}
@@ -613,15 +657,8 @@ def summarize_closed_today(entries, fills, day_start_ms, env, open_positions=Non
 
 def _inside_logs(path):
     """True when path is a file path inside the workspace logs/ directory, lexically and after resolving symlinks."""
-    logs = os.path.abspath(_logs_dir())
-    target = os.path.abspath(path)
-    real_logs, real_target = os.path.realpath(logs), os.path.realpath(target)
-    try:
-        lexical = os.path.commonpath([logs, target]) == logs and target != logs
-        resolved = os.path.commonpath([real_logs, real_target]) == real_logs and real_target != real_logs
-    except ValueError:
-        return False
-    return lexical and resolved
+    from utils.atomic_writer import path_inside_dir
+    return path_inside_dir(path, _logs_dir())
 
 
 def _since_ts(value):

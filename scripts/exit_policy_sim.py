@@ -11,7 +11,9 @@ sl_price, tp1_price and tp2_price; others are counted under "skipped" by reason 
 "malformed" lines of the outcomes file, included).
 
 Replay (per trade, per policy, 1m resolution, from the first full 1m bar after entry to entry + --horizon-hours; the
-entry price is the row's entry_vwap, the basis of its initial_risk, else entry_price, for every policy, fee and level):
+entry price is the row's entry_vwap, the basis of its initial_risk, else entry_price, for every policy, fee and level;
+the trail engine therefore gets the VWAP entry, while the live guardian hands it the audit entry_price, so on a slipped
+entry the replayed break-even / profit-lock levels differ slightly from live):
   - Worst case first: a 1m bar touching the current stop (LONG low <= stop, SHORT high >= stop) exits the remaining
     size at the stop (taker), even when a TP level is inside the same bar. Stop exits fill AT the stop price, with no
     gap slippage past it (slightly optimistic).
@@ -38,7 +40,8 @@ Capture ratio = sum R / sum MFE_R, with MFE over the whole horizon (including af
 trade_outcomes' capture_ratio (MFE up to the real exit). Per trade: atr_r (ATR_15m at entry / R) and lock_binding
 (the profit lock set the stop at least once).
 
-Output: logs/exit_policy_sim.json (--out PATH, rewritten atomically) and, with --json, the same object on stdout.
+Output: logs/exit_policy_sim.json (--out PATH: a file inside logs/, else exit 2 before any read; rewritten atomically)
+and, with --json, the same object on stdout.
 Exit code 0 when at least one trade was simulated, 1 when none, 2 on bad arguments.
 
 Usage:
@@ -60,6 +63,7 @@ import execute_futures_trade as eft
 import dynamic_exit_manager as dem
 import user_profile
 from decimal import Decimal
+from utils.atomic_writer import path_inside_dir
 from utils.env_resolver import resolve_env
 from utils import trade_excursion
 
@@ -582,11 +586,14 @@ def main(argv=None):
     except ValueError as e:
         print(f"exit_policy_sim: invalid environment: {e}", file=sys.stderr)
         return 2
+    out_path = args.out or os.path.join(_logs_dir(), "exit_policy_sim.json")
+    if not path_inside_dir(out_path, _logs_dir()):  # issue #191: before any read or request
+        print(f"exit_policy_sim: --out must be a file inside {_logs_dir()} (got {out_path!r})", file=sys.stderr)
+        return 2
 
     rows, malformed = _read_jsonl(args.outcomes or os.path.join(_logs_dir(), "trade_outcomes.jsonl"))
     result = simulate(rows, env, names, args.horizon_hours, args.taker_fee, args.maker_fee,
                       trail_cadence=args.trail_cadence, exact_entry_only=args.exact_entry_only, malformed=malformed)
-    out_path = args.out or os.path.join(_logs_dir(), "exit_policy_sim.json")
     _write_json_atomic(out_path, result)
 
     if args.json_output:
