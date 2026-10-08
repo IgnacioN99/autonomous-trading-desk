@@ -15,7 +15,9 @@ minimal outcome row}, buckets: {label: stats}, unscored, out_of_range}. `trades`
 and merged across scorecard runs, so n grows beyond one trade_outcomes.py --since window without double counting.
 
 Gate (PROD only): an approved, unconfirmed, non-YOLO Tier S candidate whose bucket is not calibrated needs the
-user's explicit confirmation (--confirmed), exactly like Tier A+/A. Any read or parse problem means not calibrated
+user's explicit confirmation (--confirmed), exactly like Tier A+/A. The bucket also counts only when the stored
+dossier record's radar snapshot confidence equals the dossier score (YOLO trades never enter the buckets). Any read
+or parse problem means not calibrated
 (fail closed); it is never a rejection of the trade and never applies to risk-reducing commands.
 """
 
@@ -90,6 +92,8 @@ def build_calibration(rows: Iterable[dict], env: str = STORE_ENV, min_trades: in
     for row in rows or []:
         if not isinstance(row, dict) or _norm_env(row.get("env")) != want or row.get("status") != "closed":
             continue
+        if row.get("is_yolo") is True:
+            continue  # YOLO trades never calibrate the Tier S gate (PR #204 review)
         r_net = _num(row.get("realized_r_net"))
         if r_net is None:
             continue
@@ -124,8 +128,8 @@ def trade_key(row: dict) -> str:
     return f"{str(row.get('symbol') or '').upper()}|{str(row.get('direction') or '').upper()}|{row.get('entry_ts')}"
 
 
-_STORE_FIELDS = ("symbol", "direction", "entry_ts", "env", "status", "dossier_score", "score", "realized_r_net",
-                 "mfe_r")
+_STORE_FIELDS = ("symbol", "direction", "entry_ts", "env", "status", "is_yolo", "dossier_score", "score",
+                 "realized_r_net", "mfe_r")
 
 
 def merge_store(existing: Optional[dict], rows: Iterable[dict], now: Optional[float] = None,
@@ -136,7 +140,8 @@ def merge_store(existing: Optional[dict], rows: Iterable[dict], now: Optional[fl
     if isinstance(existing, dict) and isinstance(existing.get("trades"), dict):
         trades = {k: v for k, v in existing["trades"].items() if isinstance(v, dict)}
     for row in rows or []:
-        if isinstance(row, dict) and _norm_env(row.get("env")) == "prod" and row.get("status") == "closed":
+        if (isinstance(row, dict) and _norm_env(row.get("env")) == "prod" and row.get("status") == "closed"
+                and row.get("is_yolo") is not True):
             trades[trade_key(row)] = dict({k: row.get(k) for k in _STORE_FIELDS}, env="prod")
     store = build_calibration(trades.values(), STORE_ENV, min_trades)
     store.update(schema_version=SCHEMA_VERSION, generated_at_ts=int(time.time() if now is None else now),
@@ -247,6 +252,34 @@ def tier_s_confirmation_required(cand: Any, env: str, profile: Any, base_dir: st
             ok, reason = False, load_reason
         else:
             ok, reason = bucket_is_calibrated(cal, score, STORE_ENV, now=now, min_trades=min_trades)
+        if ok:
+            ok, reason = radar_snapshot_matches(cand, base_dir)
     except Exception as e:  # fail closed
         ok, reason = False, f"calibration check failed ({type(e).__name__})"
     return None if ok else confirmation_reason(score, reason)
+
+
+DOSSIER_REL_PATH = os.path.join("logs", "evaluations", "latest_dossier.json")
+
+
+def radar_snapshot_matches(cand: dict, base_dir: str) -> Tuple[bool, str]:
+    """(True, reason) only when the stored latest dossier record carries radar_snapshots["SYMBOL|DIRECTION"] (joined
+    by record_evaluation.py from the brief's radar rows) whose `confidence` equals the dossier `score` exactly, so the
+    evaluator cannot pick a calibrated bucket by writing a different score. Any read problem is not a match."""
+    key = f"{str(cand.get('symbol') or '').upper()}|{str(cand.get('direction') or '').upper()}"
+    try:
+        with open(os.path.join(base_dir, DOSSIER_REL_PATH), "r", encoding="utf-8") as f:
+            record = json.load(f)
+        snaps = record.get("radar_snapshots") if isinstance(record, dict) else None
+    except Exception:
+        return False, "radar_snapshot_unreadable"
+    entry = snaps.get(key) if isinstance(snaps, dict) else None
+    row = entry.get("radar_snapshot") if isinstance(entry, dict) else None
+    if not isinstance(row, dict):
+        return False, "radar_snapshot_missing"
+    dossier_score, radar_score = _int_score(cand.get("score")), _num(row.get("confidence"))
+    if dossier_score is None or radar_score is None or radar_score != int(radar_score) \
+            or int(radar_score) != dossier_score:
+        shown = "n/a" if radar_score is None else (int(radar_score) if radar_score == int(radar_score) else radar_score)
+        return False, f"score_mismatch (dossier {cand.get('score')} vs radar {shown})"
+    return True, "radar snapshot matches the dossier score"

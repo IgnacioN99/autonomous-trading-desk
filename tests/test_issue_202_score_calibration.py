@@ -70,7 +70,7 @@ def tearDownModule():
     _net_patch.stop()
 
 
-def write_agy_dossier(brain, dossier_path, candidates, created=None, target_env=None):
+def write_agy_dossier(brain, dossier_path, candidates, created=None, target_env=None, snapshots=False):
     """Evaluator transcript + record exactly like record_evaluation.py --from-subagent (agy). Returns extraction."""
     created = created or datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=30)
     tdir = os.path.join(brain, CONV_ID, ".system_generated", "logs")
@@ -90,8 +90,11 @@ def write_agy_dossier(brain, dossier_path, candidates, created=None, target_env=
     extracted = dp.extract_dossier_from_transcript(tpath)
     if dossier_path:
         os.makedirs(os.path.dirname(dossier_path), exist_ok=True)
+        record = dp.build_record_from_extraction(extracted)
+        if snapshots:
+            tgb.add_radar_snapshots(record)
         with open(dossier_path, "w", encoding="utf-8") as f:
-            json.dump(dp.build_record_from_extraction(extracted), f)
+            json.dump(record, f)
     return extracted
 
 
@@ -544,6 +547,18 @@ class TestScoreCalibrationModule(_Workspace):
         cal.update(over)
         return cal
 
+    def test_yolo_rows_never_calibrate_tier_s(self):
+        yolo = [dict(outcome(85, 1.0, key=i), is_yolo=True) for i in range(30)]
+        self.assertEqual(scal.build_calibration(yolo, "PROD", 30)["buckets"]["80-89"]["n"], 0)
+        store = scal.merge_store(None, yolo, now=time.time())
+        self.assertEqual((store["trades"], store["buckets"]["80-89"]["calibrated"]), ({}, False))
+        self.assertFalse(scal.bucket_is_calibrated(store, 85, "PROD")[0])
+        # a stored YOLO row from an older store is skipped by the recompute too; is_yolo is persisted
+        legacy = {"trades": {"k": dict(outcome(85, 1.0), is_yolo=True)}}
+        self.assertEqual(scal.merge_store(legacy, [], now=1)["buckets"]["80-89"]["n"], 0)
+        kept = scal.merge_store(None, [dict(outcome(85, 1.0), is_yolo=False)], now=1)
+        self.assertIs(next(iter(kept["trades"].values()))["is_yolo"], False)
+
     def test_bucket_is_calibrated_reasons(self):
         now = time.time()
         self.assertTrue(scal.bucket_is_calibrated(self.store(), 85, "PROD", now)[0])
@@ -619,7 +634,7 @@ class TestExecutorCalibrationGate(_Workspace):
     def dossier(self, **cand):
         write_agy_dossier(self.brain, self.dossier_path,
                           [dict({"symbol": "SOLUSDT", "direction": "LONG", "tier": "S", "score": 85,
-                                 "requires_user_confirmation": False}, **cand)])
+                                 "requires_user_confirmation": False}, **cand)], snapshots=True)
 
     def gate(self, env="prod", confirmed=False, **kw):
         return eft.enforce_evaluation_dossier("SOLUSDT", "LONG", env, confirmed=confirmed, base_dir=self.root, **kw)
@@ -629,6 +644,17 @@ class TestExecutorCalibrationGate(_Workspace):
         self.dossier()
         ok, reason, _ = self.gate()
         self.assertTrue(ok, reason)
+
+    def test_helper_exception_asks_the_user(self):
+        tgb.write_calibrated_store(self.root)
+        self.dossier()
+        with patch.object(scal, "tier_s_confirmation_required", side_effect=RuntimeError("boom")):
+            ok, reason, cand = self.gate()
+        self.assertFalse(ok)
+        self.assertIn("Tier S score bucket 80-89 not calibrated (calibration check failed (RuntimeError))", reason)
+        self.assertIsNotNone(cand)
+        with patch.object(scal, "tier_s_confirmation_required", side_effect=RuntimeError("boom")):
+            self.assertTrue(self.gate(confirmed=True)[0])
 
     def test_uncalibrated_asks_and_confirmed_proceeds(self):
         self.dossier()
@@ -707,6 +733,59 @@ class TestGuardCalibrationGate(tgb.GuardHarness):
                 message = ex_reason.split("BTCUSDT: ", 1)[1]
                 self.assertIn(message, res["reason"])  # one helper, one message
                 self.assertEqual(self.deploy("--confirmed").get("decision"), "allow")
+
+    def edit_snapshots(self, snaps):
+        with open(self.dossier_path, encoding="utf-8") as f:
+            record = json.load(f)
+        if snaps is None:
+            record.pop("radar_snapshots", None)
+        else:
+            record["radar_snapshots"] = snaps
+        with open(self.dossier_path, "w", encoding="utf-8") as f:
+            json.dump(record, f)
+
+    def test_dossier_score_must_match_the_radar_snapshot(self):
+        cases = (({"BTCUSDT|LONG": {"radar_snapshot": {"confidence": 82}}}, "score_mismatch (dossier 85 vs radar 82)"),
+                 ({"BTCUSDT|LONG": {"radar_snapshot": {"confidence": 85.5}}}, "score_mismatch (dossier 85 vs radar 85.5)"),
+                 ({"BTCUSDT|LONG": {"radar_snapshot": {}}}, "score_mismatch (dossier 85 vs radar n/a)"),
+                 (None, "radar_snapshot_missing"),
+                 ({}, "radar_snapshot_missing"),
+                 ("garbage", "radar_snapshot_missing"),
+                 ({"BTCUSDT|LONG": {"radar_snapshot": None, "radar_snapshot_reason": "stale"}},
+                  "radar_snapshot_missing"),
+                 ({"BTCUSDT|SHORT": {"radar_snapshot": {"confidence": 85}}}, "radar_snapshot_missing"))
+        for snaps, fragment in cases:
+            with self.subTest(snaps=snaps):
+                self.write_provenance_dossier()
+                self.edit_snapshots(snaps)
+                res = self.deploy()
+                self.assertDenied(res, CALIB_GATE)
+                self.assertIn(f"80-89 not calibrated ({fragment})", res["reason"])
+                ok, ex_reason, _ = eft.enforce_evaluation_dossier("BTCUSDT", "LONG", "prod", base_dir=self.root)
+                self.assertFalse(ok)
+                self.assertIn(ex_reason.split("BTCUSDT: ", 1)[1], res["reason"])  # same message
+                self.assertEqual(self.deploy("--confirmed").get("decision"), "allow")
+        self.write_provenance_dossier()  # matching snapshot + calibrated store
+        self.assertEqual(self.deploy().get("decision"), "allow")
+        self.assertTrue(eft.enforce_evaluation_dossier("BTCUSDT", "LONG", "prod", base_dir=self.root)[0])
+
+    def test_unreadable_dossier_record_is_not_a_match(self):
+        cand = {"symbol": "BTCUSDT", "direction": "LONG", "score": 85}
+        self.assertEqual(scal.radar_snapshot_matches(cand, os.path.join(self.root, "nowhere")),
+                         (False, "radar_snapshot_unreadable"))
+        with open(self.dossier_path, "w", encoding="utf-8") as f:
+            f.write("{bad")
+        self.assertEqual(scal.radar_snapshot_matches(cand, self.root), (False, "radar_snapshot_unreadable"))
+        msg = scal.tier_s_confirmation_required(dict(cand, tier="S"), "prod", {}, self.root)
+        self.assertIn("80-89 not calibrated (radar_snapshot_unreadable)", msg)
+
+    def test_guard_helper_exception_asks_the_user(self):
+        self.write_provenance_dossier()
+        with patch.object(pre_trade_guard.scal, "tier_s_confirmation_required", side_effect=RuntimeError("boom")):
+            res = self.deploy()
+            self.assertDenied(res, CALIB_GATE)
+            self.assertIn("calibration check failed (RuntimeError)", res["reason"])
+            self.assertEqual(self.deploy("--confirmed").get("decision"), "allow")
 
     def test_score_reasons(self):
         for score, fragment in ((None, "no dossier score"), (50, "outside the calibration buckets"),
@@ -787,6 +866,62 @@ class TestCalibrationStoreGroundTruth(tgb.GuardHarness):
                   "cat logs/trade_outcomes.jsonl"):
             self.assertNotEqual(self.agy(self.cmd(c)).get("decision"), "deny", c)
         self.assertIn("logs/trade_outcomes.jsonl", pre_trade_guard.GROUND_TRUTH_FILES)
+
+    def test_trades_audit_jsonl_is_ground_truth(self):
+        for c in ("echo '{}' >> logs/trades_audit.jsonl", "cp /tmp/forged.jsonl logs/trades_audit.jsonl",
+                  "sed -i 's/x/y/' logs/trades_audit.jsonl", "rm logs/trades_audit.jsonl"):
+            res = self.agy(self.cmd(c))
+            self.assertDenied(res, "Ground Truth Protection")
+            self.assertIn("logs/trades_audit.jsonl may only be written by", res["reason"], c)
+            self.assertIn("python3 scripts/execute_futures_trade.py", res["reason"], c)
+        for c in ("cat logs/trades_audit.jsonl", "tail -n 5 logs/trades_audit.jsonl",
+                  "grep BTCUSDT logs/trades_audit.jsonl", "wc -l logs/trades_audit.jsonl"):
+            self.assertNotEqual(self.agy(self.cmd(c)).get("decision"), "deny", c)
+        self.assertIn("logs/trades_audit.jsonl", pre_trade_guard.GROUND_TRUTH_FILES)
+
+    def test_sanctioned_audit_writer_invocations_still_allowed(self):
+        """The executor is the only writer (entry records, failsafe aborts); none of its commands gets denied."""
+        self.write_provenance_dossier()
+        for flags in ("--close-position --symbol BTCUSDT", "--move-breakeven --symbol BTCUSDT", "--auto-heal",
+                      "--protect-pending", "--audit-orphans"):
+            with self.subTest(flags=flags):
+                self.assertEqual(self.agy(self.cmd(f"{SCRIPT} {flags} --env prod")).get("decision"), "allow")
+        res = self.agy(self.cmd(f"{SCRIPT} --symbol BTCUSDT --direction LONG --leverage 3 --env prod",
+                                conversationId=tgb.PARENT_CONV_ID))
+        self.assertEqual(res.get("decision"), "allow", res)
+        for c in ("python3 scripts/trade_outcomes.py --env prod --json", "python3 scripts/sync_session_state.py",
+                  "python3 scripts/loops/position_guardian_loop.py --once"):
+            self.assertNotIn("Ground Truth Protection", self.agy(self.cmd(c)).get("reason", ""), c)
+
+    def test_suggested_report_issue_commands_are_not_denied(self):
+        """Every report_issue.sh command the doctor suggests (placeholders filled) passes the guard and names no
+        ground-truth file (issue #202 audit round 3)."""
+        import re
+        import trading_doctor
+        texts = [trading_doctor.ledger_audit_warning({"target_env": "prod", "audit_read_error": "PermissionError: x"},
+                                                     "prod"),
+                 trading_doctor.ledger_audit_warning({"target_env": "prod", "audit_corrupt_lines": 3}, "prod")]
+        with patch("utils.yolo_scan_health.read_health",
+                   return_value={"consecutive_unavailable": 99, "last_unavailable_reason": "scan failed"}):
+            texts.append(trading_doctor.check_yolo_scan_health({"yolo_slot_enabled": True})[1])
+        basenames = [p.rsplit("/", 1)[-1] for p in pre_trade_guard.GROUND_TRUTH_FILES]
+        commands = []
+        for text in texts:
+            found = re.findall(r"\./scripts/report_issue\.sh .*?<file with the raw output>", text)
+            self.assertEqual(len(found), 1, text)
+            commands.append(found[0].replace("<file with the raw output>", "logs/issue_output_1700000000.log")
+                            .replace("<command>", "python3 scripts/prime_evaluator_brief.py").replace("<code>", "1"))
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertNotRegex(command, r"[<>]")
+                for name in basenames:
+                    self.assertNotIn(name, command)
+                res = self.agy(self.cmd(command))
+                self.assertNotEqual(res.get("decision"), "deny", res)
+                self.assertNotIn("Ground Truth Protection", res.get("reason", ""))
+        # control: naming the ledger in the command is what the guard denies
+        self.assertDenied(self.agy(self.cmd(commands[0].replace("trades audit ledger", "trades_audit.jsonl"))),
+                          "Ground Truth Protection")
 
     def test_module_is_a_protected_harness_file(self):
         self.assertIn("scripts/utils/score_calibration.py", pre_trade_guard.HARNESS_FILES)
@@ -919,7 +1054,14 @@ class TestPromptAndDocs(unittest.TestCase):
         self.assertEqual(len(lines), 1)
         self.assertIn("alias `conviction_pct`", lines[0])
         self.assertIn("NOT a probability", text)
-        self.assertIn("copy the radar `confidence` exactly, never estimate", text)
+        contract = text.split("<output_contract>")[1].split("</output_contract>")[0]
+        must = contract.split("each item MUST include")[1].split("Optional:")[0]
+        self.assertIn("`score` (the brief `confidence` copied exactly: never estimated, never omitted", must)
+        c41 = next(l for l in text.splitlines() if l.strip().startswith("- C4.1 Confirmation policy"))
+        self.assertIn("brief `confidence` next to its dossier `score` (they must be equal)", c41)
+        for shot in ("FILUSDT Tier S, confidence 95 = score 95", "SOLUSDT Tier A+, confidence 70 = score 70",
+                     "Tier A), confidence 60 = score 60"):
+            self.assertIn(shot, text)
         self.assertEqual(text.count('"score": '), 3)  # the three shot dossiers
         self.assertNotIn("Maximum Conviction", text)
 

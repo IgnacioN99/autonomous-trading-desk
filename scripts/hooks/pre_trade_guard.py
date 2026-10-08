@@ -100,7 +100,8 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    <- scripts/execute_futures_trade.py (registration and --protect-pending); logs/hook_heartbeat.json (hook
    liveness, see 11) <- this hook itself (issue #73); logs/score_calibration.json (Tier S score calibration,
    issue #202) <- scripts/trading_scorecard.py; logs/trade_outcomes.jsonl (the store's only input) <-
-   scripts/trade_outcomes.py. File tools targeting them are denied: relative, absolute and Windows paths, NTFS aliases
+   scripts/trade_outcomes.py; logs/trades_audit.jsonl (entry ledger, the outcomes' source) <-
+   scripts/execute_futures_trade.py. File tools targeting them are denied: relative, absolute and Windows paths, NTFS aliases
    (trailing dot/space, ::$DATA streams) and targets whose os.path.realpath / samefile is a protected file
    (symlinked directory, hard link).
    Shell commands. The program of a sub-command is found past VAR=value / VAR+=value assignments, shell keywords
@@ -720,7 +721,8 @@ TRANSCRIPT_ROOT_OVERRIDE_RE = re.compile(
 # same-env symbols (issue #48). hook_heartbeat.json is this guard's liveness attestation (issue #73): the guard
 # refreshes it from Python on every live invocation (_write_heartbeat); a forged one would make the hooks look alive.
 # score_calibration.json decides whether an autonomous Tier S needs the user's confirmation (issue #202); a forged
-# calibrated bucket would skip it. trade_outcomes.jsonl is the only input the scorecard merges into that store.
+# calibrated bucket would skip it. trade_outcomes.jsonl is the only input the scorecard merges into that store, and
+# trades_audit.jsonl (the executor's entry ledger, also read by Gate 0A and the exit manager) is its source.
 GROUND_TRUTH_FILES = {
     "logs/session_state.json": "`python3 scripts/sync_session_state.py`",
     "logs/guardian_state.json": "`python3 scripts/loops/position_guardian_loop.py`",
@@ -728,6 +730,7 @@ GROUND_TRUTH_FILES = {
     "logs/hook_heartbeat.json": "`scripts/hooks/pre_trade_guard.py` itself (refreshed on every live hook invocation)",
     "logs/score_calibration.json": "`python3 scripts/trading_scorecard.py`",
     "logs/trade_outcomes.jsonl": "`python3 scripts/trade_outcomes.py`",
+    "logs/trades_audit.jsonl": "`python3 scripts/execute_futures_trade.py` (entry audit records and failsafe-abort events)",
 }
 GROUND_TRUTH_BASENAMES = {path.rsplit("/", 1)[-1].lower(): path for path in GROUND_TRUTH_FILES}
 GROUND_TRUTH_RE = re.compile("|".join(re.escape(n) for n in GROUND_TRUTH_BASENAMES), re.IGNORECASE)
@@ -5724,7 +5727,10 @@ def _tier_s_calibration_message(cand: dict, env: str, user_prof: dict, base_dir:
             return ("Tier S score bucket not calibrated (calibration module unavailable): ask the user and rerun "
                     "with --confirmed.")
         return None
-    return scal.tier_s_confirmation_required(cand, env, user_prof, base_dir, now=now_ts)
+    try:
+        return scal.tier_s_confirmation_required(cand, env, user_prof, base_dir, now=now_ts)
+    except Exception as e:  # fail closed: ask the user (same text as the executor)
+        return scal.confirmation_reason(cand.get("score"), f"calibration check failed ({type(e).__name__})")
 
 
 def _pending_entry_symbols(base_dir: str, env: str) -> Tuple[set, Optional[str]]:

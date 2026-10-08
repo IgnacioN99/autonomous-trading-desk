@@ -56,6 +56,15 @@ def write_calibrated_store(root, now=None, env="PROD", n=30, expectancy=0.25):
                    "buckets": {"80-89": dict(stats), "90-95": dict(stats)}}, f)
 
 
+def add_radar_snapshots(record):
+    """Issue #202 fixture: the radar_snapshots record_evaluation.py joins in, one per scored candidate with the
+    radar confidence equal to the dossier score (the gate requires the match)."""
+    record["radar_snapshots"] = {
+        f"{c['symbol']}|{c['direction']}": {"radar_snapshot": {"confidence": c["score"]}, "radar_snapshot_reason": None}
+        for c in record.get("approved_candidates") or [] if c.get("score") is not None}
+    return record
+
+
 class GuardHarness(unittest.TestCase):
     """Isolated workspace (temp dir) with profile, fresh session state and a fake Antigravity brain."""
 
@@ -114,7 +123,7 @@ class GuardHarness(unittest.TestCase):
         with open(transcript, "w", encoding="utf-8") as f:
             for s in steps:
                 f.write(json.dumps(s) + "\n")
-        record = dp.build_record_from_extraction(dp.extract_dossier_from_transcript(transcript))
+        record = add_radar_snapshots(dp.build_record_from_extraction(dp.extract_dossier_from_transcript(transcript)))
         with open(self.dossier_path, "w", encoding="utf-8") as f:
             json.dump(record, f)
         return record
@@ -434,7 +443,7 @@ class TestDossierProvenance(GuardHarness):
             with open(path, "w", encoding="utf-8") as f:
                 for r in rows:
                     f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        record = dp.build_record_from_extraction(dp.extract_dossier_from_transcript(transcript))
+        record = add_radar_snapshots(dp.build_record_from_extraction(dp.extract_dossier_from_transcript(transcript)))
         self.assertTrue(record["provenance"]["full_transcript_used"])
         with open(self.dossier_path, "w", encoding="utf-8") as f:
             json.dump(record, f)
@@ -494,9 +503,10 @@ class TestGroundTruthProtection(GuardHarness):
         "hook_heartbeat.json": "scripts/hooks/pre_trade_guard.py",
         "score_calibration.json": "scripts/trading_scorecard.py",  # issue #202
         "trade_outcomes.jsonl": "scripts/trade_outcomes.py",       # issue #202: the store's only input
+        "trades_audit.jsonl": "scripts/execute_futures_trade.py",  # issue #202 (PR #204): the outcomes' source
     }
     NEW_FILES = ("guardian_state.json", "pending_entries.json", "hook_heartbeat.json", "score_calibration.json",
-                 "trade_outcomes.jsonl")
+                 "trade_outcomes.jsonl", "trades_audit.jsonl")
 
     def assertGroundTruthDenied(self, res, name, label=""):
         self.assertDenied(res, "Ground Truth Protection")

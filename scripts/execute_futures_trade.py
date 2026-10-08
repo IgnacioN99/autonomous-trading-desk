@@ -1823,7 +1823,10 @@ def _tier_s_calibration_message(cand, env, base_dir):
         prof = up.load_user_profile(base_dir=base_dir)
     except Exception:
         prof = {}  # missing keys fall back to the defaults (gate on)
-    return scal.tier_s_confirmation_required(cand, env, prof, base_dir)
+    try:
+        return scal.tier_s_confirmation_required(cand, env, prof, base_dir)
+    except Exception as e:  # fail closed: ask the user
+        return scal.confirmation_reason((cand or {}).get('score'), f"calibration check failed ({type(e).__name__})")
 
 
 def _tier_label_of(cand):

@@ -131,6 +131,9 @@ class _TempWorkspace(unittest.TestCase):
             for s in steps:
                 f.write(json.dumps(s) + "\n")
         record = dp.build_record_from_extraction(dp.extract_dossier_from_transcript(tpath))
+        # Issue #202: radar snapshots as record_evaluation.py joins them (confidence == dossier score)
+        record["radar_snapshots"] = {f"{c['symbol']}|{c['direction']}": {"radar_snapshot": {"confidence": c["score"]}}
+                                     for c in record["approved_candidates"] if c.get("score") is not None}
         with open(self.dossier_path, "w", encoding="utf-8") as f:
             json.dump(record, f)
         return record

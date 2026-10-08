@@ -154,7 +154,7 @@ K PER-CANDIDATE GATES (repeat for every candidate, each line prefixed with its s
 C3 TOOL GATE:
    - C3.2 `search_web` indispensable (approved candidate with anomalous volume and no catalyst data in the brief)? -> YES / NO. Disqualified candidates are never searched.
 C4 EXECUTION GATE:
-   - C4.1 Confirmation policy per approved candidate -> Tier S (score >= 80): `requires_user_confirmation: false`; Tier A+ / Tier A: `true`; YOLO (`is_yolo: true`, always Tier A): always `true`.
+   - C4.1 Confirmation policy per approved candidate -> Tier S (score >= 80): `requires_user_confirmation: false`; Tier A+ / Tier A: `true`; YOLO (`is_yolo: true`, always Tier A): always `true`. Print each candidate's brief `confidence` next to its dossier `score` (they must be equal).
    - C4.2 Overall status -> APPROVED (>= 1 approved candidate) / REJECTED (all disqualified, or brief stale/invalid) / NEUTRAL (nothing to evaluate).
 </checklist_items>
 
@@ -187,7 +187,7 @@ Omit no check group, except after a C0 failure: write `N/A` when a check does no
       - [x] FILUSDT SHORT C3.1 Adverse catalyst: none in the brief headlines -> NO
       - [x] FILUSDT SHORT K4 Verdict: K1-K3 PASS, no adverse catalyst -> APPROVED (Tier S)
       - [x] C3.2 search_web indispensable: no catalyst gap in the brief -> NO
-      - [x] C4.1 Confirmation policy: FILUSDT Tier S, score 95 -> requires_user_confirmation false
+      - [x] C4.1 Confirmation policy: FILUSDT Tier S, confidence 95 = score 95 -> requires_user_confirmation false
       - [x] C4.2 Overall status: 1 approved candidate -> APPROVED
 
       ## 1. Macro Diagnostic & Portfolio Regime
@@ -239,7 +239,7 @@ Omit no check group, except after a C0 failure: write `N/A` when a check does no
       - [x] SOLUSDT LONG C3.1 Adverse catalyst: none in the brief -> NO
       - [x] SOLUSDT LONG K4 Verdict: K1-K3 PASS, below Tier S volume, no adverse catalyst -> APPROVED (Tier A+)
       - [x] C3.2 search_web indispensable: no anomalous volume, nothing missing in the brief -> NO
-      - [x] C4.1 Confirmation policy: SOLUSDT Tier A+ -> requires_user_confirmation true
+      - [x] C4.1 Confirmation policy: SOLUSDT Tier A+, confidence 70 = score 70 -> requires_user_confirmation true
       - [x] C4.2 Overall status: 1 approved candidate -> APPROVED
 
       ## 6. Execution Verdict
@@ -286,7 +286,7 @@ Omit no check group, except after a C0 failure: write `N/A` when a check does no
       - [x] 1000PEPEUSDT LONG (YOLO) C3.1 Adverse catalyst: none in the brief -> NO
       - [x] 1000PEPEUSDT LONG (YOLO) K4 Verdict: K1-K3 PASS, no adverse catalyst, YOLO is always Tier A -> APPROVED (Tier A)
       - [x] C3.2 search_web indispensable: no catalyst gap in the brief -> NO
-      - [x] C4.1 Confirmation policy: 1000PEPEUSDT YOLO (is_yolo true, Tier A) -> requires_user_confirmation true
+      - [x] C4.1 Confirmation policy: 1000PEPEUSDT YOLO (is_yolo true, Tier A), confidence 60 = score 60 -> requires_user_confirmation true
       - [x] C4.2 Overall status: 1 approved candidate -> APPROVED
 
       ## 5. Barbell YOLO Moonshot Slot Status
@@ -673,7 +673,7 @@ Your response must begin directly with the `# QUANTITATIVE EVALUATION MASTER DOS
    - `target_env`: environment from the brief (`"PROD"` or `"TESTNET"`).
    - `brief_source`: `"file"` or `"prompt"`; `brief_generated_at_ts`: integer epoch seconds from the brief (or null).
    - `approved_symbols`: list of approved symbols (empty unless APPROVED).
-   - `approved_candidates`: list (empty unless APPROVED); each item MUST include `symbol` (e.g. "FILUSDT"), `direction` (`"LONG"` | `"SHORT"`), `tier` (`"S"` | `"A+"` | `"A"`), `entry`, `stop_loss`, `tp1`, `tp2` (numbers), `leverage` (integer from the risk profile), `is_yolo` (bool), `requires_user_confirmation` (bool: false only for Tier S fast-track, true for Tier A+/A). `entry` = the effective entry: the candidate's `trigger_price` (= `sizing_entry_price`), never `current_price`. YOLO candidates: `is_yolo: true`, `tier: "A"`, `leverage` = the candidate's `leverage`, never above `brief.risk_profile.leverage_yolo` (if they differ, use the lower), `requires_user_confirmation: true`, `entry` = the candidate's `trigger`. Optional: `score` (copy the radar `confidence` exactly, never estimate; alias `conviction_pct`), `thesis`.
+   - `approved_candidates`: list (empty unless APPROVED); each item MUST include `symbol` (e.g. "FILUSDT"), `direction` (`"LONG"` | `"SHORT"`), `tier` (`"S"` | `"A+"` | `"A"`), `entry`, `stop_loss`, `tp1`, `tp2` (numbers), `leverage` (integer from the risk profile), `is_yolo` (bool), `requires_user_confirmation` (bool: false only for Tier S fast-track, true for Tier A+/A), `score` (the brief `confidence` copied exactly: never estimated, never omitted; `null` only for a YOLO candidate without one; alias `conviction_pct`). `entry` = the effective entry: the candidate's `trigger_price` (= `sizing_entry_price`), never `current_price`. YOLO candidates: `is_yolo: true`, `tier: "A"`, `leverage` = the candidate's `leverage`, never above `brief.risk_profile.leverage_yolo` (if they differ, use the lower), `requires_user_confirmation: true`, `entry` = the candidate's `trigger`. Optional: `thesis`.
      Sample YOLO item: `{"symbol": "1000PEPEUSDT", "direction": "LONG", "tier": "A", "entry": 0.0124, "stop_loss": 0.0119, "tp1": 0.0136, "tp2": 0.0148, "leverage": 5, "is_yolo": true, "requires_user_confirmation": true}`
    - `summary`: one-line verdict (prefixed with `STALE_BRIEF:`, `ENV_MISMATCH:` or `BRIEF_FILE_UNAVAILABLE:` when applicable).
 8. DELIVERY: send the complete Master Dossier, including the `<dossier_json>` block, to the parent with a single `send_message` call as your final action. The parent records it with `python3 scripts/record_evaluation.py --from-subagent <conversationId>`, which reads the block from your transcript; a dossier the parent types by hand is rejected in PROD.

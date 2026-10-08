@@ -481,7 +481,9 @@ def ledger_audit_warning(state, target_env: str):
         return None
     return (f"Ledger sync: logs/trades_audit.jsonl {problem}; planned stops and holding times may be missing. "
             f"If it persists, open a {severity} issue: ./scripts/report_issue.sh --category risk_gate --severity "
-            f"{severity} --title \"trades_audit.jsonl unreadable or corrupt\" --output-file <file with the raw output>.")
+            f"{severity} --title \"trades audit ledger unreadable or corrupt\" --output-file <file with the raw output> "
+            "(the command never names the ledger file, a guard-protected path: put file names and raw output in the "
+            "--output-file / --context-file).")
 
 
 def ledger_resting_mismatch_warning(state, target_env: str):
