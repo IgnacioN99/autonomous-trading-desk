@@ -4,9 +4,11 @@ exit_policy_sim.py - Offline exit-policy simulator on the desk's real trade path
 
 Read-only and unsigned: it never places, changes or cancels orders and sends no signed request. Inputs are the closed
 rows of logs/trade_outcomes.jsonl (scripts/trade_outcomes.py) for --env, public klines
-(utils/trade_excursion.fetch_klines_range, 1m and 15m, paged 1500 per request, 6 s timeout) and one public
+(utils/trade_excursion.fetch_klines_range, 1m and 15m, paged 1000 per request (weight 5), 0.2 s between pages, HTTP
+429 / 418 retried up to 3 tries honouring Retry-After, then "klines_error"; 6 s timeout) and one public
 GET /fapi/v1/exchangeInfo per run (tick size for the trail engine). A row needs initial_risk, entry_ts, entry_price,
-sl_price, tp1_price and tp2_price; others are counted under "skipped" by reason.
+sl_price, tp1_price and tp2_price; others are counted under "skipped" by reason ("no_entry_fill" rows, and
+"malformed" lines of the outcomes file, included).
 
 Replay (per trade, per policy, 1m resolution, from the first full 1m bar after entry to entry + --horizon-hours):
   - Worst case first: a 1m bar touching the current stop (LONG low <= stop, SHORT high >= stop) exits the remaining
@@ -26,9 +28,11 @@ Replay (per trade, per policy, 1m resolution, from the first full 1m bar after e
     tier by default), expressed in R: fee_rate x price / R per leg.
 Results are in-sample on a small sample (insufficient_sample below MIN_SAMPLE trades): use them to compare policies,
 not as a forecast. The "fidelity" block compares the "current" policy's simulated R with each row's realized_r_net,
-over all rows and over rows with an exact entry time only. A row with entry_commission_included false has an
-approximate entry_ts (trade_outcomes' audit timestamp - 120 s fallback): flagged entry_ts_approx, counted in the
-warnings, skipped with --exact-entry-only (reason "entry_ts_approx").
+over all rows and over rows with an exact entry time only. A row with entry_match "legacy" (or, without
+entry_match, entry_commission_included false) has an approximate entry_ts (trade_outcomes' audit timestamp - 120 s
+fallback): flagged entry_ts_approx, counted in the warnings, skipped with --exact-entry-only (reason
+"entry_ts_approx"). The warnings also carry the ranking caveat (policies are counterfactuals; promoting one to live
+settings requires a reviewed PR) and the auth_mode note (the replay assumes verified TP1, KEYS mode).
 Capture ratio = sum R / sum MFE_R, with MFE over the whole horizon (including after the exit): not comparable to
 trade_outcomes' capture_ratio (MFE up to the real exit). Per trade: atr_r (ATR_15m at entry / R) and lock_binding
 (the profit lock set the stop at least once).
@@ -48,6 +52,7 @@ import os
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -61,7 +66,11 @@ from utils import trade_excursion
 BAR_1M_MS = trade_excursion.BAR_MS
 BAR_15M_MS = 15 * BAR_1M_MS
 WARMUP_15M_BARS = 98  # closed 15m bars handed to the trail engine (+1 forming row = the live limit=99 read)
-KLINES_LIMIT = 1500
+KLINES_LIMIT = 1000  # weight 5 per page (1500 costs 10) on the PROD host shared with the guardian / executor
+KLINES_PAGE_SLEEP_SECONDS = 0.2  # pause between pages
+KLINES_MAX_TRIES = 3  # per page on HTTP 429 / 418, honouring Retry-After
+KLINES_BACKOFF_SECONDS = 1.0  # backoff without Retry-After: 1 s, 2 s
+KLINES_MAX_RETRY_AFTER_SECONDS = 60
 KLINES_TIMEOUT_SECONDS = 6
 EXCHANGE_INFO_TIMEOUT_SECONDS = 6
 MIN_WARMUP_BARS = 15  # calculate_structural_stop needs at least 15 closed 15m bars
@@ -70,14 +79,22 @@ DEFAULT_TAKER_FEE = 0.0005
 DEFAULT_MAKER_FEE = 0.0002
 MIN_SAMPLE = 30
 IN_SAMPLE_NOTE = "Results are in-sample on the desk's own trades: compare policies, do not read them as a forecast."
+RANKING_NOTE = ("Ranking caveat: policies are counterfactuals; promoting one to live settings requires a reviewed PR "
+                "(tp2_2_5r is below 3:1 R:R, close_at_0_5r truncates the right tail).")
+AUTH_MODE_NOTE = ("auth_mode: the replay counts TP1 fills as verified (KEYS mode); in MCP mode the live guardian "
+                  "never verifies TP1, so post-TP1 trailing there differs from the simulation.")
 EXIT_KINDS = ("sl", "trail_stop", "be", "tp1+trail", "tp2", "capped", "target")
-SKIP_REASONS = ("other_env", "not_closed", "no_risk", "no_levels", "entry_ts_approx", "klines_error", "warmup_short",
-                "filters_error")
+SKIP_REASONS = ("other_env", "no_entry_fill", "not_closed", "no_risk", "no_levels", "entry_ts_approx",
+                "klines_error", "warmup_short", "filters_error", "malformed")
 TRAIL_CADENCES = ("1m", "15m")
 
 
 def entry_ts_approx(row):
-    """True when the row's entry_ts is trade_outcomes' fallback (audit timestamp - 120 s, no entry fill matched)."""
+    """True when the row's entry_ts is trade_outcomes' legacy fallback (audit timestamp - 120 s, no entry fill
+    matched): entry_match "legacy", or, for rows written before entry_match existed, entry_commission_included
+    false."""
+    if row.get("entry_match") is not None:
+        return row.get("entry_match") == "legacy"
     return row.get("entry_commission_included", True) is False
 
 
@@ -123,9 +140,11 @@ def _logs_dir():
 
 
 def _read_jsonl(path):
+    """(JSON-object lines of path, malformed line count); ([], 0) when missing. A non-empty line that is not a JSON
+    object is malformed."""
     if not os.path.exists(path):
-        return []
-    out = []
+        return [], 0
+    out, malformed = [], 0
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -134,10 +153,13 @@ def _read_jsonl(path):
             try:
                 rec = json.loads(line)
             except ValueError:
+                malformed += 1
                 continue
             if isinstance(rec, dict):
                 out.append(rec)
-    return out
+            else:
+                malformed += 1
+    return out, malformed
 
 
 def select_rows(rows, env, exact_entry_only=False):
@@ -152,6 +174,8 @@ def select_rows(rows, env, exact_entry_only=False):
     for r in rows:
         if str(r.get("env") or "").strip().lower() != env:
             skip("other_env")
+        elif r.get("status") == "no_entry_fill":
+            skip("no_entry_fill")
         elif r.get("status") != "closed":
             skip("not_closed")
         elif not _num(r.get("initial_risk")) or _num(r.get("initial_risk")) <= 0:
@@ -168,14 +192,42 @@ def select_rows(rows, env, exact_entry_only=False):
     return out, skipped
 
 
+def _retry_after_seconds(err, attempt):
+    """Wait before retrying a rate-limited page: the Retry-After header (seconds, capped), else 1 s, 2 s, ..."""
+    try:
+        value = float((getattr(err, "headers", None) or {}).get("Retry-After"))
+        if value >= 0:
+            return min(value, KLINES_MAX_RETRY_AFTER_SECONDS)
+    except (TypeError, ValueError, AttributeError):
+        pass
+    return KLINES_BACKOFF_SECONDS * (2 ** attempt)
+
+
+def _fetch_page(symbol, interval, start, env):
+    """One klines page; HTTP 429 / 418 is retried up to KLINES_MAX_TRIES tries in total (Retry-After honoured), then
+    raised like any other failed read."""
+    for attempt in range(KLINES_MAX_TRIES):
+        try:
+            return trade_excursion.fetch_klines_range(symbol, interval, start, KLINES_LIMIT, env,
+                                                      timeout=KLINES_TIMEOUT_SECONDS)
+        except urllib.error.HTTPError as e:
+            if e.code not in (429, 418) or attempt + 1 >= KLINES_MAX_TRIES:
+                raise
+            time.sleep(_retry_after_seconds(e, attempt))
+
+
 def fetch_range(symbol, interval, start_ms, end_ms, env):
-    """Raw klines of [start_ms, end_ms) in pages of KLINES_LIMIT (public endpoint). Raises on a failed read."""
+    """Raw klines of [start_ms, end_ms) in pages of KLINES_LIMIT (public endpoint), KLINES_PAGE_SLEEP_SECONDS apart.
+    Raises on a failed read (after the 429 / 418 backoff of _fetch_page)."""
     step = BAR_15M_MS if interval == "15m" else BAR_1M_MS
     out = []
     start = int(start_ms)
+    first = True
     while start < end_ms:
-        rows = trade_excursion.fetch_klines_range(symbol, interval, start, KLINES_LIMIT, env,
-                                                  timeout=KLINES_TIMEOUT_SECONDS)
+        if not first:
+            time.sleep(KLINES_PAGE_SLEEP_SECONDS)
+        first = False
+        rows = _fetch_page(symbol, interval, start, env)
         last_open = None
         for k in rows:
             open_ms = int(k[0])
@@ -422,13 +474,16 @@ def implied_fee_rate(rows):
 # ------------------------------------------------------------------------------------------------------------ run
 
 def simulate(rows_all, env, policy_names, horizon_hours, taker_fee, maker_fee, now_ms=None, *, trail_cadence="1m",
-             exact_entry_only=False):
+             exact_entry_only=False, malformed=0):
+    """malformed: malformed lines of the outcomes file (counted in skipped["malformed"] when > 0)."""
     started = time.monotonic()
     now_ms = int(time.time() * 1000) if now_ms is None else now_ms
     horizon_ms = int(horizon_hours * 3600 * 1000)
     registry = build_policies()
     rows, skipped = select_rows(rows_all, env, exact_entry_only=exact_entry_only)
-    warnings = [IN_SAMPLE_NOTE]
+    if malformed:
+        skipped["malformed"] = int(malformed)
+    warnings = [IN_SAMPLE_NOTE, RANKING_NOTE, AUTH_MODE_NOTE]
 
     filters_by_symbol = None
     if rows:
@@ -562,9 +617,9 @@ def main(argv=None):
         print(f"exit_policy_sim: invalid environment: {e}", file=sys.stderr)
         return 2
 
-    rows = _read_jsonl(args.outcomes or os.path.join(_logs_dir(), "trade_outcomes.jsonl"))
+    rows, malformed = _read_jsonl(args.outcomes or os.path.join(_logs_dir(), "trade_outcomes.jsonl"))
     result = simulate(rows, env, names, args.horizon_hours, args.taker_fee, args.maker_fee,
-                      trail_cadence=args.trail_cadence, exact_entry_only=args.exact_entry_only)
+                      trail_cadence=args.trail_cadence, exact_entry_only=args.exact_entry_only, malformed=malformed)
     out_path = args.out or os.path.join(_logs_dir(), "exit_policy_sim.json")
     _write_json_atomic(out_path, result)
 

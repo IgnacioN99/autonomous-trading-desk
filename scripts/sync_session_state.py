@@ -17,7 +17,10 @@ either. Issue #160: portfolio_exposure.resting_mismatches lists same-env records
 open position (not counted; the doctor warns), and the order listings are read before positionRisk so an entry
 filling between the reads is double counted rather than missed. The state is only ever written atomically
 (issue #127): a failed write leaves the
-previous file. CLI exit code 1 when the state written is INVALID or the write failed, else 0.
+previous file. Issue #208: closed_today_summary counts trades, not fills (trade_outcomes.summarize_closed_today on
+the day's userTrades, limit 1000, and the audit records): closed_trades_count / wins / losses / scratches per trade,
+realized_r_net (sum of per-trade R), partial_history (trades entered before today), fills_closed (fills with a
+realized PnL); the USDT figures stay sums over the fills. CLI exit code 1 when the state written is INVALID or the write failed, else 0.
 """
 
 import os
@@ -122,7 +125,11 @@ def write_error_state(err_msg: str, now_ts: int, now_utc: str, target_env: str, 
             "closed_trades_count": 0,
             "wins": 0,
             "losses": 0,
+            "scratches": 0,
             "win_rate_pct": 0.0,
+            "realized_r_net": 0.0,
+            "partial_history": 0,
+            "fills_closed": 0,
             "gross_realized_pnl_usdt": 0.0,
             "commissions_usdt": 0.0,
             "net_realized_pnl_usdt": 0.0
@@ -343,14 +350,14 @@ def sync_session_state(target_env: str = None) -> dict:
                 "type": o.get("type")
             })
 
-    # 5. Today's Trades & Realized PnL
+    # 5. Today's Trades & Realized PnL. USDT sums per fill; trade counts per trade (issue #208): the day's fills are
+    #    matched to the audit entries by trade_outcomes.summarize_closed_today (no extra request), so a TP1 partial
+    #    plus its runner is one trade, not two wins; fills_closed keeps the per-fill count.
     start_ms = get_start_of_day_utc()
-    trades_res = eft.send_signed_request("GET", "/fapi/v1/userTrades", {"startTime": start_ms, "limit": 100}, target_env=target_env)
+    trades_res = eft.send_signed_request("GET", "/fapi/v1/userTrades", {"startTime": start_ms, "limit": 1000}, target_env=target_env)
     today_realized_pnl = 0.0
     today_commissions = 0.0
-    closed_trades_count = 0
-    wins_count = 0
-    losses_count = 0
+    fills_closed = 0
 
     if isinstance(trades_res, list):
         for t in trades_res:
@@ -359,11 +366,22 @@ def sync_session_state(target_env: str = None) -> dict:
             today_commissions += comm
             if pnl != 0:
                 today_realized_pnl += pnl
-                closed_trades_count += 1
-                if pnl > 0:
-                    wins_count += 1
-                else:
-                    losses_count += 1
+                fills_closed += 1
+
+    day = {"trades_closed": 0, "wins": 0, "losses": 0, "scratches": 0, "realized_r_net_sum": 0.0,
+           "partial_history": 0}
+    day_error = None
+    if isinstance(trades_res, list):
+        try:
+            import trade_outcomes
+            day = trade_outcomes.summarize_closed_today(
+                records, trades_res, start_ms, target_env,
+                open_positions={(p["symbol"].upper(), p["direction"]) for p in active_positions})
+        except Exception as e:
+            day_error = f"{type(e).__name__}: {e}"[:200]
+    closed_trades_count = day["trades_closed"]
+    wins_count = day["wins"]
+    losses_count = day["losses"]
 
     net_realized_today = today_realized_pnl - today_commissions
     win_rate_today = (wins_count / closed_trades_count * 100) if closed_trades_count > 0 else 0.0
@@ -445,13 +463,19 @@ def sync_session_state(target_env: str = None) -> dict:
             "closed_trades_count": closed_trades_count,
             "wins": wins_count,
             "losses": losses_count,
+            "scratches": day["scratches"],
             "win_rate_pct": round(win_rate_today, 1),
+            "realized_r_net": day["realized_r_net_sum"],
+            "partial_history": day["partial_history"],
+            "fills_closed": fills_closed,
             "gross_realized_pnl_usdt": round(today_realized_pnl, 4),
             "commissions_usdt": round(today_commissions, 4),
             "net_realized_pnl_usdt": round(net_realized_today, 4)
         },
         "shadow_desk_summary": shadow_summary
     }
+    if day_error:
+        state["closed_today_summary"]["trade_summary_error"] = day_error
 
     # Save to atomic file with kernel-level replace (no non-atomic fallback, issue #127)
     return _write_state(state)
@@ -469,13 +493,16 @@ def format_markdown_summary(state: dict) -> str:
     exp = state["portfolio_exposure"]
     closed = state["closed_today_summary"]
     btc = state["macro_btc"]
+    partial_note = (f" | Entered before today: {closed['partial_history']}" if closed.get("partial_history") else "")
 
     lines = [
         f"# 📡 SESSION & PORTFOLIO STATE ({state['last_updated_utc']})",
         f"**BTC:** ${btc['price_usdt']:,.2f} USDT | **Env:** {state['target_env'].upper()}",
         "",
         "### 📊 Today's Operating Balance",
-        f"* **Closed Trades Today:** {closed['closed_trades_count']} (Wins: {closed['wins']} | Losses: {closed['losses']} | Win Rate: {closed['win_rate_pct']}%)",
+        f"* **Closed Trades Today:** {closed['closed_trades_count']} (Wins: {closed['wins']} | Losses: {closed['losses']} | Scratches: {closed.get('scratches', 0)} | Win Rate: {closed['win_rate_pct']}%)"
+        f" | **Realized R (net):** {closed.get('realized_r_net', 0.0):+.2f}R | Closing fills: {closed.get('fills_closed', 0)}"
+        f"{partial_note}",
         f"* **Net Realized PnL Today:** **{'+' if closed['net_realized_pnl_usdt'] >= 0 else ''}{closed['net_realized_pnl_usdt']:.4f} USDT** (Commissions: -${closed['commissions_usdt']:.4f})",
         f"* **Total Floating PnL:** **{'+' if exp['total_floating_pnl_usdt'] >= 0 else ''}{exp['total_floating_pnl_usdt']:.4f} USDT**",
         "",

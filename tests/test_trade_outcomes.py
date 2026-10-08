@@ -84,8 +84,10 @@ class OutcomesBase(unittest.TestCase):
         self.ws = tempfile.mkdtemp()
         self.logs = os.path.join(self.ws, "logs")
         os.makedirs(self.logs)
+        self.filters = {}  # exchangeInfo filters by symbol served to trade_outcomes.load_filters
         for p in (patch("execute_futures_trade._workspace_dir", return_value=self.ws),
-                  patch("urllib.request.urlopen", side_effect=AssertionError("network access in offline test"))):
+                  patch("urllib.request.urlopen", side_effect=AssertionError("network access in offline test")),
+                  patch("trade_outcomes.load_filters", side_effect=lambda env: self.filters)):
             p.start()
             self.addCleanup(p.stop)
 
@@ -317,7 +319,7 @@ class TestFillsUnavailableAndRequests(OutcomesBase):
             self.assertLessEqual(p["endTime"] - p["startTime"], 7 * DAY_MS)
             self.assertEqual(p["limit"], 1000)
         starts = sorted({p["startTime"] for _, _, p in fake.calls})
-        self.assertEqual(starts[0], entry_s * 1000 - 5 * MIN)
+        self.assertEqual(starts[0], entry_s * 1000 - to.ENTRY_LOOKBACK_MS)  # 90 min: the side + qty match window
         self.assertGreaterEqual(len(fake.calls), 3)  # two windows, the first one paginated
         t = self.rows()[0]
         self.assertEqual(t["status"], "closed")
@@ -326,10 +328,11 @@ class TestFillsUnavailableAndRequests(OutcomesBase):
 
     def test_full_windows_collected_whatever_the_reply_order(self):
         # > 1000 fills in one window, several of them sharing a millisecond; a full reply may hold the newest rows
-        # or any subset: every fill id must still be collected.
+        # or any subset: every fill id must still be collected. Groups of 3 fills 1 s apart (~14 min): complete
+        # within MAX_SPLIT_DEPTH halvings of the window.
         t_entry = T0 - 30_000
         fills = [fill(1, 1, "BUY", 100, 2500, t_entry)]
-        fills += [fill(10 + i, 500 + i, "SELL", 101, 1, t_entry + 1000 + 10 * (i // 3)) for i in range(2500)]
+        fills += [fill(10 + i, 500 + i, "SELL", 101, 1, t_entry + 1000 + 1000 * (i // 3)) for i in range(2500)]
         for order in ("desc", "shuffle"):
             with self.subTest(order=order):
                 with open(os.path.join(self.logs, "trades_audit.jsonl"), "w", encoding="utf-8"):
@@ -348,7 +351,7 @@ class TestFillsUnavailableAndRequests(OutcomesBase):
                 self.assertEqual(len(t["legs"]), 2500)
 
     def test_output_rewritten_atomically(self):
-        out_path = os.path.join(self.ws, "out", "trade_outcomes.jsonl")
+        out_path = os.path.join(self.logs, "out", "trade_outcomes.jsonl")  # --output must stay inside logs/
         self.audit(symbol="BTCUSDT", entry_order_id=1)
         self.audit(symbol="ETHUSDT", entry_order_id=1)
         fills = {s: [fill(1, 1, "BUY", 100, 10, T0, symbol=s), fill(2, 2, "SELL", 110, 10, T0 + 3600_000, symbol=s)]
