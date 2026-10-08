@@ -460,13 +460,15 @@ class TestGuardWithClaudeDossier(tgb.GuardHarness):
         os.environ[dp.CLAUDE_PROJECTS_ENV] = self.projects  # restored by GuardHarness' patch.dict
 
     def write_claude_dossier(self, symbol="BTCUSDT", direction="LONG", agent_type=dp.EVALUATOR_NAME, extra=None):
-        cand = {"symbol": symbol, "direction": direction, "tier": "S", "leverage": 3}
+        # "score": 85 lies in the calibrated fixture bucket written by GuardHarness (issue #202)
+        cand = {"symbol": symbol, "direction": direction, "tier": "S", "leverage": 3, "score": 85}
         cand.update(extra or {})  # optional candidate overrides (is_yolo, tier, requires_user_confirmation, ...)
         block = json.dumps({"status": "APPROVED", "target_env": "PROD", "summary": "test",
                             "approved_candidates": [cand]})
         path = write_claude_transcript(Path(self.projects), EVALUATOR_AGENT_ID,
                                        f"Master Dossier\n<dossier_json>\n{block}\n</dossier_json>", agent_type)
-        record = dp.build_record_from_extraction(dp.extract_dossier_from_claude_transcript(str(path)))
+        record = tgb.add_radar_snapshots(dp.build_record_from_extraction(
+            dp.extract_dossier_from_claude_transcript(str(path))))
         record["target_env"] = "prod"
         with open(self.dossier_path, "w", encoding="utf-8") as f:
             json.dump(record, f)

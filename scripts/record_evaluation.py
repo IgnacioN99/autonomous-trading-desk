@@ -88,8 +88,57 @@ def _register_shadow() -> None:
         pass
 
 
+RADAR_SNAPSHOT_WINDOW_S = 900  # the brief's radar scores must be at most 15 min older than the dossier
+
+
+def build_radar_snapshots(record: dict, base_dir: Optional[str] = None) -> Optional[dict]:
+    """Join of each approved candidate with the radar row that prime_evaluator_brief.py wrote to
+    logs/primed_brief_scores.json (issue #202). Keyed "SYMBOL|DIRECTION"; each value is {radar_snapshot,
+    radar_snapshot_reason} with reason missing / unreadable / stale / no_match when the row is null. It is stored
+    outside the provenance sha256 (which hashes only the evaluator's <dossier_json>). Readers: the executor's audit
+    record, and the calibrated Tier S gate (utils.score_calibration.radar_snapshot_matches, in the executor and the
+    guard), which asks the user unless the snapshot confidence equals the dossier score and the record's sha256 is
+    the one the gate validated."""
+    cands = [c for c in record.get("approved_candidates") or [] if isinstance(c, dict)]
+    if str(record.get("status", "")).upper() != "APPROVED" or not cands:
+        return None
+    path = os.path.join(base_dir or BASE_DIR, "logs", "primed_brief_scores.json")
+    reason, rows = None, []
+    if not os.path.exists(path):
+        reason = "missing"
+    else:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            generated_at = int(data["generated_at_ts"])
+            rows = [r for r in data["rows"] if isinstance(r, dict)]
+            sidecar_env = str(data.get("env") or "").lower()
+        except Exception:
+            reason = "unreadable"
+        else:
+            ts = int(record.get("timestamp_ts") or 0)
+            if not ts - RADAR_SNAPSHOT_WINDOW_S <= generated_at <= ts:
+                reason = "stale"
+            elif sidecar_env and record.get("target_env") and sidecar_env != str(record["target_env"]).lower():
+                rows = []  # scores of another environment never match
+    out = {}
+    for c in cands:
+        symbol, direction = str(c.get("symbol") or "").upper(), str(c.get("direction") or "").upper()
+        row = None if reason else next((r for r in rows if str(r.get("symbol") or "").upper() == symbol
+                                        and str(r.get("direction") or "").upper() == direction), None)
+        out[f"{symbol}|{direction}"] = {"radar_snapshot": row,
+                                        "radar_snapshot_reason": reason or (None if row else "no_match")}
+    return out
+
+
 def _persist(record: dict, base_dir: Optional[str] = None, shadow: bool = True) -> str:
     base, dossier_file, history_file = _paths(base_dir)
+    try:
+        snapshots = build_radar_snapshots(record, base)
+    except Exception:  # audit metadata only: never blocks recording the verdict
+        snapshots = None
+    if snapshots is not None:
+        record["radar_snapshots"] = snapshots
     atomic_write_json(dossier_file, record)
     prov = record.get("provenance") or {}
     atomic_append_jsonl(history_file, {

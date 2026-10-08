@@ -299,6 +299,10 @@ def scan_market(top_n=5, interval="15m", symbols=None):
     candidates.sort(key=lambda x: x["score"], reverse=True)
     return candidates[:top_n]
 
+def intraday_tier_label(score):
+    """Display tier for a heuristic score; Tier S at >= 80, the same threshold as broad_market_radar (issue #202)."""
+    return "Tier S (🔥 Top Score)" if score >= 80 else "Tier A (Strong)"
+
 def main(argv=None):
     """Read-only public market data; never places orders. Exit codes: 0 ok, 1 data/API error, 2 bad usage.
     --format json keeps its legacy shape (a bare list); --json emits the {status, ..., candidates} envelope."""
@@ -344,10 +348,11 @@ def main(argv=None):
         if not results:
             print("No opportunities with sufficient confluence found at this moment.")
         for i, item in enumerate(results, 1):
-            tier = "Tier S (🔥 Maximum)" if item["score"] >= 75 else "Tier A (Strong)"
+            tier = intraday_tier_label(item["score"])
             roe_est = round(item["risk_pct"] * item["rr"] * 3, 1) # at 3x
             trigger_str = f"{item['trigger']:.4f}" if item.get("trigger") else f"{item['entry']:.4f}"
-            print(f"#{i} | {item['symbol']} - {item['direction']} | Confluence: {item['score']}% ({tier})")
+            print(f"#{i} | {item['symbol']} - {item['direction']} | Score: {item['score']} ({tier}; heuristic, "
+                  f"not a probability)")
             print(f"   • Trigger (entry): {trigger_str} | Market Price: {item['price']}")
             print(f"   • Stop Loss (1.3x ATR Buffer): {item['sl']:.4f} (-{item['risk_pct']}%)")
             print(f"   • TP1 (EMA 20 / BE): {item['tp1']:.4f} | TP2 (Structural): {item['tp2']:.4f}")

@@ -206,8 +206,10 @@ class TestTierSEligibility(unittest.TestCase):
             self.assertEqual(cand["tier_code"], "S")
 
     def test_below_80_unchanged_when_ineligible(self):
+        # #165 owner decision: the cap is unconditional, an ineligible 75 (60 + 15) stays inside the A+ band at 74
         cand = self._enrich("LONG", confidence=60, tier_s_eligible=False)
-        self.assertEqual(cand["confidence"], 75)
+        self.assertEqual(cand["confidence"], 74)
+        self.assertEqual(self._enrich("LONG", confidence=50, tier_s_eligible=False)["confidence"], 65)
 
     def test_radar_row_carries_the_exact_flag(self):
         self.assertIs(_broad(mixed_wick_klines())["tier_s_eligible"], True)     # 3.0x volume

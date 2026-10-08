@@ -66,11 +66,11 @@ Whenever the user explicitly requests crypto trading operations, Binance Futures
         - *Horizon:* Multi-day to multi-week.
         - *Risk Profile:* Directional risk neutralized ($\Delta \approx 0$). Purpose-built to remain open overnight harvesting passive funding yields every 8 hours with zero liquidation risk.
 
-2. **Phase 2: Broad Radar & Confidence Tier Ranking (Multi-Conviction Map)**
-   - Present a wide, multi-tier opportunity map classified by **Confidence Level / Technical Confluence**:
-     * **Tier S (Institutional Maximum Conviction — 80% to 95%):** Mandatory confluence of climax volume ($\ge 1.4\times$) or massive absorption ($\ge 60\%$) + RSI extreme + local liquidity sweep + Order Flow Imbalance ($|OIB| \ge 0.15$) and VWAP stretch. Without institutional volume, a setup cannot qualify as Tier S.
-     * **Tier A+ (High Conviction — 65% to 74%):** Obvious absorption $\ge 55\%$, clean support/resistance, and R:R $\ge 3:1$.
-     * **Tier A (Strong Confluence / Hedge — 55% to 64%):** Robust setups to balance portfolio delta.
+2. **Phase 2: Broad Radar & Score Tier Ranking**
+   - Present a wide, multi-tier opportunity map classified by **radar score / Technical Confluence**:
+     * **Tier S (score ≥ 80; heuristic, uncalibrated, not a probability):** Mandatory confluence of climax volume ($\ge 1.4\times$) or massive absorption ($\ge 60\%$) + RSI extreme + local liquidity sweep + Order Flow Imbalance ($|OIB| \ge 0.15$) and VWAP stretch. Without institutional volume, a setup cannot qualify as Tier S.
+     * **Tier A+ (score 65-79):** Obvious absorption $\ge 55\%$, clean support/resistance, and R:R $\ge 3:1$.
+     * **Tier A (score 55-64, hedge):** Robust setups to balance portfolio delta.
    - **Financial Friction & Commission Filter:** Automatically disqualify any trade where distance to TP1 is less than 3.5x roundtrip transaction cost ($TP1 - \text{Entry} < 3.5 \times (\text{Taker Roundtrip} + \text{Spread}) \approx 0.50\%$), ensuring fees never consume the statistical edge.
    - **Macro Rule for Altcoin Shorts:** Prohibit altcoin shorts on technical overbought alone if Bitcoin is undergoing an aggressive volume breakout or vertical short squeeze. To short an altcoin, Bitcoin must display simultaneous resistance rejection or the altcoin pair must show exhausted climax volume ($\ge 2.5\times$).
    - **True Delta-Neutral Portfolio Architecture ($\Delta \approx 0$):** Balance the basket taking into account individual asset betas relative to BTC ($\sum w_i \beta_{i/BTC} \approx 0$), combining exhaustion shorts with support longs or cointegrated spreads.
@@ -88,7 +88,7 @@ Whenever the user explicitly requests crypto trading operations, Binance Futures
      * Runtime hooks (`pre_trade_guard.py` in PreToolUse) and the executor require `logs/evaluations/latest_dossier.json` recorded with `record_evaluation.py --from-subagent` (provenance verified against the `isolated_market_evaluator` transcript), < 20 min old, approving the symbol AND direction.
      * If absent, the platform **denies tool execution outright**. Never write the dossier by hand; `--symbols` / `--json-file` are refused in PROD (TESTNET only).
    - **Autonomous Immediate Execution Protocol (Fast-Track / Zero Latency):**
-     * **Tier S** candidates (conviction $\ge 80\%$, `requires_user_confirmation: false`) are executed and shielded immediately without chat confirmation **only if** the profile enables `autonomous_execution_tier_s`; otherwise ask the user.
+     * **Tier S** candidates (score ≥ 80, `requires_user_confirmation: false`) are executed without chat confirmation **only if** the profile enables `autonomous_execution_tier_s` and, with `require_calibrated_tier_s`, the score bucket is calibrated; otherwise ask the user.
      * Tier A+ / Tier A candidates (`requires_user_confirmation: true`) always need the user's explicit confirmation in chat.
    - **Technical Execution Engine (`scripts/execute_futures_trade.py`, the single choke point; no MCP wrapper):**
      * Position management: `--positions --json` (read-only), `--move-breakeven --symbol <S>`, `--close-position --symbol <S>`, `--audit-orphans`, `--auto-heal`, `--protect-pending`.

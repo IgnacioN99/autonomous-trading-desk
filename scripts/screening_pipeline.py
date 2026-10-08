@@ -14,7 +14,7 @@ import json
 import math
 import time
 import threading
-from typing import List, Literal, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from pydantic import BaseModel, Field
@@ -108,6 +108,8 @@ class CandidateSetup(BaseModel):
     sizing_entry_price: Optional[float] = None  # entry the sizing was computed from (trigger, else current price)
     tier_code: Optional[str] = None  # radar tier code (S / A+ / A / B+), kept for the brief (issue #135)
     absorption_scored: bool = True  # False: the wick/taker candles did not match, absorption gave no score (#135)
+    score_components: Dict[str, int] = {}  # radar points per factor, sum == confidence (issue #202, audit only)
+    tier_s_eligible: bool = False  # radar volume-or-wick rule (issue #134), kept for the audit sidecar (#202)
 
 class StatArbPair(BaseModel):
     pair: str
@@ -311,6 +313,8 @@ def enrich_and_size_candidate(c: dict, target_env: Optional[str] = None) -> Opti
             reasons=c.get("reasons", []),
             tier_code=c.get("tier_code"),
             absorption_scored=c.get("absorption_scored") is True,
+            score_components={str(k): int(v) for k, v in (c.get("score_components") or {}).items()},
+            tier_s_eligible=c.get("tier_s_eligible") is True,
         )
     except Exception as e:
         sym = c.get("symbol") if isinstance(c, dict) else None
@@ -726,7 +730,7 @@ def main(argv: Optional[list] = None) -> int:
         print(f"• Macro BTC: {payload.macro.btc_regime} | Price: ${payload.macro.btc_price:,.1f} | Allows Shorts: {payload.macro.allows_alt_shorts}")
         print(f"• Top Qualified Setups: {len(payload.top_candidates)}")
         for c in payload.top_candidates:
-            print(f"  [{c.tier}] {c.symbol} ({c.direction}): Conf {c.confidence}% | Entry {c.current_price} | SL {c.sl_price} | Margin ${c.required_margin:.1f} USDT")
+            print(f"  [{c.tier}] {c.symbol} ({c.direction}): Score {c.confidence} | Entry {c.current_price} | SL {c.sl_price} | Margin ${c.required_margin:.1f} USDT")
         print(f"• Stat-Arb Pairs ({len(payload.actionable_stat_arb)} analyzed):")
         actionable = [p for p in payload.actionable_stat_arb if p.is_actionable]
         if actionable:

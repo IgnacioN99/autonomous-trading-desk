@@ -44,6 +44,28 @@ def setUpModule():
     os.environ.update(OFFLINE_ENV)
 
 
+def write_calibrated_store(root, now=None, env="PROD", n=30, expectancy=0.25):
+    """Issue #202 fixture: a fresh logs/score_calibration.json whose Tier S buckets (80-89, 90-95) are calibrated
+    (n trades with positive net expectancy), so the autonomous Tier S gate is exercised positively by default."""
+    lcb = round(expectancy - 1.645 * 0.5 / n ** 0.5, 4)  # sd 0.5R: 30 trades at +0.25R give LCB95 ~ +0.10R
+    stats = {"n": n, "wins": n // 2, "win_rate": 0.5, "expectancy_r_net": expectancy, "sd_r_net": 0.5,
+             "lcb95_r_net": lcb, "mean_mfe_r": 1.0, "insufficient": n < 20, "calibrated": n >= 30 and lcb > 0}
+    os.makedirs(os.path.join(root, "logs"), exist_ok=True)
+    with open(os.path.join(root, "logs", "score_calibration.json"), "w", encoding="utf-8") as f:
+        json.dump({"schema_version": 1, "generated_at_ts": int(now if now is not None else time.time()), "env": env,
+                   "min_trades": 30, "trades": {}, "unscored": 0, "out_of_range": 0,
+                   "buckets": {"80-89": dict(stats), "90-95": dict(stats)}}, f)
+
+
+def add_radar_snapshots(record):
+    """Issue #202 fixture: the radar_snapshots record_evaluation.py joins in, one per scored candidate with the
+    radar confidence equal to the dossier score (the gate requires the match)."""
+    record["radar_snapshots"] = {
+        f"{c['symbol']}|{c['direction']}": {"radar_snapshot": {"confidence": c["score"]}, "radar_snapshot_reason": None}
+        for c in record.get("approved_candidates") or [] if c.get("score") is not None}
+    return record
+
+
 class GuardHarness(unittest.TestCase):
     """Isolated workspace (temp dir) with profile, fresh session state and a fake Antigravity brain."""
 
@@ -62,6 +84,7 @@ class GuardHarness(unittest.TestCase):
                        "max_open_positions": 5, "autonomous_execution_tier_s": True}, f)
         self.dossier_path = os.path.join(self.root, "logs", "evaluations", "latest_dossier.json")
         self.write_session_state()
+        write_calibrated_store(self.root)  # issue #202: Tier S fixtures below carry "score": 85
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -89,7 +112,7 @@ class GuardHarness(unittest.TestCase):
         conv_dir = os.path.join(self.brain, EVALUATOR_CONV_ID, ".system_generated", "logs")
         os.makedirs(conv_dir, exist_ok=True)
         created = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        cand = {"symbol": symbol, "direction": direction, "tier": "Tier S", "leverage": 3}
+        cand = {"symbol": symbol, "direction": direction, "tier": "Tier S", "leverage": 3, "score": 85}
         cand.update(extra or {})
         block = json.dumps({"status": "APPROVED", "summary": "test", "approved_candidates": [cand]})
         steps = [
@@ -101,7 +124,7 @@ class GuardHarness(unittest.TestCase):
         with open(transcript, "w", encoding="utf-8") as f:
             for s in steps:
                 f.write(json.dumps(s) + "\n")
-        record = dp.build_record_from_extraction(dp.extract_dossier_from_transcript(transcript))
+        record = add_radar_snapshots(dp.build_record_from_extraction(dp.extract_dossier_from_transcript(transcript)))
         with open(self.dossier_path, "w", encoding="utf-8") as f:
             json.dump(record, f)
         return record
@@ -403,7 +426,7 @@ class TestDossierProvenance(GuardHarness):
         created = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         block = json.dumps({"status": "APPROVED", "target_env": "PROD", "summary": "test",
                             "approved_candidates": [{"symbol": "BTCUSDT", "direction": "LONG", "tier": "Tier S",
-                                                     "leverage": 3}]})
+                                                     "leverage": 3, "score": 85}]})
         message = "Master Dossier — régimen σ\n" * 30 + f"<dossier_json>\n{block}\n</dossier_json>"
         encoded = json.dumps(message, ensure_ascii=False)
         removed = len(encoded.encode("utf-8")) - len(encoded[:50].encode("utf-8"))
@@ -421,7 +444,7 @@ class TestDossierProvenance(GuardHarness):
             with open(path, "w", encoding="utf-8") as f:
                 for r in rows:
                     f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        record = dp.build_record_from_extraction(dp.extract_dossier_from_transcript(transcript))
+        record = add_radar_snapshots(dp.build_record_from_extraction(dp.extract_dossier_from_transcript(transcript)))
         self.assertTrue(record["provenance"]["full_transcript_used"])
         with open(self.dossier_path, "w", encoding="utf-8") as f:
             json.dump(record, f)
@@ -479,8 +502,14 @@ class TestGroundTruthProtection(GuardHarness):
         "guardian_state.json": "scripts/loops/position_guardian_loop.py",
         "pending_entries.json": "scripts/execute_futures_trade.py",
         "hook_heartbeat.json": "scripts/hooks/pre_trade_guard.py",
+        "score_calibration.json": "scripts/trading_scorecard.py",  # issue #202
+        "trade_outcomes.jsonl": "scripts/trade_outcomes.py",       # issue #202: the store's only input
+        "trades_audit.jsonl": "scripts/execute_futures_trade.py",  # issue #202 (PR #204): the outcomes' source
+        "primed_brief.json": "scripts/prime_evaluator_brief.py",   # issue #202: the evaluator's input
+        "primed_brief_scores.json": "scripts/prime_evaluator_brief.py",
     }
-    NEW_FILES = ("guardian_state.json", "pending_entries.json", "hook_heartbeat.json")
+    NEW_FILES = ("guardian_state.json", "pending_entries.json", "hook_heartbeat.json", "score_calibration.json",
+                 "trade_outcomes.jsonl", "trades_audit.jsonl", "primed_brief.json", "primed_brief_scores.json")
 
     def assertGroundTruthDenied(self, res, name, label=""):
         self.assertDenied(res, "Ground Truth Protection")

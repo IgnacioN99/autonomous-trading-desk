@@ -5,6 +5,8 @@
   "max_open_positions": 3,
   "operating_mode": "BALANCED_DELTA_NEUTRAL",
   "autonomous_execution_tier_s": false,
+  "require_calibrated_tier_s": true,
+  "tier_s_calibration_min_trades": 30,
   "yolo_slot_enabled": false,
   "yolo_equity_pct": 0.005,
   "overnight_mode": "ZERO_OVERNIGHT_RISK",
