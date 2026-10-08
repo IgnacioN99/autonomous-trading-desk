@@ -538,7 +538,8 @@ class TestNightCutoff(unittest.TestCase):
         return code, out.getvalue(), close, heal, be, reads
 
     def test_unreadable_stops_are_unknown_no_action(self):
-        for mode in ("ZERO_OVERNIGHT_RISK", "SWING_STRUCTURAL_STOP"):
+        # Modes that do not close at market: no heal, ratchet or close (unchanged by PR #170 round 2).
+        for mode in ("SWING_STRUCTURAL_STOP",):
             with self.subTest(mode=mode):
                 code, out, close, heal, be, reads = self.run_night(mode, [SOL], READ_ERROR)
                 self.assertEqual(code, 1)
@@ -551,6 +552,33 @@ class TestNightCutoff(unittest.TestCase):
                 self.assertIn("stop_unknown: ['SOLUSDT']", out)
                 self.assertNotIn("NIGHT CUTOFF COMPLETED", out)
 
+    def test_zero_overnight_unknown_stop_still_closes(self):
+        # Closing is risk-reducing: ZERO_OVERNIGHT_RISK closes a stop_unknown position; heal and ratchet stay skipped.
+        code, out, close, heal, be, reads = self.run_night("ZERO_OVERNIGHT_RISK", [SOL], READ_ERROR)
+        close.assert_called_once_with("SOLUSDT", target_env="testnet")
+        heal.assert_not_called()
+        be.assert_not_called()
+        self.assertEqual(len(reads), 4, "retried with STOP_VERIFY_RETRY_DELAYS")
+        self.assertIn("SOLUSDT stop state UNKNOWN", out)
+        self.assertIn("SOLUSDT closed at market", out)
+        # The unknown read is still reported: exit 1 and the INCOMPLETE banner.
+        self.assertEqual(code, 1)
+        self.assertIn("NIGHT CUTOFF INCOMPLETE", out)
+        self.assertIn("stop_unknown: ['SOLUSDT']", out)
+        self.assertNotIn("close_failures", out)
+        self.assertNotIn("NIGHT CUTOFF COMPLETED", out)
+
+    def test_zero_overnight_unknown_stop_close_fails(self):
+        code, out, close, heal, be, _ = self.run_night("ZERO_OVERNIGHT_RISK", [SOL], READ_ERROR,
+                                                        close_result={"success": False, "error": "x"})
+        close.assert_called_once_with("SOLUSDT", target_env="testnet")
+        heal.assert_not_called()
+        be.assert_not_called()
+        self.assertEqual(code, 1)
+        self.assertIn("close_failures: ['SOLUSDT']", out)
+        self.assertIn("stop_unknown: ['SOLUSDT']", out)
+        self.assertIn("NIGHT CUTOFF INCOMPLETE", out)
+
     def test_summary_key(self):
         def send(method, endpoint, params=None, target_env=None, retry_count=0):
             if endpoint == "/fapi/v2/positionRisk":
@@ -558,13 +586,20 @@ class TestNightCutoff(unittest.TestCase):
             if endpoint == ALGO_READ:
                 return dict(READ_ERROR)
             return []
-        with patch("execute_futures_trade.send_signed_request", side_effect=send), \
-                patch("user_profile.load_user_profile", return_value={"overnight_mode": "ZERO_OVERNIGHT_RISK"}), \
-                patch("execute_futures_trade.heal_orphan_position") as heal, \
-                patch("time.sleep"), patch("os.system", return_value=0), contextlib.redirect_stdout(io.StringIO()):
-            summary = ncl.run_night_cutoff(target_env="testnet")
-        self.assertEqual(summary, {"close_failures": [], "unprotected": [], "stop_unknown": ["SOLUSDT"]})
-        heal.assert_not_called()
+        for close_result, failures in (({"success": True}, []), ({"success": False, "error": "x"}, ["SOLUSDT"])):
+            with self.subTest(close_result=close_result):
+                with patch("execute_futures_trade.send_signed_request", side_effect=send), \
+                        patch("user_profile.load_user_profile", return_value={"overnight_mode": "ZERO_OVERNIGHT_RISK"}), \
+                        patch("execute_futures_trade.heal_orphan_position") as heal, \
+                        patch("execute_futures_trade.move_sl_to_breakeven") as be, \
+                        patch("execute_futures_trade.close_position_market", return_value=close_result) as close, \
+                        patch("time.sleep"), patch("os.system", return_value=0), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    summary = ncl.run_night_cutoff(target_env="testnet")
+                self.assertEqual(summary, {"close_failures": failures, "unprotected": [], "stop_unknown": ["SOLUSDT"]})
+                close.assert_called_once_with("SOLUSDT", target_env="testnet")
+                heal.assert_not_called()
+                be.assert_not_called()
 
     def test_failure_banners(self):
         cases = [

@@ -18,7 +18,8 @@ Usage:
 
 run_night_cutoff returns {"close_failures": [symbols], "unprotected": [symbols], "stop_unknown": [symbols]} plus
 "read_error" when positionRisk cannot be read (orphan order cleanup is then skipped). stop_unknown: openAlgoOrders
-stayed unreadable after retries, so no heal, ratchet or close was attempted for that symbol (manual check). Exit
+stayed unreadable after retries, so no heal or ratchet was attempted for that symbol (manual check); in
+ZERO_OVERNIGHT_RISK it is still closed at market (reduce-only, risk-reducing) and stays listed as stop_unknown. Exit
 status: 1 when a market close failed, a position remains without a verified stop, its stop state is unknown or
 positions could not be read, else 0 (a failed Break-Even ratchet does not change it). Any of those prints the
 "NIGHT CUTOFF INCOMPLETE" banner instead of the success banner.
@@ -112,7 +113,16 @@ def run_night_cutoff(target_env: str = None, auto_ratchet: bool = True, overnigh
             if not isinstance(algos, list):
                 summary["stop_unknown"].append(sym)
                 print(f"     ❌ CRITICAL: {sym} stop state UNKNOWN (openAlgoOrders unreadable: {algos}). "
-                      f"No heal, ratchet or close attempted. Manual check required.")
+                      f"No heal or ratchet attempted. Manual check required.")
+                # Closing is risk-reducing, so ZERO_OVERNIGHT_RISK still closes the position (Break-Even unverifiable).
+                if overnight_mode == "ZERO_OVERNIGHT_RISK":
+                    print(f"     🚪 ZERO_OVERNIGHT_RISK: closing {sym} at market (reduce-only) despite the unknown stop...")
+                    close_res = eft.close_position_market(sym, target_env=target_env)
+                    if close_res.get("success"):
+                        print(f"     ✅ Position {sym} closed at market. Stop read still UNKNOWN: verify no stray orders.")
+                    else:
+                        summary["close_failures"].append(sym)
+                        print(f"     ❌ Failed to close {sym} at market: {close_res.get('error')}")
                 continue
             active_sl = [a for a in algos if a.get("orderType") in ["STOP_MARKET", "STOP"]]
 
