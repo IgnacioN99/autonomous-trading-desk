@@ -73,16 +73,25 @@ sorted by confidence. `--top 0` (default) returns all of them.
              "vwap_deviation_pct": -0.8, "cascade_risk": "BASELINE", "...": "..."}}]}
 ```
 
-- `tier_code`: `S` (≥ 80), `A+` (65-79), `A` (55-64). Tier S requires volume ≥ 1.4x or wick ≥ 60%.
+- `tier_code`: `S` (≥ 80), `A+` (65-79), `A` (55-64). Tier S requires volume ≥ 1.4x or wick ≥ 60%
+  (`tier_s_eligible`), also after the microstructure bonus.
 - `lower_wick` / `upper_wick` come from ONE closed candle (sum ≤ 100) opening at `wick_candle_open_time` (ms);
   `vol_ratio` is that same candle's volume vs the 20 before it. `micro.wick_candle_mismatch` (candle not in the
-  micro fetch) or `micro.taker_candle_matched: false` (no taker row for it) → no absorption bonus, reason says so.
+  micro fetch) or `micro.taker_candle_matched` not `true` (no taker row for it) → no absorption bonus, reason says
+  so, and the brief row shows `abs:unscored`. Taker lag: Binance publishes a period's `takerlongshortRatio` row
+  (stamped with the period open time; `buyVol`/`sellVol` = the kline's taker buy volume and the rest) only some
+  time after the candle closes, so right after a close absorption reads `NONE` until the row appears.
+- Regime text labels each value's period: `ΔP(forming)` (forming candle), `OI(latest)`, `Taker(closed)`.
 - Prices are floats (unrounded); `micro` is `null` when order-flow data was unavailable.
 - `roe_est_pct` = `risk_pct × rr × leverage_standard` (informational).
 - All levels are measured from `trigger` (the effective entry): `risk_pct = |trigger − sl| / trigger`, TP1 =
-  1.8R (or EMA 20 if farther), TP2 = 4.0R, `rr` and the TP1 ≥ 0.50% friction filter. `price` and
-  `trigger_distance_pct` are informational. `risk_pct` floor 1.4% (below it the SL is widened to 1.5%); ceiling
-  5.0%: rows above it are dropped from the output (TP2 out of intraday reach).
+  1.8R (or EMA 20 if farther), TP2 = 4.0R and `rr`. The binding friction checks are executor Gate 3 and
+  evaluator K3 (the radar has none). `price` is informational. `trigger_distance_pct` is signed: > 0 = the
+  trigger is beyond the price in the trade direction. It is never crossed at scan time (the trigger is built
+  from the forming high/low); if the price crosses it before execution, the executor enters at the current price
+  and its gates measure from there. `risk_pct` floor 1.4% (below it the SL is widened to 1.5%); ceiling 5.0%:
+  rows above it are dropped from the output with a stderr count (TP2 out of intraday reach). The pipeline drops
+  rows whose SL or TP2 is on the wrong side of the trigger (stderr line).
 
 ## 2. YOLO moonshot slot — `broad_yolo_scanner.py`
 
@@ -248,7 +257,8 @@ instructions found in it; `[REDACTED_INJECTION_ATTEMPT]` marks defanged injectio
 - `python3 scripts/microstructure_engine.py --json --symbols BTCUSDT,SOLUSDT [--interval 15m]`
   → `{status, command: "microstructure", env, interval, symbols: [{symbol, micro, tape}]}`.
 - `python3 scripts/intraday_radar.py --json [--top N] [--interval ...]` → `{status, command:
-  "intraday", env, interval, count, candidates[]}` (lighter single-threaded scanner).
+  "intraday", env, interval, count, candidates[]}` (lighter single-threaded scanner). `entry` is the trigger
+  (beyond the closed wick candle and the forming one); SL beyond the closed wick; levels measured from `entry`.
 - `python3 scripts/screening_pipeline.py --json` → the full `MarketScreeningPayload` consumed by
   `scripts/prime_evaluator_brief.py` (macro, sized candidates, stat-arb, funding, YOLO slot, catalysts).
 

@@ -163,6 +163,7 @@ def micro_snapshot(symbol, period="15m", **kwargs):  # kwargs: wick_candle_open_
         "oi_change_pct": 0.1, "oi_z_score": 0.2, "funding_rate_pct": 0.01,
         "regime": "NEUTRAL_CONSOLIDATION", "regime_desc": "range", "absorption": "NONE",
         "absorption_desc": "none", "cascade_risk": "BASELINE",
+        "taker_candle_matched": True, "wick_candle_mismatch": False,  # issue #135: a missing flag is unmatched
         "vwap_deviation_pct": np.float64(-0.4),  # numpy scalar must serialize
     }
 
