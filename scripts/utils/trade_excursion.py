@@ -6,7 +6,8 @@ Pure helpers shared by the position guardian (live tracking, scripts/loops/posit
 scripts/trade_outcomes.py (offline reconstruction). The only I/O is fetch_klines_range (public klines, one request),
 kept as a single function so tests patch trade_excursion.fetch_klines_range. fetch_klines_pages (offline CLIs:
 trade_outcomes.py, exit_policy_sim.py) pages it: KLINES_PAGE_LIMIT 1000 bars (weight 5), KLINES_PAGE_SLEEP_SECONDS
-between pages, HTTP 429 / 418 retried up to KLINES_MAX_TRIES tries in total honouring Retry-After (issues #210 / #191).
+between pages, HTTP 429 retried up to KLINES_MAX_TRIES tries in total honouring Retry-After; HTTP 418 (IP ban) or a
+Retry-After above the cap is never retried (issues #210 / #191, PR #212 review).
 
 Units: entry_ts / now_ts in seconds; kline open/close times, mfe_ts, mae_ts and last_bar_open_ms in milliseconds.
 R multiples use the initial risk |entry - planned SL|: mfe_r >= 0, mae_r <= 0, None without a risk. Percent values
@@ -26,7 +27,7 @@ GUARDIAN_KLINES_LIMIT = 99  # weight 1 per request (Binance: limit in [1, 100) -
 KLINES_TIMEOUT_SECONDS = 2  # guardian excursion read: short, so a slow host never stalls the cycle
 KLINES_PAGE_LIMIT = 1000  # offline pages: weight 5 (1500 costs 10) on the PROD host shared with the guardian / executor
 KLINES_PAGE_SLEEP_SECONDS = 0.2  # pause between pages
-KLINES_MAX_TRIES = 3  # per page on HTTP 429 / 418
+KLINES_MAX_TRIES = 3  # per page on HTTP 429 (418 = IP ban: never retried)
 KLINES_BACKOFF_SECONDS = 1.0  # wait without Retry-After: 1 s, 2 s
 KLINES_MAX_RETRY_AFTER_SECONDS = 60
 DEFAULT_HOSTS = {"prod": "https://fapi.binance.com", "testnet": "https://testnet.binancefuture.com"}
@@ -103,15 +104,24 @@ def retry_after_seconds(err, attempt):
     return KLINES_BACKOFF_SECONDS * (2 ** attempt)
 
 
+def _retry_after_exceeds_cap(err):
+    try:
+        return float((getattr(err, "headers", None) or {}).get("Retry-After")) > KLINES_MAX_RETRY_AFTER_SECONDS
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
 def fetch_klines_page(symbol, interval, start_ms, limit, target_env, timeout=None, max_tries=None):
-    """One fetch_klines_range page; HTTP 429 / 418 is retried up to max_tries (default KLINES_MAX_TRIES) tries in
-    total, waiting retry_after_seconds, then raised like any other failed read."""
+    """One fetch_klines_range page; HTTP 429 is retried up to max_tries (default KLINES_MAX_TRIES) tries in total,
+    waiting retry_after_seconds, then raised like any other failed read. HTTP 418 (Binance IP ban) and a 429 whose
+    Retry-After exceeds KLINES_MAX_RETRY_AFTER_SECONDS are raised at once: retrying into a ban lengthens it and the
+    IP is shared with the guardian and the executor."""
     max_tries = KLINES_MAX_TRIES if max_tries is None else max_tries
     for attempt in range(max_tries):
         try:
             return fetch_klines_range(symbol, interval, start_ms, limit, target_env, timeout=timeout)
         except urllib.error.HTTPError as e:
-            if e.code not in (429, 418) or attempt + 1 >= max_tries:
+            if e.code != 429 or attempt + 1 >= max_tries or _retry_after_exceeds_cap(e):
                 raise
             time.sleep(retry_after_seconds(e, attempt))
 

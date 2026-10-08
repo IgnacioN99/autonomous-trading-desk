@@ -41,6 +41,8 @@ trail engine uses the audit entry_price). Leg reasons: orderId == tp1_order_id -
 entry and the fill (max(0.3% of the price, 2 x tickSize)) -> SL / TRAILED_STOP, True Net BE entry x (1 + 0.002)
 (LONG; 1 - 0.002 SHORT; +/- 0.15 % of the price) -> BREAKEVEN; else MANUAL_OR_OTHER (stop fills are market child
 orders without the algo id, so stops are matched by price).
+  realized_r_budget = the same gross R measured from the audit entry_price the order was sized on (shows entry
+  slippage against the risk_pct_equity budget); audit_ts = the audit record's timestamp (s), the stable trade identity.
   realized_r_gross = sum(qty_i x signed(price_i - entry)) / (risk x filled_qty), risk = |entry - sl| (SL on the loss
   side, else null); realized_r_net = sum(realizedPnl - commission) over the closing legs and the matched entry fills
   / (risk x filled_qty), null unless every commission is in USDT (entry_commission_included says whether the entry
@@ -466,14 +468,15 @@ def resolve_trade(rec, fills, consumed, trail_stops, next_start_ms, env, klines=
     filled_qty = entry_qty or total_qty
     close_side = "SELL" if direction == "LONG" else "BUY"
     foreign = {str(i) for i in foreign_entry_ids if i is not None}
-    out = {"symbol": symbol, "direction": direction, "entry_ts": entry_ms, "entry_price": entry,
+    out = {"symbol": symbol, "direction": direction, "entry_ts": entry_ms, "audit_ts": _num(rec.get("timestamp")),
+           "entry_price": entry,
            "entry_vwap": round(entry_vwap, 10) if entry_vwap else None, "entry_match": match["match"], "sl_price": sl,
            "initial_risk": round(risk, 10) if risk else None, "total_qty": total_qty, "filled_qty": filled_qty,
            "tp1_price": _num(rec.get("tp1_price")), "tp2_price": _num(rec.get("tp2_price")),
            "is_yolo": bool(rec.get("is_yolo")), **score_fields(rec)}
     if match["match"] == "no_entry_fill":
         out.update(status="no_entry_fill", filled_qty=None, legs=[], exit_ts=None, realized_r_gross=None,
-                   realized_r_net=None, entry_commission_included=False, tp1_filled=False, exit_reason=None)
+                   realized_r_net=None, realized_r_budget=None, entry_commission_included=False, tp1_filled=False, exit_reason=None)
         return out
     if match["match"] == "partial_history":
         out["partial_history"] = True
@@ -507,7 +510,10 @@ def resolve_trade(rec, fills, consumed, trail_stops, next_start_ms, env, klines=
 
     closed = remaining <= filled_qty * QTY_TOLERANCE
     sign = 1.0 if direction == "LONG" else -1.0
-    gross = net = None
+    gross = net = budget_r = None
+    budget_risk = _initial_risk(direction, entry, sl)  # the risk the order was sized on (audit entry, PR #212)
+    if budget_risk and legs:
+        budget_r = round(sum(l["qty"] * sign * (l["price"] - entry) for l in legs) / (budget_risk * filled_qty), 4)
     if risk and legs:
         gross = round(sum(l["qty"] * sign * (l["price"] - basis) for l in legs) / (risk * filled_qty), 4)
         assets = {str(l["commission_asset"] or "").upper() for l in legs}
@@ -517,7 +523,8 @@ def resolve_trade(rec, fills, consumed, trail_stops, next_start_ms, env, klines=
             pnl -= sum(_num(f.get("commission"), 0.0) for f in entry_fills)
             net = round(pnl / (risk * filled_qty), 4)
     out.update(status="closed" if closed else "open", legs=legs, exit_ts=legs[-1]["time"] if closed else None,
-               realized_r_gross=gross, realized_r_net=net, entry_commission_included=bool(entry_fills),
+               realized_r_gross=gross, realized_r_net=net, realized_r_budget=budget_r,
+               entry_commission_included=bool(entry_fills),
                tp1_filled=any(l["reason"] == "TP1" for l in legs),
                exit_reason=legs[-1]["reason"] if closed else None)
     if klines and closed and risk:
@@ -573,7 +580,8 @@ def build_outcomes(env, since_ts, symbol=None, klines=True, now_ms=None):
             unavailable += 1
             for r in recs:
                 trades.append({"symbol": sym, "direction": str(r.get("direction")).upper(),
-                               "entry_ts": int(_num(r.get("timestamp")) * 1000), "entry_price": _num(r.get("entry_price")),
+                               "entry_ts": int(_num(r.get("timestamp")) * 1000), "audit_ts": _num(r.get("timestamp")),
+                               "entry_price": _num(r.get("entry_price")),
                                "sl_price": _num(r.get("sl_price")), "total_qty": _num(r.get("total_qty")),
                                "is_yolo": bool(r.get("is_yolo")), **score_fields(r),
                                "status": "fills_unavailable", "error": err})

@@ -173,6 +173,7 @@ def write_error_state(err_msg: str, now_ts: int, now_utc: str, target_env: str, 
             "partial_history": 0,
             "fills_closed": 0,
             "truncated": False,
+            "counted_by": "trades",
             "gross_realized_pnl_usdt": 0.0,
             "commissions_usdt": 0.0,
             "net_realized_pnl_usdt": 0.0
@@ -422,6 +423,12 @@ def sync_session_state(target_env: str = None) -> dict:
                 open_positions={(p["symbol"].upper(), p["direction"]) for p in active_positions})
         except Exception as e:
             day_error = f"{type(e).__name__}: {e}"[:200]
+            # PR #212 review: never report "0 closed trades" after real exits; fall back to the legacy per-fill
+            # counts (counted_by "fills") so the brief still sees activity, with the error alongside.
+            wins_f = sum(1 for t in trades_res if float(t.get("realizedPnl", 0)) > 0)
+            losses_f = sum(1 for t in trades_res if float(t.get("realizedPnl", 0)) < 0)
+            day = {"trades_closed": wins_f + losses_f, "wins": wins_f, "losses": losses_f, "scratches": 0,
+                   "realized_r_net_sum": None, "partial_history": 0}
     closed_trades_count = day["trades_closed"]
     wins_count = day["wins"]
     losses_count = day["losses"]
@@ -518,11 +525,17 @@ def sync_session_state(target_env: str = None) -> dict:
         },
         "shadow_desk_summary": shadow_summary
     }
+    state["closed_today_summary"]["counted_by"] = "fills" if day_error else "trades"
     if day_error:
         state["closed_today_summary"]["trade_summary_error"] = day_error
 
     # Save to atomic file with kernel-level replace (no non-atomic fallback, issue #127)
     return _write_state(state)
+
+def _fmt_r(value):
+    """Signed R for the markdown summary; "n/a" when the per-trade summary failed (counted_by "fills")."""
+    return "n/a" if value is None else f"{value:+.2f}R"
+
 
 def format_markdown_summary(state: dict) -> str:
     """Generates a compact Markdown report for direct consumption by any agent."""
@@ -547,7 +560,7 @@ def format_markdown_summary(state: dict) -> str:
         "",
         "### 📊 Today's Operating Balance",
         f"* **Closed Trades Today:** {closed['closed_trades_count']} (Wins: {closed['wins']} | Losses: {closed['losses']} | Scratches: {closed.get('scratches', 0)} | Win Rate: {closed['win_rate_pct']}%)"
-        f" | **Realized R (net):** {closed.get('realized_r_net', 0.0):+.2f}R | Closing fills: {closed.get('fills_closed', 0)}"
+        f" | **Realized R (net):** {_fmt_r(closed.get('realized_r_net', 0.0))} | Closing fills: {closed.get('fills_closed', 0)}"
         f"{partial_note}",
         f"* **Net Realized PnL Today:** **{'+' if closed['net_realized_pnl_usdt'] >= 0 else ''}{closed['net_realized_pnl_usdt']:.4f} USDT** (Commissions: -${closed['commissions_usdt']:.4f})",
         f"* **Total Floating PnL:** **{'+' if exp['total_floating_pnl_usdt'] >= 0 else ''}{exp['total_floating_pnl_usdt']:.4f} USDT**",

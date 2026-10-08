@@ -340,11 +340,19 @@ class TestSimRobustness(SimBase):
             return urllib.error.HTTPError("u", code, "limited", {"Retry-After": retry_after} if retry_after else {},
                                           None)
 
-        seq = [http(429, "3"), http(418), [[0, "1", "1", "1", "1", "1", MIN - 1]]]
+        seq = [http(429, "3"), http(429), [[0, "1", "1", "1", "1", "1", MIN - 1]]]
         with patch("utils.trade_excursion.fetch_klines_range", side_effect=seq):
             rows = eps.fetch_range("BTCUSDT", "1m", 0, MIN, "prod")
         self.assertEqual(len(rows), 1)
         self.assertEqual([c.args[0] for c in self.sleep.call_args_list], [3.0, 2.0])
+        # PR #212 review: 418 = IP ban and a Retry-After above the cap are never retried into.
+        for err in (http(418), http(418, "5"), http(429, str(eps.trade_excursion.KLINES_MAX_RETRY_AFTER_SECONDS + 1))):
+            self.sleep.reset_mock()
+            with patch("utils.trade_excursion.fetch_klines_range", side_effect=[err]) as f, \
+                    self.assertRaises(urllib.error.HTTPError):
+                eps.fetch_range("BTCUSDT", "1m", 0, MIN, "prod")
+            self.assertEqual(f.call_count, 1)
+            self.sleep.assert_not_called()
         with patch("utils.trade_excursion.fetch_klines_range", side_effect=[http(429)] * 3) as f, \
                 self.assertRaises(urllib.error.HTTPError):
             eps.fetch_range("BTCUSDT", "1m", 0, MIN, "prod")
@@ -523,6 +531,23 @@ class TestSyncClosedTodayKeys(unittest.TestCase):
              patch("execute_futures_trade.send_signed_request", side_effect=fake):
             return sss.sync_session_state(target_env="prod")
 
+    def test_summary_failure_falls_back_to_fill_counts(self):
+        """PR #212 review: a summarize_closed_today exception never reports 0 closed trades after real exits."""
+        rec = dict(symbol="BTCUSDT", direction="LONG", entry_price=100.0, sl_price=95.0, total_qty=10.0,
+                   target_env="prod", timestamp=DAY // 1000 + 600, entry_order_id=1, tp1_order_id=2)
+        fills = [fill(1, 1, "BUY", 100, 10, DAY + 590_000, comm=0.5),
+                 fill(2, 2, "SELL", 109, 3, DAY + 590_000 + H, pnl=27.0, comm=0.1),
+                 fill(3, 8, "SELL", 94, 7, DAY + 590_000 + 2 * H, pnl=-42.0, comm=0.2)]
+        with patch("trade_outcomes.summarize_closed_today", side_effect=RuntimeError("boom")):
+            state = self.run_sync(DayExchange(fills), audit=[rec])
+        c = state["closed_today_summary"]
+        self.assertTrue(state["is_valid"], state)
+        self.assertEqual((c["closed_trades_count"], c["wins"], c["losses"]), (2, 1, 1))
+        self.assertEqual(c["counted_by"], "fills")
+        self.assertIn("RuntimeError: boom", c["trade_summary_error"])
+        self.assertIsNone(c["realized_r_net"])
+        self.assertIn("Realized R (net):** n/a", sss.format_markdown_summary(state))
+
     def test_sync_counts_trades_and_mirrors_keys_in_the_error_state(self):
         rec = dict(symbol="BTCUSDT", direction="LONG", entry_price=100.0, sl_price=95.0, total_qty=10.0,
                    target_env="prod", timestamp=DAY // 1000 + 600, entry_order_id=1, tp1_order_id=2)
@@ -633,3 +658,69 @@ class TestOfflineOutputPaths(ScorecardBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCalibrationStoreRekeying(unittest.TestCase):
+    """PR #212 review (trading_risk): a re-keyed trade (better entry matching) is counted once in the Tier S
+    calibration store; a now-no_entry_fill or truncated row removes / skips it (fail-closed: n only shrinks)."""
+
+    AUDIT = 1791470000
+
+    def row(self, **kw):
+        base = {"symbol": "BTCUSDT", "direction": "SHORT", "env": "prod", "status": "closed", "is_yolo": False,
+                "audit_ts": self.AUDIT, "entry_ts": self.AUDIT * 1000 - 3000, "realized_r_net": 1.0, "mfe_r": 1.5,
+                "score": 85, "dossier_score": 85}
+        base.update(kw)
+        return base
+
+    def legacy_store(self):
+        from utils import score_calibration as sc
+        legacy = self.row(entry_ts=self.AUDIT * 1000 - sc.LEGACY_ENTRY_SLACK_MS)
+        legacy.pop("audit_ts")
+        return sc.merge_store(None, [legacy], now=1)
+
+    def test_legacy_key_replaced_not_added(self):
+        from utils import score_calibration as sc
+        store = self.legacy_store()
+        self.assertEqual(len(store["trades"]), 1)
+        merged = sc.merge_store(store, [self.row(entry_match="side_qty_window")], now=2)
+        self.assertEqual(list(merged["trades"]), [sc.trade_key(self.row())])
+
+    def test_same_audit_ts_rekeyed(self):
+        from utils import score_calibration as sc
+        first = sc.merge_store(None, [self.row(entry_ts=self.AUDIT * 1000 - 9000)], now=1)
+        merged = sc.merge_store(first, [self.row()], now=2)
+        self.assertEqual(len(merged["trades"]), 1)
+
+    def test_no_entry_fill_removes_stored_trade(self):
+        from utils import score_calibration as sc
+        merged = sc.merge_store(self.legacy_store(), [self.row(status="no_entry_fill", entry_ts=self.AUDIT * 1000)],
+                                now=2)
+        self.assertEqual(merged["trades"], {})
+
+    def test_truncated_rows_not_stored(self):
+        from utils import score_calibration as sc
+        merged = sc.merge_store(None, [self.row(truncated=True)], now=1)
+        self.assertEqual(merged["trades"], {})
+
+    def test_other_symbol_or_direction_untouched(self):
+        from utils import score_calibration as sc
+        store = self.legacy_store()
+        merged = sc.merge_store(store, [self.row(direction="LONG"), self.row(symbol="ETHUSDT")], now=2)
+        self.assertEqual(len(merged["trades"]), 3)
+
+
+class TestRealizedRBudget(unittest.TestCase):
+
+    def test_budget_r_uses_audit_entry(self):
+        """Entry slippage shows in realized_r_budget (sized on the audit entry), not in VWAP-based realized_r_gross."""
+        rec = {"symbol": "BTCUSDT", "direction": "LONG", "entry_price": 100.0, "sl_price": 90.0, "total_qty": 1.0,
+               "timestamp": 1000, "entry_order_id": 7}
+        fills = [{"id": 1, "orderId": 7, "side": "BUY", "price": "102", "qty": "1", "time": 999000,
+                  "realizedPnl": "0", "commission": "0", "commissionAsset": "USDT"},
+                 {"id": 2, "orderId": 8, "side": "SELL", "price": "92", "qty": "1", "time": 1001000,
+                  "realizedPnl": "-10", "commission": "0", "commissionAsset": "USDT"}]
+        out = to.resolve_trade(rec, fills, {}, [], None, "prod", klines=False)
+        self.assertEqual(out["audit_ts"], 1000)
+        self.assertAlmostEqual(out["realized_r_gross"], -10 / 12, places=3)  # VWAP 102, R 12
+        self.assertAlmostEqual(out["realized_r_budget"], -0.8, places=3)  # audit entry 100, R 10
