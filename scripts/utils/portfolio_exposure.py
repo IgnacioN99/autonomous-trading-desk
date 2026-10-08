@@ -123,7 +123,8 @@ def resting_opening_legs(resting, registry_records=(), price_tol_by_symbol=None)
         trigger_or_limit_price when its own price is not positive) from its registry record, matched by
         symbol + entry id + kind (the find_unregistered_resting_entries key; the MCP listing carries algoId), and
         only when the live order has no id by symbol + entry_side + price (within price_tol_by_symbol[symbol], an
-        absolute tolerance such as half a tick, issue #126; else 1e-9 relative);
+        absolute tolerance such as half a tick, issue #126; else 1e-9 relative; several within it: the nearest price,
+        ties by entry_id string order, issue #160);
       - a registry record without a live order is ignored (filled: already in positionRisk; gone: no exposure).
     Fail closed (ValueError): a live order with no quantity and no registry record, an unparseable quantity, an
     unknown side, or no positive price / registry total_qty.
@@ -161,10 +162,13 @@ def resting_opening_legs(resting, registry_records=(), price_tol_by_symbol=None)
             else:
                 tol = max(_positive((price_tol_by_symbol or {}).get(sym)) or 0.0,
                           1e-9 * max(1.0, price or 0.0))
-                rec = next((r for r in records if str(r.get("symbol", "")).upper() == sym
-                            and str(r.get("entry_side") or "").upper() == side and price is not None
-                            and _positive(r.get("trigger_or_limit_price")) is not None
-                            and abs(float(r["trigger_or_limit_price"]) - price) <= tol), None)
+                # Issue #160: deterministic among the records within tolerance: nearest price, then entry_id.
+                matches = [r for r in records if str(r.get("symbol", "")).upper() == sym
+                           and str(r.get("entry_side") or "").upper() == side and price is not None
+                           and _positive(r.get("trigger_or_limit_price")) is not None
+                           and abs(float(r["trigger_or_limit_price"]) - price) <= tol]
+                rec = min(matches, default=None,
+                          key=lambda r: (abs(float(r["trigger_or_limit_price"]) - price), str(r.get("entry_id"))))
             if rec is None:
                 raise ValueError(f"{label}: the exchange reports no quantity and logs/pending_entries.json has no "
                                  "record for it, so its exposure cannot be measured")

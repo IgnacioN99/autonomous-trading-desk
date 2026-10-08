@@ -303,7 +303,8 @@ def _plain_decimal(value):
 
 def _mcp_json_dumps(obj):
     """json.dumps for the MCP gateway body that writes finite floats and Decimals as plain decimals (no exponent);
-    same separators as json.dumps and json.loads round-trips to the same values."""
+    same separators as json.dumps and json.loads round-trips to the same values. NaN / Infinity raise ValueError
+    (never sent: the gateway body must be valid JSON)."""
     if isinstance(obj, dict):
         return "{" + ", ".join(f"{json.dumps(str(k))}: {_mcp_json_dumps(v)}" for k, v in obj.items()) + "}"
     if isinstance(obj, (list, tuple)):
@@ -312,9 +313,11 @@ def _mcp_json_dumps(obj):
         return json.dumps(obj)
     if isinstance(obj, float) and math.isfinite(obj):
         return _plain_decimal(obj)
-    if isinstance(obj, Decimal) and obj.is_finite():
+    if isinstance(obj, Decimal):
+        if not obj.is_finite():
+            raise ValueError(f"Out of range Decimal value is not JSON compliant: {obj}")
         return _plain_decimal(obj)
-    return json.dumps(obj)
+    return json.dumps(obj, allow_nan=False)
 
 
 def call_binance_mcp(tool_name: str, args: dict = None, session_id: str = None):
@@ -347,12 +350,13 @@ def call_binance_mcp(tool_name: str, args: dict = None, session_id: str = None):
             "arguments": args or {}
         }
     }
-    req = urllib.request.Request(
-        "https://agent.binance.com/mcp/agentic",
-        headers=headers,
-        data=_mcp_json_dumps(payload).encode("utf-8")
-    )
     try:
+        # Inside the try: a non-finite number raises ValueError here and nothing is sent (issue #173).
+        req = urllib.request.Request(
+            "https://agent.binance.com/mcp/agentic",
+            headers=headers,
+            data=_mcp_json_dumps(payload).encode("utf-8")
+        )
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             if "error" in data:
@@ -935,7 +939,7 @@ def get_open_stop_orders_with_retry(symbol, exit_side, target_env=None, retry_de
 
 def _is_explicit_rejection(placement):
     """True when an order placement was explicitly rejected by Binance: no order id and a negative code other than
-    the "unknown error / execution status unknown" codes, after which the order may exist. Transport and MCP errors
+    the "unknown error / execution status unknown / server overloaded" codes, after which the order may exist. Transport and MCP errors
     without a code are not explicit rejections."""
     if not isinstance(placement, dict) or _order_id(placement) is not None:
         return False
@@ -943,7 +947,7 @@ def _is_explicit_rejection(placement):
         code = int(placement.get('code'))
     except (TypeError, ValueError):
         return False
-    return code < 0 and code not in (-1000, -1001, -1006, -1007)
+    return code < 0 and code not in (-1000, -1001, -1006, -1007, -1008)
 
 
 HEDGE_MODE_UNSUPPORTED = ("hedge mode (dualSidePosition=true) is not supported by the desk: reduce-only closes and "
@@ -1164,19 +1168,22 @@ def get_atr_15m(symbol):
         return None
 
 
-def heal_orphan_position(position, target_env=None, close_on_failure=False, *, planned_sl=None):
+def heal_orphan_position(position, target_env=None, close_on_failure=False, *, planned_sl=None, report_failure=True):
     """
     Places a verified emergency stop on a position that has none. The stop sits ORPHAN_HEAL_SL_DISTANCE away
     from the worse of entry/mark so it can never trigger on placement. planned_sl (the trade's planned SL, passed
-    only by close_position_market) replaces that anchor when it is tighter and not crossed (below mark for LONG,
+    only by close_position_market and heal_unknown_stop) replaces that anchor when it is tighter and not crossed (below mark for LONG,
     above for SHORT); it never loosens the stop. A rejected or unverified planned-SL stop is retried once at the
     anchor (sl_source "anchor_after_planned_rejected"). An explicit Binance rejection (_is_explicit_rejection) skips
     the verification wait. When the anchor is not verified either and the planned placement was not explicitly
     rejected, the planned stop is verified once more (late indexing): success then has sl_source
-    "planned_sl_late_indexed" and keeps planned_attempt / anchor_attempt. If it cannot be verified and
+    "planned_sl_late_indexed" and keeps planned_attempt / anchor_attempt; an anchor placement accepted with an id is
+    listed in redundant_stops (reduce-only/closePosition, never cancelled here). If it cannot be verified and
     close_on_failure=True, the position is closed with a reduce-only market order (fail-safe auto-destruct). A hedge-mode
     row (positionSide != BOTH) returns reason "hedge_mode_unsupported" without any order. Never opens or increases
-    exposure.
+    exposure. A heal-and-close failure files a CRITICAL/P0 report (_report_abort_failure) unless report_failure=False
+    (issue #160: the guardian passes it when this cycle's failed crossed close already reported the symbol); the heal
+    and the close run either way.
     """
     target_env = resolve_env(target_env)
     sym = position['symbol']
@@ -1241,6 +1248,11 @@ def heal_orphan_position(position, target_env=None, close_on_failure=False, *, p
                                                         tick_size=filters.get('tickSize'), target_env=target_env)
             if verified:
                 out["anchor_attempt"] = {"sl_price": out["healed_sl_price"], "placement": out.get("placement")}
+                anchor_id = _order_id(out.get("placement")) if isinstance(out.get("placement"), dict) else None
+                if anchor_id is not None:
+                    # The anchor was accepted too (unverified, may exist): listed, never cancelled here.
+                    out["redundant_stops"] = [{"algo_id": anchor_id, "trigger_price": out["healed_sl_price"],
+                                               "sl_source": "anchor_after_planned_rejected"}]
                 out.update(verified=True, success=True, reason="healed", healed_sl_price=planned_price,
                            sl_source="planned_sl_late_indexed", new_stop=stop_summary(info),
                            placement=out["planned_attempt"]["placement"])
@@ -1255,7 +1267,7 @@ def heal_orphan_position(position, target_env=None, close_on_failure=False, *, p
         out["close_result"] = close_res
         out["success"] = out["closed"]
         out["reason"] = "closed_after_failed_heal" if out["closed"] else "heal_and_close_failed"
-        if not out["closed"]:
+        if not out["closed"] and report_failure:
             _report_abort_failure(sym, target_env, "heal_orphan_position",
                                   f"heal stop unverified and reduce-only close not confirmed ({close_res})")
     return out
@@ -1511,7 +1523,7 @@ def monetary_loss_cap(account_equity, prof, *, is_testnet, is_yolo, ref, total_q
 
 def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty, leverage, bypass_delta_gate=False, target_env=None, bypass_all_gates=False, is_yolo=False,
                            maint_margin_ratio=None, maint_amount=0.0, mmr_source=None, liq_entry_price=None, entry_price=None,
-                           live_snapshot=None):
+                           live_snapshot=None, exchange_ticks=None):
     """
     Mechanical Software Gates (Deterministic Precondition Validation).
     Verifies mathematical invariants and physically prevents execution if risk rules are violated.
@@ -1531,7 +1543,8 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
     (execute_complete_trade, no explicit --margin) is sized on the same min(wallet, wallet + uPnL), so open losses
     size the order down instead of making Gate 2 reject it; an explicit margin is the user's and is not re-sized.
     Gate 0A and Gate 1 read the registry captured in the snapshot (issue #127). TESTNET skips Gate 1 and keeps the
-    10000 fallback.
+    10000 fallback. `exchange_ticks` ({symbol: tickSize}, issue #160) caps the registry tick_size used to match
+    quantity-less resting orders to their records (record_price_tolerances).
     """
     ref = entry_price if entry_price else cur_price
     target_env = resolve_env(target_env)
@@ -1655,7 +1668,8 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
         resting = [dict(resting_entry_info(source, kind, o), executed_qty=o.get('executedQty'))
                    for source, kind, o in live_resting_opening_orders(live_snapshot)]
         try:
-            legs = resting_opening_legs(resting, records, price_tol_by_symbol=record_price_tolerances(records))
+            legs = resting_opening_legs(resting, records,
+                                        price_tol_by_symbol=record_price_tolerances(records, exchange_ticks))
         except ValueError as e:
             return False, (f"MECHANICAL HARD GATE REJECTION: FAIL-CLOSED — {e}. The delta-neutral gate cannot "
                            "measure the portfolio. Order blocked.")
@@ -1836,6 +1850,38 @@ def place_take_profit_orders(symbol, exit_side, tp1_price, tp2_price, tp1_qty, t
     return placed[0], placed[1]
 
 
+def find_resting_take_profits(symbol, exit_side, wanted, tick_size=None, exclude_ids=(), target_env=None):
+    """Issue #160 (read-only): reduce-only exit-side LIMIT orders already resting at the TP prices, so a record whose
+    TP ids were not persisted adopts them instead of placing duplicates. wanted: {name: price}; an order matches when
+    its price is within one tick (exact to 1e-9 relative without a tick); each order is adopted at most once and
+    exclude_ids are skipped. Returns ({name: orderId}, error_or_None); a failed GET /fapi/v1/openOrders?symbol= is
+    ({}, error)."""
+    try:
+        res = send_signed_request('GET', '/fapi/v1/openOrders', {'symbol': symbol}, target_env=target_env)
+    except Exception as e:
+        res = {"error": str(e)}
+    if not isinstance(res, list):
+        return {}, f"/fapi/v1/openOrders query for {symbol} failed: {res}"
+    used = {str(i) for i in exclude_ids or ()}
+    found = {}
+    for name, price in (wanted or {}).items():
+        price = _to_float(price)
+        if price <= 0:
+            continue
+        tol = _to_float(tick_size) * 1.01 if _to_float(tick_size) > 0 else abs(price) * 1e-9
+        for o in res:
+            if not isinstance(o, dict) or str(_order_id(o)) in used or _order_id(o) is None:
+                continue
+            if (str(o.get('symbol') or symbol).upper() == str(symbol).upper()
+                    and str(o.get('type') or '').upper() == 'LIMIT'
+                    and str(o.get('side') or '').upper() == str(exit_side).upper()
+                    and _truthy(o.get('reduceOnly')) and abs(_to_float(o.get('price')) - price) <= tol):
+                found[name] = _order_id(o)
+                used.add(str(_order_id(o)))
+                break
+    return found, None
+
+
 def append_trade_audit_record(record, margin_usdt):
     """Appends an entry record to logs/trades_audit.jsonl with canonical provenance (atomic append)."""
     log_dir = os.path.join(_workspace_dir(), 'logs')
@@ -1914,6 +1960,7 @@ def load_pending_entries(base_dir=None):
 
 
 PENDING_REGISTRY_LOCK_WAIT_S = 5.0
+PENDING_SAVE_RETRY_DELAYS_S = (0.5, 1.0)   # issue #160: 3 attempts of the TP ids / audit_done saves
 _registry_lock_state = threading.local()
 
 
@@ -2339,7 +2386,9 @@ def check_pending_entry_conflict(symbol, target_env):
 def fetch_live_gate_snapshot(target_env):
     """
     PROD gate inputs read from the exchange, fetched ONCE per order attempt (issue #101): three all-symbol GETs,
-    /fapi/v2/positionRisk, /fapi/v1/openAlgoOrders and /fapi/v1/openOrders. Gate 0A (max open positions), Gate 1
+    /fapi/v1/openAlgoOrders, /fapi/v1/openOrders, then /fapi/v2/positionRisk (issue #160: listings first, as in
+    _protect_pending_entry, so an entry filling between the reads is counted twice, the safe side, instead of
+    vanishing from both). Gate 0A (max open positions), Gate 1
     (delta-neutral, incl. resting opening orders), Gate 2 (unrealized PnL of the open positions, issue #119) and the
     unregistered-resting-entry check (1d) all read this snapshot, so editing or deleting
     logs/session_state.json / logs/pending_entries.json cannot make a gate pass that the live state would fail.
@@ -2352,8 +2401,8 @@ def fetch_live_gate_snapshot(target_env):
     (#46). A registry read error is kept in the capture (the gates fail closed on it as before). Read-only.
     """
     snap = {"env": target_env, "fetched_at": int(time.time()), "registry": load_pending_entries_status()}
-    for name, endpoint in (('positions', '/fapi/v2/positionRisk'), ('open_algo_orders', '/fapi/v1/openAlgoOrders'),
-                           ('open_orders', '/fapi/v1/openOrders')):
+    for name, endpoint in (('open_algo_orders', '/fapi/v1/openAlgoOrders'), ('open_orders', '/fapi/v1/openOrders'),
+                           ('positions', '/fapi/v2/positionRisk')):
         try:
             res = send_signed_request('GET', endpoint, target_env=target_env)
         except Exception as e:
@@ -2368,12 +2417,17 @@ def fetch_live_gate_snapshot(target_env):
     return snap, None
 
 
-def record_price_tolerances(records):
+def record_price_tolerances(records, exchange_ticks=None):
     """Issue #126: {symbol: half a tick} from the tick_size stored in registry records at registration (exchangeInfo
-    is not cached, so no extra read here). Records without a positive tick_size add nothing (exact match)."""
+    is not cached, so no extra read here). Records without a positive tick_size add nothing (exact match).
+    Issue #160: the registry is editable, so a record's tick_size is capped at the exchange tick of its symbol when
+    exchange_ticks ({symbol: tickSize}, filters already fetched by the caller) knows it."""
+    known = {str(s).upper(): _to_float(t) for s, t in (exchange_ticks or {}).items()}
     out = {}
     for r in records or []:
         tick = _to_float((r or {}).get('tick_size')) if isinstance(r, dict) else 0.0
+        if tick > 0 and known.get(str(r.get('symbol') or '').upper(), 0.0) > 0:
+            tick = min(tick, known[str(r.get('symbol') or '').upper()])
         if tick > 0:
             sym = str(r.get('symbol') or '').upper()
             out[sym] = min(out.get(sym, tick / 2.0), tick / 2.0)
@@ -2827,7 +2881,10 @@ def protect_pending_entries(target_env=None, dry_run=False, keys=None):
           existing stops; leftovers are cancelled only once flat. A failed close with no stop at all gets an
           orphan-heal stop (issue #39).
         Once the entry order is gone, TP1/TP2 are placed reduce-only from the ACTUAL position size (idempotent:
-        placed TP ids are saved first and only a missing TP is retried), an audit record is appended (with
+        placed TP ids are saved first and only a missing TP is retried; issue #160: that save and the audit_done save
+        retry a registry lock error, and a missing TP id first adopts a reduce-only exit-side LIMIT already resting
+        at its price, find_resting_take_profits; a failed read places as before with a "tp_reconcile" warning),
+        an audit record is appended (with
         realized_rr_tp2, tp1_distance_pct and fill_quality_flags, issue #39, log only) and the record dropped.
         A partially filled LIMIT keeps its record (remainder cancelled at expiry, TPs on a later run).
       - not filled and still open: cancelled once expires_at_ts is reached, else kept.
@@ -3064,6 +3121,18 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out, run_ctx=None
                         entries[key][k] = v
         if not dry_run:
             update_pending_entries(mutate)
+
+    def save_retrying(**fields):
+        """save() retried on PendingRegistryLockError after each PENDING_SAVE_RETRY_DELAYS_S delay (issue #160: the
+        TP ids and audit_done saves); the last failure is raised as before."""
+        for delay in PENDING_SAVE_RETRY_DELAYS_S + (None,):
+            try:
+                return save(**fields)
+            except PendingRegistryLockError as e:
+                if delay is None:
+                    raise
+                logger.warning(f"{sym} {key}: registry update {sorted(fields)} retried in {delay}s ({e})")
+                time.sleep(delay)
 
     def save_before_stop(**fields):
         """save() for the bookkeeping writes that run BEFORE the stop is placed/verified: a registry lock failure
@@ -3496,16 +3565,35 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out, run_ctx=None
             return act("pending_tp_placed", False, tp1_price=tp1_p, tp1_qty=tp1_qty, tp2_price=tp2_p, tp2_qty=tp2_qty,
                        quantity=qty, place_tp1=need1, place_tp2=need2, fill_quality_flags=fill_flags)
         retried = ids['tp1_order_id'] is not None or ids['tp2_order_id'] is not None
+        adopted = []
+        if need1 or need2:
+            # Issue #160: TP ids lost to a failed save must not mean duplicate TPs: adopt the reduce-only exit-side
+            # LIMIT orders already resting at the TP prices. A failed read places as before (never blocks protection).
+            wanted = {name: price for name, price, need in (('tp1_order_id', tp1_p, need1),
+                                                            ('tp2_order_id', tp2_p, need2)) if need}
+            found, read_err = find_resting_take_profits(sym, exit_side, wanted, tick,
+                                                        exclude_ids=[v for v in ids.values() if v is not None],
+                                                        target_env=target_env)
+            if read_err:
+                out.setdefault("warnings", []).append({"key": key, "symbol": sym, "stage": "tp_reconcile",
+                                                       "warning": f"{read_err}; TPs placed without the duplicate "
+                                                                  "check"})
+            for name, order_id in found.items():
+                ids[name] = order_id
+                adopted.append(name)
+            need1 = need1 and ids['tp1_order_id'] is None
+            need2 = need2 and ids['tp2_order_id'] is None
         o1, o2 = place_take_profit_orders(sym, exit_side, tp1_p, tp2_p, tp1_qty if need1 else 0, tp2_qty if need2 else 0,
                                           target_env=target_env)
         for name, order in (('tp1_order_id', o1), ('tp2_order_id', o2)):
             if isinstance(order, dict) and 'orderId' in order and not _is_api_error(order):
                 ids[name] = order['orderId']
         tp_ok = (tp1_qty <= 0 or ids['tp1_order_id'] is not None) and (tp2_qty <= 0 or ids['tp2_order_id'] is not None)
-        # Persist what was placed BEFORE anything else, so a later run never duplicates a TP.
-        save(tp1_qty=tp1_qty, tp2_qty=tp2_qty, tp_placed=tp_ok, **ids)
+        # Persist what was placed BEFORE anything else, so a later run never duplicates a TP (lock retried, #160).
+        save_retrying(tp1_qty=tp1_qty, tp2_qty=tp2_qty, tp_placed=tp_ok, **ids)
         act("pending_tp_placed", tp_ok, tp1_price=tp1_p, tp1_qty=tp1_qty, tp2_price=tp2_p, tp2_qty=tp2_qty, quantity=qty,
-            retried=retried, record_dropped=tp_ok, fill_quality_flags=fill_flags, **ids)
+            retried=retried, record_dropped=tp_ok, fill_quality_flags=fill_flags, **ids,
+            **({"adopted_existing": adopted} if adopted else {}))
         if not tp_ok:
             return fail("take_profit", f"TP placement failed for {sym} (tp1={o1}, tp2={o2}); SL is in place, only the "
                                        "missing TP is retried next run.")
@@ -3539,7 +3627,7 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out, run_ctx=None
             append_trade_audit_record(record, rec.get('margin_usdt'))
         except Exception as e:
             return fail("audit", f"Audit append failed ({e}); record kept, only the audit/drop is retried.")
-        save(audit_done=True)
+        save_retrying(audit_done=True)   # a lost flag would re-append the audit record next run (issue #160)
     return drop()
 
 
@@ -3783,7 +3871,8 @@ def execute_complete_trade(
         direction, cur_price, sl_p, tp1_p, total_qty, effective_leverage,
         bypass_delta_gate=bypass_delta_gate, target_env=target_env, is_yolo=is_yolo,
         maint_margin_ratio=mmr, maint_amount=maint_amount, mmr_source=mmr_source,
-        liq_entry_price=liq_entry_price, entry_price=effective_entry, live_snapshot=live_snapshot
+        liq_entry_price=liq_entry_price, entry_price=effective_entry, live_snapshot=live_snapshot,
+        exchange_ticks={symbol: filters.get('tickSize')}
     )
     if not gate_ok:
         return {"success": False, "hard_gate_rejection": True, "error": gate_err}
@@ -4444,7 +4533,8 @@ def audit_orphan_positions(target_env=None, auto_heal=False):
     If auto_heal=True, places an emergency Algo SL calculated via volatility/liquidation buffer.
     Stops are read with retries (get_open_stop_orders_with_retry; after one symbol's read fails persistently, later
     symbols get a single read so the hook's audit stays bounded). protection per position: "protected" | "orphan" |
-    "unknown" (every read failed: never healed, not counted as an orphan, counted in unknown_count). A hedge-mode
+    "unknown" (every read failed: never healed here, not counted as an orphan, counted in unknown_count; the guardian
+    heals one that stays UNKNOWN for STOP_UNKNOWN_ESCALATE_AFTER cycles via heal_unknown_stop). A hedge-mode
     account returns {"error", "hedge_mode": True}.
     """
     target_env = resolve_env(target_env)
@@ -4553,12 +4643,20 @@ def _read_open_position(symbol, target_env=None, is_long=None):
     return None, None
 
 
+def _qty_tolerance(symbol, target_env=None):
+    """Quantity match tolerance: max(1e-9, stepSize / 2) from get_symbol_filters; 1e-9 when the filters read fails."""
+    try:
+        return max(1e-9, float(get_symbol_filters(symbol, target_env=target_env)['stepSize']) / 2)
+    except Exception:
+        return 1e-9
+
+
 def _planned_sl_for_position(symbol, row, target_env=None):
     """sl_price of the latest trades_audit entry record that matches the live position (direction, env, entry within
     tolerance, total_qty >= |positionAmt|), else None. Never raises.
     With a matching record, a ratcheted stop (break-even / trailed) from logs/session_state.json replaces it when the
     state is valid, of the same env and not older than the record, the entry matches (symbol, direction, entry within
-    tolerance, qty >= |positionAmt|, sl_algo_verified) and its sl_price is tighter than the planned SL and not crossed
+    tolerance, qty >= |positionAmt| within _qty_tolerance, sl_algo_verified) and its sl_price is tighter than the planned SL and not crossed
     vs markPrice. The state's sl_price is any open algo trigger of the symbol, hence those guards. Limitation: the
     state reflects the last ledger sync only."""
     try:
@@ -4583,14 +4681,17 @@ def _planned_sl_for_position(symbol, row, target_env=None):
         live_entry = _to_float(row.get('entryPrice'))
         mark = _to_float(row.get('markPrice'))
         planned_f = _to_float(planned)
+        qty_tol = None
         for entry in state.get('active_positions') or []:
             if not isinstance(entry, dict) or str(entry.get('symbol', '')).upper() != str(symbol).upper() \
                     or str(entry.get('direction', '')).upper() != direction or entry.get('sl_algo_verified') is not True:
                 continue
+            if qty_tol is None:
+                qty_tol = _qty_tolerance(symbol, target_env)
             entry_p = _to_float(entry.get('entry_price'))
             if live_entry <= 0 or entry_p <= 0 \
                     or abs(entry_p - live_entry) / live_entry * 100 > pt.AUDIT_ENTRY_PRICE_TOLERANCE_PCT \
-                    or abs(_to_float(entry.get('qty'))) < abs(amt) - 1e-9:
+                    or abs(_to_float(entry.get('qty'))) < abs(amt) - qty_tol:
                 continue
             cand = float(entry.get('sl_price'))
             if cand > 0 and mark > 0 and (planned_f <= 0 or is_tighter_stop(cand, planned_f, is_long)) \
@@ -4677,7 +4778,9 @@ def _report_abort_failure(symbol, target_env, site, error):
     """CRITICAL/P0 issue (issue #40) for a fail-safe abort or close that did not end flat or protected: the
     pending_abort and crossed-close paths of --protect-pending, the inline partial-fill abort and the
     heal_orphan_position close. Never raises (reporting must not break the risk-reducing path). error_detail (hashed
-    into the 24h dedup fingerprint with the title) is stable per symbol + site; the full error goes into context."""
+    into the 24h dedup fingerprint with the title) is stable per symbol + site; the full error goes into context.
+    Issue #160: the fingerprint differs per site, so a guardian cycle whose failed crossed close already reported a
+    symbol heals it with heal_orphan_position(report_failure=False): one P0 per failure, the heal/close still run."""
     try:
         import report_agent_issue
         report_agent_issue.report_issue(
@@ -4690,6 +4793,46 @@ def _report_abort_failure(symbol, target_env, site, error):
             remediation="Check the position on Binance now; protect it or close it with --close-position.")
     except Exception as e:
         logger.error(f"abort failure report for {symbol} could not be filed: {e}")
+
+
+def heal_unknown_stop(symbol, position, target_env=None):
+    """Heal of a position whose stop read failed (issue #173: close_position_market, the guardian's persistent UNKNOWN
+    escalation, the SWING night cutoff). heal_orphan_position with close_on_failure=False and the planned SL of
+    _planned_sl_for_position; never closes and never raises. Returns {"result", "detail", "heal", "redundant_stops",
+    "note"}:
+      result "healed" -> an emergency stop was placed and verified; one more read lists any other protective stops in
+                         redundant_stops (never cancelled: the cancelled one could be the only real stop; all are
+                         reduce-only/closePosition and the next flat close cancels the leftovers) with a note;
+             "kept"   -> the placement got -4130: a closePosition stop already exists (note "stop inferred from -4130");
+             "failed" -> anything else (heal unverified or raised).
+    heal is the raw heal_orphan_position result ({"verified": False, "reason": "heal failed: ..."} on an exception)."""
+    try:
+        heal = heal_orphan_position(position, target_env=target_env, close_on_failure=False,
+                                    planned_sl=_planned_sl_for_position(symbol, position, target_env))
+    except Exception as e:
+        heal = {"verified": False, "reason": f"heal failed: {e}"}
+    out = {"result": "failed", "detail": f"heal not verified ({heal.get('reason')})", "heal": heal,
+           "redundant_stops": [], "note": None}
+    if heal.get("verified"):
+        out.update(result="healed", detail=f"verified emergency stop at {heal.get('healed_sl_price')}")
+        try:
+            exit_side = 'SELL' if _to_float(position.get('positionAmt')) > 0 else 'BUY'
+            after, after_err = get_open_stop_orders(symbol, exit_side, target_env=target_env)
+            healed = heal.get("new_stop") or {}
+            others = [s for s in after if (str(_order_id(s)) != str(healed.get("algo_id"))
+                                           if healed.get("algo_id") is not None
+                                           else _trigger_price(s) != healed.get("trigger_price"))] \
+                if after_err is None else []
+        except Exception:
+            others = []
+        if others:
+            out["redundant_stops"] = [stop_summary(s) for s in others]
+            out["note"] = ("heal stop placed next to existing stop(s) (pre-heal reads failed); all are "
+                           "reduce-only/closePosition and the next flat close cancels the leftovers")
+    elif _is_existing_close_position_stop_rejection(heal.get("placement")):
+        out.update(result="kept", detail="placement rejected -4130: a closePosition stop already exists",
+                   note="stop inferred from -4130")
+    return out
 
 
 def close_position_market(symbol, target_env=None):
@@ -4713,7 +4856,7 @@ def close_position_market(symbol, target_env=None):
                   "none"    -> a successful read showed no stop and the heal failed, stop_protected False;
                   "unknown" -> every read failed and the heal failed for another reason, stop_protected None.
     stop_protected is True / False / None; consumers MUST treat anything but True as unprotected (never test
-    `is False`). When every pre-heal read failed and the heal verified, one more read lists any other protective stops
+    `is False`). When every pre-heal read failed the heal is heal_unknown_stop; when it verified, one more read lists any other protective stops
     in redundant_stops with a stop_note: they are never cancelled here (the cancelled one could be the only real
     stop); all are reduce-only/closePosition and the next flat close cancels the leftovers.
     Early returns (only "error"; no report): no position, unreadable positionRisk, hedge mode ("hedge_mode": True).
@@ -4763,32 +4906,19 @@ def close_position_market(symbol, target_env=None):
     heal, note, redundant = None, None, None
     if stops:
         stop_source = "kept"
-    else:
+    elif stop_err is None:
         try:
             heal = heal_orphan_position(row, target_env=target_env, close_on_failure=False,
                                         planned_sl=_planned_sl_for_position(symbol, row, target_env))
         except Exception as e:
             heal = {"verified": False, "reason": f"heal failed: {e}"}
-        if heal.get("verified"):
-            stop_source = "healed"
-            if stop_err is not None:
-                # Every pre-heal read failed: the heal may sit next to an existing (e.g. quantity-based) stop.
-                after, after_err = get_open_stop_orders(symbol, exit_side, target_env=target_env)
-                healed = heal.get("new_stop") or {}
-                others = [s for s in after if (str(_order_id(s)) != str(healed.get("algo_id"))
-                                               if healed.get("algo_id") is not None
-                                               else _trigger_price(s) != healed.get("trigger_price"))] \
-                    if after_err is None else []
-                if others:
-                    redundant = [stop_summary(s) for s in others]
-                    note = ("heal stop placed next to existing stop(s) (pre-heal reads failed); all are "
-                            "reduce-only/closePosition and the next flat close cancels the leftovers")
-        elif stop_err is None:
-            stop_source = "none"
-        elif _is_existing_close_position_stop_rejection(heal.get("placement")):
-            stop_source, note = "kept", "stop inferred from -4130"
-        else:
-            stop_source = "unknown"
+        stop_source = "healed" if heal.get("verified") else "none"
+    else:
+        # Every read failed: the shared unknown-stop heal (-4130 = kept, redundant stops listed, never a close).
+        unknown = heal_unknown_stop(symbol, row, target_env=target_env)
+        heal, redundant = unknown["heal"], unknown["redundant_stops"] or None
+        stop_source = {"healed": "healed", "kept": "kept"}.get(unknown["result"], "unknown")
+        note = unknown.get("note")
     error = (f"Reduce-only MARKET close of {symbol} not confirmed flat after {attempts} attempt(s) "
              f"(last response: {res}); nothing cancelled; stop {stop_source}")
     if note:

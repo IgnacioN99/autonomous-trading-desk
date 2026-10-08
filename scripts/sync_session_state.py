@@ -11,7 +11,12 @@ Issue #48: portfolio_exposure also carries resting_entries [{"symbol", "dir", "k
 logs/pending_entries.json records whose entry order still rests on openAlgoOrders / openOrders and whose symbol has
 no open position), resting_margin_usdt (sum of their margin_usdt) and delta_bias_incl_resting (delta_bias with each
 resting entry as a leg of its direction; "UNKNOWN" when the registry or an order listing cannot be read).
-delta_bias itself is unchanged. The state is only ever written atomically (issue #127): a failed write leaves the
+delta_bias itself is unchanged. Issue #173: audit_read_error (logs/trades_audit.jsonl exists but is unreadable:
+the exception text, else None) and audit_corrupt_lines (skipped non-JSON-object lines, else 0); the doctor warns on
+either. Issue #160: portfolio_exposure.resting_mismatches lists same-env records with no live order match and no
+open position (not counted; the doctor warns), and the order listings are read before positionRisk so an entry
+filling between the reads is double counted rather than missed. The state is only ever written atomically
+(issue #127): a failed write leaves the
 previous file. CLI exit code 1 when the state written is INVALID or the write failed, else 0.
 """
 
@@ -39,12 +44,14 @@ def get_start_of_day_utc() -> int:
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     return int(start.timestamp() * 1000)
 
-def _read_audit_records() -> List[dict]:
-    """Parsed dict lines of trades_audit.jsonl (AUDIT_LOG), read once per sync; [] when missing or unreadable, bad
-    lines skipped."""
-    records = []
+def _read_audit_records():
+    """(records, read_error, corrupt_lines) for trades_audit.jsonl (AUDIT_LOG), read once per sync. records: parsed
+    dict lines ([] when missing or unreadable). read_error: "<ExceptionType>: <text>" when the file exists but cannot
+    be read, else None. corrupt_lines: non-empty lines that are not JSON objects (skipped). Issue #173: both go into
+    the ledger as audit_read_error / audit_corrupt_lines."""
+    records, corrupt = [], 0
     if not os.path.exists(AUDIT_LOG):
-        return records
+        return records, None, 0
     try:
         with open(AUDIT_LOG, "r", encoding="utf-8") as f:
             for line in f:
@@ -54,12 +61,15 @@ def _read_audit_records() -> List[dict]:
                 try:
                     record = json.loads(line)
                 except ValueError:
+                    corrupt += 1
                     continue
                 if isinstance(record, dict):
                     records.append(record)
-    except Exception:
-        return []
-    return records
+                else:
+                    corrupt += 1
+    except Exception as e:
+        return [], f"{type(e).__name__}: {e}", 0
+    return records, None, corrupt
 
 
 def load_audit_metadata(target_env: str = None, records: List[dict] = None) -> Dict[str, dict]:
@@ -68,7 +78,7 @@ def load_audit_metadata(target_env: str = None, records: List[dict] = None) -> D
     meta = {}
     # Env aliases normalised on both sides ("mainnet" == "prod"), same as utils/position_timing (issue #92).
     norm_env = pt.norm_env(target_env)
-    for record in (_read_audit_records() if records is None else records):
+    for record in (_read_audit_records()[0] if records is None else records):
         try:
             rec_env = pt.norm_env(record.get("target_env"))
             if norm_env and rec_env and rec_env != norm_env:
@@ -101,6 +111,7 @@ def write_error_state(err_msg: str, now_ts: int, now_utc: str, target_env: str, 
             "delta_bias_incl_resting": "UNKNOWN",
             "resting_entries": [],
             "resting_margin_usdt": 0.0,
+            "resting_mismatches": [],
             "delta_advice": f"🚨 LEDGER SYNC FAILED: {err_msg}",
             "total_floating_pnl_usdt": 0.0
         },
@@ -156,8 +167,11 @@ def resting_entry_exposure(target_env: str, algos_res, open_orders_res, exposure
     already fetched (eft.live_resting_opening_orders: not closePosition / reduceOnly, no final algoStatus) and its
     symbol has no open position (a filled record waiting for its protect cycle is not counted twice). Each one is a
     leg of its direction at trigger_or_limit_price x total_qty. Returns {"resting_entries", "resting_margin_usdt",
-    "delta_bias_incl_resting"}; "UNKNOWN" when the registry or a listing cannot be read."""
-    out = {"resting_entries": [], "resting_margin_usdt": 0.0, "delta_bias_incl_resting": "UNKNOWN"}
+    "delta_bias_incl_resting", "resting_mismatches"}; "UNKNOWN" when the registry or a listing cannot be read.
+    Issue #160: a record with no live order match and no open position on its symbol is not counted but listed in
+    resting_mismatches [{"symbol", "entry_id", "side"}] (a stale record or an unexpected id format; the doctor warns)."""
+    out = {"resting_entries": [], "resting_margin_usdt": 0.0, "delta_bias_incl_resting": "UNKNOWN",
+           "resting_mismatches": []}
     if not isinstance(algos_res, list) or not isinstance(open_orders_res, list):
         return out
     records, err = _load_registry_records(target_env)
@@ -170,14 +184,19 @@ def resting_entry_exposure(target_env: str, algos_res, open_orders_res, exposure
     for rec in records:
         sym = str(rec.get("symbol") or "").upper()
         kind = "STOP_MARKET" if str(rec.get("kind") or "").upper() == "STOP_MARKET" else "LIMIT"
-        if sym in open_symbols or (sym, kind, str(rec.get("entry_id"))) not in live_ids:
-            continue
         is_long = str(rec.get("direction") or "").upper() == "LONG"
+        if sym in open_symbols:
+            continue
+        if (sym, kind, str(rec.get("entry_id"))) not in live_ids:
+            out["resting_mismatches"].append({"symbol": sym, "entry_id": str(rec.get("entry_id")),
+                                              "side": "LONG" if is_long else "SHORT"})
+            continue
         try:
             notional = abs(float(rec.get("trigger_or_limit_price")) * float(rec.get("total_qty")))
             margin += float(rec.get("margin_usdt") or 0.0)
         except (TypeError, ValueError):
-            return {"resting_entries": [], "resting_margin_usdt": 0.0, "delta_bias_incl_resting": "UNKNOWN"}
+            return {"resting_entries": [], "resting_margin_usdt": 0.0, "delta_bias_incl_resting": "UNKNOWN",
+                    "resting_mismatches": []}
         if is_long:
             long_n += notional
         else:
@@ -197,7 +216,7 @@ def sync_session_state(target_env: str = None) -> dict:
         target_env = (os.environ.get("BINANCE_API_ENV") or cfg.get("BINANCE_API_ENV", "prod")).lower()
     target_env = resolve_env(target_env)  # "mainnet" -> "prod": one spelling in the ledger (issue #92)
     os.makedirs(LOGS_DIR, exist_ok=True)
-    records = _read_audit_records()   # one read of trades_audit.jsonl per sync (issue #138)
+    records, audit_read_error, audit_corrupt_lines = _read_audit_records()   # one read per sync (issue #138)
     audit_meta = load_audit_metadata(target_env, records=records)
     now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     now_ts = int(time.time())
@@ -205,6 +224,18 @@ def sync_session_state(target_env: str = None) -> dict:
     # 1. Macro BTC
     btc_ticker = eft.send_signed_request("GET", "/fapi/v1/ticker/price", {"symbol": "BTCUSDT"}, target_env=target_env)
     btc_price = float(btc_ticker.get("price", 0.0)) if isinstance(btc_ticker, dict) else 0.0
+
+    # Issue #160: the order listings are read BEFORE positionRisk (same order as the executor's
+    # fetch_live_gate_snapshot): an entry that fills between the reads then shows as both resting and filled (double
+    # counted, the safe side) instead of vanishing from both. A raised read is a failed listing (non-list: resting
+    # exposure UNKNOWN), so a failing positionRisk read still writes the fail-closed state below.
+    listings = []
+    for endpoint in ("/fapi/v1/openAlgoOrders", "/fapi/v1/openOrders"):
+        try:
+            listings.append(eft.send_signed_request("GET", endpoint, target_env=target_env))
+        except Exception as e:
+            listings.append({"error": f"{type(e).__name__}: {e}"})
+    algos_res, open_orders_res = listings
 
     # 2. Active Ledger Positions
     try:
@@ -274,8 +305,7 @@ def sync_session_state(target_env: str = None) -> dict:
             if entry_diag["rate_limited"]:
                 active_positions[-1]["entry_time_rate_limited"] = True
 
-    # 3. Active Algo Orders (Stop Loss) on Binance
-    algos_res = eft.send_signed_request("GET", "/fapi/v1/openAlgoOrders", target_env=target_env)
+    # 3. Active Algo Orders (Stop Loss) on Binance (algos_res read before positionRisk, issue #160)
     active_sl_orders = []
     if isinstance(algos_res, list):
         for a in algos_res:
@@ -299,8 +329,7 @@ def sync_session_state(target_env: str = None) -> dict:
         else:
             pos["sl_algo_verified"] = False
 
-    # 4. Open Limit Orders (TP1, TP2)
-    open_orders_res = eft.send_signed_request("GET", "/fapi/v1/openOrders", target_env=target_env)
+    # 4. Open Limit Orders (TP1, TP2) (open_orders_res read before positionRisk, issue #160)
     active_tp_orders = []
     if isinstance(open_orders_res, list):
         for o in open_orders_res:
@@ -391,6 +420,8 @@ def sync_session_state(target_env: str = None) -> dict:
         "last_updated_ts": now_ts,
         "last_updated_utc": now_utc,
         "target_env": target_env,
+        "audit_read_error": audit_read_error,
+        "audit_corrupt_lines": audit_corrupt_lines,
         "macro_btc": {
             "price_usdt": btc_price
         },
@@ -403,6 +434,7 @@ def sync_session_state(target_env: str = None) -> dict:
             "delta_bias_incl_resting": resting["delta_bias_incl_resting"],
             "resting_entries": resting["resting_entries"],
             "resting_margin_usdt": resting["resting_margin_usdt"],
+            "resting_mismatches": resting["resting_mismatches"],
             "delta_advice": delta_advice,
             "total_floating_pnl_usdt": round(sum(p["unrealized_pnl_usdt"] for p in active_positions), 4)
         },

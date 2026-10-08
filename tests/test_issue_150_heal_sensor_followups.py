@@ -41,7 +41,7 @@ import trading_doctor
 import position_guardian_loop as pgl
 from utils import position_timing as pt
 import test_issue_92_holding_time as t92
-from test_exit_management import FakeExchange, offline, long_position, stop, write_audit, ALGO_ENDPOINT
+from test_exit_management import FakeExchange, offline, long_position, stop, write_audit, ALGO_ENDPOINT, FILTERS
 from test_issue_137_close_keeps_stop import CloseExchange, keys_env, posts_of, REJECT_2022
 from test_issue_144_close_path_followups import (ReadFailExchange, RejectFirstStopsExchange, REJECT_4130, READ_ERROR,
                                                  ALGO_READ, algo_reads)
@@ -50,9 +50,11 @@ from test_issue_92_holding_time import FillsExchange, STALLED, HEALTHY, row, fil
 NOW = int(time.time())
 
 
-def audit_ws(direction="LONG", sl_price=99.0, ts=None, **extra):
-    """Temp workspace with one matching prod audit record (entry 100, qty 10, like long_position())."""
+def audit_ws(case, direction="LONG", sl_price=99.0, ts=None, **extra):
+    """Temp workspace with one matching prod audit record (entry 100, qty 10, like long_position()); removed by the
+    TestCase `case` cleanup."""
     ws = tempfile.mkdtemp()
+    case.addCleanup(shutil.rmtree, ws, True)
     rec = dict(symbol="BTCUSDT", direction=direction, target_env="prod", entry_price=100.0, total_qty=10.0,
                sl_price=sl_price, timestamp=NOW - 600 if ts is None else ts)
     rec.update(extra)
@@ -105,7 +107,7 @@ class TestLateIndexedPlannedStop(unittest.TestCase):
 
     def test_close_path_long(self):
         fake = LateIndexExchange([long_position()], [REJECT_2022])
-        with keys_env(fake) as mock_report, patch("execute_futures_trade._workspace_dir", return_value=audit_ws()):
+        with keys_env(fake) as mock_report, patch("execute_futures_trade._workspace_dir", return_value=audit_ws(self)):
             res = eft.close_position_market("BTCUSDT", target_env="prod")
         self.assertFalse(res["success"])
         self.assertEqual((res["stop_source"], res["stop_protected"]), ("healed", True))
@@ -228,14 +230,16 @@ class TestRatchetedSl(unittest.TestCase):
         return res["heal"]
 
     def test_break_even_used_long(self):
-        ws = audit_ws()
+        ws = audit_ws(self)
         write_state(ws)
         heal = self.heal_price(ws)
         self.assertEqual((heal["healed_sl_price"], heal["sl_source"]), (100.2, "planned_sl"))
 
     def planned(self, ws, position=None):
         position = position or long_position()
-        with patch("execute_futures_trade._workspace_dir", return_value=ws):
+        # get_symbol_filters stubbed: the qty tolerance (issue #173) reads stepSize, never the live exchangeInfo.
+        with patch("execute_futures_trade._workspace_dir", return_value=ws), \
+                patch("execute_futures_trade.get_symbol_filters", return_value=dict(FILTERS)):
             return eft._planned_sl_for_position("BTCUSDT", position, "prod")
 
     def test_negative_cases_fall_back_to_the_audit_sl(self):
@@ -253,19 +257,19 @@ class TestRatchetedSl(unittest.TestCase):
         }
         for name, overrides in cases.items():
             with self.subTest(case=name):
-                ws = audit_ws()
+                ws = audit_ws(self)
                 write_state(ws, **overrides)
                 self.assertEqual(self.planned(ws), 99.0)
 
     def test_missing_or_corrupt_state_falls_back(self):
-        ws = audit_ws()
+        ws = audit_ws(self)
         self.assertEqual(self.planned(ws), 99.0)
         with open(os.path.join(ws, "logs", "session_state.json"), "w", encoding="utf-8") as f:
             f.write("{not json")
         self.assertEqual(self.planned(ws), 99.0)
 
     def test_short_mirror(self):
-        ws = audit_ws(direction="SHORT", sl_price=101.0)
+        ws = audit_ws(self, direction="SHORT", sl_price=101.0)
         write_state(ws, position={"direction": "SHORT", "sl_price": 99.8})
         pos = long_position(amt="-10", mark="95.0")
         self.assertEqual(self.planned(ws, pos), 99.8)
@@ -276,6 +280,7 @@ class TestRatchetedSl(unittest.TestCase):
 
     def test_no_audit_match_uses_the_anchor(self):
         ws = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, ws, True)
         os.makedirs(os.path.join(ws, "logs"))
         write_state(ws)
         self.assertIsNone(self.planned(ws))
@@ -527,27 +532,39 @@ class TestNightCutoff(unittest.TestCase):
         heal = MagicMock(return_value=heal_result or {"success": True, "healed_sl_price": 145.0})
         be = MagicMock(return_value={"success": True})
         out = io.StringIO()
+        ws = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, ws, True)
+        # Issue #173: the SWING unknown-stop path files a P0 (reporter stubbed) and reads the planned SL (temp ws).
         with patch("execute_futures_trade.send_signed_request", side_effect=send), \
                 patch("execute_futures_trade.get_symbol_filters", return_value={"tickSize": 0.1, "precision_price": 1}), \
                 patch("user_profile.load_user_profile", return_value={"overnight_mode": mode}), \
                 patch("execute_futures_trade.close_position_market", close), \
                 patch("execute_futures_trade.heal_orphan_position", heal), \
                 patch("execute_futures_trade.move_sl_to_breakeven", be), \
+                patch("execute_futures_trade._workspace_dir", return_value=ws), \
+                patch("report_agent_issue.report_issue") as self.report, \
                 patch("time.sleep"), patch("os.system", return_value=0), contextlib.redirect_stdout(out):
             code = ncl.main(["--env", "testnet"])
         return code, out.getvalue(), close, heal, be, reads
 
     def test_unreadable_stops_are_unknown_no_action(self):
-        # Modes that do not close at market: no heal, ratchet or close (unchanged by PR #170 round 2).
+        # Issue #173 (deliberate update): SWING_STRUCTURAL_STOP now heals an unknown stop (close_on_failure=False) and
+        # files a CRITICAL/P0; it still never closes or ratchets, and the symbol stays stop_unknown (exit 1).
         for mode in ("SWING_STRUCTURAL_STOP",):
             with self.subTest(mode=mode):
-                code, out, close, heal, be, reads = self.run_night(mode, [SOL], READ_ERROR)
+                code, out, close, heal, be, reads = self.run_night(
+                    mode, [SOL], READ_ERROR, heal_result={"verified": True, "success": True, "healed_sl_price": 145.0})
                 self.assertEqual(code, 1)
                 self.assertIn("SOLUSDT stop state UNKNOWN", out)
-                heal.assert_not_called()
+                heal.assert_called_once()
+                self.assertIs(heal.call_args.kwargs["close_on_failure"], False)
                 close.assert_not_called()
                 be.assert_not_called()
-                self.assertEqual(len(reads), 4, "retried with STOP_VERIFY_RETRY_DELAYS")
+                self.assertEqual(len(reads), 5, "4 retried reads + the post-heal redundant-stop read")
+                self.assertIn("Unknown-stop heal of SOLUSDT: healed", out)
+                self.report.assert_called_once()
+                self.assertEqual((self.report.call_args.kwargs["severity"], self.report.call_args.kwargs["priority"]),
+                                 ("CRITICAL", "P0"))
                 self.assertIn("NIGHT CUTOFF INCOMPLETE", out)
                 self.assertIn("stop_unknown: ['SOLUSDT']", out)
                 self.assertNotIn("NIGHT CUTOFF COMPLETED", out)
@@ -787,7 +804,9 @@ class TestSyncAuditOnce(unittest.TestCase):
 
     def test_load_audit_metadata_records_param(self):
         recs = [t92.audit_rec(1, sl_price=95.0), t92.audit_rec(2, symbol="ETHUSDT", env="prod")]
-        with patch.object(sss, "AUDIT_LOG", os.path.join(tempfile.mkdtemp(), "missing.jsonl")):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        with patch.object(sss, "AUDIT_LOG", os.path.join(tmp, "missing.jsonl")):
             self.assertEqual(sorted(sss.load_audit_metadata("testnet", records=recs)), ["BTCUSDT"])
             self.assertEqual(sss.load_audit_metadata("testnet"), {})
 

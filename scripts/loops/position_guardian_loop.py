@@ -14,7 +14,10 @@ Per cycle:
   1. Sync open positions (GET /fapi/v2/positionRisk).
   2. Orphan audit: a position without a verified protective stop is auto-healed with a verified
      emergency stop (execute_futures_trade.heal_orphan_position); if the stop cannot be verified,
-     the position is closed with a reduce-only market order (fail-safe auto-destruct policy).
+     the position is closed with a reduce-only market order (fail-safe auto-destruct policy; no second P0 when
+     step 0's failed crossed close already reported the symbol this cycle, issue #160). An unreadable stop
+     listing is UNKNOWN (no action) until it persists STOP_UNKNOWN_ESCALATE_AFTER cycles (issue #173): then
+     eft.heal_unknown_stop (no close) and a CRITICAL/P0 report (see stop_unknown_cycles).
   3. Structural trailing (dynamic_exit_manager.update_position_to_structural_stop): place-then-cancel,
      never loosens, stops re-read right before a write. YOLO positions are skipped until TP1 has filled
      (right-tail preservation). is_yolo / yolo_source / tp1_filled come from dem's result (its matched trade
@@ -85,6 +88,11 @@ State file (logs/guardian_state.json):
       "protected": bool, "stop_price": float | null,
       "is_yolo": bool, "yolo_source": str | null, "tp1_filled": bool | null,  # from dem's result
       "reference_unverified": bool,    # this cycle's dem reference had no userTrades open time
+      "stop_unknown_cycles": int,      # consecutive cycles whose stop read failed (0 after a successful read; carried
+                                       # from the previous state by symbol + side, so --once runs beside a live loop
+                                       # do not advance it). At each multiple of STOP_UNKNOWN_ESCALATE_AFTER (3):
+                                       # stop_unknown_heal action (eft.heal_unknown_stop, never a close) and a
+                                       # CRITICAL/P0 report at the first crossing or when the heal "failed"
       "trailing": {"success", "updated", "reason", "previous_sl", "new_sl"?, "planned_sl"?,
                    "activation_reason"?: "tp1_filled" | "r_multiple" | "atr_expansion" | null,
                    "reference_source"?: "trade_audit" | "current_stop", "message",
@@ -121,7 +129,7 @@ Action record (also one JSON line in logs/guardian_actions.jsonl):
    "type": "orphan_heal" | "orphan_close" | "trail_stop" | "dead_alpha_close" | "pending_protect_sl" |
            "pending_tp_placed" | "pending_abort" | "pending_timeout_cancel" | "pending_dropped" |
            "pending_sl_crossed_close" | "pending_record_mismatch" | "unknown_resting_entry" (report only, success
-           false) | "position_closed", "detail": {...}}
+           false) | "stop_unknown_heal" (success = heal result healed/kept) | "position_closed", "detail": {...}}
   trail_stop details carry "new_stop" (the new algo stop) when a stop was replaced. position_closed (issue #182,
   observation only, also in --dry-run): a previous "excursions" record whose symbol + side is no longer open; detail =
   that record + "last_stop_r" (last stop in R, favourable sign, null without risk), "disappeared_after_ts" (previous
@@ -186,6 +194,7 @@ LOCK_FILE_TEMPLATE = "guardian_loop.{env}.lock"
 LEGACY_LOCK_FILE_NAME = "guardian_loop.lock"  # shared lock of loops started before issue #167
 LOG_FILE_MAX_BYTES = 5 * 1024 * 1024
 LOG_FILE_BACKUPS = 3
+STOP_UNKNOWN_ESCALATE_AFTER = 3  # consecutive UNKNOWN stop reads before heal_unknown_stop + P0 report (issue #173)
 _UNRESOLVED = object()  # persist(): owner not resolved by the caller
 
 
@@ -222,6 +231,7 @@ def _position_view(p):
         "yolo_source": None,
         "tp1_filled": None,
         "reference_unverified": False,
+        "stop_unknown_cycles": 0,
         "trailing": None,
         "dead_alpha": None,
         "error": None,
@@ -242,6 +252,16 @@ def holding_verdict(p, view, target_env, now_ts=None, *, fetch=None):
     return res
 
 
+def _crossed_close_reported(action):
+    """Issue #160: True when a protect-pending action is a failed crossed close that filed a P0 (eft crossed_close:
+    not flat, no stop kept and no verified orphan-heal stop). A dry run has no "flat" key and never reports."""
+    if not isinstance(action, dict) or action.get("type") != "pending_sl_crossed_close" or action.get("success"):
+        return False
+    detail = action.get("detail") or {}
+    return (detail.get("flat") is False and not detail.get("kept_stops")
+            and not (detail.get("heal") or {}).get("success"))
+
+
 class GuardianCycle:
     def __init__(self, target_env, dry_run=False, close_dead_alpha=False, log_dir=None, mode="once", interval_seconds=None,
                  lock_warning=None):
@@ -252,6 +272,7 @@ class GuardianCycle:
         self._user_trades = {}  # (SYMBOL, limit) -> userTrades response, shared by trailing and dead alpha
         self._audit_kinds = set()  # dem's raw audit_* warnings of this cycle (issue #163 escalation)
         self._audit_resolved = False  # at least one trailing evaluation resolved the trade reference
+        self._crossed_close_reported = set()  # symbols whose failed crossed close filed a P0 this cycle (issue #160)
         self._previous = {}  # previous guardian_state.json of this env (read at the start of run())
         self._excursion_misses = set()  # symbols whose excursion reference needed an uncached userTrades read
         now = int(time.time())
@@ -318,6 +339,42 @@ class GuardianCycle:
                 return True
         return False
 
+    def _previous_stop_unknown_cycles(self, view):
+        """stop_unknown_cycles of the same position (symbol + side) in the previous state, else 0."""
+        for v in self._previous.get("positions") or []:
+            if isinstance(v, dict) and v.get("symbol") == view["symbol"] and v.get("side") == view["side"]:
+                try:
+                    return max(int(v.get("stop_unknown_cycles") or 0), 0)
+                except (TypeError, ValueError):
+                    return 0
+        return 0
+
+    def _escalate_unknown_stop(self, p, view):
+        """Issue #173: a stop read that stays UNKNOWN for a multiple of STOP_UNKNOWN_ESCALATE_AFTER consecutive cycles
+        gets eft.heal_unknown_stop (never a close; -4130 = a closePosition stop exists = kept) and a CRITICAL/P0 issue
+        at the first crossing or whenever the heal result is "failed". --dry-run: planned action only, no report."""
+        sym, count = view["symbol"], view["stop_unknown_cycles"]
+        if count < STOP_UNKNOWN_ESCALATE_AFTER or count % STOP_UNKNOWN_ESCALATE_AFTER:
+            return
+        if self.dry_run:
+            self.action(sym, "stop_unknown_heal", False, {"planned": True, "reason": "dry_run",
+                                                         "stop_unknown_cycles": count})
+            return
+        res = eft.heal_unknown_stop(sym, p, target_env=self.env)
+        result = res.get("result")
+        heal = res.get("heal") or {}
+        self.action(sym, "stop_unknown_heal", result in ("healed", "kept"),
+                    {"stop_unknown_cycles": count, "result": result, "detail": res.get("detail"),
+                     "healed_sl_price": heal.get("healed_sl_price"), "new_stop": heal.get("new_stop"),
+                     "redundant_stops": res.get("redundant_stops"), "note": res.get("note")})
+        if result == "healed":
+            view["protected"] = True
+            view["stop_price"] = heal.get("healed_sl_price")
+        elif result == "kept":
+            view["protected"] = True
+        if count == STOP_UNKNOWN_ESCALATE_AFTER or result == "failed":
+            _report_unknown_stop(self.env, sym, count, result, res.get("detail"))
+
     # -- per-position steps ------------------------------------------------
     def _guard_position(self, p, view):
         sym = view["symbol"]
@@ -327,9 +384,11 @@ class GuardianCycle:
         # 1. Orphan audit
         stops, err = eft.get_open_stop_orders(sym, exit_side, target_env=self.env)
         if err:
-            # Unknown protection state: never act blindly, retry next cycle.
+            # Unknown protection state: never act blindly, retry next cycle; a persistent UNKNOWN escalates.
             view["error"] = err
             self.error(sym, "orders_query", err)
+            view["stop_unknown_cycles"] = self._previous_stop_unknown_cycles(view) + 1
+            self._escalate_unknown_stop(p, view)
             return
         if stops:
             view["protected"] = True
@@ -351,7 +410,9 @@ class GuardianCycle:
                                                     "message": "Unprotected position; would place a verified emergency stop."})
             self.error(sym, "orphan", "Position has no verified stop (dry run: not healed).")
             return "dry_run"
-        heal = eft.heal_orphan_position(p, target_env=self.env, close_on_failure=True)
+        # Issue #160: the heal and its close always run; only a second P0 for the same failure is skipped.
+        heal = eft.heal_orphan_position(p, target_env=self.env, close_on_failure=True,
+                                        report_failure=str(sym).upper() not in self._crossed_close_reported)
         detail = {k: heal.get(k) for k in ("reason", "verified", "healed_sl_price", "new_stop", "closed")}
         if heal.get("closed"):
             self.action(sym, "orphan_close", True, dict(detail, close_result=heal.get("close_result")))
@@ -413,8 +474,8 @@ class GuardianCycle:
         (dynamic_exit_manager.check_dead_alpha_timeout). Issue #92: a stall alone no longer qualifies, so a position
         is never flagged (or closed with --close-dead-alpha) before max_hours, and an UNKNOWN holding time is
         report-only (status UNKNOWN_HOLDING_TIME), never closed. The holding time (a userTrades call) is only
-        looked up when the 15m stall fires. --close-dead-alpha closes only when the entry time comes from Binance
-        fills; a trades_audit-sourced DEAD_ALPHA_STALLED is report-only (close_blocked, REVIEW_MANUALLY)."""
+        looked up when the 15m stall fires. --close-dead-alpha closes only per pt.dead_alpha_close_decision (the
+        watchdog's rule): a trades_audit-sourced DEAD_ALPHA_STALLED is report-only (close_blocked, REVIEW_MANUALLY)."""
         sym = view["symbol"]
         try:
             da = dem.check_dead_alpha_timeout(sym, target_env=self.env)
@@ -443,10 +504,11 @@ class GuardianCycle:
                                                   f"{pt.DEFAULT_MAX_HOURS}h and stagnant).")
         if view["dead_alpha"].get("status") != "DEAD_ALPHA_STALLED" or not self.close_dead_alpha:
             return
-        if not pt.is_autonomous_close_allowed(verdict.get("entry_time_source")):
-            # Holding time from trades_audit (not Binance fills): verdict reported, never an autonomous close.
-            view["dead_alpha"].update(recommendation="REVIEW_MANUALLY",
-                                      close_blocked=f"entry time source {verdict.get('entry_time_source')}: report only")
+        allowed, reason = pt.dead_alpha_close_decision(verdict.get("verdict"), verdict.get("entry_time_source"),
+                                                       da.get("status"))
+        if not allowed:
+            # Shared close rule (issue #173): e.g. holding time from trades_audit is report only, never a close.
+            view["dead_alpha"].update(recommendation="REVIEW_MANUALLY", close_blocked=reason)
             return
         if self.dry_run:
             self.action(sym, "dead_alpha_close", False, {"planned": True, "reason": "dry_run", "dead_alpha": view["dead_alpha"]})
@@ -576,6 +638,8 @@ class GuardianCycle:
         for a in res.get("actions", []):
             self.action(a.get("symbol"), a.get("type"), a.get("success"),
                         dict(a.get("detail") or {}, pending_entry_key=a.get("key")))
+            if _crossed_close_reported(a):
+                self._crossed_close_reported.add(str(a.get("symbol") or "").upper())
         for e in res.get("errors", []):
             self.error(e.get("symbol"), f"pending_{e.get('stage')}", e.get("error"))
         for w in res.get("warnings") or []:
@@ -720,6 +784,27 @@ def _report_audit_health(env, health, detail):
             remediation="Inspect logs/trades_audit.jsonl (malformed or unreadable lines); do not hand-edit it during trading.")
     except Exception as e:
         print(f"guardian: trades_audit health report could not be filed ({type(e).__name__}: {e})", file=sys.stderr)
+
+
+def _report_unknown_stop(env, symbol, cycles, result, detail):
+    """Issue #173: CRITICAL/P0 issue for a stop read UNKNOWN for `cycles` consecutive guardian cycles, with the
+    heal_unknown_stop result. Never raises. error_detail carries the count and result, so a repeat at a later multiple
+    after a failed heal is a new fingerprint while the reporter's 24h dedup absorbs exact repeats."""
+    try:
+        import report_agent_issue
+        report_agent_issue.report_issue(
+            title=f"position_guardian_loop: stop of {symbol} UNKNOWN for {cycles} consecutive cycles",
+            error_detail=f"{symbol} stop UNKNOWN {cycles} cycles; heal {result}",
+            category="risk_gate", severity="CRITICAL", priority="P0",
+            agent_name="position_guardian_loop",
+            affected_files="scripts/loops/position_guardian_loop.py:_escalate_unknown_stop",
+            context=(f"env={env}; symbol={symbol}; stop_unknown_cycles={cycles}; heal result={result}; "
+                     f"detail: {detail}"),
+            remediation=("Check the position's stop on Binance now (openAlgoOrders unreadable); protect it or close "
+                         "it with --close-position."))
+    except Exception as e:
+        print(f"guardian: unknown-stop report for {symbol} could not be filed ({type(e).__name__}: {e})",
+              file=sys.stderr)
 
 
 def run_cycle(target_env=None, dry_run=False, close_dead_alpha=False, log_dir=None, mode="once", interval_seconds=None,

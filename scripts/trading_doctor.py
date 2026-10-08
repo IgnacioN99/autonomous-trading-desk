@@ -377,10 +377,47 @@ def ensure_fresh_ledger(target_env: str, max_age_s: int = LEDGER_MAX_AGE_FOR_TEM
         synced = sss.sync_session_state(target_env)
     except Exception as e:
         return False, f"ledger sync raised {type(e).__name__}: {e}", None
-    if not isinstance(synced, dict) or not synced.get("is_valid", False):
-        err = synced.get("error") if isinstance(synced, dict) else synced
+    if not isinstance(synced, dict) or not synced.get("is_valid", False) or synced.get("state_write_error"):
+        # Issue #160: a sync whose atomic write failed (state_write_error) left no fresh ledger on disk.
+        err = (synced.get("state_write_error") or synced.get("error")) if isinstance(synced, dict) else synced
         return False, f"ledger sync returned an invalid state ({err})", None
     return True, "ledger synced in-process", None
+
+
+def ledger_audit_warning(state, target_env: str):
+    """Issue #173: WARN text when the same-env ledger reports logs/trades_audit.jsonl unreadable (audit_read_error) or
+    with corrupt lines (audit_corrupt_lines > 0), else None. Suggests report_issue.sh; never files an issue itself."""
+    if not isinstance(state, dict) or pt.norm_env(state.get("target_env")) != pt.norm_env(target_env):
+        return None
+    read_error = state.get("audit_read_error")
+    try:
+        corrupt = int(state.get("audit_corrupt_lines") or 0)
+    except (TypeError, ValueError):
+        corrupt = 0
+    if read_error:
+        problem, severity = f"is unreadable ({str(read_error)[:200]})", "HIGH"
+    elif corrupt > 0:
+        problem, severity = f"has {corrupt} corrupt line(s) (skipped)", "MEDIUM"
+    else:
+        return None
+    return (f"Ledger sync: logs/trades_audit.jsonl {problem}; planned stops and holding times may be missing. "
+            f"If it persists, open a {severity} issue: ./scripts/report_issue.sh --category risk_gate --severity "
+            f"{severity} --title \"trades_audit.jsonl unreadable or corrupt\" --output-file <file with the raw output>.")
+
+
+def ledger_resting_mismatch_warning(state, target_env: str):
+    """Issue #160: WARN text when the same-env ledger lists pending-registry records with no live order match and no
+    open position (portfolio_exposure.resting_mismatches), else None. Read-only: the cleanup is --protect-pending or
+    the guardian (a record is dropped once its entry has been gone for 60 s)."""
+    if not isinstance(state, dict) or pt.norm_env(state.get("target_env")) != pt.norm_env(target_env):
+        return None
+    mismatches = (state.get("portfolio_exposure") or {}).get("resting_mismatches") or []
+    if not isinstance(mismatches, list) or not mismatches:
+        return None
+    names = ", ".join(f"{m.get('symbol')}#{m.get('entry_id')}" for m in mismatches if isinstance(m, dict))
+    return (f"Pending registry record(s) with no live entry order and no open position: {names}. They are not "
+            "counted in delta_bias_incl_resting; clear stale records with python3 scripts/execute_futures_trade.py "
+            "--protect-pending or the position guardian.")
 
 
 def run_doctor(target_env: str = None, auto_heal: bool = False) -> int:
@@ -571,6 +608,10 @@ def run_doctor(target_env: str = None, auto_heal: bool = False) -> int:
                     warnings.append(msg)
                     print(f"⚠️  [DEAD ALPHA] {msg}")
                 else:
+                    audit_warning = ledger_audit_warning(_read_session_state(), target_env)
+                    if audit_warning:
+                        warnings.append(audit_warning)
+                        print(f"⚠️  [STATE LEDGER] {audit_warning}")
                     try:
                         import trading_drift_watchdog as tdw
                         drift_report = tdw.audit_dead_alpha(target_env=target_env, max_hours=4.0, auto_exit=False)
@@ -578,7 +619,9 @@ def run_doctor(target_env: str = None, auto_heal: bool = False) -> int:
                         unknown = drift_report.get("unknown_holding_symbols") or []
                         read_error = drift_report.get("read_error")
                         if read_error:
-                            msg = f"Temporal audit failed: {read_error}"
+                            msg = (f"Temporal audit failed: {read_error} (watchdog read error: its view may diverge "
+                                   "from the exchange; verify with python3 scripts/execute_futures_trade.py "
+                                   "--positions --json).")
                             warnings.append(msg)
                             print(f"⚠️  [DEAD ALPHA] {msg}")
                         if dead_count > 0:
@@ -618,6 +661,10 @@ def run_doctor(target_env: str = None, auto_heal: bool = False) -> int:
         else:
             ok_items.append(f"session_state.json is fresh ({int(age_sec)}s)")
             print(f"✅ [STATE LEDGER] session_state.json synced {int(age_sec)}s ago")
+        mismatch_warning = ledger_resting_mismatch_warning(_read_session_state(), target_env)
+        if mismatch_warning:
+            warnings.append(mismatch_warning)
+            print(f"⚠️  [STATE LEDGER] {mismatch_warning}")
     else:
         warnings.append("session_state.json does not exist yet. Run `sync_session_state.py`.")
         print("⚠️  [STATE LEDGER] session_state.json does not exist. Run `sync_session_state.py`.")

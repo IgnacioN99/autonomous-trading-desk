@@ -13,6 +13,7 @@ import io
 import os
 import sys
 import json
+import shutil
 import tempfile
 import unittest
 import contextlib
@@ -101,16 +102,22 @@ def stop(algo_id, trigger, side="SELL", symbol="BTCUSDT", close_position=True):
 
 @contextlib.contextmanager
 def offline(fake, workspace=None, profile=None):
-    """Patches every exchange / filesystem touchpoint used by the exit manager."""
-    ws = workspace or tempfile.mkdtemp()
-    with patch("execute_futures_trade.send_signed_request", side_effect=fake), \
-         patch("execute_futures_trade.get_symbol_filters", return_value=dict(FILTERS)), \
-         patch("execute_futures_trade.subprocess.run", side_effect=FileNotFoundError("binance-cli")), \
-         patch("execute_futures_trade.time.sleep", return_value=None), \
-         patch("execute_futures_trade._workspace_dir", return_value=ws), \
-         patch("user_profile.load_user_profile", return_value=dict(profile or PROFILE)), \
-         patch("utils.trade_excursion.fetch_klines_range", return_value=[]):  # guardian excursion tracking (#182)
-        yield ws
+    """Patches every exchange / filesystem touchpoint used by the exit manager. A temp workspace created here (no
+    workspace given) is removed when the block exits."""
+    own = None if workspace else tempfile.mkdtemp()
+    ws = workspace or own
+    try:
+        with patch("execute_futures_trade.send_signed_request", side_effect=fake), \
+             patch("execute_futures_trade.get_symbol_filters", return_value=dict(FILTERS)), \
+             patch("execute_futures_trade.subprocess.run", side_effect=FileNotFoundError("binance-cli")), \
+             patch("execute_futures_trade.time.sleep", return_value=None), \
+             patch("execute_futures_trade._workspace_dir", return_value=ws), \
+             patch("user_profile.load_user_profile", return_value=dict(profile or PROFILE)), \
+             patch("utils.trade_excursion.fetch_klines_range", return_value=[]):  # guardian excursion tracking (#182)
+            yield ws
+    finally:
+        if own:
+            shutil.rmtree(own, ignore_errors=True)
 
 
 def write_audit(ws, **record):
