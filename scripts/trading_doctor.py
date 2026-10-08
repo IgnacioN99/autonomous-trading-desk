@@ -151,11 +151,22 @@ def check_yolo_scan_health(profile: dict) -> tuple:
 
 
 def check_guardian_service(target_env: str) -> tuple:
-    """WARN-only position guardian liveness (issue #55) from execute_futures_trade.check_guardian_alive (reads
-    logs/guardian_state.json; no subprocess). Returns (level, message) with level "ok" or "warn". Never critical:
-    only PROD resting entries need the guardian loop."""
+    """Position guardian liveness (issues #55, #167) from execute_futures_trade.check_guardian_alive (reads
+    logs/guardian_state.json; no subprocess). Returns (level, message), level "ok", "warn" or "critical".
+    "critical" only in PROD when the loop is not alive AND logs/pending_entries.json holds a PROD resting entry (or
+    cannot be read): a filled entry could stay without its planned SL/TPs. Not alive otherwise -> "warn". Alive but
+    running without the single-instance lock (state lock_warning) -> "warn"."""
     alive, why = eft.check_guardian_alive(target_env)
     if alive:
+        try:
+            with open(os.path.join(eft._workspace_dir(), "logs", "guardian_state.json"), "r", encoding="utf-8") as f:
+                state = json.load(f)
+        except Exception:
+            state = None
+        lock_warning = state.get("lock_warning") if isinstance(state, dict) and state.get("env") == target_env else None
+        if isinstance(lock_warning, str) and lock_warning.strip():
+            return "warn", (f"Position guardian loop alive but running WITHOUT the single-instance lock ({lock_warning}): "
+                            "a second loop or a --once run may repeat heal/trailing requests.")
         return "ok", f"Position guardian loop alive: {why}."
     if is_prod_environment(target_env):
         impact = "PROD resting STOP_MARKET/LIMIT entries are rejected without it"
@@ -166,6 +177,22 @@ def check_guardian_service(target_env: str) -> tuple:
         hint = f"Install it as a background service: python3 scripts/install_guardian_service.py --install --env {target_env}"
     else:
         hint = f"Start the loop: python3 scripts/loops/position_guardian_loop.py --interval 60 --env {target_env}"
+    if is_prod_environment(target_env):
+        try:
+            entries, err = eft.load_pending_entries()
+        except Exception as e:
+            entries, err = {}, f"{type(e).__name__}: {e}"
+        if err:
+            pending = f"pending entries registry unreadable: {err}"
+        else:
+            count = sum(1 for rec in (entries or {}).values()
+                        if isinstance(rec, dict) and rec.get("target_env") == target_env)
+            pending = f"{count} pending PROD resting entr{'y' if count == 1 else 'ies'}" if count else None
+        if pending:
+            return "critical", (f"Position guardian loop not alive ({why}) with {pending} in logs/pending_entries.json: "
+                                "a filled entry can stay without its planned SL/TPs (MCP: no pre-armed SL). Run "
+                                "python3 scripts/execute_futures_trade.py --protect-pending now and start the loop. "
+                                f"{hint}")
     return "warn", (f"Position guardian loop not alive ({why}). {impact}; MARKET entries do not need the guardian. "
                     f"{hint}")
 
@@ -598,12 +625,15 @@ def run_doctor(target_env: str = None, auto_heal: bool = False) -> int:
     elif level == "info":
         print(f"ℹ️  [YOLO_SCAN] {msg}")
 
-    # 5c. Position guardian loop liveness (WARN only, never critical; issue #55)
+    # 5c. Position guardian loop liveness (issue #55; critical only in PROD with pending resting entries, issue #167)
     try:
         level, msg = check_guardian_service(target_env)
     except Exception as e:
         level, msg = "warn", f"Position guardian liveness unreadable ({type(e).__name__})."
-    if level == "warn":
+    if level == "critical":
+        critical_failures.append(msg)
+        print(f"❌ [GUARDIAN] {msg}")
+    elif level == "warn":
         warnings.append(msg)
         print(f"⚠️  [GUARDIAN] {msg}")
     else:

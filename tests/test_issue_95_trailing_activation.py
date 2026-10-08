@@ -68,6 +68,18 @@ def short_position(symbol="BTCUSDT", amt="-10", entry="100.0", mark="100.0", lev
     return long_position(symbol=symbol, amt=amt, entry=entry, mark=mark, leverage=leverage)
 
 
+def user_trades_exchange(*args, **kw):
+    """test_issue_106's UserTradesExchange (imported lazily: that module imports this one)."""
+    from test_issue_106_exit_manager_hardening import UserTradesExchange
+    return UserTradesExchange(*args, **kw)
+
+
+def reconciling_fills(open_ts):
+    """BUY 10 at open_ts then SELL 3 (TP1) 5s later: reconciles to positionAmt 7 opened at open_ts (verified)."""
+    from test_issue_106_exit_manager_hardening import buy_fill
+    return [buy_fill(open_ts), dict(buy_fill(open_ts + 5, qty="3"), id=2, side="SELL")]
+
+
 class TestFreshPositionNotTrailed(unittest.TestCase):
 
     def test_fresh_long_keeps_planned_sl(self):
@@ -218,9 +230,11 @@ class TestActivation(unittest.TestCase):
         self.assertEqual(res["activation_reason"], "atr_expansion")
 
     def test_tp1_filled_activates(self):
+        # Issue #163: TP1 counts only for a reference verified against Binance fills (BUY 10 then SELL 3 -> amt 7).
         now = time.time()
         klines, entry_ts = make_klines(flat_pre(), [], (100.8, 99.9, 100.5), now)
-        fake = FakeExchange([long_position(amt="7", mark="100.5")], algos=[stop(501, 90.0)])
+        fake = user_trades_exchange([long_position(amt="7", mark="100.5")], reconciling_fills(int(now) - 7),
+                                    algos=[stop(501, 90.0)])
         with offline(fake) as ws, market(klines):
             write_audit(ws, symbol="BTCUSDT", direction="LONG", entry_price=100.0, sl_price=90.0, total_qty=10,
                         tp1_qty=3, is_yolo=False, target_env="testnet", timestamp=int(now) - 7)
@@ -310,8 +324,8 @@ class TestYoloGate(unittest.TestCase):
     def test_yolo_after_tp1_trails(self):
         now = time.time()
         klines, _ = make_klines(flat_pre(), [], (100.8, 99.9, 100.5), now)
-        fake = FakeExchange([long_position("PEPEUSDT", amt="7", mark="100.5", leverage="15")],
-                            algos=[stop(501, 90.0, symbol="PEPEUSDT")])
+        fake = user_trades_exchange([long_position("PEPEUSDT", amt="7", mark="100.5", leverage="15")],
+                                    reconciling_fills(int(now) - 600), algos=[stop(501, 90.0, symbol="PEPEUSDT")])
         with offline(fake) as ws, market(klines):
             write_audit(ws, symbol="PEPEUSDT", direction="LONG", entry_price=100.0, sl_price=90.0, total_qty=10,
                         tp1_qty=3, is_yolo=True, target_env="testnet", timestamp=int(now) - 600)

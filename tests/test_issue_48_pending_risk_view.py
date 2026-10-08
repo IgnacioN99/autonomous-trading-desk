@@ -914,7 +914,7 @@ class TestGuardianStateOwnership(unittest.TestCase):
         code, err = self.run_once()
         self.assertEqual(code, 0)
         self.assertEqual(self.read_state(), before)
-        self.assertIn("a live guardian loop owns", err)
+        self.assertIn("a live prod guardian loop owns logs/guardian_state.json", err)
         with patch("execute_futures_trade._workspace_dir", return_value=self.ws):
             self.assertTrue(eft.check_guardian_alive("prod")[0])
 

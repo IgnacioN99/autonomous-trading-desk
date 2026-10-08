@@ -16,10 +16,16 @@ Per cycle:
      emergency stop (execute_futures_trade.heal_orphan_position); if the stop cannot be verified,
      the position is closed with a reduce-only market order (fail-safe auto-destruct policy).
   3. Structural trailing (dynamic_exit_manager.update_position_to_structural_stop): place-then-cancel,
-     never loosens. YOLO positions are skipped until TP1 has filled (right-tail preservation). Activation
+     never loosens, stops re-read right before a write. YOLO positions are skipped until TP1 has filled
+     (right-tail preservation). is_yolo / yolo_source / tp1_filled come from dem's result (its matched trade
+     reference; issue #163: TP1 is unknown when the reference is unverified). Activation
      gate (Issue #95): the planned SL is kept (reason "trail_not_activated") until +1.0R of planned risk or
      +2.0x ATR_15m of favourable excursion since entry on closed 15m bars, or TP1 fill; the Chandelier stop is
-     then anchored to the extreme since entry. Take-profit orders are never re-based.
+     then anchored to the extreme since entry. Take-profit orders are never re-based. userTrades is read at most
+     once per symbol per cycle (shared with step 4). "reference_unverified" is reported once per position (not
+     repeated while the previous state already flags it). An unreadable / corrupt logs/trades_audit.jsonl
+     (audit_health) files one issue per state change through report_agent_issue (never in --dry-run, never
+     stops the loop).
   4. Dead-alpha check: reported only; positions are closed (reduce-only) only with --close-dead-alpha.
      DEAD_ALPHA_STALLED requires BOTH the 15m range stall (last 6 closed 15m bars < 0.40%) AND the shared
      holding-time verdict also used by the doctor's watchdog (utils/position_timing.py: held >= 4h, mark within
@@ -48,9 +54,15 @@ Usage:
       [--log-file logs/guardian.log]
   (PROD resting STOP_MARKET / LIMIT entries require a running loop with --interval <= 120; the default interval is
   execute_futures_trade.GUARDIAN_MAX_INTERVAL_FOR_RESTING // 2 = 60s and a larger one prints a warning at start)
-  --log-file tees everything printed to a rotating file (5 MiB x 3 backups, UTF-8; relative to the repo root).
-  Loop mode (not --once, not --dry-run) holds a non-blocking lock on logs/guardian_loop.lock: a second loop prints
-  "another guardian loop is already running; exiting" and exits 0 (so a supervisor does not restart it).
+  --log-file tees everything printed to a rotating file (5 MiB x 3 backups, UTF-8; relative to the repo root); if it
+  cannot be opened, one stderr line is printed and the guardian runs with stdout/stderr only.
+  Loop mode (not --once, not --dry-run) holds a non-blocking per-env lock on logs/guardian_loop.<env>.lock with the
+  holder's {"env", "interval_seconds", "pid", "started_ts"} written into it: a second loop of the same env prints
+  "another guardian loop for <env> is already running (interval <n>s, pid <pid>); exiting" and exits 0 (so a
+  supervisor does not restart it). A loop started before issue #167 holds the legacy logs/guardian_loop.lock: a new
+  loop then prints "a pre-upgrade guardian loop holds logs/guardian_loop.lock; restart the guardian task; exiting".
+  When the lock cannot be taken for another reason the loop runs unlocked and records it as lock_warning (the
+  doctor shows it).
 
 Exit code (--once): 0 when the cycle completed without errors and every position ends protected, else 1.
 
@@ -61,14 +73,18 @@ State file (logs/guardian_state.json):
     "mode": "loop" | "once",           # "loop" when running with --interval (no --once)
     "interval_seconds": int | null,    # loop interval; PROD resting entries need a loop with <= 120s
                                        # (execute_futures_trade.check_guardian_alive)
-    "cycle_ok": bool,                  # no errors and every position protected at the end of the cycle
+    "lock_warning": str | null,        # set when this process runs without the single-instance lock
+    "audit_health": "ok" | "unreadable" | "corrupt" | null,  # logs/trades_audit.jsonl as seen by trailing; carried
+                                       # forward from the previous state when no trailing evaluation ran
+    "cycle_ok": bool,                 # no errors and every position protected at the end of the cycle
     "error_stages": [str],             # distinct stages of "errors" (issue #40): positions_sync or a pending_* stage
                                        # other than pending_unknown_entry makes PROD reject new resting entries
     "positions": [{
       "symbol": str, "side": "LONG" | "SHORT", "size": float, "entry_price": float, "mark_price": float,
       "leverage": int, "unrealized_pnl": float, "liquidation_price": float,
       "protected": bool, "stop_price": float | null,
-      "is_yolo": bool, "yolo_source": str | null, "tp1_filled": bool | null,
+      "is_yolo": bool, "yolo_source": str | null, "tp1_filled": bool | null,  # from dem's result
+      "reference_unverified": bool,    # this cycle's dem reference had no userTrades open time
       "trailing": {"success", "updated", "reason", "previous_sl", "new_sl"?, "planned_sl"?,
                    "activation_reason"?: "tp1_filled" | "r_multiple" | "atr_expansion" | null,
                    "reference_source"?: "trade_audit" | "current_stop", "message",
@@ -93,7 +109,17 @@ Action record (also one JSON line in logs/guardian_actions.jsonl):
            false), "detail": {...}}
 
 A --once run does not overwrite the state of a live loop (mode "loop", fresh by check_guardian_alive's age rule):
-it prints its result and appends its actions only (issue #40).
+it prints its result and appends its actions only (issue #40). Likewise a non-PROD cycle never overwrites a live
+PROD loop's state (issue #167: the PROD liveness attestation wins); a PROD loop always writes.
+
+Request weight per cycle (Binance-documented values at the time of writing, may change; USD-M limit 2400/min per
+IP, shared with the executor and the scanners): GET /fapi/v2/positionRisk (all symbols, 5);
+protect_pending_entries (calls only for pending records); all-symbol GET /fapi/v1/openAlgoOrders and
+/fapi/v1/openOrders (find_unregistered_resting_entries, 40 each); per position: symbol openAlgoOrders twice (orphan
+audit + dem, 1 each), exchangeInfo (calculate_structural_stop, 1), 15m klines limit=99 and limit=10 (1 each),
+userTrades at most once (5); per actual stop write: one more openAlgoOrders re-read, exchangeInfo, the POST, the
+verification reads and the DELETE. About 85 + ~10 per position per cycle: at the 60s default even 10 positions use
+well under 10% of the per-minute limit.
 
 Scheduling: on Windows (WSL) install it as a Task Scheduler task that starts the loop at logon and restarts it on
 failure: python3 scripts/install_guardian_service.py --install --env prod (--status, --uninstall, --dry-run).
@@ -134,9 +160,15 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 DEFAULT_LOG_DIR = os.path.join(BASE_DIR, "logs")
 STATE_FILE_NAME = "guardian_state.json"
 ACTIONS_FILE_NAME = "guardian_actions.jsonl"
-LOCK_FILE_NAME = "guardian_loop.lock"
+LOCK_FILE_TEMPLATE = "guardian_loop.{env}.lock"
+LEGACY_LOCK_FILE_NAME = "guardian_loop.lock"  # shared lock of loops started before issue #167
 LOG_FILE_MAX_BYTES = 5 * 1024 * 1024
 LOG_FILE_BACKUPS = 3
+
+
+def lock_file_name(env):
+    """Per-env single-instance lock file name (issue #167): a TESTNET loop never blocks the PROD one."""
+    return LOCK_FILE_TEMPLATE.format(env=env)
 
 
 def _f(value, default=0.0):
@@ -166,17 +198,19 @@ def _position_view(p):
         "is_yolo": False,
         "yolo_source": None,
         "tp1_filled": None,
+        "reference_unverified": False,
         "trailing": None,
         "dead_alpha": None,
         "error": None,
     }
 
 
-def holding_verdict(p, view, target_env, now_ts=None):
+def holding_verdict(p, view, target_env, now_ts=None, *, fetch=None):
     """Shared holding-time dead-alpha verdict for one positionRisk row (utils/position_timing, issue #92): entry time
-    from Binance fills, then trades_audit, else UNKNOWN; same criteria and ROE as trading_drift_watchdog."""
+    from Binance fills, then trades_audit, else UNKNOWN; same criteria and ROE as trading_drift_watchdog. fetch:
+    send_signed_request-like callable for the userTrades read (the cycle's per-symbol cache)."""
     entry_ts, source = pt.resolve_entry_time(view["symbol"], view["side"], p.get("positionAmt"), target_env,
-                                             entry_price=view["entry_price"], fetch=eft.send_signed_request,
+                                             entry_price=view["entry_price"], fetch=fetch or eft.send_signed_request,
                                              audit_path=os.path.join(eft._workspace_dir(), "logs", "trades_audit.jsonl"))
     elapsed = pt.holding_hours(entry_ts, now_ts)
     res = pt.assess_dead_alpha(elapsed_hours=elapsed, entry_price=view["entry_price"], mark_price=view["mark_price"],
@@ -186,11 +220,16 @@ def holding_verdict(p, view, target_env, now_ts=None):
 
 
 class GuardianCycle:
-    def __init__(self, target_env, dry_run=False, close_dead_alpha=False, log_dir=None, mode="once", interval_seconds=None):
+    def __init__(self, target_env, dry_run=False, close_dead_alpha=False, log_dir=None, mode="once", interval_seconds=None,
+                 lock_warning=None):
         self.env = target_env
         self.dry_run = bool(dry_run)
         self.close_dead_alpha = bool(close_dead_alpha)
         self.log_dir = log_dir or DEFAULT_LOG_DIR
+        self._user_trades = {}  # (SYMBOL, limit) -> userTrades response, shared by trailing and dead alpha
+        self._audit_kinds = set()  # dem's raw audit_* warnings of this cycle (issue #163 escalation)
+        self._audit_resolved = False  # at least one trailing evaluation resolved the trade reference
+        self._previous = {}  # previous guardian_state.json of this env (read at the start of run())
         now = int(time.time())
         self.state = {
             "schema_version": SCHEMA_VERSION,
@@ -200,6 +239,8 @@ class GuardianCycle:
             "dry_run": self.dry_run,
             "mode": mode,
             "interval_seconds": interval_seconds,
+            "lock_warning": lock_warning,
+            "audit_health": None,
             "cycle_ok": False,
             "positions": [],
             "actions": [],
@@ -223,6 +264,34 @@ class GuardianCycle:
         self.state["actions"].append(rec)
         return rec
 
+    def _fetch(self, method, endpoint, params=None, target_env=None, **kw):
+        """send_signed_request with a per-cycle cache for GET /fapi/v1/userTrades keyed by (SYMBOL, limit): trailing
+        and dead alpha share one read per symbol (issue #163). Lists and error payloads are cached alike; an
+        exception propagates uncached. Every other request passes straight through."""
+        if method == "GET" and endpoint == "/fapi/v1/userTrades":
+            p = params or {}
+            key = (str(p.get("symbol")).upper(), p.get("limit"))
+            if key not in self._user_trades:
+                self._user_trades[key] = eft.send_signed_request(method, endpoint, params, target_env=target_env, **kw)
+            return self._user_trades[key]
+        return eft.send_signed_request(method, endpoint, params, target_env=target_env, **kw)
+
+    def _load_previous_state(self):
+        """Previous logs/guardian_state.json when it is a dict for this env, else {}. Read-only, never raises."""
+        try:
+            with open(os.path.join(self.log_dir, STATE_FILE_NAME), "r", encoding="utf-8") as f:
+                prev = json.load(f)
+        except Exception:
+            return {}
+        return prev if isinstance(prev, dict) and prev.get("env") == self.env else {}
+
+    def _was_reference_unverified(self, view):
+        for v in self._previous.get("positions") or []:
+            if (isinstance(v, dict) and v.get("symbol") == view["symbol"] and v.get("side") == view["side"]
+                    and v.get("reference_unverified") is True):
+                return True
+        return False
+
     # -- per-position steps ------------------------------------------------
     def _guard_position(self, p, view):
         sym = view["symbol"]
@@ -242,15 +311,8 @@ class GuardianCycle:
         elif self._heal_orphan(p, view) != "healed":
             return  # still unprotected, dry run, or closed: nothing left to trail
 
-        # 2. Structural trailing (YOLO positions only after TP1)
-        yolo, yolo_src = eft.detect_yolo_position(sym, leverage=p.get("leverage"))
-        tp1_filled, _ = eft.detect_tp1_filled(sym, view["size"])
-        view.update(is_yolo=yolo, yolo_source=yolo_src, tp1_filled=tp1_filled)
-        if yolo and tp1_filled is not True:
-            view["trailing"] = {"success": True, "updated": False, "reason": "yolo_before_tp1",
-                                "message": "YOLO position: trailing deferred until TP1 fills (right-tail preservation)."}
-        else:
-            self._trail(p, view)
+        # 2. Structural trailing (dem defers YOLO positions until TP1 and reports is_yolo / tp1_filled)
+        self._trail(p, view)
 
         # 3. Dead alpha (report only unless --close-dead-alpha)
         self._dead_alpha(p, view)
@@ -283,14 +345,30 @@ class GuardianCycle:
     def _trail(self, p, view):
         sym = view["symbol"]
         try:
-            res = dem.update_position_to_structural_stop(sym, target_env=self.env, dry_run=self.dry_run, position=p)
+            res = dem.update_position_to_structural_stop(sym, target_env=self.env, dry_run=self.dry_run, position=p,
+                                                         fetch=self._fetch)
         except Exception as e:
             self.error(sym, "trailing", e)
             view["trailing"] = {"success": False, "updated": False, "reason": "exception", "message": str(e)}
             return
+        # YOLO / TP1 come from dem's matched trade reference (issue #163); an early return keeps the view defaults.
+        for k in ("is_yolo", "yolo_source", "tp1_filled"):
+            if k in res:
+                view[k] = res[k]
+        if "is_yolo" in res:
+            self._audit_resolved = True
+        raw_warnings = list(res.get("warnings") or [])
+        self._audit_kinds.update(w for w in raw_warnings if isinstance(w, str) and w.startswith("audit_"))
+        view["reference_unverified"] = "reference_unverified" in raw_warnings
         keys = ("success", "updated", "reason", "previous_sl", "new_sl", "planned_sl", "activation_reason",
                 "reference_source", "message", "error", "warnings")
         view["trailing"] = {k: res.get(k) for k in keys if k in res}
+        if "warnings" in view["trailing"]:
+            warnings = list(raw_warnings)
+            if view["reference_unverified"] and self._was_reference_unverified(view):
+                # Reported once per position: already flagged in the previous cycle's state.
+                warnings = [w for w in warnings if w != "reference_unverified"]
+            view["trailing"]["warnings"] = warnings
         if res.get("updated"):
             view["stop_price"] = res.get("new_sl")
             self.action(sym, "trail_stop", True, view["trailing"])
@@ -299,7 +377,7 @@ class GuardianCycle:
         elif not res.get("success"):
             if res.get("reason") == "new_stop_unverified":
                 self.action(sym, "trail_stop", False, view["trailing"])
-                if not res.get("previous_sl"):
+                if not res.get("current_sl"):  # the stops re-read right before the write (issue #167)
                     view["protected"] = False
             self.error(sym, "trailing", res.get("error") or res.get("message"))
 
@@ -321,7 +399,7 @@ class GuardianCycle:
         if da.get("status") != "DEAD_ALPHA_STALLED":
             return  # no 15m stall: no holding-time lookup (saves a userTrades call per position per cycle)
         try:
-            verdict = holding_verdict(p, view, self.env)
+            verdict = holding_verdict(p, view, self.env, fetch=self._fetch)
         except Exception as e:
             verdict = {"verdict": pt.VERDICT_UNKNOWN, "elapsed_hours": None, "entry_time_source": pt.SOURCE_UNKNOWN}
             self.error(sym, "dead_alpha", f"holding time unresolved: {type(e).__name__}: {e}")
@@ -387,6 +465,7 @@ class GuardianCycle:
 
     # -- cycle -------------------------------------------------------------
     def run(self):
+        self._previous = self._load_previous_state()
         self._protect_pending()
         try:
             pos_res = eft.send_signed_request("GET", "/fapi/v2/positionRisk", target_env=self.env)
@@ -417,25 +496,46 @@ class GuardianCycle:
     def finish(self):
         self.state["cycle_ok"] = not self.state["errors"] and all(v["protected"] for v in self.state["positions"])
         self.state["error_stages"] = sorted({str(e.get("stage")) for e in self.state["errors"]})
+        previous_health = self._previous.get("audit_health")
+        health = self._audit_health(previous_health)
+        self.state["audit_health"] = health
         self.persist()
+        if health in ("unreadable", "corrupt") and health != previous_health and not self.dry_run:
+            _report_audit_health(self.env, health, sorted(self._audit_kinds))
         return self.state
 
+    def _audit_health(self, previous_health):
+        """Issue #163: "unreadable" / "corrupt" from dem's raw audit warnings of this cycle, "ok" when a trailing
+        evaluation resolved the reference without them, else the previous state's value (no evaluation ran)."""
+        if "audit_unreadable" in self._audit_kinds:
+            return "unreadable"
+        if any(k.startswith("audit_corrupt_lines") for k in self._audit_kinds):
+            return "corrupt"
+        if self._audit_resolved:
+            return "ok"
+        return previous_health if previous_health in ("ok", "unreadable", "corrupt") else None
+
     def _keeps_loop_state(self, path):
-        """Issue #40: a --once run never overwrites the state of a guardian loop that is still alive (mode "loop",
-        fresh by check_guardian_alive's age rule, any env), so it cannot drop the loop's liveness attestation."""
-        if self.state.get("mode") != "once":
-            return False
+        """Env of a live guardian loop whose state this cycle must not overwrite, else None. Issue #40: a --once run
+        never overwrites a live loop's state (any env). Issue #167: a non-PROD cycle never overwrites a live PROD
+        loop's state (PROD liveness attestation); a PROD loop always writes. Live = fresh by
+        check_guardian_alive's age rule (guardian_loop_state_fresh)."""
         try:
             with open(path, "r", encoding="utf-8") as f:
                 existing = json.load(f)
         except (OSError, ValueError):
-            return False
-        return eft.guardian_loop_state_fresh(existing)
+            return None
+        if not eft.guardian_loop_state_fresh(existing):
+            return None
+        if self.state.get("mode") == "once" or (existing.get("env") == "prod" and self.env != "prod"):
+            return str(existing.get("env") or "unknown-env")
+        return None
 
     def persist(self):
         state_path = os.path.join(self.log_dir, STATE_FILE_NAME)
-        if self._keeps_loop_state(state_path):
-            print("guardian: a live guardian loop owns logs/guardian_state.json; this --once cycle is not recorded "
+        owner = self._keeps_loop_state(state_path)
+        if owner is not None:
+            print(f"guardian: a live {owner} guardian loop owns logs/guardian_state.json; this cycle is not recorded "
                   "there (its actions are still appended to logs/guardian_actions.jsonl)", file=sys.stderr)
         else:
             try:
@@ -450,10 +550,31 @@ class GuardianCycle:
                 print(f"guardian: failed to append action: {e}", file=sys.stderr)
 
 
-def run_cycle(target_env=None, dry_run=False, close_dead_alpha=False, log_dir=None, mode="once", interval_seconds=None):
+def _report_audit_health(env, health, detail):
+    """Issue #163: file an issue when logs/trades_audit.jsonl turns unreadable or corrupt (called once per state
+    change). Never raises: reporting must never change cycle_ok or stop the loop. error_detail is stable so the
+    reporter's 24h fingerprint dedups as a second layer."""
+    try:
+        import report_agent_issue
+        severity, priority = ("HIGH", "P1") if health == "unreadable" else ("MEDIUM", "P2")
+        report_agent_issue.report_issue(
+            title=f"position_guardian_loop: logs/trades_audit.jsonl is {health}",
+            error_detail=f"trades_audit.jsonl {health}",
+            category="risk_gate", severity=severity, priority=priority,
+            agent_name="position_guardian_loop",
+            affected_files="logs/trades_audit.jsonl, scripts/dynamic_exit_manager.py:_resolve_trade_reference_full",
+            context=(f"env={env}; warnings={', '.join(detail)}; trailing reference falls back to "
+                     "the current stop; executor Gate 0A reads the same file"),
+            remediation="Inspect logs/trades_audit.jsonl (malformed or unreadable lines); do not hand-edit it during trading.")
+    except Exception as e:
+        print(f"guardian: trades_audit health report could not be filed ({type(e).__name__}: {e})", file=sys.stderr)
+
+
+def run_cycle(target_env=None, dry_run=False, close_dead_alpha=False, log_dir=None, mode="once", interval_seconds=None,
+              lock_warning=None):
     target_env = resolve_env(target_env)
     return GuardianCycle(target_env, dry_run=dry_run, close_dead_alpha=close_dead_alpha, log_dir=log_dir,
-                         mode=mode, interval_seconds=interval_seconds).run()
+                         mode=mode, interval_seconds=interval_seconds, lock_warning=lock_warning).run()
 
 
 def format_state(state):
@@ -469,6 +590,8 @@ def format_state(state):
         lines.append(f"  * action {a['type']} {a['symbol']} success={a['success']}{' (dry run)' if a['dry_run'] else ''}")
     for e in state["errors"]:
         lines.append(f"  ! {e['stage']} {e['symbol'] or ''}: {str(e['error']).splitlines()[0]}")
+    if state.get("lock_warning"):
+        lines.append(f"  ! lock: {state['lock_warning']}")
     return "\n".join(lines)
 
 
@@ -554,36 +677,89 @@ _LOCK_HELD_ERRNOS = {errno.EWOULDBLOCK, errno.EAGAIN}
 _MSVCRT_LOCK_HELD_ERRNOS = {errno.EACCES, getattr(errno, "EDEADLOCK", errno.EDEADLK)}
 
 
-def _acquire_loop_lock(log_dir):
-    """Non-blocking exclusive lock on <log_dir>/guardian_loop.lock (flock on POSIX, msvcrt.locking on Windows).
-    Returns (held_by_other, fh); fh stays open while the loop runs. Only "already locked" (EWOULDBLOCK/EAGAIN, or
-    EACCES/EDEADLOCK from msvcrt) means another loop holds it. Any other error (open failure, ENOLCK, EOPNOTSUPP)
-    prints one stderr line and the loop runs unlocked: the lock never stops the guardian."""
+def _try_lock(fh):
+    """Non-blocking exclusive lock on an open file (flock on POSIX, msvcrt.locking on Windows); raises OSError."""
+    if fcntl is not None:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    elif msvcrt is not None:
+        fh.seek(0)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+
+
+def _lock_held_errnos():
+    return _LOCK_HELD_ERRNOS if fcntl is not None else _MSVCRT_LOCK_HELD_ERRNOS
+
+
+def _close_quietly(fh):
+    try:
+        fh.close()
+    except OSError:
+        pass
+
+
+def _legacy_lock_held(log_dir):
+    """True only when the pre-issue-#167 shared <log_dir>/guardian_loop.lock exists and another process holds it
+    (a loop started before the upgrade). Any other error counts as not held: it never blocks the guardian."""
+    path = os.path.join(log_dir, LEGACY_LOCK_FILE_NAME)
+    if not os.path.exists(path):
+        return False
+    try:
+        fh = open(path, "a+")
+    except OSError:
+        return False
+    try:
+        _try_lock(fh)
+    except OSError as e:
+        _close_quietly(fh)
+        return e.errno in _lock_held_errnos()
+    _release_loop_lock(fh)
+    return False
+
+
+def _acquire_loop_lock(log_dir, env, interval_seconds=None):
+    """Non-blocking exclusive lock on <log_dir>/guardian_loop.<env>.lock (issue #167: per env, so a TESTNET loop never
+    blocks the PROD one). Returns (held_by_other, fh, info); fh stays open while the loop runs.
+    - Held by another process (EWOULDBLOCK/EAGAIN, or EACCES/EDEADLOCK from msvcrt): info is the holder JSON written
+      into the lock file ({"env", "interval_seconds", "pid", "started_ts"}) or None when unreadable. A held legacy
+      guardian_loop.lock (a loop started before the upgrade) also counts: info {"legacy": True}.
+    - Any other error (open failure, ENOLCK, EOPNOTSUPP): one stderr line, the loop runs unlocked and info is that
+      warning text (recorded as lock_warning in the state): the lock never stops the guardian.
+    - Acquired: the holder JSON is written into the file (best effort) and info is None."""
+    name = lock_file_name(env)
     try:
         os.makedirs(log_dir, exist_ok=True)
-        fh = open(os.path.join(log_dir, LOCK_FILE_NAME), "a+")
+        fh = open(os.path.join(log_dir, name), "a+")
     except OSError as e:
-        print(f"guardian: cannot open {LOCK_FILE_NAME} ({e}); running without the single-instance lock",
-              file=sys.stderr)
-        return False, None
+        warning = f"cannot open {name} ({e}); running without the single-instance lock"
+        print(f"guardian: {warning}", file=sys.stderr)
+        return False, None, warning
     try:
-        if fcntl is not None:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        elif msvcrt is not None:
-            fh.seek(0)
-            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
-        return False, fh
+        _try_lock(fh)
     except OSError as e:
-        held_errnos = _LOCK_HELD_ERRNOS if fcntl is not None else _MSVCRT_LOCK_HELD_ERRNOS
-        try:
-            fh.close()
-        except OSError:
-            pass
-        if e.errno in held_errnos:
-            return True, None
-        print(f"guardian: cannot lock {LOCK_FILE_NAME} ({e}); running without the single-instance lock",
-              file=sys.stderr)
-        return False, None
+        if e.errno in _lock_held_errnos():
+            try:
+                fh.seek(0)
+                info = json.loads(fh.read())
+            except Exception:
+                info = None
+            _close_quietly(fh)
+            return True, None, info if isinstance(info, dict) else None
+        _close_quietly(fh)
+        warning = f"cannot lock {name} ({e}); running without the single-instance lock"
+        print(f"guardian: {warning}", file=sys.stderr)
+        return False, None, warning
+    if _legacy_lock_held(log_dir):
+        _release_loop_lock(fh)
+        return True, None, {"legacy": True}
+    try:
+        fh.seek(0)
+        fh.truncate()
+        fh.write(json.dumps({"env": env, "interval_seconds": interval_seconds, "pid": os.getpid(),
+                             "started_ts": int(time.time())}))
+        fh.flush()
+    except OSError:
+        pass
+    return False, fh, None
 
 
 def _release_loop_lock(fh):
@@ -622,22 +798,44 @@ def main(argv=None):
         return 1
 
     lock_fh = None
+    lock_warning = None
     if not args.once and not args.dry_run:
-        held_by_other, lock_fh = _acquire_loop_lock(DEFAULT_LOG_DIR)
+        held_by_other, lock_fh, info = _acquire_loop_lock(DEFAULT_LOG_DIR, target_env, max(int(args.interval), 10))
         if held_by_other:
-            message = "another guardian loop is already running; exiting"
-            print(json.dumps({"success": True, "already_running": True, "message": message})
+            if isinstance(info, dict) and info.get("legacy"):
+                message = ("a pre-upgrade guardian loop holds logs/guardian_loop.lock; restart the guardian task; "
+                           "exiting")
+            elif isinstance(info, dict) and "interval_seconds" in info and "pid" in info:
+                message = (f"another guardian loop for {target_env} is already running "
+                           f"(interval {info.get('interval_seconds')}s, pid {info.get('pid')}); exiting")
+            else:
+                message = (f"another guardian loop for {target_env} is already running (holder details unavailable); "
+                           "exiting")
+            print(json.dumps({"success": True, "already_running": True, "env": target_env, "holder": info,
+                              "message": message})
                   if args.json_output else message, flush=True)
             return 0
+        if isinstance(info, str):
+            lock_warning = info
 
     saved_streams = (sys.stdout, sys.stderr)
     handler = None
     try:
         if args.log_file:
-            logger, handler = _open_log_file(args.log_file, error_stream=saved_streams[1])
-            sys.stdout = _TeeStream(sys.stdout, logger)
-            sys.stderr = _TeeStream(sys.stderr, logger)
-        return _run_main(args, target_env)
+            try:
+                logger, handler = _open_log_file(args.log_file, error_stream=saved_streams[1])
+            except Exception as e:
+                handler = None
+                try:
+                    saved_streams[1].write(f"guardian: cannot open --log-file {args.log_file} ({type(e).__name__}: "
+                                           f"{e}); running without the log file\n")
+                    saved_streams[1].flush()
+                except Exception:
+                    pass
+            if handler is not None:
+                sys.stdout = _TeeStream(sys.stdout, logger)
+                sys.stderr = _TeeStream(sys.stderr, logger)
+        return _run_main(args, target_env, lock_warning=lock_warning)
     finally:
         if handler is not None:
             for stream in (sys.stdout, sys.stderr):
@@ -650,7 +848,7 @@ def main(argv=None):
         _release_loop_lock(lock_fh)
 
 
-def _run_main(args, target_env):
+def _run_main(args, target_env, lock_warning=None):
     interval = max(int(args.interval), 10)
     mode = "once" if args.once else "loop"
     if not args.once and interval > eft.GUARDIAN_MAX_INTERVAL_FOR_RESTING:
@@ -661,7 +859,8 @@ def _run_main(args, target_env):
     def one_cycle():
         try:
             state = run_cycle(target_env, dry_run=args.dry_run, close_dead_alpha=args.close_dead_alpha,
-                              mode=mode, interval_seconds=None if args.once else interval)
+                              mode=mode, interval_seconds=None if args.once else interval,
+                              lock_warning=lock_warning)
         except Exception as e:  # never let a cycle crash the loop
             print(f"guardian: cycle failed: {e}", file=sys.stderr)
             return False
