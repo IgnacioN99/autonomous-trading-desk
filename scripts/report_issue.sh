@@ -365,7 +365,7 @@ while [[ $# -gt 0 ]]; do
             echo "  -p, --priority <Px>             P0 | P1 | P2 | P3 (default from severity:"
             echo "                                  CRITICAL->P0, HIGH->P1, MEDIUM->P2, LOW->P3)"
             echo "  -c, --category <type>           agent_failure | risk_gate | tool_error | infra (default: agent_failure;"
-            echo "                                  case-insensitive, [a-z0-9_-] only, otherwise exit 2)"
+            echo "                                  case-insensitive, spaces/dashes become '_', other characters outside [a-z0-9_] exit 2)"
             echo "  -a, --agent <name>              Reporting agent name (default: autonomous_agent)"
             echo "  -r, --remediation <text>        Suggested fix or remediation step"
             echo "  --repro <text>                  Exact reproduction command and its exit code (for the trade executor:"
@@ -373,8 +373,10 @@ while [[ $# -gt 0 ]]; do
             echo "  --root-cause <text>             Suspected or confirmed root cause"
             echo "  --affected-files <list>         Code pointers 'path:lines, path:lines' (comma or newline separated)"
             echo "  --context <text>                What the agent was doing and what it observed"
-            echo "  --context-file <path>           File appended to --context (first 8000 chars)"
-            echo "  --output-file <path>            Raw command/agent output; last 200 lines (max 12000 chars) attached"
+            echo "  --context-file <path>           File appended to --context (first 8000 chars);"
+            echo "                                  credential files (.env, *.env, MCP configs, *.pem, *.key) exit 2"
+            echo "  --output-file <path>            Raw command/agent output; last 200 lines (max 12000 chars) attached;"
+            echo "                                  credential files (.env, *.env, MCP configs, *.pem, *.key) exit 2"
             echo "  --impact <text>                 Operational impact on the desk (default derived from category)"
             echo "  --acceptance-criteria <text>    Acceptance criteria, one per line or ';'-separated"
             echo "  --repo <owner/repo>             Target GitHub repository (derived dynamically if omitted)"
@@ -383,7 +385,7 @@ while [[ $# -gt 0 ]]; do
             echo "Labels: agent-failure, severity:<level>, priority:<Px>, cat:<category>. If the repository rejects"
             echo "labels they are created (gh label create --force) and the create is retried; as a last resort the"
             echo "issue is created unlabelled with a '[SEV/Px] ' title prefix and the labels are added afterwards."
-            echo "Free text is sanitized (tokens, keys, USD/USDT amounts, numeric values of monetary keys)."
+            echo "Free text is sanitized (tokens, secret/token/password/api-key values, signature/listenKey, USD/USDT amounts, monetary keys); t_stat=-3.42 style quant values are kept."
             echo "Only HTTP 422 triggers the label fallback; other gh/curl failures queue the report in the backlog."
             echo "Backlog: \${ISSUE_REPORTER_LOGS_DIR:-logs}/issues_backlog.jsonl"
             exit 0
@@ -508,12 +510,34 @@ else
     esac
 fi
 
-CATEGORY_LOWER=$(printf '%s' "$CATEGORY" | tr '[:upper:]' '[:lower:]')
+CATEGORY_LOWER=$(printf '%s' "$CATEGORY" | tr '[:upper:]' '[:lower:]' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g; s/[[:space:]-]+/_/g')
 if ! [[ "$CATEGORY_LOWER" =~ ^[a-z0-9_-]+$ ]]; then
-    echo "❌ Error: invalid --category '${CATEGORY}' (lowercase letters, digits, '_' and '-' only, e.g. tool_error|risk_gate|infra|agent_failure)."
+    echo "❌ Error: invalid --category '${CATEGORY}' (lowercase letters, digits and '_' only; spaces and '-' become '_', e.g. tool_error|risk_gate|infra|agent_failure)."
     exit 2
 fi
 CATEGORY="$CATEGORY_LOWER"
+
+CREDENTIAL_PATH_RE='^(\.env(\..*)?|.*\.env|\.?mcp\.json|.*mcp_config.*|.*credentials.*|.*\.pem|.*\.key)$'
+# True when the path as given or its resolved target names a credential-bearing file (#58)
+is_credential_path() {
+    local candidate resolved base
+    resolved=$(readlink -f -- "$1" 2>/dev/null || true)
+    for candidate in "$1" "$resolved"; do
+        [ -n "$candidate" ] || continue
+        candidate="${candidate//\\//}"
+        base=$(printf '%s' "${candidate##*/}" | tr '[:upper:]' '[:lower:]')
+        [[ "$base" =~ $CREDENTIAL_PATH_RE ]] && return 0
+    done
+    return 1
+}
+for attach_pair in "--context-file:${CONTEXT_FILE}" "--output-file:${OUTPUT_FILE}"; do
+    attach_flag="${attach_pair%%:*}"
+    attach_path="${attach_pair#*:}"
+    if [ -n "$attach_path" ] && is_credential_path "$attach_path"; then
+        echo "❌ Error: refusing to attach '${attach_path}' (${attach_flag}): credential-bearing file (.env, *.env, MCP configs (.mcp.json, mcp_config*), *credentials*, *.pem, *.key). Copy only the relevant non-secret lines into logs/issue_output_<unix_ts>.log and attach that file instead."
+        exit 2
+    fi
+done
 
 SEV_LABEL="severity:$(printf '%s' "$SEVERITY" | tr '[:upper:]' '[:lower:]')"
 PRIO_LABEL="priority:${PRIORITY}"
@@ -533,6 +557,10 @@ sanitize_telemetry() {
     text=$(printf '%s\n' "$text" | sed -E 's|(Bearer[[:space:]]+)[A-Za-z0-9._~+/-]+=*|\1[REDACTED_TOKEN]|gI')
     # Redact API Keys / Passwords
     text=$(printf '%s\n' "$text" | sed -E 's/(api[_-]?key|secret[_-]?key|password|app[_-]?password)[[:space:]]*[:=][[:space:]]*["\x27]?[A-Za-z0-9/+=._-]{8,}["\x27]?/\1=[REDACTED]/gI')
+    # Generic secret/token/password/private-key/api-key values (key=value, key: value, JSON "key": "value"); key name kept
+    text=$(printf '%s\n' "$text" | sed -E 's/((secret|token|passw(or)?d|private[_-]?key|api[_-]?key)[A-Za-z0-9_-]*"?[[:blank:]]*[:=][[:blank:]]*"?)[A-Za-z0-9/+=._~-]+/\1[REDACTED]/gI')
+    # Binance signed-request signatures and user-data stream listen keys
+    text=$(printf '%s\n' "$text" | sed -E 's/((signature|listen[_-]?key)"?[[:blank:]]*[:=][[:blank:]]*"?)[A-Za-z0-9]+/\1[REDACTED]/gI')
     # Redact numeric values of monetary keys in JSON / key=value text (e.g. "notional_usdt": 4321.87, margin=-3.2)
     text=$(printf '%s\n' "$text" | sed -E 's/("?[A-Za-z0-9_]*(usdt|usd|pnl|notional|margin|balance|equity|profit|wallet)[A-Za-z0-9_]*"?[[:space:]]*[:=][[:space:]]*)["\x27]?[-+]?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?["\x27]?/\1"[REDACTED]"/gI')
     # Redact balances and dollar amounts (signed too: $+3087.31, $-16.75)
@@ -540,8 +568,13 @@ sanitize_telemetry() {
     # Amounts followed by USDT/USD, also after a closing backtick/bold marker (`3.20` USDT, **3.20** USDT);
     # the non-word guard keeps symbols such as API3USDT / C98USDT intact
     text=$(printf '%s\n' "$text" | sed -E 's/(^|[^A-Za-z0-9_])[0-9]+(\.[0-9]+)?[`*]*[[:space:]]*(USDT|USD)/\1[REDACTED_AMT] USDT/gI')
+    # Labelled quant statistics (t_stat: -3.42, "z": -2.15, beta:-0.87) keep their sign: protect it, redact, restore
+    text=$(printf '%s\n' "$text" | sed -E -e 's/~Q(NEG|POS)~//g' \
+        -e 's/(^|[^A-Za-z0-9_])("?(t[_-]?stat|tstat|z|z[_-]?score|beta|half[_-]?life|hurst|r2|p[_-]?value|pvalue|corr)"?[[:blank:]]*[:=][[:blank:]]*)-([0-9])/\1\2~QNEG~\4/gI' \
+        -e 's/(^|[^A-Za-z0-9_])("?(t[_-]?stat|tstat|z|z[_-]?score|beta|half[_-]?life|hurst|r2|p[_-]?value|pvalue|corr)"?[[:blank:]]*[:=][[:blank:]]*)\+([0-9])/\1\2~QPOS~\4/gI')
     # Bare signed decimals (PnL table cells like "| -16.75 |"), not percentages
     text=$(printf '%s\n' "$text" | sed -E -e ':a' -e 's/(^|[[:space:]|`(:])[+-][0-9]+\.[0-9]+([^0-9%]|$)/\1[REDACTED_AMT]\2/' -e 'ta')
+    text=$(printf '%s\n' "$text" | sed -E -e 's/~QNEG~/-/g' -e 's/~QPOS~/+/g')
     printf '%s\n' "$text"
 }
 

@@ -53,10 +53,10 @@ Rigorously verify the following mathematical axioms in every code change:
 
 3. **Right-Tail Anti-Truncation & True Net Break-Even:**
    - Moving the Stop Loss to Break-Even prematurely on minor fluctuations or 5m noise is prohibited.
-   - On memecoins (15x), the SL only moves to BE after TP1 (+75% ROE) is confirmed filled.
+   - On YOLO memecoins (`leverage_yolo`), the SL only moves to BE after TP1 is confirmed filled (TP1 at +1.8R; ROE = price % × `leverage_yolo`).
    - In standard intraday, the SL only moves to True Net Break-Even after a minimum expansion of $+2.0 \times \text{ATR}_{15m}$ or a TP1 fill.
    - **True Net BE Buffer:** The Break-Even price MUST include the Binance taker roundtrip fee buffer (+0.2%), never the exact entry price (to avoid net losses from fee friction).
-   - **Trailing Activation Gate:** the planned SL is kept until **+1.0R** or **+2.0x ATR_15m** of favourable excursion since entry (closed 15m bars) or a TP1 fill; YOLO positions are never trailed before TP1. Before +2.0x ATR_15m or TP1 an activated trail stays at least one tick short of entry (never in the fee dead zone).
+   - **Trailing Activation Gate:** the planned SL is kept until **+1.0R** or **+2.0x ATR_15m** of favourable excursion since entry (closed 15m bars) or a TP1 fill; YOLO positions are never trailed before TP1. Before +2.0x ATR_15m or TP1 an activated trail stays at least one tick short of entry (never in the fee dead zone). TP1 counts only when the trade reference is verified against Binance fills (MCP or unavailable fills: TP1 unknown, no TP1-based trail or BE). The one-tick-short cap gives up profit protection on a fast reversal through entry; accepted to stay out of the fee dead zone. (Same thresholds as AGENTS.md Layer 8 / Dynamic Exit Management; edit both together.)
    - **TPs never re-based:** trailing and break-even moves only touch the Stop Loss; TP1/TP2 keep their original levels.
 
 4. **Stat-Arb & Cointegration (Engine 2):**

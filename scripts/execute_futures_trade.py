@@ -1065,7 +1065,7 @@ def latest_trade_audit_record(symbol, base_dir=None):
     return None
 
 
-def detect_yolo_position(symbol, leverage=None, explicit=None, base_dir=None, *, record=None):
+def detect_yolo_position(symbol, leverage=None, explicit=None, base_dir=None, *, record=None, audit_fallback=True):
     """
     Returns (is_yolo, source). A position is YOLO if any of:
       - explicit flag (can only mark a position as YOLO, never un-mark it),
@@ -1074,6 +1074,7 @@ def detect_yolo_position(symbol, leverage=None, explicit=None, base_dir=None, *,
         latest entry: the caller's already-matched trade reference),
       - leverage >= profile leverage_yolo, or leverage > profile leverage_standard (the executor refuses
         leverage above leverage_standard for non-YOLO trades).
+    audit_fallback=False with record None skips the latest-entry lookup (no stale record of another trade).
     """
     if _truthy(explicit):
         return True, 'explicit_flag'
@@ -1085,7 +1086,10 @@ def detect_yolo_position(symbol, leverage=None, explicit=None, base_dir=None, *,
             return True, 'dossier_candidate'
     except Exception:
         pass
-    rec = record if record is not None else latest_trade_audit_record(symbol, base)
+    if record is not None:
+        rec = record
+    else:
+        rec = latest_trade_audit_record(symbol, base) if audit_fallback else None
     if rec and _truthy(rec.get('is_yolo')):
         return True, 'trade_audit'
     if leverage:

@@ -118,7 +118,7 @@ Whenever the user explicitly requests crypto trading operations, Binance Futures
 
 5. **Phase 5: Automated GitHub Issue Reporting (Self-Healing & Observability)**
    - On any unrecoverable failure, exception, anomalous API rejection or harness misconfiguration at any stage, the agent MUST immediately run (`run_command`):
-     `./scripts/report_issue.sh --title "..." --error "..." --category tool_error --severity HIGH --priority P1`
-   - Always pass the structured flags (`--repro`, `--root-cause`, `--affected-files`, `--context`/`--context-file`, `--output-file`, `--acceptance-criteria`); full contract in `.agents/rules/trading-code-freeze.md`. Offline it queues to `logs/issues_backlog.jsonl`.
+     `./scripts/report_issue.sh --title "..." --error "..." --category tool_error --severity HIGH`
+   - Pass every structured flag you have evidence for and never invent values; full contract in `.agents/rules/trading-code-freeze.md`. Offline it queues to `logs/issues_backlog.jsonl`.
 
 6. **PR Review:** Run the `/pr-review` skill (`.agents/skills/pr-review/SKILL.md`): one `invoke_subagent` call with the read-only `*_reviewer` subagents listed by `scripts/ci/triage_pr.py`. The Stop hook starts it after `gh pr create` or a feature-branch push.

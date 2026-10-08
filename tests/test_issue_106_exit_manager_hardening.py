@@ -376,6 +376,7 @@ class TestAuditReadabilityWarnings(unittest.TestCase):
         healthy = {"status": "HEALTHY_MOMENTUM", "range_pct": 1.2, "recommendation": "HOLD", "message": "ok"}
         with offline(fake) as ws, market(klines), patch.object(pgl, "DEFAULT_LOG_DIR", log_dir), \
              patch("dynamic_exit_manager.check_dead_alpha_timeout", return_value=healthy), \
+             patch("report_agent_issue.report_issue"), \
              contextlib.redirect_stdout(io.StringIO()):
             prepare(ws)
             code = pgl.main(["--once", "--env", "testnet"])

@@ -333,13 +333,14 @@ class TestGuardianLoopService(unittest.TestCase):
     @unittest.skipIf(fcntl is None, "fcntl not available")
     def test_second_loop_exits_0_while_the_lock_is_held_and_once_ignores_it(self):
         os.makedirs(self.log_dir, exist_ok=True)
-        holder = open(os.path.join(self.log_dir, pgl.LOCK_FILE_NAME), "a+")
+        holder = open(os.path.join(self.log_dir, pgl.lock_file_name("testnet")), "a+")
         self.addCleanup(holder.close)
         fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         cycle = MagicMock(side_effect=AssertionError("the second loop must not run a cycle"))
         code, out, _ = self.run_loop(["--interval", "60", "--env", "testnet"], cycle=cycle)
         self.assertEqual(code, 0)
-        self.assertIn("another guardian loop is already running; exiting", out)
+        self.assertIn("another guardian loop for testnet is already running (holder details unavailable); exiting",
+                      out)
         cycle.assert_not_called()
         code, out, _ = self.run_loop(["--once", "--env", "testnet"])
         self.assertEqual(code, 0, out)
@@ -377,7 +378,7 @@ class TestGuardianLoopService(unittest.TestCase):
             code, out, err = capture(pgl.main, ["--interval", "60", "--env", "testnet"])
         self.assertEqual(code, 0)
         self.assertIn("CYCLE RAN", out)
-        self.assertIn("cannot open guardian_loop.lock", err)
+        self.assertIn("cannot open guardian_loop.testnet.lock", err)
 
     def test_held_lock_errno_exits_0_with_json(self):
         for code_ in (errno.EWOULDBLOCK, errno.EAGAIN):
@@ -385,8 +386,10 @@ class TestGuardianLoopService(unittest.TestCase):
             with self.fake_fcntl(BlockingIOError(code_, "busy")):
                 code, out, _ = self.run_loop(["--interval", "60", "--env", "testnet", "--json"], cycle=cycle)
             self.assertEqual(code, 0)
-            self.assertEqual(json.loads(out), {"success": True, "already_running": True,
-                                               "message": "another guardian loop is already running; exiting"})
+            self.assertEqual(json.loads(out), {"success": True, "already_running": True, "env": "testnet",
+                                               "holder": None,
+                                               "message": "another guardian loop for testnet is already running "
+                                                          "(holder details unavailable); exiting"})
             cycle.assert_not_called()
 
     def test_log_rollover_failure_never_stops_the_cycle(self):
@@ -411,7 +414,7 @@ class TestGuardianLoopService(unittest.TestCase):
     @unittest.skipIf(fcntl is None, "fcntl not available")
     def test_loop_releases_the_lock_on_exit(self):
         self.run_loop(["--interval", "60", "--env", "testnet"])
-        with open(os.path.join(self.log_dir, pgl.LOCK_FILE_NAME), "a+") as fh:
+        with open(os.path.join(self.log_dir, pgl.lock_file_name("testnet")), "a+") as fh:
             fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)  # raises if still held
             fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
