@@ -144,6 +144,74 @@ def get_leverage_ceiling(profile: Optional[Dict[str, Any]] = None) -> int:
         return DEFAULT_LEVERAGE_CEILING
     return min(value, MAX_LEVERAGE_CEILING)
 
+# Issue #183: R-based profit-lock steps applied by dynamic_exit_manager once True Net BE is allowed (verified TP1
+# fill or closed-15m MFE >= 2x ATR_15m). lock_r 0 = True Net BE; lock_r > 0 = entry +/- lock_r x initial risk.
+DEFAULT_EXIT_MANAGEMENT = {
+    "profit_lock_enabled": True,
+    "profit_lock_steps": [{"mfe_r": 1.0, "lock_r": 0.0}, {"mfe_r": 2.0, "lock_r": 1.0}, {"mfe_r": 3.0, "lock_r": 2.0}],
+    "extend_last_step": True,   # beyond the last step, each further full 1.0R of MFE raises the lock by 1.0R
+    "lock_on_tp1": True,        # on a verified TP1 fill the lock also uses intrabar MFE (closed 1m bars, mark, TP1)
+}
+
+
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value == value \
+        and value not in (float("inf"), float("-inf"))
+
+
+def _profit_lock_steps_error(steps) -> Optional[str]:
+    """Why `steps` is not a valid profit_lock_steps list, else None."""
+    if not isinstance(steps, list) or not steps:
+        return "must be a non-empty list"
+    prev = None
+    for i, step in enumerate(steps):
+        if not isinstance(step, dict) or not _is_number(step.get("mfe_r")) or not _is_number(step.get("lock_r")):
+            return f"step {i} needs numeric mfe_r and lock_r"
+        mfe_r, lock_r = float(step["mfe_r"]), float(step["lock_r"])
+        if mfe_r <= 0:
+            return f"step {i} mfe_r must be > 0"
+        if not 0 <= lock_r < mfe_r:
+            return f"step {i} needs 0 <= lock_r < mfe_r"
+        if prev is not None and mfe_r <= prev:
+            return f"step {i} mfe_r must be strictly ascending"
+        prev = mfe_r
+    return None
+
+
+def get_exit_management(profile: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Profile `exit_management` (issue #183) merged key by key over DEFAULT_EXIT_MANAGEMENT. An invalid value falls
+    back to the default for that key only and adds a warning. Returns profit_lock_enabled, profit_lock_steps (list of
+    {"mfe_r": float, "lock_r": float}), extend_last_step, lock_on_tp1 and warnings (list of str). Never raises."""
+    warnings = []
+    out = {k: v for k, v in DEFAULT_EXIT_MANAGEMENT.items() if k != "profit_lock_steps"}
+    out["profit_lock_steps"] = [dict(s) for s in DEFAULT_EXIT_MANAGEMENT["profit_lock_steps"]]
+    try:
+        if profile is None:
+            profile = load_user_profile()
+        raw = (profile or {}).get("exit_management") if isinstance(profile, dict) else None
+    except Exception as e:
+        raw = None
+        warnings.append(f"exit_management unreadable ({type(e).__name__}); defaults used")
+    if raw is not None and not isinstance(raw, dict):
+        warnings.append("exit_management invalid: must be an object; defaults used")
+        raw = None
+    for key in ("profit_lock_enabled", "extend_last_step", "lock_on_tp1"):
+        if raw and key in raw:
+            if isinstance(raw[key], bool):
+                out[key] = raw[key]
+            else:
+                warnings.append(f"exit_management.{key} invalid: must be true or false; defaults used")
+    if raw and "profit_lock_steps" in raw:
+        err = _profit_lock_steps_error(raw["profit_lock_steps"])
+        if err:
+            warnings.append(f"exit_management.profit_lock_steps invalid: {err}; defaults used")
+        else:
+            out["profit_lock_steps"] = [{"mfe_r": float(s["mfe_r"]), "lock_r": float(s["lock_r"])}
+                                        for s in raw["profit_lock_steps"]]
+    out["warnings"] = warnings
+    return out
+
+
 def validate_leverage_setting(name: str, value: int, ceiling: int) -> Optional[str]:
     """Returns an error message if `value` is not a valid leverage for `name` (1..ceiling), else None."""
     if not isinstance(value, int) or value < 1 or value > ceiling:
