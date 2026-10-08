@@ -294,6 +294,13 @@ class TestPreTradeGuardProfileEnforcement(unittest.TestCase):
         self.brain_dir = os.path.join(self.mock_root, "brain")
         self._brain_env = patch.dict(os.environ, {"AGY_BRAIN_DIRS": self.brain_dir})
         self._brain_env.start()
+        # Issue #202: calibrated Tier S buckets, so the autonomous fast-track tests exercise the gate positively
+        stats = {"n": 30, "wins": 15, "win_rate": 0.5, "expectancy_r_net": 0.25, "sd_r_net": 0.5,
+                 "lcb95_r_net": 0.0998, "mean_mfe_r": 1.0,
+                 "insufficient": False, "calibrated": True}
+        with open(os.path.join(self.logs_dir, "score_calibration.json"), "w", encoding="utf-8") as f:
+            json.dump({"schema_version": 1, "generated_at_ts": int(time.time()), "env": "PROD", "min_trades": 30,
+                       "trades": {}, "buckets": {"80-89": dict(stats), "90-95": dict(stats)}}, f)
 
     def tearDown(self):
         self._brain_env.stop()
@@ -303,7 +310,9 @@ class TestPreTradeGuardProfileEnforcement(unittest.TestCase):
         """Writes a dossier exactly as `record_evaluation.py --from-subagent` would (schema v2 + provenance)."""
         import datetime
         from utils import dossier_provenance as dp
-        candidates = [dict(c, direction=c.get("direction", "LONG")) for c in approved_candidates]
+        # Issue #202: a dossier score in the calibrated fixture bucket (80-89, written in setUp)
+        candidates = [dict(c, direction=c.get("direction", "LONG"), score=c.get("score", 85))
+                      for c in approved_candidates]
         conv_id = "abcdef12-3456-7890-abcd-ef1234567890"
         tdir = os.path.join(self.brain_dir, conv_id, ".system_generated", "logs")
         os.makedirs(tdir, exist_ok=True)
@@ -316,6 +325,9 @@ class TestPreTradeGuardProfileEnforcement(unittest.TestCase):
             f.write(json.dumps({"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": created,
                                 "content": f"<dossier_json>{block}</dossier_json>"}) + "\n")
         record = dp.build_record_from_extraction(dp.extract_dossier_from_transcript(tpath))
+        # Issue #202: radar snapshots as record_evaluation.py joins them (confidence == dossier score)
+        record["radar_snapshots"] = {f"{c['symbol']}|{c['direction']}": {"radar_snapshot": {"confidence": c["score"]}}
+                                     for c in record["approved_candidates"] if c.get("score") is not None}
         with open(self.dossier_path, "w", encoding="utf-8") as f:
             json.dump(record, f)
 

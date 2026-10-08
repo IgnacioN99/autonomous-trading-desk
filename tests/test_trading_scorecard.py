@@ -4,7 +4,7 @@ test_trading_scorecard.py - scripts/trading_scorecard.py (issue #200): metrics f
 (resolved closed trades of the requested env only), the net -> gross R fallback, tiers from is_yolo / the latest
 dossier (never leverage), the MIN_SAMPLE-gated meta-improver, staleness / env-mismatch warnings and a tolerated
 shadow-desk failure.
-Hermetic: temp workspace via execute_futures_trade._workspace_dir, urlopen and send_signed_request blocked.
+Hermetic: temp workspace via trading_scorecard._workspace_dir, urlopen and send_signed_request blocked.
 """
 
 import io
@@ -47,7 +47,7 @@ class ScorecardBase(unittest.TestCase):
         self.ws = tempfile.mkdtemp()
         self.logs = os.path.join(self.ws, "logs")
         os.makedirs(os.path.join(self.logs, "evaluations"))
-        for p in (patch("execute_futures_trade._workspace_dir", return_value=self.ws),
+        for p in (patch("trading_scorecard._workspace_dir", return_value=self.ws),
                   patch("execute_futures_trade.send_signed_request", side_effect=AssertionError("Binance call")),
                   patch("urllib.request.urlopen", side_effect=AssertionError("network access in offline test"))):
             p.start()
@@ -185,11 +185,11 @@ class TestMetaImprover(ScorecardBase):
     def test_negative_expectancy(self):
         recs = self.recs([row(net=-0.5)] * 20, causes=["BTC_DUMP_CORRELATION"] * 2)
         self.assertEqual(recs, ["Negative expectancy (-0.5000R/trade over 20): review entries before scaling.",
-                                sc.CLUSTER_MSG])
+                                sc.CLUSTER_MSG.format(count=2)])
 
     def test_positive_expectancy_and_profit_factor_scales(self):
         recs = self.recs([row(net=2.0)] * 10 + [row(net=-1.0)] * 10)
-        self.assertEqual(recs, [sc.SCALING_MSG])
+        self.assertEqual(recs, [sc.SCALING_MSG.format(n=20)])
         self.assertEqual(self.recs([row(net=1.5)] * 10 + [row(net=-1.0)] * 10), [])  # PF 1.5 < 1.8
 
     def test_filter_text_never_appears(self):
@@ -264,7 +264,7 @@ class TestSourceAndCli(ScorecardBase):
     def test_top_level_keys(self):
         s = sc.generate_scorecard("prod")
         for key in ("timestamp_utc", "sample_size", "performance", "tiers_breakdown", "recommendations", "source",
-                    "excluded", "r_basis"):
+                    "excluded", "r_basis", "score_calibration"):
             self.assertIn(key, s)
         self.assertEqual(set(s["tiers_breakdown"]), {"S", "A+", "A", "YOLO", "unknown"})
 

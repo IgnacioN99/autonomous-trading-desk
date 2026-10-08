@@ -193,7 +193,8 @@ class ExecutorHarness(unittest.TestCase):
         with patch("execute_futures_trade.send_signed_request", side_effect=send or self.fake), \
              patch("execute_futures_trade._workspace_dir", return_value=self.ws), \
              patch("execute_futures_trade.load_env", return_value={"LIVE_TRADING_ARMED": "true"}), \
-             patch("execute_futures_trade.enforce_evaluation_dossier", return_value=(True, "ok", None)), \
+             patch("execute_futures_trade.enforce_evaluation_dossier",  # eval_result: issue #202 audit tests
+                   return_value=getattr(self, "eval_result", (True, "ok", None))), \
              patch("execute_futures_trade.check_mechanical_gates", return_value=(True, None)), \
              patch("execute_futures_trade.get_symbol_filters", return_value=dict(EX_FILTERS)), \
              patch("execute_futures_trade.uses_mcp_gateway", return_value=mcp), \

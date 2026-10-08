@@ -35,7 +35,8 @@ import test_issue_148_guard_worktree_paths as t148  # noqa: E402  (fixtures only
 import trading_doctor  # noqa: E402
 
 GATE_MODULES = ("scripts/utils/gate_limits.py", "scripts/execute_futures_trade.py",
-                "scripts/utils/portfolio_exposure.py", "scripts/utils/env_resolver.py", "scripts/user_profile.py")
+                "scripts/utils/portfolio_exposure.py", "scripts/utils/env_resolver.py", "scripts/user_profile.py",
+                "scripts/utils/score_calibration.py")  # #202: decides when an autonomous Tier S asks the user
 EXECUTOR = "scripts/execute_futures_trade.py"
 HEARTBEAT = "hook_heartbeat.json"
 HEARTBEAT_WRITER = "scripts/hooks/pre_trade_guard.py"

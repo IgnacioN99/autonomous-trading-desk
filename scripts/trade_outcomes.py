@@ -398,6 +398,14 @@ def kline_excursion(symbol, direction, entry, risk, entry_ms, exit_ms, legs, env
     return mfe_r, mae_r, mfe_ts
 
 
+SCORE_FIELDS = ("score", "score_tier", "score_components", "dossier_tier", "dossier_score", "dossier_sha256")
+
+
+def score_fields(rec):
+    """Score metadata of the audit entry (issue #202), None when the record predates it."""
+    return {k: rec.get(k) for k in SCORE_FIELDS}
+
+
 def resolve_trade(rec, fills, consumed, trail_stops, next_start_ms, env, klines=True, foreign_entry_ids=(),
                   match=None, tick=None):
     """Outcome dict of one audit entry. consumed: {fill id: qty already assigned to earlier trades} (updated).
@@ -425,7 +433,7 @@ def resolve_trade(rec, fills, consumed, trail_stops, next_start_ms, env, klines=
            "entry_vwap": round(entry_vwap, 10) if entry_vwap else None, "entry_match": match["match"], "sl_price": sl,
            "initial_risk": round(risk, 10) if risk else None, "total_qty": total_qty, "filled_qty": filled_qty,
            "tp1_price": _num(rec.get("tp1_price")), "tp2_price": _num(rec.get("tp2_price")),
-           "is_yolo": bool(rec.get("is_yolo"))}
+           "is_yolo": bool(rec.get("is_yolo")), **score_fields(rec)}
     if match["match"] == "no_entry_fill":
         out.update(status="no_entry_fill", filled_qty=None, legs=[], exit_ts=None, realized_r_gross=None,
                    realized_r_net=None, entry_commission_included=False, tp1_filled=False, exit_reason=None)
@@ -530,7 +538,8 @@ def build_outcomes(env, since_ts, symbol=None, klines=True, now_ms=None):
                 trades.append({"symbol": sym, "direction": str(r.get("direction")).upper(),
                                "entry_ts": int(_num(r.get("timestamp")) * 1000), "entry_price": _num(r.get("entry_price")),
                                "sl_price": _num(r.get("sl_price")), "total_qty": _num(r.get("total_qty")),
-                               "is_yolo": bool(r.get("is_yolo")), "status": "fills_unavailable", "error": err})
+                               "is_yolo": bool(r.get("is_yolo")), **score_fields(r),
+                               "status": "fills_unavailable", "error": err})
             continue
         readable += 1
         sym_filters = filters.get(sym) or {}
