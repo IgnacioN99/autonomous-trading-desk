@@ -62,6 +62,7 @@ PRICE_TOLERANCE = 0.003
 BREAKEVEN_BAND = 0.002
 QTY_TOLERANCE = 1e-6
 KLINES_LIMIT = 1500
+KLINES_TIMEOUT_SECONDS = 6  # offline CLI: longer than the guardian's 2 s
 DEFAULT_SINCE_DAYS = 7
 REASONS = ("TP1", "TP2", "SL", "TRAILED_STOP", "BREAKEVEN", "MANUAL_OR_OTHER")
 
@@ -246,7 +247,8 @@ def kline_excursion(symbol, direction, entry, risk, entry_ms, exit_ms, legs, env
 
     start = trade_excursion.first_post_entry_bar_ms(entry_ms / 1000.0)
     while start < exit_ms:
-        rows = trade_excursion.fetch_klines_range(symbol, "1m", start, KLINES_LIMIT, env)
+        rows = trade_excursion.fetch_klines_range(symbol, "1m", start, KLINES_LIMIT, env,
+                                                  timeout=KLINES_TIMEOUT_SECONDS)
         last_open = None
         for k in rows:
             open_ms = int(k[0])

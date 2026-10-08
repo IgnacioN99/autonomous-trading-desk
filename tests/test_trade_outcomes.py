@@ -66,8 +66,9 @@ class KlinesFake:
         self.path = path
         self.calls = []
 
-    def __call__(self, symbol, interval, start_ms, limit, target_env):
+    def __call__(self, symbol, interval, start_ms, limit, target_env, timeout=None):
         self.calls.append((symbol, interval, start_ms, limit, target_env))
+        self.timeouts = getattr(self, "timeouts", []) + [timeout]
         out = []
         o = int(start_ms)
         while len(out) < limit and o < NOW_S * 1000 - MIN:
@@ -246,6 +247,7 @@ class TestKlineExcursion(OutcomesBase):
         self.assertEqual(t["mfe_ts"], peak_bar)
         self.assertAlmostEqual(t["giveback_r"], 3.0 - t["realized_r_gross"], places=4)
         self.assertEqual(klines.calls[0][1:4], ("1m", (T0 // MIN) * MIN + MIN, 1500))
+        self.assertEqual(set(klines.timeouts), {to.KLINES_TIMEOUT_SECONDS})  # offline CLI: the longer timeout
         s = json.loads(out)["summary"]
         self.assertAlmostEqual(s["capture_ratio"], round(t["realized_r_gross"] / 3.0, 4), places=4)
         self.assertAlmostEqual(s["mean_giveback_r"], t["giveback_r"], places=4)

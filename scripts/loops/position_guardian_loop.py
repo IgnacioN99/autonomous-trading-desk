@@ -40,6 +40,8 @@ Per cycle:
      order resting on the exchange without a logs/pending_entries.json record (e.g. deleted registry) would get
      no SL on fill; each one is reported (unknown_resting_entry action + pending_unknown_entry error, so
      cycle_ok is false) and never cancelled. A query failure is a pending_unknown_entry error too.
+     Before step 5, after steps 2-4 have run for EVERY position, excursion tracking (issue #182, data capture only)
+     reads one 1m klines page per position (2 s timeout); its failures never count as errors.
   6. State is written atomically to logs/guardian_state.json and every action is appended to
      logs/guardian_actions.jsonl.
 
@@ -145,8 +147,8 @@ IP, shared with the executor and the scanners): GET /fapi/v2/positionRisk (all s
 protect_pending_entries (calls only for pending records); all-symbol GET /fapi/v1/openAlgoOrders and
 /fapi/v1/openOrders (find_unregistered_resting_entries, 40 each); per position: symbol openAlgoOrders twice (orphan
 audit + dem, 1 each), exchangeInfo (calculate_structural_stop, 1), 15m klines limit=99 and limit=10 (1 each),
-userTrades at most once (5), 1m klines from the next bar limit=99 (excursion tracking, 1; skipped when no bar has
-closed since the last read); per actual stop write: one more openAlgoOrders re-read, exchangeInfo, the POST, the
+userTrades at most once (5), 1m klines from the next bar limit=99 (excursion tracking, 1; runs after all positions
+are protected, 2 s timeout; skipped when no bar has closed since the last read); per actual stop write: one more openAlgoOrders re-read, exchangeInfo, the POST, the
 verification reads and the DELETE. About 85 + ~11 per position per cycle: at the 60s default even 10 positions use
 well under 10% of the per-minute limit.
 
@@ -680,6 +682,7 @@ class GuardianCycle:
             self._check_unknown_entries()
             return self.finish()
 
+        guarded = []
         for p in pos_res:
             try:
                 if _f(p.get("positionAmt")) == 0:
@@ -689,11 +692,15 @@ class GuardianCycle:
                 self.error(None, "position_parse", e)
                 continue
             self.state["positions"].append(view)
+            guarded.append((p, view))
             try:
                 self._guard_position(p, view)
             except Exception as e:
                 view["error"] = f"{type(e).__name__}: {e}"
                 self.error(view["symbol"], "exception", f"{view['error']}\n{traceback.format_exc(limit=3)}")
+        # Excursion tracking (data capture only) runs after every position went through its protective steps, so a
+        # slow klines read can never delay another position's orphan heal or trail.
+        for p, view in guarded:
             try:
                 self._track_excursion(p, view)
             except Exception as e:

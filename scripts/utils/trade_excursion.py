@@ -17,6 +17,7 @@ import urllib.request
 
 BAR_MS = 60_000
 GUARDIAN_KLINES_LIMIT = 99  # weight 1 per request (Binance: limit in [1, 100) -> weight 1)
+KLINES_TIMEOUT_SECONDS = 2  # guardian excursion read: short, so a slow host never stalls the cycle
 DEFAULT_HOSTS = {"prod": "https://fapi.binance.com", "testnet": "https://testnet.binancefuture.com"}
 
 
@@ -33,14 +34,16 @@ def klines_base_url(target_env):
     return str(base or DEFAULT_HOSTS[env]).rstrip("/")
 
 
-def fetch_klines_range(symbol, interval, start_ms, limit, target_env):
+def fetch_klines_range(symbol, interval, start_ms, limit, target_env, timeout=None):
     """Raw klines of symbol from start_ms (inclusive, ascending, at most `limit`) from the public endpoint of
-    target_env's host. Raises on a network error or a non-list response."""
+    target_env's host. Raises on a network error or a non-list response. timeout: seconds, default
+    KLINES_TIMEOUT_SECONDS (the guardian path; the offline trade_outcomes CLI passes a longer one)."""
+    timeout = KLINES_TIMEOUT_SECONDS if timeout is None else timeout
     qs = urllib.parse.urlencode({"symbol": str(symbol).upper(), "interval": interval, "startTime": int(start_ms),
                                  "limit": int(limit)})
     url = f"{klines_base_url(target_env)}/fapi/v1/klines?{qs}"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=6) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         data = json.loads(resp.read().decode())
     if not isinstance(data, list):
         raise ValueError(f"unexpected klines response: {str(data)[:160]}")

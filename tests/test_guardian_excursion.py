@@ -26,6 +26,7 @@ for p in (os.path.join(BASE_DIR, "scripts"), os.path.join(BASE_DIR, "scripts", "
     if p not in sys.path:
         sys.path.insert(0, p)
 
+import dynamic_exit_manager as dem
 import position_guardian_loop as pgl
 from utils import trade_excursion as tx
 from test_exit_management import FakeExchange, offline, long_position, stop, structural
@@ -39,13 +40,18 @@ USER_TRADES = "/fapi/v1/userTrades"
 class KlineSource:
     """Fake fetch_klines_range: closed 1m bars from start_ms (at most `limit`), price from `path(open_ms)`."""
 
-    def __init__(self, path, error=None):
+    def __init__(self, path, error=None, events=None):
         self.path = path
         self.error = error
         self.calls = []
+        self.timeouts = []
+        self.events = events  # optional shared list: ("klines", symbol) appended per call
 
-    def __call__(self, symbol, interval, start_ms, limit, target_env):
+    def __call__(self, symbol, interval, start_ms, limit, target_env, timeout=None):
         self.calls.append((symbol, interval, start_ms, limit, target_env))
+        self.timeouts.append(timeout)
+        if self.events is not None:
+            self.events.append(("klines", symbol))
         if self.error:
             raise self.error
         now_ms = int(time.time() * 1000)
@@ -119,6 +125,28 @@ class TestExcursionTracking(GuardianExcursionBase):
         self.assertEqual((view["mfe_r"], view["mae_r"], view["peak_price"]), (1.6, -0.4, 108.0))
         self.assertTrue(state["cycle_ok"], state["errors"])
         self.assertEqual(state, self.read_state())
+
+    def test_excursion_pass_runs_after_every_position_is_guarded(self):
+        entry_ts = int(time.time()) - 3600
+        for sym in ("BTCUSDT", "ETHUSDT"):
+            long_record(self.ws, symbol=sym, sl_price=95.0, timestamp=entry_ts)
+        events = []
+        real_trail = dem.update_position_to_structural_stop
+
+        def trail(symbol, *a, **kw):
+            events.append(("trail", symbol))
+            return real_trail(symbol, *a, **kw)
+
+        klines = KlineSource(lambda o: (101.0, 99.0), events=events)
+        fake = FakeExchange([long_position("BTCUSDT", mark="101.0"), long_position("ETHUSDT", mark="101.0")],
+                            algos=[stop(501, 95.0, symbol="BTCUSDT"), stop(502, 95.0, symbol="ETHUSDT")])
+        with patch("dynamic_exit_manager.update_position_to_structural_stop", side_effect=trail):
+            state = self.cycle(fake, klines)
+        self.assertEqual(events, [("trail", "BTCUSDT"), ("trail", "ETHUSDT"),
+                                  ("klines", "BTCUSDT"), ("klines", "ETHUSDT")])
+        self.assertEqual(set(state["excursions"]), {"BTCUSDT|LONG", "ETHUSDT|LONG"})
+        self.assertEqual(klines.timeouts, [None, None])  # guardian path: trade_excursion's 2 s default
+        self.assertTrue(state["cycle_ok"], state["errors"])
 
     def test_carry_over_never_decreases_and_fetches_from_next_bar(self):
         entry_ts = int(time.time()) - 3600

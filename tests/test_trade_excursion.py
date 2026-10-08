@@ -160,16 +160,22 @@ class TestFetchHost(unittest.TestCase):
             def __exit__(self, *a):
                 return False
 
+        timeouts = []
+
         def fake_urlopen(req, timeout=None):
             seen.append(req.full_url)
-            return Resp(b"[[1, \"1\", \"2\", \"0.5\", \"1\", \"1\", 60000]]" if len(seen) == 1 else b"{\"code\": -1}")
+            timeouts.append(timeout)
+            return Resp(b"[[1, \"1\", \"2\", \"0.5\", \"1\", \"1\", 60000]]" if len(seen) != 2 else b"{\"code\": -1}")
 
         with patch("execute_futures_trade.get_client_config", return_value=(None, None, None)), \
              patch("urllib.request.urlopen", side_effect=fake_urlopen):
             rows = tx.fetch_klines_range("btcusdt", "1m", 123000, 99, "prod")
             with self.assertRaises(ValueError):
                 tx.fetch_klines_range("BTCUSDT", "1m", 123000, 99, "prod")
+            tx.fetch_klines_range("BTCUSDT", "1m", 123000, 1500, "prod", timeout=6)
         self.assertEqual(len(rows), 1)
+        self.assertEqual(tx.KLINES_TIMEOUT_SECONDS, 2)
+        self.assertEqual(timeouts, [2, 2, 6])  # guardian default 2 s; callers may pass a longer one
         self.assertTrue(seen[0].startswith("https://fapi.binance.com/fapi/v1/klines?"))
         for part in ("symbol=BTCUSDT", "interval=1m", "startTime=123000", "limit=99"):
             self.assertIn(part, seen[0])
