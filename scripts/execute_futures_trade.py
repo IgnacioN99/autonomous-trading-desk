@@ -89,9 +89,11 @@ JSON schemas (stable; extra keys may be added, existing keys are never renamed):
                 "success": bool,
                 "dry_run": bool, "detail": {...}}],
       "errors": [{"key", "symbol", "stage", "error"}],
-      "warnings"?: [{"key", "symbol", "stage": "loss_cap_check" | "qty_check", "warning"}]}   # check deferred
+      "warnings"?: [{"key", "symbol", "stage": "loss_cap_check" | "qty_check" | "loss_cap_drift" | "registry_lock" |
+                     "deferral_report", "warning"}]}   # check deferred / drift tolerated / not errors
       (issue #118 loss cap; issue #126 total_qty: a record whose total_qty is below margin_usdt x leverage / price
-      x 0.98 minus one stepSize is untrusted, pending_record_mismatch)
+      x 0.98 minus one stepSize is untrusted, pending_record_mismatch; issue #156: 3 consecutive deferred runs of a
+      record (check_deferrals) file a HIGH issue; pending_tp_placed detail has fill_quality_flags)
   trade deployment: {"success": bool, "symbol", "direction", "leverage", "entry_price", "total_qty",
       "sl_price", "tp1_price", "tp2_price", ..., "error"?: str, "hard_gate_rejection"?: bool}
       Resting entries (untriggered STOP_MARKET via the algo order API, resting LIMIT) return
@@ -100,6 +102,9 @@ JSON schemas (stable; extra keys may be added, existing keys are never renamed):
       Issue #36: on KEYS their planned SL is pre-armed as a closePosition stop when not crossed ("prearm_status":
       "placed" | "rejected:<code-or-text>" | "skipped:mcp" | "skipped:crossed", "prearm_algo_id"); the guardian
       verifies it at fill and is the fallback; it is cancelled (by algo id) when the entry ends without a position.
+      Issue #157: a rejected (except -2021) or unverified pre-arm adds "prearm_anomaly": {"status", "message"} and
+      files a MEDIUM issue (the entry is kept). A MARKET entry's SL is verified by its own algo id only; a -4130 on
+      that placement (a leftover closePosition stop) auto-destructs and files a HIGH issue.
       In PROD every new entry is rejected while an opening order rests on the exchange without a registry record
       (find_unregistered_resting_entries; the position guardian reports them as unknown_resting_entry).
       PROD gates are anchored to the exchange (issue #101): logs/session_state.json and logs/pending_entries.json
@@ -162,7 +167,8 @@ except Exception:  # pragma: no cover - exercised only on broken installs
 
 # GATE 2 (YOLO loss cap) and GATE 3 (friction floor) limits, shared with the YOLO scanner and the screening
 # pipeline (scripts/utils/gate_limits.py, issue #64).
-from utils.gate_limits import MIN_TP1_DISTANCE, YOLO_MAX_LOSS_MARGIN_FRACTION, YOLO_MIN_LOSS_CAP_USDT
+from utils.gate_limits import (MIN_TP1_DISTANCE, PENDING_DRIFT_CAP_TOLERANCE, YOLO_MAX_LOSS_MARGIN_FRACTION,
+                               YOLO_MIN_LOSS_CAP_USDT)
 # Portfolio delta classification shared with sync_session_state.py; PROD gates apply it to the live exchange view.
 from utils.portfolio_exposure import (compute_exposure, book_exposure, project_order, resting_opening_legs,
                                       unrealized_pnl_total, LONG_HEAVY, SHORT_HEAVY)
@@ -793,12 +799,14 @@ def place_algo_stop_loss(symbol, exit_side, sl_price, target_env=None, quantity=
         pass
     return res
 
-def verify_algo_stop_loss(symbol, exit_side, sl_price=None, target_env=None):
+def verify_algo_stop_loss(symbol, exit_side, sl_price=None, target_env=None, algo_id=None):
     """
     Verifies that the Algo Stop Loss order actually exists and is active on the exchange.
     Ensures that if sl_price is specified, True is ONLY returned if the price matches within 3% tolerance.
     Only real protective stops count (is_protective_stop): a resting conditional ENTRY on the same side
     (neither closePosition nor reduceOnly) never verifies as a Stop Loss.
+    Issue #157: with algo_id, only the protective stop with that exact algo id counts (no price fallback), so a
+    leftover stop (e.g. an old pre-arm at the same price) never confirms another entry's stop.
     """
     target_env = resolve_env(target_env)
     try:
@@ -806,7 +814,10 @@ def verify_algo_stop_loss(symbol, exit_side, sl_price=None, target_env=None):
         if isinstance(algos, list):
             for ao in algos:
                 if is_protective_stop(ao, exit_side, symbol):
-                    if sl_price is not None:
+                    if algo_id is not None:
+                        if str(_order_id(ao)) == str(algo_id):
+                            return True, ao
+                    elif sl_price is not None:
                         trig = float(ao.get('triggerPrice') or ao.get('stopPrice') or 0)
                         if trig > 0 and abs(trig - float(sl_price)) / trig < 0.03:
                             return True, ao
@@ -1847,12 +1858,15 @@ def append_trade_audit_record(record, margin_usdt):
 # Schema v2 record fields: prearm_status ("placed" | "rejected:<code-or-text>" | "skipped:mcp" |
 # "skipped:crossed"), prearm_algo_id / prearm_price (an algo id was returned), sl_close_position: true and
 # sl_qty: null (verified pre-arm, covers any size). v1 records have none of them: not pre-armed.
+# Issue #156 (optional, no version bump): gate2_loss_cap_usdt (PROD Gate 2 cap at placement; bounds the drift
+# tolerance of the filled-record loss-cap re-check) and check_deferrals (consecutive runs with a deferred check).
 # -----------------------------------------------------------------------------
 PENDING_ENTRY_TIMEOUT_SECONDS = 5400    # desk order timeout (60-90 min) for unfilled resting entries
 GUARDIAN_MAX_INTERVAL_FOR_RESTING = 120 # resting entries require a guardian LOOP (--interval <= 120s) for the env
 PENDING_MISSING_GRACE_SECONDS = 60      # "entry gone, no position" must persist this long before a record is dropped
 PENDING_ENTRIES_SCHEMA_VERSION = 2
 FILL_MIN_RR_TP2 = 3.0                   # issue #39: audit flag "rr_below_3" for a fill whose real R:R to TP2 is lower
+PENDING_DEFERRAL_REPORT_AFTER = 3       # issue #156: consecutive deferred record checks before a HIGH issue is filed
 
 
 def pending_entries_path(base_dir=None):
@@ -1931,10 +1945,12 @@ def update_pending_entries(mutate, base_dir=None):
 
 def register_resting_entry(kind, entry_id, symbol, direction, entry_side, exit_side, target_env, price, total_qty,
                            sl_price, tp1_price, tp2_price, leverage, is_yolo, margin_usdt, prearm=None,
-                           tick_size=None, step_size=None):
+                           tick_size=None, step_size=None, gate2_loss_cap_usdt=None):
     """Records a resting entry in logs/pending_entries.json (schema v2; `prearm`: the prearm_resting_entry_stop
     fields; tick_size / step_size: the symbol filters used for rounding, stored when given for the half-tick
-    registry match of Gate 1 and the total_qty check, issue #126). Returns (key, record); raises on failure."""
+    registry match of Gate 1 and the total_qty check, issue #126; gate2_loss_cap_usdt: the Gate 2 loss cap at
+    placement, stored when positive, bounds the equity-drift tolerance of the protect-pending re-check, issue #156).
+    Returns (key, record); raises on failure."""
     now = int(time.time())
     key = pending_entry_key(target_env, symbol, entry_id)
     record = {
@@ -1956,7 +1972,8 @@ def register_resting_entry(kind, entry_id, symbol, direction, entry_side, exit_s
         'placed_at_ts': now,
         'expires_at_ts': now + PENDING_ENTRY_TIMEOUT_SECONDS,
     }
-    for name, value in (('tick_size', tick_size), ('step_size', step_size)):
+    for name, value in (('tick_size', tick_size), ('step_size', step_size),
+                        ('gate2_loss_cap_usdt', gate2_loss_cap_usdt)):
         if _to_float(value) > 0:
             record[name] = _to_float(value)
     record.update(prearm or {})
@@ -1987,7 +2004,8 @@ def prearm_resting_entry_stop(symbol, exit_side, sl_price, ref_price, target_env
       - sl_price is on the protective side of ref_price (the current last price; the stop has no workingType, i.e.
         CONTRACT_PRICE): below it for a SELL stop (LONG), above it for a BUY stop (SHORT).
     Never blocks the entry. Returns the v2 registry fields: {"prearm_status": "placed" | "rejected:<code-or-text>" |
-    "skipped:mcp" | "skipped:crossed"}, plus prearm_algo_id / prearm_price when an algo id was returned (cancelled
+    "skipped:mcp" | "skipped:crossed"}, plus prearm_algo_id / prearm_price (the listed trigger once verified, else
+    the requested sl_price) when an algo id was returned (cancelled
     with the entry) and sl_close_position: True / sl_qty: None once verified on /fapi/v1/openAlgoOrders. Never
     raises: an unexpected error is "rejected:<error>" (the entry must still be registered).
     """
@@ -2012,17 +2030,51 @@ def _prearm_resting_entry_stop(symbol, exit_side, sl_price, ref_price, target_en
     if placed_id is None:
         return {'prearm_status': f"rejected:{_rejection_text(placement)}"}
     fields = {'prearm_algo_id': placed_id, 'prearm_price': sl_price}
-    verified, _info = wait_for_stop_confirmation(symbol, exit_side, sl_price, algo_id=placed_id, tick_size=tick_size,
-                                                 target_env=target_env)
+    verified, info = wait_for_stop_confirmation(symbol, exit_side, sl_price, algo_id=placed_id, tick_size=tick_size,
+                                                target_env=target_env)
     if not verified:
         return dict(fields, prearm_status='rejected:unverified')
+    # Issue #157: the trigger as listed (tick-rounded by place_algo_stop_loss), else the requested price.
+    fields['prearm_price'] = _trigger_price(info) if isinstance(info, dict) and _trigger_price(info) > 0 else sl_price
     return dict(fields, prearm_status='placed', sl_close_position=True, sl_qty=None)
 
 
 def _prearm_note(prearm, sl_price):
-    if prearm.get('prearm_status') == 'placed':
+    status = prearm.get('prearm_status')
+    if status == 'placed':
         return f"Stop Loss pre-armed at {sl_price} (closePosition, algo {prearm.get('prearm_algo_id')}). "
-    return f"Stop Loss not pre-armed ({prearm.get('prearm_status')}). "
+    if status == 'rejected:unverified':
+        return (f"Stop Loss pre-arm may exist (unverified, algo id {prearm.get('prearm_algo_id')}); the guardian "
+                "verifies or places it at fill. ")
+    return f"Stop Loss not pre-armed ({status}). "
+
+
+def _prearm_anomaly(prearm):
+    """Issue #157: a KEYS pre-arm that was not crossed but was rejected ("rejected:<code-or-text>", except -2021:
+    the exchange saying the SL would trigger at once) or not verified ("rejected:unverified"). skipped:* never is.
+    Returns {"status", "message"} or None."""
+    status = str((prearm or {}).get('prearm_status') or '')
+    if not status.startswith('rejected:') or status == 'rejected:-2021':
+        return None
+    return {"status": status, "message": _prearm_note(prearm, None).strip()}
+
+
+def _report_prearm_anomaly(symbol, target_env, kind, entry_id, anomaly):
+    """MEDIUM issue (issue #157) for a pre-arm anomaly. Never raises (the entry is kept and registered). error_detail
+    is stable per symbol + status for the reporter's 24h fingerprint dedup."""
+    try:
+        import report_agent_issue
+        report_agent_issue.report_issue(
+            title=f"prearm_resting_entry_stop: pre-armed stop of {symbol} {anomaly['status']}",
+            error_detail=f"{symbol} pre-arm {anomaly['status']}",
+            category="risk_gate", severity="MEDIUM",
+            agent_name="execute_futures_trade.prearm_resting_entry_stop",
+            affected_files="scripts/execute_futures_trade.py:_prearm_resting_entry_stop",
+            context=(f"env={target_env}; symbol={symbol}; {kind} entry {entry_id}; {anomaly['message']} The entry "
+                     "was kept; the position guardian protects it at fill."),
+            remediation="Check the algo orders of the symbol on Binance and the pre-arm rejection code.")
+    except Exception as e:
+        logger.error(f"pre-arm anomaly report for {symbol} could not be filed: {e}")
 
 
 def cancel_prearmed_stop(symbol, exit_side, algo_id, target_env=None):
@@ -2030,8 +2082,8 @@ def cancel_prearmed_stop(symbol, exit_side, algo_id, target_env=None):
     Cancels the pre-armed stop of a resting entry that ended without a position (issue #36), by its algo id only:
     never a sweep of the symbol's stops. It is cancelled only when /fapi/v1/openAlgoOrders lists it for symbol as a
     protective stop on exit_side (a forged id cannot cancel another symbol's stop); not listed = already gone (ok).
-    A leftover stop must not stay: verify_algo_stop_loss accepts any protective stop within 3% of the price, so it
-    could falsely confirm the stop of a later MARKET entry on the symbol. Returns (ok, detail); a failed read or
+    A leftover stop must not stay: a later MARKET entry's closePosition SL on the symbol would get -4130 and, being
+    verified by its own algo id only (issue #157), auto-destruct. Returns (ok, detail); a failed read or
     cancel returns ok False (callers keep the record and retry on the next cycle; never blocking).
     """
     if algo_id is None:
@@ -2059,7 +2111,11 @@ def _ensure_entry_stop(symbol, exit_side, sl_price, prearm_algo_id=None, quantit
          tick; one read) is kept: no placement;
       2. otherwise (no pre-arm, or it was consumed, e.g. triggered before the fill) the planned stop is placed as
          before (quantity=None: closePosition) and verified with progressive retries;
-      3. a -4130 on that placement means a closePosition stop already exists: re-verified by listing, "kept".
+      3. a -4130 on that placement means a closePosition stop already exists: re-verified by listing, "kept"; when
+         that fails, one more error-aware listing (get_open_stop_orders_with_retry) keeps a listed protective stop
+         (issue #157; closePosition preferred, its own trigger in "info", which may differ from sl_price: callers
+         reach here with no stop listed just before, so it is taken as the pre-arm / own stop); an empty or failed
+         listing is unverified.
     Returns {"verified", "source": "prearm" | "placed" | "kept" | None, "placement", "info"}.
     """
     if prearm_algo_id is not None:
@@ -2074,6 +2130,14 @@ def _ensure_entry_stop(symbol, exit_side, sl_price, prearm_algo_id=None, quantit
     if _is_existing_close_position_stop_rejection(placement):
         verified, info = wait_for_stop_confirmation(symbol, exit_side, sl_price, algo_id=prearm_algo_id,
                                                     tick_size=tick_size, target_env=target_env)
+        if not verified:
+            # Issue #157: wait_for_stop_confirmation cannot tell "every read failed" from "no stop": one error-aware
+            # listing more. A protective stop listed for symbol/side is the closePosition stop -4130 refers to
+            # (kept); an empty listing or another failed read stays unverified (the caller auto-destructs).
+            stops, err = get_open_stop_orders_with_retry(symbol, exit_side, target_env=target_env)
+            if err is None and stops:
+                close_stops = [s for s in stops if _truthy(s.get('closePosition'))]
+                verified, info = True, tightest_stop(close_stops or stops, str(exit_side).upper() == 'SELL')
         return {"verified": verified, "source": "kept" if verified else None, "placement": placement, "info": info}
     placed_id = _order_id(placement) if isinstance(placement, dict) else None
     verified, info = wait_for_stop_confirmation(symbol, exit_side, sl_price, algo_id=placed_id, tick_size=tick_size,
@@ -2119,25 +2183,40 @@ def fill_quality_fields(is_long, entry_px, stop_px, tp1_px, tp2_px):
             "fill_quality_flags": flags}
 
 
-def record_loss_cap_problem(rec, ref_price, equity, prof, unrealized=0.0, leverage=None):
-    """Issue #118 (PROD, pure): the loss at the record's SL, abs(ref_price - sl_price) x total_qty, must not exceed
-    the Gate 2 cap (monetary_loss_cap): standard min(wallet, wallet + uPnL) x risk_pct_equity x 1.25; YOLO the margin
-    cap, with `leverage` (the live position's when filled, else the record's). Returns a problem string or None."""
+def _record_loss_vs_cap(rec, ref_price, equity, prof, unrealized=0.0, leverage=None, position_qty=None):
+    """Issue #118/#156 (pure): the loss at the record's SL and its Gate 2 cap. qty = max(total_qty, position_qty)
+    (a filled record whose total_qty was edited below |positionAmt| is sized on the live position); leverage = the
+    live position's, else the record's. Returns {"loss", "cap", "qty", "message"}, or {"problem": str} for a YOLO
+    record without a positive leverage (its margin cap cannot be sized: the record is untrusted)."""
     ref = _to_float(ref_price)
     sl = _to_float(rec.get('sl_price'))
-    total_qty = _to_float(rec.get('total_qty'))
+    qty = max(_to_float(rec.get('total_qty')), abs(_to_float(position_qty)))
     is_yolo = _truthy(rec.get('is_yolo'))
-    lev = _to_float(leverage) or _to_float(rec.get('leverage')) or 1.0
+    lev = _to_float(leverage) or _to_float(rec.get('leverage'))
+    if is_yolo and lev <= 0:
+        return {"problem": f"yolo record without leverage (leverage {rec.get('leverage')!r}); the YOLO margin cap "
+                           "cannot be sized"}
     cap, risk_fraction, equity_used, _note = monetary_loss_cap(
-        _to_float(equity), prof, is_testnet=False, is_yolo=is_yolo, ref=ref, total_qty=total_qty, leverage=lev,
+        _to_float(equity), prof, is_testnet=False, is_yolo=is_yolo, ref=ref, total_qty=qty, leverage=lev,
         unrealized=_to_float(unrealized))
-    loss = abs(ref - sl) * total_qty
-    if loss > cap:
-        basis = (f"YOLO margin cap at {lev:g}x" if is_yolo else
-                 f"equity ${equity_used:.2f} x {risk_fraction * 100:.2f}% x 1.25")
-        return (f"loss at sl_price {sl} ({loss:.2f} USDT for {total_qty} from {ref}) exceeds the Gate 2 loss cap "
-                f"{cap:.2f} USDT ({basis})")
-    return None
+    loss = abs(ref - sl) * qty
+    basis = (f"YOLO margin cap at {lev:g}x" if is_yolo else
+             f"equity ${equity_used:.2f} x {risk_fraction * 100:.2f}% x 1.25")
+    return {"loss": loss, "cap": cap, "qty": qty,
+            "message": (f"loss at sl_price {sl} ({loss:.2f} USDT for {qty} from {ref}) exceeds the Gate 2 loss cap "
+                        f"{cap:.2f} USDT ({basis})")}
+
+
+def record_loss_cap_problem(rec, ref_price, equity, prof, unrealized=0.0, leverage=None, position_qty=None):
+    """Issue #118 (PROD, pure): the loss at the record's SL, abs(ref_price - sl_price) x qty, must not exceed the
+    Gate 2 cap (monetary_loss_cap): standard min(wallet, wallet + uPnL) x risk_pct_equity x 1.25; YOLO the margin
+    cap, with `leverage` (the live position's when filled, else the record's). Issue #156: qty = max(total_qty,
+    position_qty) (|positionAmt| when filled); a YOLO record without a positive leverage is a problem (never 1x).
+    Returns a problem string or None."""
+    out = _record_loss_vs_cap(rec, ref_price, equity, prof, unrealized, leverage, position_qty)
+    if "problem" in out:
+        return out["problem"]
+    return out["message"] if out["loss"] > out["cap"] else None
 
 
 def cancel_resting_entry(symbol, kind, entry_id, target_env=None):
@@ -2750,6 +2829,13 @@ def protect_pending_entries(target_env=None, dry_run=False, keys=None):
         PROD (issue #118): the record's SL is also invalid when abs(trigger_or_limit_price - sl_price) x total_qty
         exceeds the Gate 2 loss cap (record_loss_cap_problem; YOLO leverage from the live position when filled); a
         failed equity read only adds a "warnings" entry and defers the check. TESTNET skips it.
+        Issue #156: a filled record is sized on max(total_qty, |positionAmt|); a YOLO record without leverage is
+        untrusted; a profile not read from config/user_profile.json defers the check of a standard record. Equity
+        drift: a FILLED standard record whose loss exceeds the live cap but not min(gate2_loss_cap_usdt stored at
+        placement, live cap x PENDING_DRIFT_CAP_TOLERANCE 1.2) stays trusted (TPs placed) with a "loss_cap_drift"
+        warning; above that bound, a resting entry, a YOLO record or a record without the stored cap: breach as above. Consecutive runs with a
+        deferred loss-cap or qty check are counted in check_deferrals (reset by a run without deferral); the
+        PENDING_DEFERRAL_REPORT_AFTER-th files one HIGH issue (report_agent_issue). Deferrals stay warnings.
     Any query error keeps the record (fail closed). dry_run reports the decisions without any write. A missing
     registry reads as empty (never blocks this risk-reducing path).
     Returns {"ok", "env", "dry_run", "actions": [{"type", "key", "symbol", "success", "dry_run", "detail"}],
@@ -2870,14 +2956,27 @@ def _pending_loss_cap_problem(rec, position, target_env, run_ctx):
     trigger_or_limit_price (the check is about the record, not the fill's slippage). Standard records read the wallet
     balance (quant_risk_engine.get_account_equity) and the all-symbol positionRisk uPnL once per protect-pending run
     (run_ctx); YOLO records need no read (margin cap; leverage from the live position when filled, else the record).
-    Returns (problem_or_None, warning_or_None): a failed read is a warning and defers the check (never blocks)."""
+    Issue #156: for a standard record, a profile that did not come from config/user_profile.json (`_profile_source`
+    "example" / "default") defers the check like a failed read (its risk_pct_equity is not the user's). A FILLED
+    record (position given) is sized on max(total_qty, |positionAmt|); when a standard record's loss exceeds the
+    live cap only by equity drift since placement, i.e. loss <= min(gate2_loss_cap_usdt stored at registration,
+    live cap x PENDING_DRIFT_CAP_TOLERANCE), it stays trusted with a "loss_cap_drift" warning. A resting entry, a
+    YOLO record, or a record without the stored cap is governed by the live cap alone.
+    Returns (problem_or_None, warning_or_None, warning_stage): stage "loss_cap_check" for a deferral (a failed read
+    or a non-user profile; never blocks), "loss_cap_drift" for a tolerated drift."""
     try:
         import user_profile as up
         prof = up.load_user_profile()
     except Exception:
         prof = {}
     equity, unrealized = 0.0, 0.0
-    if not _truthy(rec.get('is_yolo')):
+    is_yolo = _truthy(rec.get('is_yolo'))
+    if not is_yolo:
+        # The YOLO margin cap reads neither the profile nor equity: only standard records defer on them.
+        source = prof.get('_profile_source') if isinstance(prof, dict) else None
+        if source is not None and source != 'user':
+            return None, (f"SL distance vs loss cap check deferred to the next run: the user profile was not read "
+                          f"from config/user_profile.json (source: {source})"), 'loss_cap_check'
         if 'equity' not in run_ctx:
             try:
                 import quant_risk_engine as qre
@@ -2890,10 +2989,26 @@ def _pending_loss_cap_problem(rec, position, target_env, run_ctx):
                 run_ctx['equity'] = f"{type(e).__name__}: {e}"
         if isinstance(run_ctx['equity'], str):
             return None, (f"SL distance vs loss cap check deferred to the next run: equity read failed "
-                          f"({run_ctx['equity']})")
+                          f"({run_ctx['equity']})"), 'loss_cap_check'
         equity, unrealized = run_ctx['equity']
     leverage = position.get('leverage') if position is not None else None
-    return record_loss_cap_problem(rec, rec.get('trigger_or_limit_price'), equity, prof, unrealized, leverage), None
+    position_qty = abs(_to_float(position.get('positionAmt'))) if position is not None else None
+    out = _record_loss_vs_cap(rec, rec.get('trigger_or_limit_price'), equity, prof, unrealized, leverage,
+                              position_qty)
+    if "problem" in out:
+        return out["problem"], None, None
+    loss, cap = out["loss"], out["cap"]
+    if loss <= cap:
+        return None, None, None
+    # Standard records only: a YOLO cap does not depend on equity, so a lower live YOLO cap means a higher live
+    # leverage, never equity drift.
+    stored = _to_float(rec.get('gate2_loss_cap_usdt'))
+    if (position is not None and not is_yolo and stored > 0
+            and loss <= min(stored, cap * PENDING_DRIFT_CAP_TOLERANCE)):
+        return None, (f"loss at sl_price {loss:.2f} USDT exceeds the live Gate 2 cap {cap:.2f} USDT but not the cap "
+                      f"stored at placement {stored:.2f} USDT (bounded by live x {PENDING_DRIFT_CAP_TOLERANCE:g}): "
+                      "equity drift since placement; record kept trusted"), 'loss_cap_drift'
+    return out["message"], None, None
 
 
 def _protect_pending_entry(key, rec, target_env, dry_run, now, out, run_ctx=None):
@@ -2968,6 +3083,7 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out, run_ctx=None
 
     # --- Record vs exchange cross-check (issue #101): never act on a forged / corrupted record ---------------
     problems = pending_record_problems(rec, is_long)
+    deferred = []   # issue #156: checks deferred in this run (counted in check_deferrals)
     if entry_open or position is not None:
         # Issue #126: a total_qty shrunk below the record's own sizing makes the record untrusted. The stepSize comes
         # from the record (stored at registration); exchangeInfo is read only when a record without it is flagged
@@ -2984,6 +3100,7 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out, run_ctx=None
                 out.setdefault("warnings", []).append({
                     "key": key, "symbol": sym, "stage": "qty_check",
                     "warning": "total_qty check deferred to the next run: symbol filters unavailable"})
+                deferred.append("qty_check")
                 qty_problem = None
         if qty_problem:
             problems["entry"].append(qty_problem)
@@ -2993,14 +3110,30 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out, run_ctx=None
         # A breach makes the record untrusted: the entry is cancelled while it rests; a filled position without a
         # stop gets the orphan heal, whose 2.5% anchor may be looser than the record SL (accepted: the record is not
         # trusted at that point).
-        cap_problem, cap_warning = _pending_loss_cap_problem(rec, position, target_env,
-                                                             run_ctx if run_ctx is not None else {})
+        cap_problem, cap_warning, cap_stage = _pending_loss_cap_problem(rec, position, target_env,
+                                                                        run_ctx if run_ctx is not None else {})
         if cap_problem:
             problems["sl"].append(cap_problem)
         if cap_warning:
             logger.warning(f"{sym} {key}: {cap_warning}")
-            out.setdefault("warnings", []).append({"key": key, "symbol": sym, "stage": "loss_cap_check",
+            out.setdefault("warnings", []).append({"key": key, "symbol": sym, "stage": cap_stage,
                                                    "warning": cap_warning})
+            if cap_stage == 'loss_cap_check':
+                deferred.append("loss_cap_check")
+    if entry_open or position is not None:
+        # Issue #156: consecutive runs with a deferred loss-cap / qty check are counted on the record
+        # (check_deferrals); reaching PENDING_DEFERRAL_REPORT_AFTER files one HIGH issue. A run where none was
+        # deferred resets it. Never blocks (registry lock failures are warnings).
+        if deferred:
+            n_deferrals = int(_to_float(rec.get('check_deferrals'))) + 1
+            save_before_stop(check_deferrals=n_deferrals)
+            if n_deferrals == PENDING_DEFERRAL_REPORT_AFTER and not dry_run:
+                report_err = _report_check_deferrals(sym, key, target_env, n_deferrals, deferred)
+                if report_err:
+                    out.setdefault("warnings", []).append({"key": key, "symbol": sym, "stage": "deferral_report",
+                                                           "warning": report_err})
+        elif rec.get('check_deferrals') is not None:
+            save_before_stop(check_deferrals=None)
 
     def cancel_prearm_if_flat():
         """Issue #36: cancels the record's pre-armed stop (by algo id only) once the entry ended without a position.
@@ -3336,12 +3469,14 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out, run_ctx=None
     else:
         # The TP1 leg is a LIMIT at the record's TP1 price: check its minNotional there (issue #42).
         tp1_qty, tp2_qty = split_take_profit_quantities(qty, filters, tp1_p if tp1_p > 0 else entry_px)
+    # Issue #156: the fill quality flags (issue #39) are also shown in the pending_tp_placed action (guardian output).
+    fill_flags = fill_quality_fields(is_long, entry_px, target_p, tp1_p, tp2_p)["fill_quality_flags"]
     if not rec.get('tp_placed'):
         need1 = tp1_qty > 0 and ids['tp1_order_id'] is None
         need2 = tp2_qty > 0 and ids['tp2_order_id'] is None
         if dry_run:
             return act("pending_tp_placed", False, tp1_price=tp1_p, tp1_qty=tp1_qty, tp2_price=tp2_p, tp2_qty=tp2_qty,
-                       quantity=qty, place_tp1=need1, place_tp2=need2)
+                       quantity=qty, place_tp1=need1, place_tp2=need2, fill_quality_flags=fill_flags)
         retried = ids['tp1_order_id'] is not None or ids['tp2_order_id'] is not None
         o1, o2 = place_take_profit_orders(sym, exit_side, tp1_p, tp2_p, tp1_qty if need1 else 0, tp2_qty if need2 else 0,
                                           target_env=target_env)
@@ -3352,7 +3487,7 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out, run_ctx=None
         # Persist what was placed BEFORE anything else, so a later run never duplicates a TP.
         save(tp1_qty=tp1_qty, tp2_qty=tp2_qty, tp_placed=tp_ok, **ids)
         act("pending_tp_placed", tp_ok, tp1_price=tp1_p, tp1_qty=tp1_qty, tp2_price=tp2_p, tp2_qty=tp2_qty, quantity=qty,
-            retried=retried, record_dropped=tp_ok, **ids)
+            retried=retried, record_dropped=tp_ok, fill_quality_flags=fill_flags, **ids)
         if not tp_ok:
             return fail("take_profit", f"TP placement failed for {sym} (tp1={o1}, tp2={o2}); SL is in place, only the "
                                        "missing TP is retried next run.")
@@ -3639,6 +3774,21 @@ def execute_complete_trade(
     # and prevent premature profit truncation. The TP1 leg is a LIMIT at tp1_p, so its minNotional is checked there.
     tp1_qty, tp2_qty = split_take_profit_quantities(total_qty, filters, tp1_p)
 
+    def placement_loss_cap():
+        """Issue #156 (PROD): the Gate 2 loss cap at placement (pure monetary_loss_cap on the values Gate 2 used:
+        equity, profile, the snapshot's uPnL, effective entry, qty, leverage), stored in the record. None when it
+        cannot be computed (the record then has no stored cap: no drift tolerance)."""
+        if not is_prod:
+            return None
+        try:
+            unrealized = unrealized_pnl_total(live_snapshot["exposure"]) if live_snapshot else 0.0
+            cap = monetary_loss_cap(float(account_equity), prof, is_testnet=False, is_yolo=is_yolo,
+                                    ref=effective_entry, total_qty=total_qty, leverage=effective_leverage,
+                                    unrealized=unrealized)[0]
+            return round(cap, 8) if cap > 0 else None
+        except Exception:
+            return None
+
     def register_or_cancel(kind, entry_id, price, prearm=None):
         """Records the resting entry for post-fill protection; if that fails the entry and its pre-armed stop are
         cancelled (fail closed)."""
@@ -3646,7 +3796,8 @@ def execute_complete_trade(
             key, rec = register_resting_entry(
                 kind, entry_id, symbol, direction, entry_side, exit_side, target_env, price, total_qty,
                 sl_p, tp1_p, tp2_p, effective_leverage, is_yolo, margin_usdt, prearm=prearm,
-                tick_size=filters.get('tickSize'), step_size=filters.get('stepSize'))
+                tick_size=filters.get('tickSize'), step_size=filters.get('stepSize'),
+                gate2_loss_cap_usdt=placement_loss_cap())
             return key, rec, None
         except Exception as e:
             cancelled, cancel_res = cancel_resting_entry(symbol, kind, entry_id, target_env=target_env)
@@ -3700,7 +3851,7 @@ def execute_complete_trade(
                     key, rec, failure = register_or_cancel('STOP_MARKET', order_id, trigger_p, prearm)
                     if failure:
                         return failure
-                    return {
+                    result = {
                         "success": True,
                         "conditional_entry": True,
                         "orderId": order_id,
@@ -3720,6 +3871,12 @@ def execute_complete_trade(
                                     "verifies the stop; unfilled after "
                                     f"{PENDING_ENTRY_TIMEOUT_SECONDS // 60} min it is cancelled.")
                     }
+                    # Issue #157: a rejected / unverified pre-arm is reported (the entry is kept).
+                    anomaly = _prearm_anomaly(prearm)
+                    if anomaly:
+                        result["prearm_anomaly"] = anomaly
+                        _report_prearm_anomaly(symbol, target_env, 'STOP_MARKET', order_id, anomaly)
+                    return result
                 else:
                     return {"success": False, "error": f"Failed to place conditional order: {cond_order}"}
             else:
@@ -3783,6 +3940,10 @@ def execute_complete_trade(
         }
         if prearm:
             result.update(prearm_status=prearm['prearm_status'], prearm_algo_id=prearm.get('prearm_algo_id'))
+            anomaly = _prearm_anomaly(prearm)   # issue #157: reported, the entry is kept
+            if anomaly:
+                result["prearm_anomaly"] = anomaly
+                _report_prearm_anomaly(symbol, target_env, 'LIMIT', entry_order.get('orderId'), anomaly)
         if entry_status == 'PARTIALLY_FILLED':
             entry_id = entry_order.get('orderId')
             head = f"LIMIT order PARTIALLY_FILLED at {lim_p} (order ID: {entry_id}). "
@@ -3862,7 +4023,17 @@ def execute_complete_trade(
     try:
         # 9. Execute Hard Stop Loss (Algo Order, closePosition=true, reduceOnly=true)
         sl_order = place_algo_stop_loss(symbol, exit_side, sl_p, target_env=target_env)
-        sl_verified, sl_info = verify_algo_stop_loss(symbol, exit_side, sl_p, target_env=target_env)
+
+        def verify_placed_stop():
+            # Issue #157: verified by the algo id of THIS placement only (never by price), so a leftover stop on the
+            # symbol (e.g. an old pre-arm at the same price) cannot confirm it. A placement without an id (e.g. -4130:
+            # a closePosition stop already exists) is unverified and auto-destructs (accepted, fail closed).
+            placed_id = _order_id(sl_order) if isinstance(sl_order, dict) and not _is_api_error(sl_order) else None
+            if placed_id is None:
+                return False, None
+            return verify_algo_stop_loss(symbol, exit_side, sl_p, target_env=target_env, algo_id=placed_id)
+
+        sl_verified, sl_info = verify_placed_stop()
 
         # Progressive retries (up to 3 attempts in ~2.8s) to absorb Mainnet indexing latency
         if not sl_verified:
@@ -3870,7 +4041,7 @@ def execute_complete_trade(
                 time.sleep(retry_delay)
                 if isinstance(sl_order, dict) and ("error" in sl_order or "code" in sl_order):
                     sl_order = place_algo_stop_loss(symbol, exit_side, sl_p, target_env=target_env)
-                sl_verified, sl_info = verify_algo_stop_loss(symbol, exit_side, sl_p, target_env=target_env)
+                sl_verified, sl_info = verify_placed_stop()
                 if sl_verified:
                     break
 
@@ -3879,11 +4050,18 @@ def execute_complete_trade(
         if not sl_verified:
             abort_exit = emergency_abort_market_close(symbol, exit_side, total_qty, target_env=target_env)
             log_emergency_abort(symbol, direction, total_qty, sl_p, sl_order, abort_exit, target_env)
+            leftover = _is_existing_close_position_stop_rejection(sl_order)
+            if leftover:
+                _report_leftover_stop_abort(symbol, target_env, sl_order, abort_exit)
             return {
                 "success": False,
                 "emergency_abort": True,
                 "symbol": symbol,
-                "error": f"CRITICAL FAIL-SAFE TRIGGERED: Stop Loss could not be confirmed after 3 attempts ({sl_order}). Position closed at MARKET immediately to eliminate unhedged exposure.",
+                "error": (f"CRITICAL FAIL-SAFE TRIGGERED: Stop Loss could not be confirmed after 3 attempts ({sl_order}). "
+                          + ("Binance -4130: a closePosition stop already exists on the symbol, probably a leftover "
+                             "stop (e.g. an old pre-armed stop) that cannot be verified as this entry's stop. "
+                             if leftover else "")
+                          + "Position closed at MARKET immediately to eliminate unhedged exposure."),
                 "abort_exit": abort_exit
             }
 
@@ -4417,6 +4595,48 @@ def _report_close_failure(symbol, target_env, error, stop_source):
             remediation="Check the position on Binance; keep it protected and retry --close-position.")
     except Exception as e:
         logger.error(f"close failure report for {symbol} could not be filed: {e}")
+
+
+def _report_leftover_stop_abort(symbol, target_env, sl_order, abort_exit):
+    """HIGH issue (issue #157): a MARKET entry auto-destructed because its Stop Loss placement got -4130 (a
+    closePosition stop already exists, probably a leftover pre-arm) and stop verification is by algo id only. Never
+    raises (the abort path must not break)."""
+    try:
+        import report_agent_issue
+        report_agent_issue.report_issue(
+            title=f"execute_complete_trade: MARKET entry on {symbol} auto-destructed, probable leftover stop (-4130)",
+            error_detail=f"{symbol} MARKET SL rejected -4130, leftover stop",
+            category="risk_gate", severity="HIGH",
+            agent_name="execute_futures_trade.execute_complete_trade",
+            affected_files="scripts/execute_futures_trade.py:execute_complete_trade",
+            context=(f"env={target_env}; symbol={symbol}; SL placement: {sl_order}; abort confirmed="
+                     f"{bool((abort_exit or {}).get('confirmed'))}"),
+            remediation=("List the symbol's algo orders on Binance and cancel the leftover closePosition stop "
+                         "(e.g. a pre-arm of an ended resting entry) once no position is open."))
+    except Exception as e:
+        logger.error(f"leftover stop report for {symbol} could not be filed: {e}")
+
+
+def _report_check_deferrals(symbol, key, target_env, count, stages):
+    """HIGH issue (issue #156) when the protect-pending loss-cap / qty checks of a record were deferred `count`
+    consecutive runs. Never raises; returns None when filed, else the error text (the caller adds a warning).
+    error_detail is stable per symbol so the reporter's 24h fingerprint dedups repeats."""
+    try:
+        import report_agent_issue
+        report_agent_issue.report_issue(
+            title=f"protect-pending: record checks of {symbol} deferred {count} consecutive runs",
+            error_detail=f"{symbol} pending record loss-cap/qty check deferred repeatedly",
+            category="risk_gate", severity="HIGH",
+            agent_name="execute_futures_trade.protect_pending_entries",
+            affected_files="scripts/execute_futures_trade.py:_protect_pending_entry",
+            context=(f"env={target_env}; symbol={symbol}; key={key}; deferrals={count}; "
+                     f"deferred checks this run: {', '.join(stages)}"),
+            remediation=("Check the equity / positionRisk reads, exchangeInfo filters and config/user_profile.json; "
+                         "the record's SL is not re-checked against the Gate 2 cap until they succeed."))
+        return None
+    except Exception as e:
+        logger.error(f"deferral report for {symbol} could not be filed: {e}")
+        return f"check_deferrals={count}: issue report failed ({type(e).__name__}: {e})"
 
 
 def _report_abort_failure(symbol, target_env, site, error):

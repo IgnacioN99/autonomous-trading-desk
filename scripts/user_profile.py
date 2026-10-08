@@ -78,8 +78,13 @@ def get_yolo_margin(target_env="testnet") -> float:
         equity = 10000.0 if str(target_env).lower() == "testnet" else 100.0
     return round(min(max(equity * yolo_pct, 10.0), 15.0), 2)
 
+PROFILE_SOURCE_KEY = "_profile_source"
+
 def load_user_profile(base_dir: Optional[str] = None) -> Dict[str, Any]:
-    """Loads the user profile from config/user_profile.json or defaults."""
+    """Loads the user profile from config/user_profile.json or defaults. The returned dict carries
+    PROFILE_SOURCE_KEY ("_profile_source"): "user" (config/user_profile.json), "example" (its .example template) or
+    "default" (DEFAULT_PROFILE), so callers can tell a fallback (issue #156). It is never persisted
+    (save_user_profile strips it)."""
     config_dir = os.path.join(base_dir, "config") if base_dir else CONFIG_DIR
     profile_file = os.path.join(config_dir, "user_profile.json")
     os.makedirs(config_dir, exist_ok=True)
@@ -89,6 +94,7 @@ def load_user_profile(base_dir: Optional[str] = None) -> Dict[str, Any]:
                 data = json.load(f)
                 profile = dict(DEFAULT_PROFILE)
                 profile.update(data)
+                profile[PROFILE_SOURCE_KEY] = "user"
                 return profile
         except Exception:
             pass
@@ -100,16 +106,18 @@ def load_user_profile(base_dir: Optional[str] = None) -> Dict[str, Any]:
                 data = json.load(f)
                 profile = dict(DEFAULT_PROFILE)
                 profile.update(data)
+                profile[PROFILE_SOURCE_KEY] = "example"
                 return profile
         except Exception:
             pass
-    return dict(DEFAULT_PROFILE)
+    return dict(DEFAULT_PROFILE, **{PROFILE_SOURCE_KEY: "default"})
 
 def save_user_profile(profile_data: Dict[str, Any]) -> bool:
-    """Persists updated profile to config/user_profile.json."""
+    """Persists updated profile to config/user_profile.json (without the load-time PROFILE_SOURCE_KEY marker)."""
     os.makedirs(CONFIG_DIR, exist_ok=True)
     profile = load_user_profile()
     profile.update(profile_data)
+    profile.pop(PROFILE_SOURCE_KEY, None)
     profile["updated_at_utc"] = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
     profile["profile_completed"] = True
     try:
@@ -323,4 +331,5 @@ if __name__ == "__main__":
 
         if args.show or (len(sys.argv) == 1 and not updates):
             prof = load_user_profile()
+            prof.pop(PROFILE_SOURCE_KEY, None)
             print(json.dumps(prof, indent=2))
