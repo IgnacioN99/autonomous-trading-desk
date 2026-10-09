@@ -418,13 +418,29 @@ class TestPRReviewHooks(unittest.TestCase):
         self.state_file = os.path.join(self.tmp, "logs", "pr_review_state.json")
         self.env = mock.patch.dict(os.environ, {state_mod.STATE_ENV: self.state_file})
         self.env.start()
+        # Hermetic git: the branch never depends on the checkout the suite runs in
+        self.checkout_branches = {}  # directory -> `rev-parse --abbrev-ref HEAD` (default fix/checkout)
+        self.git_calls = []
+        self.git = mock.patch.object(post_hook, "_git", side_effect=self._fake_git)
+        self.git.start()
 
     def tearDown(self):
+        self.git.stop()
         self.env.stop()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _post(self, command: str, conv: str = "conv-parent", error: str = "") -> str:
+    def _fake_git(self, args, directory=None):
+        self.git_calls.append((list(args), directory))
+        if args[:2] == ["rev-parse", "--abbrev-ref"]:
+            return self.checkout_branches.get(directory, "fix/checkout")
+        if args == ["rev-parse", "HEAD"]:
+            return f"sha-head-{directory}"
+        return ""  # `rev-parse --verify --quiet <branch>`: no such local branch
+
+    def _post(self, command: str, conv: str = "conv-parent", error: str = "", cwd: str = "") -> str:
         payload = {"toolCall": {"name": "run_command", "args": {"CommandLine": command}}, "conversationId": conv}
+        if cwd:
+            payload["toolCall"]["args"]["Cwd"] = cwd
         if error:
             payload["error"] = error
         with redirect_stderr(io.StringIO()):
@@ -449,6 +465,100 @@ class TestPRReviewHooks(unittest.TestCase):
         self.assertFalse(is_pr_creation_or_push("python3 scripts/ci/run_pr_audit.py"))
         self.assertFalse(is_pr_creation_or_push("python3 scripts/ci/pr_review_state.py done --reason no_pr"))
         self.assertFalse(is_pr_creation_or_push(""))
+
+    # Issue #115: only executed sub-commands arm, never quoted text or heredoc bodies
+    NOT_ARMING = (
+        "for c in 'git push origin feat/x'; do echo $c; done",
+        "python3 - <<'EOF'\nimport os\n# git push origin x\nEOF",
+        "cat > notes.md <<EOF\ngit push -u origin fix/x\ngh pr create\nEOF",
+        'echo "gh pr create"',
+        "git push origin main",
+        "git push origin HEAD:main",
+        'grep -n "git push" README.md',
+        "git push origin 'fix/x",  # unbalanced quote: cannot tokenize -> never arms
+    )
+    ARMING = (
+        "git push -u origin fix/x",
+        "gh pr create --title t --body-file b.md",
+        "cd /wt && git push -u origin fix/x",
+        "git -C /wt push origin fix/x",
+        "git push origin HEAD:fix/x",
+        "git push origin +fix/x",
+        "env GIT_TRACE=0 git push origin fix/x",
+        "bash -c 'git push origin fix/x'",
+        "gh pr create --body \"$(cat <<'EOF'\nbody mentioning git push origin main\nEOF\n)\"",
+        "git push origin fix/x; Write-Output ok",  # PowerShell-style separator
+    )
+
+    def test_issue_115_mentions_do_not_arm(self):
+        for command in self.NOT_ARMING:
+            with self.subTest(command=command):
+                self.assertFalse(post_hook.is_pr_creation_or_push(command))
+                self.assertEqual(self._post(command), "ignored")
+                self.assertEqual(state_mod.load_state(), {})
+
+    def test_issue_115_executed_push_or_pr_creation_arms(self):
+        for command in self.ARMING:
+            with self.subTest(command=command):
+                self.assertTrue(post_hook.is_pr_creation_or_push(command))
+                self.assertEqual(self._post(command), "pending")
+                self.assertEqual(state_mod.load_state()["trigger_command"], command[:300])
+
+    def test_issue_115_unparsable_command_logs_detect_error(self):
+        os.makedirs(os.path.dirname(self.state_file))  # the events log lives next to the state file
+        self.assertEqual(self._post("git push origin 'fix/x"), "ignored")
+        events = [json.loads(e) for e in Path(state_mod.events_path()).read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([e["event"] for e in events], ["detect_error"])
+        self.assertIn("quotation", events[0]["error"])
+
+    def test_issue_115_branch_and_directory_from_the_command(self):
+        find = post_hook.find_review_trigger
+        self.assertEqual(find("git push -u origin fix/x", "/start").branch, "fix/x")
+        self.assertEqual(find("git push origin HEAD:fix/x", "/start").branch, "fix/x")
+        self.assertEqual(find("git push origin +refs/heads/fix/x", "/start").branch, "fix/x")
+        self.assertEqual(find("git push --force origin fix/x", "/start").branch, "fix/x")
+        self.assertEqual(find("gh pr create --base main --head fix/y", "/start").branch, "fix/y")
+        self.assertEqual(find("gh pr create -H owner:fix/y", "/start").branch, "fix/y")
+        self.assertEqual(find("gh pr create --head=fix/y", "/start").branch, "fix/y")
+        # Expansions are unknown from the text: resolved from the directory's checkout instead
+        self.assertEqual(find('git push -u origin "$BRANCH"', "/start").branch, "")
+        self.assertEqual(find("git push -u origin $(git branch --show-current)", "/start").branch, "")
+        self.assertEqual(find("git push origin `git branch --show-current`", "/start").branch, "")
+        self.assertEqual(find('gh pr create --head "$B"', "/start").branch, "")
+        self.assertEqual(find("gh pr create --fill", "/start"), post_hook.ReviewTrigger("pr_create", "", "/start"))
+        self.assertEqual(find("cd /wt && git push", "/start"), post_hook.ReviewTrigger("push", "", "/wt"))
+        self.assertEqual(find("cd /wt && cd sub && git push", "/start").directory, os.path.normpath("/wt/sub"))
+        self.assertEqual(find("cd $WT && git push", "/start").directory, "/start")  # unknown -> start dir
+        self.assertEqual(find("git -C /wt push origin fix/x", "/start").directory, "/wt")
+        # Several pushes/PRs: the last one decides
+        self.assertEqual(find("git push origin fix/x && gh pr create --fill", "/start").kind, "pr_create")
+        self.assertFalse(post_hook.is_pr_creation_or_push("git push origin fix/x && git push origin main"))
+        self.assertIsNone(find("git status && echo pushed", "/start"))
+
+    def test_issue_115_branch_resolution_uses_the_command_directory(self):
+        self.checkout_branches["/wt"] = "fix/from-worktree"
+        trigger = post_hook.find_review_trigger("cd /wt && git push", "/start")
+        self.assertEqual(post_hook.resolve_branch_and_sha(trigger), ("fix/from-worktree", "sha-head-/wt"))
+        self.assertIn((["rev-parse", "--abbrev-ref", "HEAD"], "/wt"), self.git_calls)
+        trigger = post_hook.find_review_trigger("git push origin HEAD:fix/x", "/start")
+        self.assertEqual(post_hook.resolve_branch_and_sha(trigger), ("fix/x", "sha-head-/start"))
+        # Detached HEAD: unresolved branch still arms, recorded as ""
+        self.checkout_branches["/wt"] = "HEAD"
+        self.assertEqual(self._post("cd /wt && git push"), "pending")
+        self.assertEqual(state_mod.load_state()["branch"], "")
+
+    def test_issue_115_pr_creation_on_main_without_head_does_not_arm(self):
+        self.checkout_branches[self.tmp] = "main"
+        self.assertEqual(self._post("gh pr create --fill", cwd=self.tmp), "ignored")
+        self.assertEqual(state_mod.load_state(), {})
+        self.assertEqual(self._post("gh pr create --fill --base main --head fix/x", cwd=self.tmp), "pending")
+        self.assertEqual(state_mod.load_state()["branch"], "fix/x")
+
+    def test_issue_115_worktree_push_records_the_worktree_branch(self):
+        self.checkout_branches[self.tmp] = "main"  # the session runs in the main checkout
+        self.assertEqual(self._post("cd /wt && git push -u origin fix/x", cwd=self.tmp), "pending")
+        state = state_mod.load_state()
+        self.assertEqual((state["branch"], state["head_sha"]), ("fix/x", "sha-head-/wt"))
 
     def test_review_post_detection(self):
         self.assertTrue(post_hook.is_review_post("gh pr comment 13 --body-file logs/pr_review/report.md"))
@@ -547,8 +657,9 @@ class TestPRReviewHooks(unittest.TestCase):
             self.assertEqual(res.returncode, 0)
             self.assertEqual(json.loads(res.stdout), {})
 
+        # --head keeps the subprocess run independent of the checkout's branch (main never arms, #115)
         res = self._run_hook_agy_style("post_pr_review_hook", {
-            "toolCall": {"name": "run_command", "args": {"CommandLine": "gh pr create --fill"}},
+            "toolCall": {"name": "run_command", "args": {"CommandLine": "gh pr create --fill --head feat/x"}},
             "conversationId": "conv-parent", "stepIdx": 4})
         self.assertEqual((res.returncode, json.loads(res.stdout)), (0, {}))
         res = self._run_hook_agy_style("pr_review_stop_hook", {
