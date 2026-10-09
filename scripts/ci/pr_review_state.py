@@ -6,7 +6,8 @@ Pending-review marker shared by the PR review hooks (agy .agents/hooks.json and 
 the Claude Code session_id of the session that created/pushed the PR.
 
 Lifecycle (logs/pr_review_state.json, gitignored):
-  pending      post_pr_review_hook.py (PostToolUse) saw a successful `gh pr create` or a feature-branch push.
+  pending      post_pr_review_hook.py (PostToolUse) saw a successfully executed `gh pr create` or feature-branch
+               `git push` (not merely mentioned in quoted text or a heredoc).
   in_progress  the /pr-review skill started (`start`); the reviewer subagents are running.
   done         the report was posted (`gh pr comment ... --body-file .../pr_review/report.md`, detected by the
                PostToolUse hook) or the agent closed it (`done --reason no_pr|declined|...`).
