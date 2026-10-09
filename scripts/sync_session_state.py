@@ -705,10 +705,14 @@ def format_daily_loss_gate(gate) -> str:
     if gate.get("blocked") is not False:
         return f"🚨 ACTIVE ({gate.get('scope') or 'all'}): {gate.get('reason')}"
     # Not blocked: inactive whatever a leftover scope says (ACTIVE only when blocked, issue #187)
+    if "day_loss_limit_usdt" not in gate:
+        return f"inactive ({gate.get('reason')})"
+    # Skipped audit lines and non-numeric fills are named (informational, issue #187)
+    notes = "".join(f"; {k}={gate[k]}" for k in ("malformed_audit_lines", "malformed_fills")
+                    if type(gate.get(k)) is int and gate[k] > 0)
     return (f"inactive (day_net_realized_usdt={gate.get('day_net_realized_usdt')}, limit_usdt=-"
             f"{gate.get('day_loss_limit_usdt')}, consecutive_full_sl={gate.get('consecutive_full_sl')}, "
-            f"yolo_full_losses={gate.get('yolo_full_losses')})" if "day_loss_limit_usdt" in gate
-            else f"inactive ({gate.get('reason')})")
+            f"yolo_full_losses={gate.get('yolo_full_losses')}){notes}")
 
 
 def format_markdown_summary(state: dict) -> str:

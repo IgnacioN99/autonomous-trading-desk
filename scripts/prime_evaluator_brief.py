@@ -34,6 +34,7 @@ if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
 from utils.yolo_scan_health import RUN_ID_ENV, YOLO_DISABLED_STATUS  # stdlib-only module (no pipeline import)
 from utils.squeeze_filter import SQUEEZE_REASON_PREFIX  # stdlib-only (issue #206)
+from utils.lessons import LESSON_ID_MIN_PREFIX_RE  # stdlib-only (issue #187)
 
 BASE_DIR = os.path.dirname(SCRIPTS_DIR)
 LOGS_DIR = os.path.join(BASE_DIR, "logs")
@@ -170,19 +171,24 @@ def brief_lesson_candidates(screening: Any, yolo_slot: Optional[dict] = None) ->
     return out
 
 
-def select_lessons(active: List[dict], candidates: Any = None, budget_bytes: int = LESSON_BUDGET_BYTES) -> List[dict]:
+def select_lessons(active: List[dict], candidates: Any = None, budget_bytes: int = LESSON_BUDGET_BYTES,
+                   report: Optional[dict] = None) -> List[dict]:
     """Deterministic lesson selection for the brief (issue #187). `active`: active lessons in file order (a later
     position is more recent). `candidates`: (symbol, direction) pairs of the current candidates.
-    1. Correction pairing: a lesson tagged supersedes_<id> / corrects_<id> with a non-empty <id> is a correction;
-       <id> (possibly truncated) matches the most recent lesson recorded before the correction (earlier in file
-       order) whose id starts with it, and that lesson is suppressed (never shown).
+    1. Correction pairing: a lesson tagged supersedes_<id> / corrects_<id>, <id> at least ins-<10-digit timestamp>
+       (utils.lessons.LESSON_ID_MIN_PREFIX_RE, as remember_trade_lesson --corrects), is a correction; a shorter
+       reference is not (it suppresses nothing, no exemption). <id> (possibly truncated) matches the most recent
+       lesson recorded before the correction (earlier in file order) whose id starts with it, and that lesson is
+       suppressed (never shown).
     2. Then lessons tagged `pinned` and lessons with a global pseudo-symbol (GLOBAL_LESSON_SYMBOLS, MARKET_*).
        Corrections and pinned lessons are always included (stderr warning when they exceed the budget).
     3. Relevance: lessons whose base asset matches a candidate's (same direction first).
     4. Recency fill with the remaining lessons.
     Within a priority, most recent first. A lesson that would take the committed_memory_lessons block (as written in
-    the brief file, _brief_bytes) over budget_bytes is skipped and the next ones are tried; a lesson's text is
-    never cut."""
+    the brief file, _brief_bytes) over budget_bytes, or whose entry has a line over BRIEF_MAX_LINE_CHARS, is skipped
+    (stderr warning for the long line) and the next ones are tried; a lesson's text is never cut. A correction or
+    pinned lesson is kept anyway, with a stderr warning and report["budget_exceeded"] = True (`report`: optional
+    dict)."""
     active = [r for r in active if isinstance(r, dict)]
     ids = [str(r.get("id") or "") for r in active]
     suppressed, corrections = set(), set()
@@ -190,7 +196,7 @@ def select_lessons(active: List[dict], candidates: Any = None, budget_bytes: int
         for tag in _lesson_tags(rec):
             ref = next((tag[len(p):] for p in CORRECTION_TAG_PREFIXES if tag.startswith(p)), None)
             ref = (ref or "").strip()
-            if not ref:  # no tag, or an empty reference: not a correction
+            if not LESSON_ID_MIN_PREFIX_RE.match(ref):  # no tag, or a reference shorter than ins-<ts>: no correction
                 continue
             corrections.add(i)
             # only a lesson recorded before the correction (earlier in file order) can be corrected by it
@@ -222,27 +228,36 @@ def select_lessons(active: List[dict], candidates: Any = None, budget_bytes: int
     selected, entries = [], []
     for i in order:
         entry = _brief_lesson(active[i])
-        if _brief_bytes(entries + [entry]) > budget_bytes:  # the exact size of the block in the brief file
+        lid = active[i].get("id")
+        too_long = _brief_max_line(entry) > BRIEF_MAX_LINE_CHARS  # a viewer could cut that line
+        over = _brief_bytes(entries + [entry]) > budget_bytes  # the exact size of the block in the brief file
+        if too_long or over:
             if not always(i):
+                if too_long:
+                    print(f"Lesson budget: {lid} skipped (a brief line over {BRIEF_MAX_LINE_CHARS} characters)",
+                          file=sys.stderr)
                 continue
-            print(f"Lesson budget: {active[i].get('id')} (correction or pinned) included over the "
-                  f"{budget_bytes}-byte cap", file=sys.stderr)
+            print(f"Lesson budget: {lid} (correction or pinned) included "
+                  + (f"with a brief line over {BRIEF_MAX_LINE_CHARS} characters" if too_long
+                     else f"over the {budget_bytes}-byte cap"), file=sys.stderr)
+            if report is not None:
+                report["budget_exceeded"] = True
         selected.append(active[i])
         entries.append(entry)
     return selected
 
 
 def load_recent_insights(limit: Optional[int] = None, *, candidates: Any = None,
-                         budget_bytes: int = LESSON_BUDGET_BYTES) -> List[dict]:
+                         budget_bytes: int = LESSON_BUDGET_BYTES, report: Optional[dict] = None) -> List[dict]:
     """Active lessons of trade_insights.jsonl chosen by select_lessons (issue #187), in brief order. `limit`
-    (compatibility) caps the count after the selection. Any error: a one-line stderr warning and [] (fail-open: the
-    brief is still built, without lessons)."""
+    (compatibility) caps the count after the selection. `report`: see select_lessons. Any error: a one-line stderr
+    warning and [] (fail-open: the brief is still built, without lessons)."""
     try:
         from utils.lessons import read_active_lessons
-        selected = select_lessons(read_active_lessons(INSIGHTS_FILE), candidates, budget_bytes)
+        selected = select_lessons(read_active_lessons(INSIGHTS_FILE), candidates, budget_bytes, report=report)
     except Exception as e:
-        print(f"Committed lessons not loaded ({type(e).__name__}: {' '.join(str(e).split())[:120]}): brief built without lessons",
-              file=sys.stderr)
+        print(f"Committed lessons not loaded ({type(e).__name__}: {' '.join(str(e).split())[:120]}): brief built "
+              "without lessons", file=sys.stderr)
         return []
     return selected[:limit] if limit is not None else selected
 
@@ -401,6 +416,14 @@ def _brief_bytes(data: Any) -> int:
     return len(json.dumps(data, ensure_ascii=False, **BRIEF_JSON_FORMAT).encode("utf-8"))
 
 
+BRIEF_MAX_LINE_CHARS = 2000  # a brief file line longer than this could be cut by the evaluator's file viewer
+
+
+def _brief_max_line(data: Any) -> int:
+    """Longest line (characters) of `data` serialized as the brief file."""
+    return max(len(line) for line in json.dumps(data, ensure_ascii=False, **BRIEF_JSON_FORMAT).split("\n"))
+
+
 def assemble_primed_brief(target_env: str = "prod", out_path: Optional[str] = None) -> dict:
     run_id = uuid.uuid4().hex
     state = ensure_fresh_state(target_env=target_env)
@@ -498,9 +521,12 @@ def assemble_primed_brief(target_env: str = "prod", out_path: Optional[str] = No
     # Issue #187: lessons last, ranked against the candidates this brief shows; the block gets the bytes the rest of
     # the brief leaves under BRIEF_BUDGET_BYTES ("[]" is already counted), at most LESSON_BUDGET_BYTES
     lesson_budget = min(LESSON_BUDGET_BYTES, BRIEF_BUDGET_BYTES - _brief_bytes(brief) + 2)
+    lesson_report = {}
     insights = load_recent_insights(candidates=brief_lesson_candidates(screening, yolo_slot),
-                                    budget_bytes=lesson_budget)
+                                    budget_bytes=lesson_budget, report=lesson_report)
     brief["committed_memory_lessons"] = [_brief_lesson(i) for i in insights]
+    if lesson_report.get("budget_exceeded"):  # corrections / pinned kept over the budget (omitted otherwise)
+        brief["lesson_budget_exceeded"] = True
 
     # Atomic write: the evaluator subagent reads logs/primed_brief.json with view_file
     _write_brief(BRIEF_FILE, brief)

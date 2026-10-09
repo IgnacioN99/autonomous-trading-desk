@@ -26,12 +26,11 @@ import time
 import uuid
 import datetime
 import argparse
-import re
 
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
-from utils.lessons import active_lessons, read_records  # noqa: E402  (stdlib-only, issue #187)
+from utils.lessons import LESSON_ID_MIN_PREFIX_RE, active_lessons, read_records  # noqa: E402  (stdlib, #187)
 
 LOGS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
 INSIGHTS_FILE = os.path.join(LOGS_DIR, "trade_insights.jsonl")
@@ -109,7 +108,7 @@ def list_insights(tag_filter=None):
         print(f"  👉 \"{i.get('insight')}\"{tags_str}")
     print("-" * 75 + "\n")
 
-CORRECTS_MIN_PREFIX_RE = re.compile(r"ins-\d{10}", re.IGNORECASE)  # --corrects: at least ins-<epoch seconds>
+CORRECTS_MIN_PREFIX_RE = LESSON_ID_MIN_PREFIX_RE  # --corrects: at least ins-<epoch seconds> (same as the brief)
 
 
 def resolve_lesson_id(ref: str):

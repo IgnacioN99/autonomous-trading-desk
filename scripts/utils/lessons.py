@@ -9,7 +9,12 @@ active_lessons(records) drops the tombstones and every record whose id a tombsto
 
 import json
 import os
+import re
 from typing import List
+
+# Shortest lesson-id reference a correction may use: ins-<10-digit epoch seconds> (remember_trade_lesson --corrects
+# and the brief's correction pairing)
+LESSON_ID_MIN_PREFIX_RE = re.compile(r"ins-\d{10}", re.IGNORECASE)
 
 
 def read_records(path: str) -> List[dict]:
