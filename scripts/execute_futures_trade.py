@@ -100,12 +100,15 @@ JSON schemas (stable; extra keys may be added, existing keys are never renamed):
       Resting entries (untriggered STOP_MARKET via the algo order API, resting LIMIT) return
       "conditional_entry" / "pending_limit_entry": true and "pending_entry_key"; they are recorded in
       logs/pending_entries.json, require a live position guardian in PROD and count against max_open_positions.
-      Issue #36: on KEYS their planned SL is pre-armed as a closePosition stop when not crossed ("prearm_status":
-      "placed" | "rejected:<code-or-text>" | "skipped:mcp" | "skipped:crossed", "prearm_algo_id"); the guardian
-      verifies it at fill and is the fallback; it is cancelled (by algo id) when the entry ends without a position.
-      Issue #157: a rejected (except -2021) or unverified pre-arm adds "prearm_anomaly": {"status", "message"} and
-      files a MEDIUM issue (the entry is kept). Issue #232: an API rejection also adds "prearm_reject_msg" (the
-      Binance msg, <= 200 chars; in the registry record, the message and the issue context). A MARKET entry's SL is verified by its own algo id only (an id-less
+      Issue #36: on KEYS the planned SL of a resting LIMIT is pre-armed as a closePosition stop when not crossed
+      ("prearm_status": "placed" | "rejected:<code-or-text>" | "skipped:mcp" | "skipped:no_position" |
+      "skipped:crossed", "prearm_algo_id"); the guardian verifies it at fill and is the fallback; it is cancelled (by
+      algo id) when the entry ends without a position. Issue #232: a STOP_MARKET entry is never pre-armed
+      (skipped:no_position; the guardian places its SL at fill).
+      Issue #157: a rejected (except -2021 and -4509, logged only) or unverified pre-arm adds "prearm_anomaly":
+      {"status", "message"} and files a MEDIUM issue (the entry is kept). Issue #232: an API rejection also adds
+      "prearm_reject_msg" (the Binance msg, <= 200 chars; in the registry record, the message and the issue context).
+      A MARKET entry's SL is verified by its own algo id only (an id-less
       placement response: by a closePosition stop at the SL within one tick that was not listed before the entry;
       issue #179: that read precedes the entry order, one short retry); a -4130 on that placement with no such stop
       (a leftover closePosition stop) auto-destructs and files a HIGH issue.
@@ -2198,11 +2201,12 @@ def append_trade_audit_record(record, margin_usdt):
 # Binance cannot attach a Stop Loss to a conditional/resting order, so each one is recorded in
 # logs/pending_entries.json and protect_pending_entries() (--protect-pending, run by the position
 # guardian at the start of every cycle) places the planned SL/TPs once it fills.
-# Issue #36: on KEYS (HMAC) the planned SL is also pre-armed at placement as a closePosition STOP_MARKET when it is
-# not crossed (prearm_resting_entry_stop); the guardian then verifies it at fill and stays the fallback.
+# Issue #36: on KEYS (HMAC) the planned SL of a resting LIMIT is also pre-armed at placement as a closePosition
+# STOP_MARKET when it is not crossed (prearm_resting_entry_stop); the guardian then verifies it at fill and stays the
+# fallback. Issue #232: a STOP_MARKET entry is not pre-armed (skipped:no_position; -4509 on a flat symbol).
 # Schema v2 record fields: prearm_status ("placed" | "rejected:<code-or-text>" | "skipped:mcp" |
-# "skipped:crossed"), prearm_reject_msg (Binance msg of an API rejection, issue #232), prearm_algo_id /
-# prearm_price (an algo id was returned), sl_close_position: true and
+# "skipped:no_position" | "skipped:crossed"), prearm_reject_msg (Binance msg of an API rejection, issue #232),
+# prearm_algo_id / prearm_price (an algo id was returned), sl_close_position: true and
 # sl_qty: null (verified pre-arm, covers any size). v1 records have none of them: not pre-armed.
 # Issue #156 (optional, no version bump): gate2_loss_cap_usdt (PROD Gate 2 cap at placement; bounds the drift
 # tolerance of the filled-record loss-cap re-check) and check_deferrals (consecutive runs with a deferred check).
@@ -2359,7 +2363,8 @@ def _api_reject_msg(res):
     return msg or None
 
 
-def prearm_resting_entry_stop(symbol, exit_side, sl_price, ref_price, target_env=None, tick_size=None):
+def prearm_resting_entry_stop(symbol, exit_side, sl_price, ref_price, target_env=None, tick_size=None, *,
+                              entry_type=None):
     """
     Issue #36: pre-arms the planned Stop Loss of a resting entry right after the entry is placed, as a closePosition
     STOP_MARKET on the exit side (place_algo_stop_loss with quantity=None). A closePosition order can never open a
@@ -2367,26 +2372,31 @@ def prearm_resting_entry_stop(symbol, exit_side, sl_price, ref_price, target_env
     triggers before the fill; either way the guardian verifies it at fill (_ensure_entry_stop) and places the planned
     stop when it is gone. Pre-armed only when:
       - the orders do not route through the MCP gateway (it rejects a bare closePosition with no position);
+      - entry_type is not "STOP_MARKET" (issue #232: on a flat symbol Binance rejects the closePosition stop with
+        -4509 "TIF GTE can only be used with open positions"; that SL is placed at fill by the guardian, as on MCP);
       - sl_price is on the protective side of ref_price (the current last price; the stop has no workingType, i.e.
         CONTRACT_PRICE): below it for a SELL stop (LONG), above it for a BUY stop (SHORT).
     Never blocks the entry. Returns the v2 registry fields: {"prearm_status": "placed" | "rejected:<code-or-text>" |
-    "skipped:mcp" | "skipped:crossed"}, plus prearm_reject_msg (issue #232: the Binance msg of an API rejection,
-    <= 200 chars, absent when there is none), plus prearm_algo_id / prearm_price (the listed trigger once verified, else
-    the requested sl_price) when an algo id was returned (cancelled
-    with the entry) and sl_close_position: True / sl_qty: None once verified on /fapi/v1/openAlgoOrders
-    (wait_for_stop_confirmation: by algo id, falling back to a trigger match within one tick; only the MARKET-entry
-    stop is verified by id alone, issue #157). Never
-    raises: an unexpected error is "rejected:<error>" (the entry must still be registered).
+    "skipped:mcp" | "skipped:no_position" | "skipped:crossed"}, plus prearm_reject_msg (issue #232: the Binance msg
+    of an API rejection, <= 200 chars, absent when there is none; a -4509 is also logged, issue #232), plus
+    prearm_algo_id / prearm_price (the listed trigger once verified, else the requested sl_price) when an algo id was
+    returned (cancelled with the entry) and sl_close_position: True / sl_qty: None once verified on
+    /fapi/v1/openAlgoOrders (wait_for_stop_confirmation: by algo id, falling back to a trigger match within one tick;
+    only the MARKET-entry stop is verified by id alone, issue #157). Never raises: an unexpected error is
+    "rejected:<error>" (the entry must still be registered).
     """
     try:
-        return _prearm_resting_entry_stop(symbol, exit_side, sl_price, ref_price, target_env, tick_size)
+        return _prearm_resting_entry_stop(symbol, exit_side, sl_price, ref_price, target_env, tick_size,
+                                          entry_type=entry_type)
     except Exception as e:
         return {'prearm_status': f"rejected:{type(e).__name__}: {e}"[:130]}
 
 
-def _prearm_resting_entry_stop(symbol, exit_side, sl_price, ref_price, target_env, tick_size):
+def _prearm_resting_entry_stop(symbol, exit_side, sl_price, ref_price, target_env, tick_size, entry_type=None):
     if uses_mcp_gateway(target_env):
         return {'prearm_status': 'skipped:mcp'}
+    if str(entry_type or '').upper() == 'STOP_MARKET':
+        return {'prearm_status': 'skipped:no_position'}   # issue #232: -4509 on a flat symbol
     sl_price, ref_price = _to_float(sl_price), _to_float(ref_price)
     is_long_exit = str(exit_side).upper() == 'SELL'
     if sl_price <= 0 or ref_price <= 0 or ((sl_price >= ref_price) if is_long_exit else (sl_price <= ref_price)):
@@ -2401,6 +2411,10 @@ def _prearm_resting_entry_stop(symbol, exit_side, sl_price, ref_price, target_en
         reject_msg = _api_reject_msg(placement)
         if reject_msg:
             rejected['prearm_reject_msg'] = reject_msg   # issue #232: the status keeps only the code
+        if rejected['prearm_status'] == 'rejected:-4509':
+            # Issue #232: expected on a flat symbol, not an anomaly (no issue filed); logged for the rate.
+            logger.warning(f"{symbol} pre-arm rejected:-4509 (not reported; the guardian places the SL at fill): "
+                           f"{reject_msg or 'no Binance message'}")
         return rejected
     fields = {'prearm_algo_id': placed_id, 'prearm_price': sl_price}
     verified, info = wait_for_stop_confirmation(symbol, exit_side, sl_price, algo_id=placed_id, tick_size=tick_size,
@@ -2419,16 +2433,18 @@ def _prearm_note(prearm, sl_price):
     if status == 'rejected:unverified':
         return (f"Stop Loss pre-arm may exist (unverified, algo id {prearm.get('prearm_algo_id')}); the guardian "
                 "verifies or places it at fill. ")
+    if status == 'skipped:no_position':
+        return "Stop Loss not pre-armed (STOP_MARKET entry, no position yet): the guardian places it at fill. "
     reject_msg = prearm.get('prearm_reject_msg')   # issue #232: Binance message of the rejection, when present
     return f"Stop Loss not pre-armed ({status}). " + (f'Binance message: "{reject_msg}". ' if reject_msg else "")
 
 
 def _prearm_anomaly(prearm):
     """Issue #157: a KEYS pre-arm that was not crossed but was rejected ("rejected:<code-or-text>", except -2021:
-    the exchange saying the SL would trigger at once) or not verified ("rejected:unverified"). skipped:* never is.
-    Returns {"status", "message"} or None."""
+    the exchange saying the SL would trigger at once, and -4509, issue #232: GTE refused on a flat symbol, logged
+    only) or not verified ("rejected:unverified"). skipped:* never is. Returns {"status", "message"} or None."""
     status = str((prearm or {}).get('prearm_status') or '')
-    if not status.startswith('rejected:') or status == 'rejected:-2021':
+    if not status.startswith('rejected:') or status in ('rejected:-2021', 'rejected:-4509'):
         return None
     return {"status": status, "message": _prearm_note(prearm, None).strip()}
 
@@ -3082,7 +3098,8 @@ def check_max_open_positions(prof, target_env, base_dir=None, live=None):
 def check_resting_entry_gates(symbol, target_env):
     """
     PROD gates for entries that rest on the book (untriggered STOP_MARKET, LIMIT), evaluated before any write.
-    Their TPs (and their SL when it cannot be pre-armed: MCP, crossed or rejected, issue #36) are only placed on fill
+    Their TPs (and their SL when it is not pre-armed: STOP_MARKET entries, issue #232, or MCP, crossed or rejected,
+    issue #36) are only placed on fill
     by protect_pending_entries, which also verifies a pre-armed SL, so:
       1. a guardian loop must be alive for this env (fail closed, see check_guardian_alive);
       2. the symbol must have no open position (keeps fill detection unambiguous).
@@ -3094,7 +3111,8 @@ def check_resting_entry_gates(symbol, target_env):
     if not alive:
         return False, (
             f"CONDITIONAL ENTRY REJECTED: FAIL-CLOSED — the position guardian is not alive ({why}). A resting entry "
-            "gets its TPs (and its Stop Loss unless pre-armed) on fill and its stop verified by the guardian; start "
+            "gets its TPs (and its Stop Loss unless pre-armed: a STOP_MARKET entry never is) on fill and its stop "
+            "verified by the guardian; start "
             "the guardian first: "
             f"`python3 scripts/loops/position_guardian_loop.py --interval 60 --env {target_env}`, or install it as a "
             f"background service: `python3 scripts/install_guardian_service.py --install --env {target_env}`."
@@ -4161,8 +4179,8 @@ def execute_complete_trade(
 
     # 1b. Pending resting entries (Issue #33, PROD): no new entry of any type on a symbol with a pending resting
     # entry (or an unreadable registry). An untriggered STOP_MARKET or a LIMIT entry rests on the book and gets its TPs
-    # (and its SL unless pre-armed, issue #36) on fill (--protect-pending / position guardian loop). Checked before
-    # any write.
+    # (and its SL unless pre-armed: LIMIT only, issues #36 / #232) on fill (--protect-pending / position guardian
+    # loop). Checked before any write.
     if is_prod:
         pend_ok, pend_err = check_pending_entry_conflict(symbol, target_env)
         if not pend_ok:
@@ -4419,9 +4437,10 @@ def execute_complete_trade(
                 cond_order = send_signed_request('POST', '/fapi/v1/algoOrder', entry_params, target_env=target_env)
                 order_id = _order_id(cond_order) if isinstance(cond_order, dict) and not _is_api_error(cond_order) else None
                 if order_id:
-                    # Issue #36: pre-arm the planned SL after the entry (the entry stays the first algo order sent).
+                    # Issue #232: not pre-armed (skipped:no_position, Binance rejects a closePosition stop on a flat
+                    # symbol with -4509); the guardian places the planned SL at fill.
                     prearm = prearm_resting_entry_stop(symbol, exit_side, sl_p, cur_price, target_env=target_env,
-                                                       tick_size=filters.get('tickSize'))
+                                                       tick_size=filters.get('tickSize'), entry_type='STOP_MARKET')
                     key, rec, failure = register_or_cancel('STOP_MARKET', order_id, trigger_p, prearm)
                     if failure:
                         return failure
@@ -4440,7 +4459,7 @@ def execute_complete_trade(
                         "prearm_algo_id": prearm.get('prearm_algo_id'),
                         "message": (f"Conditional STOP_MARKET entry placed at {trigger_p} (algo order {order_id}). "
                                     + _prearm_note(prearm, sl_p) +
-                                    "Its TPs (and the SL when not pre-armed) are placed on fill by "
+                                    "Its SL and TPs are placed on fill by "
                                     "`execute_futures_trade.py --protect-pending` / the position guardian loop, which also "
                                     "verifies the stop; unfilled after "
                                     f"{PENDING_ENTRY_TIMEOUT_SECONDS // 60} min it is cancelled.")
