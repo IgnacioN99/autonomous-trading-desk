@@ -108,13 +108,54 @@ class TestSqueezeBackstop(tgb.GuardHarness):
         self.dossier(squeeze="true")  # only an exact true triggers
         self.assertEqual(self.deploy().get("decision"), "allow")
 
-    def test_missing_snapshot_does_not_trigger(self):
+    def test_missing_snapshot_asks_for_a_short_only(self):
+        # Issue #207 (PR #214 review): a SHORT whose snapshot is missing cannot be checked for squeeze risk, so it
+        # asks (same helper and message in both gates); squeeze_confirmation_required itself still needs the flag.
         self.profile(require_calibrated_tier_s=False)
         self.dossier(snapshot=False)
-        self.assertEqual(self.deploy().get("decision"), "allow")
-        self.assertTrue(self.execute()[0])
+        res = self.deploy()
+        self.assertDenied(res, SQUEEZE_GATE)
+        self.assertIn(scal.SNAPSHOT_UNAVAILABLE_REASON, res["reason"])
+        ok, ex_reason, _ = self.execute()
+        self.assertFalse(ok)
+        self.assertIn(ex_reason.split(f"{self.SYMBOL}: ", 1)[1], res["reason"])
+        self.assertEqual(self.deploy("--confirmed").get("decision"), "allow")
+        self.assertTrue(self.execute(confirmed=True)[0])
         cand = {"symbol": self.SYMBOL, "direction": "SHORT", "dossier_sha256": "x"}
         self.assertIsNone(scal.squeeze_confirmation_required(cand, "prod", os.path.join(self.root, "nowhere")))
+        self.assertIn(scal.SNAPSHOT_UNAVAILABLE_REASON,
+                      scal.snapshot_confirmation_required(cand, "prod", os.path.join(self.root, "nowhere")))
+        # LONGs are unchanged: a missing snapshot does not ask
+        record = self.write_provenance_dossier(symbol=self.SYMBOL, direction="LONG",
+                                               extra={"tier": "A+", "score": 64, "requires_user_confirmation": False})
+        record.pop("radar_snapshots", None)
+        with open(self.dossier_path, "w", encoding="utf-8") as f:
+            json.dump(record, f)
+        command = f"{SCRIPT} --symbol {self.SYMBOL} --direction LONG --leverage 3 --env prod"
+        self.assertEqual(self.agy(self.cmd(command, conversationId=tgb.PARENT_CONV_ID)).get("decision"), "allow")
+        self.assertTrue(eft.enforce_evaluation_dossier(self.SYMBOL, "LONG", "prod", base_dir=self.root)[0])
+        self.assertIsNone(scal.snapshot_confirmation_required(dict(cand, direction="LONG"), "prod", self.root))
+
+    def test_stale_other_env_or_unbound_snapshot_asks_for_a_short(self):
+        self.profile(require_calibrated_tier_s=False)
+        self.dossier()
+        with open(self.dossier_path, encoding="utf-8") as f:
+            record = json.load(f)
+        sha = record["provenance"]["sha256"]
+        cand = {"symbol": self.SYMBOL, "direction": "SHORT", "dossier_sha256": sha}
+        for reason in ("stale", "no_match"):  # no_match: record_evaluation drops another env's rows
+            with self.subTest(reason=reason):
+                record["radar_snapshots"][f"{self.SYMBOL}|SHORT"] = {"radar_snapshot": None,
+                                                                      "radar_snapshot_reason": reason}
+                with open(self.dossier_path, "w", encoding="utf-8") as f:
+                    json.dump(record, f)
+                self.assertIn(scal.SNAPSHOT_UNAVAILABLE_REASON,
+                              scal.snapshot_confirmation_required(cand, "prod", self.root))
+                self.assertDenied(self.deploy(), SQUEEZE_GATE)
+                self.assertFalse(self.execute()[0])
+        self.assertIn(scal.SNAPSHOT_UNAVAILABLE_REASON,  # not bound to the validated dossier
+                      scal.snapshot_confirmation_required(dict(cand, dossier_sha256="f" * 64), "prod", self.root))
+        self.assertIsNone(scal.snapshot_confirmation_required(cand, "testnet", self.root))
 
     def test_snapshot_bound_to_the_validated_dossier(self):
         self.profile(require_calibrated_tier_s=False)

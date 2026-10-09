@@ -388,10 +388,10 @@ class TestRecorderSnapshots(_Workspace):
 # =============================================================================
 CAND = {"symbol": "SOLUSDT", "direction": "LONG", "tier": "S", "score": 85, "dossier_sha256": "abc123"}
 SNAP = {"symbol": "SOLUSDT", "direction": "LONG", "confidence": 84, "tier": "Tier S (x)",
-        "score_components": {"rsi": 35, "wick": 35, "volume": 14}}
+        "score_components": {"rsi": 35, "wick": 35, "volume": 14}, "score_schema_version": 2}
 FULL_META = {"score": 84, "score_tier": "Tier S (x)", "score_components": SNAP["score_components"],
              "score_source": "radar_snapshot", "score_missing_reason": None, "dossier_tier": "S",
-             "dossier_score": 85, "dossier_sha256": "abc123"}
+             "dossier_score": 85, "dossier_sha256": "abc123", "score_schema_version": 2}  # issue #207
 
 
 def write_snapshot_dossier(ws, sha="abc123", snaps=None):
@@ -518,8 +518,10 @@ class TestOutcomeRows(tto.OutcomesBase):
 # 8. score_calibration module
 # =============================================================================
 def outcome(score, r, env="prod", status="closed", key=0, mfe=1.0, radar=None):
+    # Issue #207: rows of the current radar score schema (older or missing versions are excluded from the buckets)
     return {"symbol": f"S{key}USDT", "direction": "LONG", "entry_ts": 1000 + key, "env": env, "status": status,
-            "dossier_score": score, "score": radar, "realized_r_net": r, "mfe_r": mfe}
+            "dossier_score": score, "score": radar, "realized_r_net": r, "mfe_r": mfe,
+            "score_schema_version": scal.SCORE_SCHEMA_VERSION}
 
 
 class TestScoreCalibrationModule(_Workspace):
@@ -567,12 +569,13 @@ class TestScoreCalibrationModule(_Workspace):
                 b = store["buckets"]["80-89"]
                 self.assertAlmostEqual(b["expectancy_r_net"], mean, places=4)
                 self.assertAlmostEqual(b["sd_r_net"], sd, places=4)
-                self.assertAlmostEqual(b["lcb95_r_net"], round(mean - 1.645 * sd / 30 ** 0.5, 4), places=4)
+                # Issue #207: Student-t critical value for df = n - 1 = 29 (1.699), not z = 1.645
+                self.assertAlmostEqual(b["lcb95_r_net"], round(mean - 1.699 * sd / 30 ** 0.5, 4), places=4)
                 self.assertEqual(b["calibrated"], calibrated)
                 ok, reason = scal.bucket_is_calibrated(store, 85, "PROD")
                 self.assertEqual(ok, calibrated, reason)
                 if not calibrated:
-                    self.assertIn("lower 95% bound -0.5508R <= 0 over n=30", reason)
+                    self.assertIn("lower 95% bound -0.5755R <= 0.1R over n=30", reason)
         self.assertEqual(scal.lower_confidence_bound([1.0]), (None, None))   # n < 2: undefined sd
         one = scal.build_calibration([outcome(85, 5.0)], "PROD", min_trades=1)["buckets"]["80-89"]
         self.assertEqual((one["lcb95_r_net"], one["calibrated"]), (None, False))
@@ -607,7 +610,7 @@ class TestScoreCalibrationModule(_Workspace):
         neg = scal.merge_store(None, [outcome(85, -0.2, key=i) for i in range(40)], now=now)
         ok, reason = scal.bucket_is_calibrated(neg, 85, "PROD", now)
         self.assertFalse(ok)
-        self.assertIn("<= 0", reason)
+        self.assertIn("<= 0.1R", reason)  # issue #207: the minimum margin (default +0.1R)
         ok, reason = scal.bucket_is_calibrated(self.store(), 85, "PROD", now, min_trades=31)
         self.assertEqual((ok, reason), (False, "n=30 < 31"))
 
@@ -632,9 +635,10 @@ class TestScoreCalibrationModule(_Workspace):
         self.assertLess(changed["buckets"]["80-89"]["expectancy_r_net"], 0.5)
 
     def test_policy_and_tier_helpers(self):
-        self.assertEqual(scal.calibration_policy({}), (True, 30))
+        # issue #207: the third value is tier_s_calibration_min_lcb_r (default +0.1R)
+        self.assertEqual(scal.calibration_policy({}), (True, 30, 0.1))
         self.assertEqual(scal.calibration_policy({"require_calibrated_tier_s": False,
-                                                  "tier_s_calibration_min_trades": 5}), (False, 5))
+                                                  "tier_s_calibration_min_trades": 5}), (False, 5, 0.1))
         for bad in ("false", 0, None):
             self.assertTrue(scal.calibration_policy({"require_calibrated_tier_s": bad})[0], bad)
         for bad in (0, -3, "30", True, 2.5):
@@ -806,7 +810,7 @@ class TestGuardCalibrationGate(tgb.GuardHarness):
         stats = {"n": 40, "wins": 30, "win_rate": 0.75, "expectancy_r_net": 0.9, "sd_r_net": 0.5,
                  "lcb95_r_net": 0.77, "insufficient": False, "calibrated": True}
         with open(self.store_path(), "w", encoding="utf-8") as f:
-            json.dump({"generated_at_ts": int(time.time()), "env": "PROD",
+            json.dump({"generated_at_ts": int(time.time()), "env": "PROD", "score_schema_version": 2,
                        "buckets": {"65-74": stats, "80-89": stats, "90-95": stats}}, f)
         self.write_provenance_dossier(extra={"score": 70})
         res = self.deploy()
@@ -1063,8 +1067,9 @@ class TestScorecardCalibration(tsc.ScorecardBase):
         self.assertEqual((tiers["S"]["n"], tiers["A"]["n"]), (1, 2))
 
     def rows(self, n=30, start=0, r=0.5, score=85):
+        # issue #207: current radar score schema (older rows are excluded from the buckets)
         return [tsc.row(net=r, symbol=f"S{i}USDT", entry_s=tsc.T + i, dossier_score=score, score=score - 1,
-                        mfe_r=1.2) for i in range(start, start + n)]
+                        mfe_r=1.2, score_schema_version=scal.SCORE_SCHEMA_VERSION) for i in range(start, start + n)]
 
     def test_block_text_and_store_written_by_the_cli(self):
         self.write_outcomes(self.rows() + [tsc.row(net=1.0, symbol="NOSCORE", entry_s=tsc.T + 999)])

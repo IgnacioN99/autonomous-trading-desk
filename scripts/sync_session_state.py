@@ -20,7 +20,10 @@ filling between the reads is double counted rather than missed. The state is onl
 previous file. Issue #208: closed_today_summary counts trades, not fills (trade_outcomes.summarize_closed_today on
 the day's userTrades, pages of 1000 up to 10 pages, "truncated" when incomplete, and the audit records): closed_trades_count / wins / losses / scratches per trade,
 win_rate_pct = wins / closed_trades_count (scratches count in the denominator), realized_r_net (sum of per-trade R), partial_history (trades entered before today), fills_closed (fills with a
-realized PnL); the USDT figures stay sums over the fills. CLI exit code 1 when the state written is INVALID or the write failed, else 0.
+realized PnL); the USDT figures stay sums over the fills. Issue #207: daily_loss_gate = the Daily Loss Gate state
+(utils/daily_loss_gate.py on the same fills and per-trade list, the profile limits and the live USDT wallet balance;
+{"blocked": true, "scope": "all", "reason": "unavailable: ..."} on any read problem and in the error state; TESTNET
+not blocked). CLI exit code 1 when the state written is INVALID or the write failed, else 0.
 """
 
 import os
@@ -41,11 +44,11 @@ LOGS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 STATE_FILE = os.path.join(LOGS_DIR, "session_state.json")
 AUDIT_LOG = os.path.join(LOGS_DIR, "trades_audit.jsonl")
 
-def get_start_of_day_utc() -> int:
-    """Returns timestamp in ms for the start of the current UTC day (00:00:00 UTC)."""
-    now = datetime.datetime.now(datetime.timezone.utc)
-    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    return int(start.timestamp() * 1000)
+def get_start_of_day_utc(now=None) -> int:
+    """Returns timestamp in ms for the start of the current UTC day (00:00:00 UTC); `now` (epoch seconds, issue #207)
+    picks another instant's day."""
+    from utils.daily_loss_gate import day_start_ms
+    return day_start_ms(now)
 
 DAY_FILLS_LIMIT = 1000
 DAY_FILLS_MAX_PAGES = 10
@@ -183,7 +186,9 @@ def write_error_state(err_msg: str, now_ts: int, now_utc: str, target_env: str, 
             "gross_realized_pnl_usdt": 0.0,
             "commissions_usdt": 0.0,
             "net_realized_pnl_usdt": 0.0
-        }
+        },
+        # Issue #207: fail closed in the cache (the executor re-reads the exchange)
+        "daily_loss_gate": _gate_unavailable(f"ledger sync failed ({err_msg})"),
     }
     return _write_state(error_state)
 
@@ -418,40 +423,9 @@ def sync_session_state(target_env: str = None) -> dict:
                 today_realized_pnl += pnl
                 fills_closed += 1
 
-    day = {"trades_closed": 0, "wins": 0, "losses": 0, "scratches": 0, "realized_r_net_sum": 0.0,
-           "partial_history": 0}
-    day_error = None
-    day_error_counts_kept = False  # True: per-trade counts kept, the error only names symbols left out of them
-    if isinstance(trades_res, list):
-        try:
-            import trade_outcomes
-            day = trade_outcomes.summarize_closed_today(
-                records, trades_res, start_ms, target_env,
-                open_positions={(p["symbol"].upper(), p["direction"]) for p in active_positions})
-        except Exception as e:
-            day_error = f"{type(e).__name__}: {e}"[:200]
-        # PR #212 review: never report "0 closed trades" after real exits. When the per-trade summary failed, the audit
-        # could not be read, or closing fills exist but no audit trade matched them (e.g. manual exits of positions
-        # missing from the audit), fall back to the legacy per-fill counts (counted_by "fills").
-        open_symbols = {str(p["symbol"]).upper() for p in active_positions}
-        flat_closing_fills = any(float(t.get("realizedPnl", 0)) != 0 and str(t.get("symbol") or "").upper()
-                                 not in open_symbols for t in trades_res)  # a TP1 partial of an open trade is not
-        if day_error is None and (audit_read_error or (day["trades_closed"] == 0 and flat_closing_fills)):
-            day_error = ("audit unreadable: per-trade counts unavailable" if audit_read_error
-                         else "closing fills without a matching audit trade")
-        audit_symbols = {str(r.get("symbol") or "").upper() for r in records if not r.get("event")}
-        unmatched_symbols = sorted({str(t.get("symbol") or "").upper() for t in trades_res
-                                    if float(t.get("realizedPnl", 0)) != 0
-                                    and str(t.get("symbol") or "").upper() not in open_symbols
-                                    and str(t.get("symbol") or "").upper() not in audit_symbols})
-        if day_error is None and unmatched_symbols:  # some symbols counted, others left out: say which (PR #212)
-            day_error = f"closing fills without an audit trade (not counted): {', '.join(unmatched_symbols)}"[:200]
-            day_error_counts_kept = True
-        if day_error is not None and not day_error_counts_kept:
-            wins_f = sum(1 for t in trades_res if float(t.get("realizedPnl", 0)) > 0)
-            losses_f = sum(1 for t in trades_res if float(t.get("realizedPnl", 0)) < 0)
-            day = {"trades_closed": wins_f + losses_f, "wins": wins_f, "losses": losses_f, "scratches": 0,
-                   "realized_r_net_sum": None, "partial_history": 0}
+    view = day_trade_view(records, trades_res, start_ms, target_env,
+                          [(p["symbol"], p["direction"]) for p in active_positions], audit_read_error)
+    day, day_error, day_error_counts_kept = view["day"], view["day_error"], view["counts_kept"]
     closed_trades_count = day["trades_closed"]
     wins_count = day["wins"]
     losses_count = day["losses"]
@@ -548,20 +522,124 @@ def sync_session_state(target_env: str = None) -> dict:
         },
         "shadow_desk_summary": shadow_summary
     }
-    state["closed_today_summary"]["counted_by"] = ("unavailable" if not isinstance(trades_res, list)
-                                                   else "fills" if day_error and not day_error_counts_kept
-                                                   else "trades")
+    state["closed_today_summary"]["counted_by"] = view["counted_by"]
     if not isinstance(trades_res, list):  # PR #212 review: an unreadable day-fill read is visible, never a silent 0
         state["closed_today_summary"]["fills_error"] = str(trades_res)[:200]
     if day_error:
         state["closed_today_summary"]["trade_summary_error"] = day_error
+    state["daily_loss_gate"] = ledger_daily_loss_gate(target_env, trades_res, day_truncated, view)
 
     # Save to atomic file with kernel-level replace (no non-atomic fallback, issue #127)
     return _write_state(state)
 
+
+def day_trade_view(records, trades_res, start_ms, target_env, open_positions, audit_read_error=None) -> dict:
+    """Today's per-trade view of the day's fills (issue #208; shared with the executor's Daily Loss Gate, issue #207):
+    {"trades": trade_outcomes.closed_trades_today list, "day": its summary, "day_error", "counts_kept",
+    "counted_by": "trades" | "fills" | "unavailable"}. open_positions: (SYMBOL, DIRECTION) pairs open now.
+    PR #212 review: never report "0 closed trades" after real exits. When the per-trade summary failed, the audit
+    could not be read, or closing fills exist but no audit trade matched them (e.g. manual exits of positions missing
+    from the audit), the counts fall back to the legacy per-fill counts (counted_by "fills"); closing fills of symbols
+    without any audit record are named in day_error while the per-trade counts are kept (counts_kept)."""
+    day = {"trades_closed": 0, "wins": 0, "losses": 0, "scratches": 0, "realized_r_net_sum": 0.0,
+           "partial_history": 0}
+    view = {"trades": [], "day": day, "day_error": None, "counts_kept": False, "counted_by": "unavailable"}
+    if not isinstance(trades_res, list):
+        return view
+    day_error = None
+    day_error_counts_kept = False  # True: per-trade counts kept, the error only names symbols left out of them
+    open_pairs = {(str(s).upper(), str(d).upper()) for s, d in open_positions or []}
+    try:
+        import trade_outcomes
+        day = trade_outcomes.summarize_closed_today(records, trades_res, start_ms, target_env,
+                                                    open_positions=open_pairs)
+        view["trades"] = trade_outcomes.closed_trades_today(records, trades_res, start_ms, target_env,
+                                                            open_positions=open_pairs)
+    except Exception as e:
+        day_error = f"{type(e).__name__}: {e}"[:200]
+    open_symbols = {s for s, _d in open_pairs}
+    flat_closing_fills = any(float(t.get("realizedPnl", 0)) != 0 and str(t.get("symbol") or "").upper()
+                             not in open_symbols for t in trades_res)  # a TP1 partial of an open trade is not
+    if day_error is None and (audit_read_error or (day["trades_closed"] == 0 and flat_closing_fills)):
+        day_error = ("audit unreadable: per-trade counts unavailable" if audit_read_error
+                     else "closing fills without a matching audit trade")
+    audit_symbols = {str(r.get("symbol") or "").upper() for r in records if not r.get("event")}
+    unmatched_symbols = sorted({str(t.get("symbol") or "").upper() for t in trades_res
+                                if float(t.get("realizedPnl", 0)) != 0
+                                and str(t.get("symbol") or "").upper() not in open_symbols
+                                and str(t.get("symbol") or "").upper() not in audit_symbols})
+    if day_error is None and unmatched_symbols:  # some symbols counted, others left out: say which (PR #212)
+        day_error = f"closing fills without an audit trade (not counted): {', '.join(unmatched_symbols)}"[:200]
+        day_error_counts_kept = True
+    if day_error is not None and not day_error_counts_kept:
+        wins_f = sum(1 for t in trades_res if float(t.get("realizedPnl", 0)) > 0)
+        losses_f = sum(1 for t in trades_res if float(t.get("realizedPnl", 0)) < 0)
+        day = {"trades_closed": wins_f + losses_f, "wins": wins_f, "losses": losses_f, "scratches": 0,
+               "realized_r_net_sum": None, "partial_history": 0}
+    view.update(day=day, day_error=day_error, counts_kept=day_error_counts_kept,
+                counted_by="fills" if day_error and not day_error_counts_kept else "trades")
+    return view
+
+
+def _gate_unavailable(reason: str) -> dict:
+    return {"blocked": True, "scope": "all", "reason": f"unavailable: {reason}"[:200]}
+
+
+def ledger_daily_loss_gate(target_env: str, trades_res, truncated: bool, view: dict, prof: dict = None,
+                           equity=None) -> dict:
+    """The Daily Loss Gate state (utils.daily_loss_gate.evaluate, as a YOLO order so `scope` shows every active
+    limit) for the ledger cache (issue #207), from the fills and per-trade view this sync already read, the profile
+    and the live USDT wallet balance (/fapi/v2/balance). TESTNET: not blocked (the executor skips the gate there).
+    Any read problem, truncated fills or per-fill counts: {"blocked": true, "scope": "all", "reason": "unavailable:
+    ..."} (fail closed in the cache; the executor re-reads the exchange and is authoritative)."""
+    if pt.norm_env(target_env) == "testnet":
+        return {"blocked": False, "scope": None, "reason": "TESTNET: gate skipped"}
+    try:
+        from utils import daily_loss_gate as dlg
+        if not isinstance(trades_res, list):
+            return _gate_unavailable(f"today's fills unreadable ({str(trades_res)[:120]})")
+        if truncated:
+            return _gate_unavailable("today's fills truncated")
+        if view.get("counted_by") != "trades":
+            return _gate_unavailable(f"trades not counted per trade ({view.get('day_error')})")
+        import user_profile as up
+        if prof is None:
+            prof = up.load_user_profile()
+        if equity is None:
+            equity = _wallet_balance_usdt(target_env)
+        limits = up.get_daily_loss_limits(prof)
+        net, _other = dlg.day_net_realized(trades_res)
+        return dlg.evaluate(net, view.get("trades") or [], risk_pct=eft.profile_risk_fraction(prof), equity_now=equity,
+                            is_yolo_order=True, **limits)
+    except Exception as e:
+        return _gate_unavailable(f"{type(e).__name__}: {e}")
+
+
+def _wallet_balance_usdt(target_env: str) -> float:
+    """USDT wallet balance from /fapi/v2/balance (the executor's equity basis); raises when unreadable."""
+    res = eft.send_signed_request("GET", "/fapi/v2/balance", target_env=target_env)
+    for b in res if isinstance(res, list) else []:
+        if isinstance(b, dict) and b.get("asset") == "USDT" and float(b.get("balance", 0.0)) > 0:
+            return float(b["balance"])
+    raise RuntimeError(f"USDT balance unreadable ({str(res)[:120]})")
+
 def _fmt_r(value):
     """Signed R for the markdown summary; "n/a" when the per-trade summary failed (counted_by "fills")."""
     return "n/a" if value is None else f"{value:+.2f}R"
+
+
+def format_daily_loss_gate(gate) -> str:
+    """One-line Daily Loss Gate state (issue #207), shared with the doctor; a missing state reads as UNKNOWN."""
+    if not isinstance(gate, dict):
+        return "UNKNOWN (no state: sync required)"
+    if gate.get("blocked") is not False:
+        return f"🚨 ACTIVE ({gate.get('scope') or 'all'}): {gate.get('reason')}"
+    if gate.get("scope"):
+        return f"⚠️ ACTIVE ({gate['scope']}): {gate.get('reason')}"
+    return (f"inactive (day_net_realized_usdt={gate.get('day_net_realized_usdt')}, limit_usdt=-"
+            f"{gate.get('day_loss_limit_usdt')}, consecutive_full_sl={gate.get('consecutive_full_sl')}, "
+            f"yolo_full_losses={gate.get('yolo_full_losses')})" if "day_loss_limit_usdt" in gate
+            else f"inactive ({gate.get('reason')})")
 
 
 def format_markdown_summary(state: dict) -> str:
@@ -591,6 +669,7 @@ def format_markdown_summary(state: dict) -> str:
         f"{partial_note}",
         f"* **Net Realized PnL Today:** **{'+' if closed['net_realized_pnl_usdt'] >= 0 else ''}{closed['net_realized_pnl_usdt']:.4f} USDT** (Commissions: -${closed['commissions_usdt']:.4f})",
         f"* **Total Floating PnL:** **{'+' if exp['total_floating_pnl_usdt'] >= 0 else ''}{exp['total_floating_pnl_usdt']:.4f} USDT**",
+        f"* **Daily Loss Gate:** {format_daily_loss_gate(state.get('daily_loss_gate'))}",
         "",
         f"### ⚖️ Portfolio Exposure & Delta: `{exp['delta_bias']}`",
         f"* **Long Notional:** ${exp['long_notional_usdt']:.2f} | **Short Notional:** ${exp['short_notional_usdt']:.2f} | **Net Delta:** ${exp['net_notional_delta_usdt']:+.2f}",

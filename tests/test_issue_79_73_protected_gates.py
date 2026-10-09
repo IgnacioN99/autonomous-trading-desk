@@ -36,7 +36,12 @@ import trading_doctor  # noqa: E402
 
 GATE_MODULES = ("scripts/utils/gate_limits.py", "scripts/execute_futures_trade.py",
                 "scripts/utils/portfolio_exposure.py", "scripts/utils/env_resolver.py", "scripts/user_profile.py",
-                "scripts/utils/score_calibration.py")  # #202: decides when an autonomous Tier S asks the user
+                "scripts/utils/score_calibration.py",  # #202: decides when an autonomous Tier S asks the user
+                # #207: the Daily Loss Gate, the module-unavailable ask texts, and the gate's inputs
+                "scripts/utils/daily_loss_gate.py", "scripts/utils/calibration_fallback.py",
+                "scripts/sync_session_state.py", "scripts/trade_outcomes.py")
+# #207: gate inputs that are also run as programs (the desk runs them; only writes to them must ask)
+RUN_AS_PROGRAM_207 = ("scripts/sync_session_state.py", "scripts/trade_outcomes.py")
 EXECUTOR = "scripts/execute_futures_trade.py"
 HEARTBEAT = "hook_heartbeat.json"
 HEARTBEAT_WRITER = "scripts/hooks/pre_trade_guard.py"
@@ -93,7 +98,8 @@ class TestGateModulesFileTools(t49.PowerShellHarness):
             self.assertEqual(pre_trade_guard.evaluate_file_write(rel, "GATE = 1\n", self.root)[0], "force_ask", rel)
 
     def test_unrelated_scripts_keep_plain_ask(self):
-        for rel in ("scripts/sync_session_state.py", "scripts/utils/position_timing.py", "tests/test_gate_limits.py"):
+        # (#207: sync_session_state.py is now a gate input; trading_doctor.py is the unrelated script here)
+        for rel in ("scripts/trading_doctor.py", "scripts/utils/position_timing.py", "tests/test_gate_limits.py"):
             self.assertEqual(pre_trade_guard.evaluate_file_write(rel, "x = 1\n", self.root)[0], "ask", rel)
 
 
@@ -129,8 +135,36 @@ class TestGateModulesBash(t49.PowerShellHarness):
     def test_bare_basenames_of_never_run_modules_force_ask(self):
         for c in ("cd scripts/utils && sed -i 's/0.35/0.95/' gate_limits.py",
                   "cd scripts/utils && echo x > portfolio_exposure.py",
-                  "cd scripts/utils; cp /tmp/x.py env_resolver.py"):
+                  "cd scripts/utils; cp /tmp/x.py env_resolver.py",
+                  "cd scripts/utils && sed -i 's/>= max_sl/>= 99/' daily_loss_gate.py",  # #207
+                  "cd scripts/utils && echo 'TIER_S_FALLBACK_MESSAGE = \"\"' > calibration_fallback.py"):
             self.assertEqual(self.agy(self.cmd(c)).get("decision"), "force_ask", c)
+
+    def test_running_the_207_gate_inputs_keeps_its_decision(self):
+        """#207: sync_session_state.py / trade_outcomes.py are protected gate inputs, but every documented way of
+        RUNNING them keeps the decision it had: only a write to the file forces an ask."""
+        runs = ("python3 scripts/sync_session_state.py", "python3 scripts/sync_session_state.py --env prod",
+                "python3 scripts/sync_session_state.py prod", "python3 scripts/sync_session_state.py testnet",
+                "python3 scripts/trade_outcomes.py --json", "python3 scripts/trade_outcomes.py --env prod --json",
+                "python3 scripts/trade_outcomes.py --since 2026-10-01 --no-klines --json",
+                "python3 scripts/trade_outcomes.py --symbol BTCUSDT --env prod")
+        suffixes = ("", " 2>&1", " > /tmp/out.log", " 2>&1 | tee /tmp/out.log", " >> /tmp/out.log 2>&1")
+        for c in runs:
+            for suffix in suffixes:
+                line = c + suffix
+                analysis = pre_trade_guard.analyze_run_command(line, self.root, self.root)
+                self.assertFalse(analysis.get("force_ask"), line)
+                self.assertFalse(analysis.get("deny"), line)
+                self.assertNotIn(self.agy(self.cmd(line)).get("decision"), ("force_ask", "deny"), line)
+                self.assertNotIn(self.decision(self.bash(line)), ("deny",), line)
+        for rel in RUN_AS_PROGRAM_207:  # a write to them still forces the ask
+            self.assertEqual(self.agy(self.cmd(f"sed -i 's/a/b/' {rel}")).get("decision"), "force_ask", rel)
+            self.assertEqual(self.agy(self.cmd(f"python3 {rel} > {rel}")).get("decision"), "force_ask", rel)
+        for command in ("python scripts\\sync_session_state.py --env prod",
+                        "python scripts\\trade_outcomes.py --json | Out-File C:\\tmp\\o.json"):
+            full = pre_trade_guard.normalize_powershell_command(command)
+            _, force_ask = pre_trade_guard.powershell_backstop(full, self.root, self.root)
+            self.assertFalse(force_ask, command)
 
     def test_reads_keep_previous_decision(self):
         for rel in GATE_MODULES:

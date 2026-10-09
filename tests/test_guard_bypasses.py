@@ -44,15 +44,17 @@ def setUpModule():
     os.environ.update(OFFLINE_ENV)
 
 
-def write_calibrated_store(root, now=None, env="PROD", n=30, expectancy=0.25):
+def write_calibrated_store(root, now=None, env="PROD", n=30, expectancy=0.4):
     """Issue #202 fixture: a fresh logs/score_calibration.json whose Tier S buckets (80-89, 90-95) are calibrated
-    (n trades with positive net expectancy), so the autonomous Tier S gate is exercised positively by default."""
-    lcb = round(expectancy - 1.645 * 0.5 / n ** 0.5, 4)  # sd 0.5R: 30 trades at +0.25R give LCB95 ~ +0.10R
+    (n trades with positive net expectancy), so the autonomous Tier S gate is exercised positively by default.
+    Issue #207: Student-t bound (t95 df 29 = 1.699) above the +0.1R margin: 30 trades at +0.4R, sd 0.5R -> +0.245R."""
+    lcb = round(expectancy - 1.699 * 0.5 / n ** 0.5, 4)
     stats = {"n": n, "wins": n // 2, "win_rate": 0.5, "expectancy_r_net": expectancy, "sd_r_net": 0.5,
-             "lcb95_r_net": lcb, "mean_mfe_r": 1.0, "insufficient": n < 20, "calibrated": n >= 30 and lcb > 0}
+             "lcb95_r_net": lcb, "mean_mfe_r": 1.0, "insufficient": n < 20, "calibrated": n >= 30 and lcb > 0.1}
     os.makedirs(os.path.join(root, "logs"), exist_ok=True)
     with open(os.path.join(root, "logs", "score_calibration.json"), "w", encoding="utf-8") as f:
-        json.dump({"schema_version": 1, "generated_at_ts": int(now if now is not None else time.time()), "env": env,
+        json.dump({"schema_version": 1, "score_schema_version": 2,  # issue #207: current score schema
+                   "generated_at_ts": int(now if now is not None else time.time()), "env": env,
                    "min_trades": 30, "trades": {}, "unscored": 0, "out_of_range": 0,
                    "buckets": {"80-89": dict(stats), "90-95": dict(stats)}}, f)
 

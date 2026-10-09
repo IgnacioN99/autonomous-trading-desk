@@ -5,7 +5,11 @@ score_calibration.py - Calibration of the heuristic radar score against resolved
 The radar `confidence` (copied into the dossier as `score`) is a heuristic point score, not a probability. This
 module buckets resolved trades by their dossier score and tells whether a bucket has earned autonomous Tier S
 execution: n >= min_trades resolved non-YOLO PROD trades whose one-sided 95% lower confidence bound of the mean net R
-(mean - 1.645 x sd / sqrt(n), sd with n-1) is above 0. Only the Tier S buckets 80-89 / 90-95 can clear a Tier S.
+(mean - t95(n-1) x sd / sqrt(n), sd with n-1, t95 = Student's t one-sided 95% critical value, issue #207) is above the
+profile margin `tier_s_calibration_min_lcb_r` (default +0.1R). Only the Tier S buckets 80-89 / 90-95 can clear a
+Tier S. Buckets use only rows of the current SCORE_SCHEMA_VERSION (`score_schema_version`; a row without it is v1):
+older rows stay in the store and are counted in `excluded_schema`. A store whose own `score_schema_version` is not
+the current one (e.g. a pre-#207 z-based store) is never calibrated (`store_schema_outdated`).
 
 Pure and network-free (stdlib only). Shared by scripts/trading_scorecard.py (the sole writer of the store),
 scripts/execute_futures_trade.py and scripts/hooks/pre_trade_guard.py (readers, through the same helpers and
@@ -35,6 +39,10 @@ MAX_AGE_S = 7 * 86400                 # an older store counts as not calibrated
 FUTURE_TOLERANCE_S = 300
 STORE_ENV = "PROD"
 SCHEMA_VERSION = 1
+# Version of the radar score itself (issue #207): v2 = after the #202 cap at 74 for rows without volume or wick and
+# the #206 squeeze cap. The radar stamps it on its rows; rows without it are v1. Calibration counts the current one only.
+SCORE_SCHEMA_VERSION = 2
+DEFAULT_MIN_LCB_R = 0.1               # profile tier_s_calibration_min_lcb_r default: lcb95 must be above this
 STORE_REL_PATH = os.path.join("logs", "score_calibration.json")
 
 
@@ -86,26 +94,53 @@ def _mean(values: Iterable[Optional[float]]) -> Optional[float]:
     return round(sum(vals) / len(vals), 4) if vals else None
 
 
-LCB_Z = 1.645  # one-sided 95%
+LCB_Z = 1.645  # one-sided 95% normal quantile: the t critical value beyond the table (df > 120)
+# One-sided 95% Student's t critical values by degrees of freedom (issue #207; stdlib only, the hook imports this
+# module). Between two listed df the value is interpolated linearly; above 120 it is LCB_Z.
+T95_TABLE = {1: 6.314, 2: 2.920, 3: 2.353, 4: 2.132, 5: 2.015, 6: 1.943, 7: 1.895, 8: 1.860, 9: 1.833, 10: 1.812,
+             11: 1.796, 12: 1.782, 13: 1.771, 14: 1.761, 15: 1.753, 16: 1.746, 17: 1.740, 18: 1.734, 19: 1.729,
+             20: 1.725, 21: 1.721, 22: 1.717, 23: 1.714, 24: 1.711, 25: 1.708, 26: 1.706, 27: 1.703, 28: 1.701,
+             29: 1.699, 30: 1.697, 40: 1.684, 60: 1.671, 120: 1.658}
+
+
+def t95_critical(df: int) -> float:
+    """One-sided 95% t critical value for df degrees of freedom (df >= 1): T95_TABLE, linear interpolation between
+    its entries, LCB_Z above 120."""
+    if df > 120:
+        return LCB_Z
+    if df in T95_TABLE:
+        return T95_TABLE[df]
+    keys = sorted(T95_TABLE)
+    lo = max(k for k in keys if k < df)
+    hi = min(k for k in keys if k > df)
+    return T95_TABLE[lo] + (T95_TABLE[hi] - T95_TABLE[lo]) * (df - lo) / (hi - lo)
 
 
 def lower_confidence_bound(values) -> Tuple[Optional[float], Optional[float]]:
     """(sd, lcb95): sample standard deviation (n-1) of the net R values and the one-sided 95% lower confidence
-    bound of their mean, mean - 1.645 * sd / sqrt(n). (None, None) when n < 2 (undefined sd: never calibrated)."""
+    bound of their mean, mean - t95(n-1) * sd / sqrt(n). (None, None) when n < 2 (undefined sd: never calibrated)."""
     vals = [v for v in values if v is not None]
     n = len(vals)
     if n < 2:
         return None, None
     mean = sum(vals) / n
     sd = math.sqrt(sum((v - mean) ** 2 for v in vals) / (n - 1))
-    return round(sd, 4), round(mean - LCB_Z * sd / math.sqrt(n), 4)
+    return round(sd, 4), round(mean - t95_critical(n - 1) * sd / math.sqrt(n), 4)
 
 
-def build_calibration(rows: Iterable[dict], env: str = STORE_ENV, min_trades: int = DEFAULT_MIN_TRADES) -> dict:
-    """Bucket table over the rows of `env` (the gate's env, PROD) that are closed with a non-null net R."""
+def row_schema_version(row: dict) -> int:
+    """The row's score_schema_version (1 when missing or not an int)."""
+    v = (row or {}).get("score_schema_version")
+    return v if isinstance(v, int) and not isinstance(v, bool) else 1
+
+
+def build_calibration(rows: Iterable[dict], env: str = STORE_ENV, min_trades: int = DEFAULT_MIN_TRADES,
+                      min_lcb_r: float = DEFAULT_MIN_LCB_R) -> dict:
+    """Bucket table over the rows of `env` (the gate's env, PROD) that are closed with a non-null net R and carry the
+    current SCORE_SCHEMA_VERSION (others count in excluded_schema). calibrated: n >= min_trades and lcb95 > min_lcb_r."""
     want = _norm_env(env)
     per = {label: [] for label in BUCKET_LABELS}
-    unscored = out_of_range = 0
+    unscored = out_of_range = excluded_schema = 0
     for row in rows or []:
         if not isinstance(row, dict) or _norm_env(row.get("env")) != want or row.get("status") != "closed":
             continue
@@ -117,6 +152,9 @@ def build_calibration(rows: Iterable[dict], env: str = STORE_ENV, min_trades: in
         score = bucket_score(row)
         if score is None:
             unscored += 1
+            continue
+        if row_schema_version(row) != SCORE_SCHEMA_VERSION:
+            excluded_schema += 1  # scored by an older radar formula (issue #207)
             continue
         label = bucket_for(score)
         if label is None:
@@ -138,10 +176,11 @@ def build_calibration(rows: Iterable[dict], env: str = STORE_ENV, min_trades: in
             "mean_mfe_r": _mean(m for _, m, _ in items),
             "mean_radar_score": _mean(s for _, _, s in items),
             "insufficient": n < MIN_SAMPLE,
-            "calibrated": n >= min_trades and lcb is not None and lcb > 0,
+            "calibrated": n >= min_trades and lcb is not None and lcb > min_lcb_r,
         }
-    return {"env": str(env).upper(), "min_trades": min_trades, "buckets": buckets, "unscored": unscored,
-            "out_of_range": out_of_range}
+    return {"env": str(env).upper(), "min_trades": min_trades, "min_lcb_r": min_lcb_r,
+            "score_schema_version": SCORE_SCHEMA_VERSION, "buckets": buckets, "unscored": unscored,
+            "out_of_range": out_of_range, "excluded_schema": excluded_schema}
 
 
 def trade_key(row: dict) -> str:
@@ -149,7 +188,7 @@ def trade_key(row: dict) -> str:
 
 
 _STORE_FIELDS = ("symbol", "direction", "entry_ts", "audit_ts", "env", "status", "is_yolo", "dossier_score",
-                 "score", "realized_r_net", "mfe_r")
+                 "score", "realized_r_net", "mfe_r", "score_schema_version")
 LEGACY_ENTRY_SLACK_MS = 120 * 1000  # trade_outcomes.ENTRY_FILL_SLACK_MS: pre-#210 entry_ts = audit_ts*1000 - this
 
 
@@ -169,7 +208,7 @@ def _same_trade(stored: dict, row: dict) -> bool:
 
 
 def merge_store(existing: Optional[dict], rows: Iterable[dict], now: Optional[float] = None,
-                min_trades: int = DEFAULT_MIN_TRADES) -> dict:
+                min_trades: int = DEFAULT_MIN_TRADES, min_lcb_r: float = DEFAULT_MIN_LCB_R) -> dict:
     """New store: the existing `trades` map updated with this run's closed PROD rows (same key = same trade, the
     newer row wins), then the buckets recomputed from the whole map. PR #212: a closed row REPLACES any earlier key of
     the same audit record (re-keyed entry_ts after better entry matching, or a pre-#210 legacy key), so one audit
@@ -187,7 +226,7 @@ def merge_store(existing: Optional[dict], rows: Iterable[dict], now: Optional[fl
         for old in [k for k, v in trades.items() if k != key and _same_trade(v, row)]:
             del trades[old]  # same audit record under its previous key: replaced, not added
         trades[key] = dict({k: row.get(k) for k in _STORE_FIELDS}, env="prod")
-    store = build_calibration(trades.values(), STORE_ENV, min_trades)
+    store = build_calibration(trades.values(), STORE_ENV, min_trades, min_lcb_r)
     store.update(schema_version=SCHEMA_VERSION, generated_at_ts=int(time.time() if now is None else now),
                  trades=trades)
     return store
@@ -197,8 +236,19 @@ def store_path(base_dir: str) -> str:
     return os.path.join(base_dir, STORE_REL_PATH)
 
 
-def load_calibration_with_reason(base_dir: str) -> Tuple[Optional[dict], Optional[str]]:
-    """(store, None), or (None, "calibration store missing" | "calibration store unreadable")."""
+STORE_SCHEMA_OUTDATED = "store_schema_outdated"
+
+
+def store_schema_current(cal: Any) -> bool:
+    """True when the store was built for the current SCORE_SCHEMA_VERSION (issue #207: a pre-#207 store has no
+    score_schema_version and z-based bounds, so it can never calibrate)."""
+    return isinstance(cal, dict) and row_schema_version(cal) == SCORE_SCHEMA_VERSION
+
+
+def load_calibration_with_reason(base_dir: str, require_current: bool = False) -> Tuple[Optional[dict], Optional[str]]:
+    """(store, None), or (None, "calibration store missing" | "calibration store unreadable"). require_current (the
+    gate): a store of another score_schema_version is (None, STORE_SCHEMA_OUTDATED). The scorecard (the store's
+    writer) reads it without the check so stored trades are kept when it rebuilds the buckets."""
     path = store_path(base_dir)
     if not os.path.exists(path):
         return None, "calibration store missing"
@@ -209,6 +259,8 @@ def load_calibration_with_reason(base_dir: str) -> Tuple[Optional[dict], Optiona
         return None, "calibration store unreadable"
     if not isinstance(data, dict):
         return None, "calibration store unreadable"
+    if require_current and isinstance(data.get("buckets"), dict) and not store_schema_current(data):
+        return None, STORE_SCHEMA_OUTDATED  # a malformed store keeps its own reason (bucket_is_calibrated)
     return data, None
 
 
@@ -217,9 +269,12 @@ def load_calibration(base_dir: str) -> Optional[dict]:
 
 
 def bucket_is_calibrated(cal: Optional[dict], score: Any, env: str = STORE_ENV, now: Optional[float] = None,
-                         max_age_s: int = MAX_AGE_S, min_trades: int = DEFAULT_MIN_TRADES) -> Tuple[bool, str]:
+                         max_age_s: int = MAX_AGE_S, min_trades: int = DEFAULT_MIN_TRADES,
+                         min_lcb_r: float = DEFAULT_MIN_LCB_R) -> Tuple[bool, str]:
     """(True, reason) only when the store is a fresh store of `env` and the score's bucket has n >= min_trades
-    and lcb95_r_net > 0; (False, reason) otherwise (missing data always means not calibrated)."""
+    and lcb95_r_net > min_lcb_r (the current profile margin, re-checked here against the stored bound, so a profile
+    change applies without rerunning the scorecard); (False, reason) otherwise (missing data always means not
+    calibrated)."""
     if cal is None:
         return False, "calibration store missing or unreadable"
     gen = _num(cal.get("generated_at_ts")) if isinstance(cal, dict) else None
@@ -227,6 +282,8 @@ def bucket_is_calibrated(cal: Optional[dict], score: Any, env: str = STORE_ENV, 
         return False, "calibration store malformed"
     if str(cal.get("env") or "").upper() != str(env or "").upper():
         return False, f"calibration store env {cal.get('env')!r} != {str(env).upper()}"
+    if not store_schema_current(cal):
+        return False, STORE_SCHEMA_OUTDATED
     now = time.time() if now is None else now
     age = now - gen
     if age > max_age_s or age < -FUTURE_TOLERANCE_S:
@@ -249,20 +306,24 @@ def bucket_is_calibrated(cal: Optional[dict], score: Any, env: str = STORE_ENV, 
     if n < min_trades:
         return False, f"n={n} < {min_trades}"
     lcb = _num(b.get("lcb95_r_net"))
-    if lcb is None or lcb <= 0:
-        return False, (f"net R lower 95% bound {'n/a' if lcb is None else format(lcb, '+.4f') + 'R'} <= 0 over "
-                       f"n={n}")
-    return True, f"bucket {label} calibrated (n={n}, net R lower 95% bound {lcb:+.4f}R)"
+    if lcb is None or lcb <= min_lcb_r:
+        return False, (f"net R lower 95% bound {'n/a' if lcb is None else format(lcb, '+.4f') + 'R'} <= "
+                       f"{min_lcb_r:g}R over n={n}")
+    return True, f"bucket {label} calibrated (n={n}, net R lower 95% bound {lcb:+.4f}R > {min_lcb_r:g}R)"
 
 
-def calibration_policy(profile: Any) -> Tuple[bool, int]:
-    """(require_calibrated_tier_s, tier_s_calibration_min_trades) from the profile. Only an explicit boolean False
-    turns the gate off (missing or malformed = on); min_trades must be an int >= 1, else the default."""
+def calibration_policy(profile: Any) -> Tuple[bool, int, float]:
+    """(require_calibrated_tier_s, tier_s_calibration_min_trades, tier_s_calibration_min_lcb_r) from the profile.
+    Only an explicit boolean False turns the gate off (missing or malformed = on); min_trades must be an int >= 1 and
+    min_lcb_r a finite number >= 0, else the default (issue #207: +0.1R)."""
     prof = profile if isinstance(profile, dict) else {}
     require = prof.get("require_calibrated_tier_s", True) is not False
     raw = prof.get("tier_s_calibration_min_trades", DEFAULT_MIN_TRADES)
     min_trades = raw if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 1 else DEFAULT_MIN_TRADES
-    return require, min_trades
+    raw = prof.get("tier_s_calibration_min_lcb_r", DEFAULT_MIN_LCB_R)
+    margin = _num(raw) if isinstance(raw, (int, float)) else None
+    min_lcb_r = float(margin) if margin is not None and margin >= 0 else DEFAULT_MIN_LCB_R
+    return require, min_trades, min_lcb_r
 
 
 def candidate_is_tier_s(cand: Any) -> bool:
@@ -286,15 +347,16 @@ def tier_s_confirmation_required(cand: Any, env: str, profile: Any, base_dir: st
     score bucket is not calibrated; None when the check does not apply (not PROD, flag off, not Tier S) or the
     bucket is calibrated. Callers invoke it only for unconfirmed, non-YOLO candidates that would not already ask.
     Checked first, for any tier and whatever the profile: a radar-flagged squeeze SHORT (squeeze_confirmation_required,
-    issue #206)."""
+    issue #206), then a SHORT without a usable radar snapshot (snapshot_confirmation_required, issue #207)."""
     if _norm_env(env) != "prod":
         return None
-    squeeze_msg = squeeze_confirmation_required(cand, env, base_dir)  # any tier, whatever the profile (#206)
+    squeeze_msg = (squeeze_confirmation_required(cand, env, base_dir)  # any tier, whatever the profile (#206)
+                   or snapshot_confirmation_required(cand, env, base_dir))
     if squeeze_msg:
         return squeeze_msg
     if not candidate_is_tier_s(cand):
         return None
-    require, min_trades = calibration_policy(profile)
+    require, min_trades, min_lcb_r = calibration_policy(profile)
     if not require:
         return None
     score = cand.get("score")
@@ -304,11 +366,12 @@ def tier_s_confirmation_required(cand: Any, env: str, profile: Any, base_dir: st
             # a Tier S label never borrows a lower bucket's calibration (PR #204 re-review)
             ok, reason = False, f"tier_s_score_below_80 (score {_int_score(score)})"
         else:
-            cal, load_reason = load_calibration_with_reason(base_dir)
+            cal, load_reason = load_calibration_with_reason(base_dir, require_current=True)
             if cal is None:
                 ok, reason = False, load_reason
             else:
-                ok, reason = bucket_is_calibrated(cal, score, STORE_ENV, now=now, min_trades=min_trades)
+                ok, reason = bucket_is_calibrated(cal, score, STORE_ENV, now=now, min_trades=min_trades,
+                                                  min_lcb_r=min_lcb_r)
         if ok:
             ok, reason = radar_snapshot_matches(cand, base_dir)
     except Exception as e:  # fail closed
@@ -331,11 +394,26 @@ def squeeze_confirmation_required(cand: Any, env: str, base_dir: str) -> Optiona
     """Mechanical backstop for evaluator RULE 9 (issue #206): in PROD, an otherwise fast-tracked candidate whose
     radar snapshot (bound to the validated dossier) has `squeeze_risk: true` needs the user's confirmation, whatever
     its tier label and whatever `require_calibrated_tier_s` says. A missing or unreadable snapshot does not trigger
-    it (the calibration gate handles that case)."""
+    this message: for a SHORT, snapshot_confirmation_required asks instead (issue #207)."""
     if _norm_env(env) != "prod" or not isinstance(cand, dict):
         return None
     row, _ = _radar_snapshot_row(cand, base_dir)
     return squeeze_confirmation_message() if isinstance(row, dict) and row.get("squeeze_risk") is True else None
+
+
+SNAPSHOT_UNAVAILABLE_REASON = "radar snapshot unavailable for SHORT: user confirmation required"
+
+
+def snapshot_confirmation_required(cand: Any, env: str, base_dir: str) -> Optional[str]:
+    """Issue #207 (PR #214 review): in PROD, an otherwise fast-tracked SHORT whose radar snapshot is missing,
+    unreadable, stale, from another environment or not bound to the validated dossier (no row to check squeeze_risk
+    on) needs the user's confirmation, whatever its tier and profile. LONGs are unaffected."""
+    if _norm_env(env) != "prod" or not isinstance(cand, dict) or str(cand.get("direction") or "").upper() != "SHORT":
+        return None
+    row, reason = _radar_snapshot_row(cand, base_dir)
+    if isinstance(row, dict):
+        return None
+    return f"{SNAPSHOT_UNAVAILABLE_REASON} ({reason}): ask the user and rerun with --confirmed (RULE 9 unverifiable)."
 
 
 def _radar_snapshot_row(cand: dict, base_dir: str) -> Tuple[Optional[dict], str]:

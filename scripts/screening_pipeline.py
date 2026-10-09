@@ -122,6 +122,9 @@ class CandidateSetup(BaseModel):
     funding_rate_8h_pct: Optional[float] = None  # funding_rate_pct normalized to 8h (squeeze thresholds use it)
     funding_interval_h: Optional[int] = None  # symbol's funding interval (fundingInfo; 8h default)
     alt_short_climax_ok: bool = False  # radar's exact vol_ratio >= 2.5 (unrounded); missing = False (fail closed)
+    # Issue #207: radar score formula version (sidecar / audit only) and the fundingInfo-fallback SHORT flag
+    score_schema_version: Optional[int] = None
+    funding_interval_unknown: bool = False
 
 class StatArbPair(BaseModel):
     pair: str
@@ -383,6 +386,9 @@ def enrich_and_size_candidate(c: dict, target_env: Optional[str] = None) -> Opti
             macro_short_check=c.get("macro_short_check"),
             funding_rate_8h_pct=_optional_float(c.get("funding_rate_8h_pct")),
             funding_interval_h=c.get("funding_interval_h") if isinstance(c.get("funding_interval_h"), int) else None,
+            score_schema_version=(c.get("score_schema_version") if isinstance(c.get("score_schema_version"), int)
+                                  and not isinstance(c.get("score_schema_version"), bool) else None),
+            funding_interval_unknown=c.get("funding_interval_unknown") is True,
         )
     except Exception as e:
         sym = c.get("symbol") if isinstance(c, dict) else None

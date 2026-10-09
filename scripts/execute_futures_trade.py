@@ -125,6 +125,11 @@ JSON schemas (stable; extra keys may be added, existing keys are never renamed):
       logs/pending_entries.json.lock (PendingRegistryLockError when not acquired: nothing is written); resting entries
       also need the guardian's last cycle free of positions_sync / pending_* errors; an abort or close that does not
       end flat or protected files a CRITICAL/P0 issue (_report_abort_failure).
+      Issue #207: Daily Loss Gate (check_daily_loss_gate, opening orders only, before any write): PROD reads today's
+      UTC fills live and refuses a new entry at -daily_stop_r x risk of the start-of-day equity, after
+      max_consecutive_sl full SLs, or (YOLO, flag or dossier) after yolo_max_daily_losses YOLO full losses; any read
+      problem, MCP mode included, refuses (fail closed). TESTNET skips it. The entry audit record (and a resting
+      entry's registry record) carries the "daily_loss_gate" state it passed.
 """
 
 import os
@@ -1487,20 +1492,23 @@ def check_liquidation_gate(direction, entry_price, sl_price, leverage, maint_mar
     return True, None, details
 
 
+def profile_risk_fraction(prof):
+    """Profile risk_pct_equity as a fraction (default 0.005 = 0.5%): 0.005 -> 0.005; 0.5 -> 0.005; 1.0 -> 0.01.
+    Shared by Gate 2 and the Daily Loss Gate (issue #207)."""
+    try:
+        raw_risk = float((prof or {}).get("risk_pct_equity", 0.005))
+    except Exception:
+        raw_risk = 0.005
+    return raw_risk if raw_risk <= 0.05 else (raw_risk / 100.0)
+
+
 def monetary_loss_cap(account_equity, prof, *, is_testnet, is_yolo, ref, total_qty, leverage, unrealized=0.0):
     """Gate 2 loss cap (pure; shared by check_mechanical_gates and the protect-pending record check, issue #118).
     TESTNET: max(equity x risk x 1.25, 50); PROD YOLO: max(YOLO_MIN_LOSS_CAP_USDT, margin x
     YOLO_MAX_LOSS_MARGIN_FRACTION) with margin = ref x total_qty / leverage; PROD standard: min(wallet balance,
     balance + unrealized PnL) x risk x 1.25 (issue #119). Returns (max_allowed_loss, risk_fraction, equity_used,
     equity_note)."""
-    # Load risk percentage from user profile (default 0.005 = 0.5%)
-    try:
-        raw_risk = float((prof or {}).get("risk_pct_equity", 0.005))
-    except Exception:
-        raw_risk = 0.005
-
-    # Normalize risk fraction: e.g. 0.005 -> 0.005; 0.5 -> 0.005; 1.0 -> 0.01
-    risk_fraction = raw_risk if raw_risk <= 0.05 else (raw_risk / 100.0)
+    risk_fraction = profile_risk_fraction(prof)
 
     equity_note = ""
     # Dynamic risk ceiling = account_equity * (risk_pct_equity / 100) * 1.25 buffer
@@ -1815,9 +1823,10 @@ def _tier_s_calibration_message(cand, env, base_dir):
     """utils.score_calibration.tier_s_confirmation_required with the profile; fails closed (asks the user)."""
     try:
         from utils import score_calibration as scal
-    except Exception as e:
-        return (f"Tier S score bucket not calibrated (calibration module unavailable: {type(e).__name__}): ask the "
-                "user and rerun with --confirmed.") if _tier_label_of(cand) == "S" else None
+    except Exception:
+        if _tier_label_of(cand) == "S":
+            return TIER_S_FALLBACK_MESSAGE  # issue #207: one text shared with the guard
+        return squeeze_fallback_message(cand, base_dir)  # issue #207: the squeeze backstop still asks
     try:
         import user_profile as up
         prof = up.load_user_profile(base_dir=base_dir)
@@ -1834,10 +1843,117 @@ def _tier_label_of(cand):
     return tokens[0] if tokens else None
 
 
+# Issue #207: the fallback texts live in utils/calibration_fallback.py, shared with pre_trade_guard (score_calibration
+# may be the missing module)
+_GENERIC_FALLBACK_ASK = ("squeeze_risk SHORT / Tier S: user confirmation required (calibration modules unavailable): "
+                         "ask the user and rerun with --confirmed.")
+try:  # a broken texts module may only make the desk ask more, never stop the close / heal paths from loading
+    from utils.calibration_fallback import TIER_S_FALLBACK_MESSAGE, SQUEEZE_FALLBACK_MESSAGE  # noqa: E402
+except Exception:  # pragma: no cover - still ask the user, with a generic text
+    TIER_S_FALLBACK_MESSAGE = SQUEEZE_FALLBACK_MESSAGE = _GENERIC_FALLBACK_ASK
+# An emptied text would turn the ask off (callers test `if calib_msg:`): never empty
+TIER_S_FALLBACK_MESSAGE = TIER_S_FALLBACK_MESSAGE or _GENERIC_FALLBACK_ASK
+SQUEEZE_FALLBACK_MESSAGE = SQUEEZE_FALLBACK_MESSAGE or _GENERIC_FALLBACK_ASK
+
+
+def squeeze_fallback_message(cand, base_dir):
+    """Squeeze backstop when utils.score_calibration cannot be imported (issue #207): SQUEEZE_FALLBACK_MESSAGE when
+    the stored dossier record's radar snapshot for the candidate has squeeze_risk true, or (a SHORT) is missing or not
+    bound to the dossier sha256, or the record cannot be read (fail closed: ask); else None."""
+    cand = cand if isinstance(cand, dict) else {}
+    try:
+        with open(os.path.join(base_dir, 'logs', 'evaluations', 'latest_dossier.json'), 'r', encoding='utf-8') as f:
+            record = json.load(f)
+        key = f"{str(cand.get('symbol') or '').upper()}|{str(cand.get('direction') or '').upper()}"
+        entry = (record.get('radar_snapshots') or {}).get(key)
+        row = entry.get('radar_snapshot') if isinstance(entry, dict) else None
+        bound = bool(cand.get('dossier_sha256')) and (record.get('provenance') or {}).get('sha256') == \
+            cand.get('dossier_sha256')
+    except Exception:
+        return SQUEEZE_FALLBACK_MESSAGE
+    if isinstance(row, dict) and row.get('squeeze_risk') is True:
+        return SQUEEZE_FALLBACK_MESSAGE
+    if str(cand.get('direction') or '').upper() == 'SHORT' and not (isinstance(row, dict) and bound):
+        return SQUEEZE_FALLBACK_MESSAGE
+    return None
+
+
+def check_daily_loss_gate(target_env, is_yolo_order, prof, equity_now, *, open_positions=None, now=None):
+    """
+    Daily Loss Gate (issue #207) for OPENING orders only: called from execute_complete_trade, never from the close /
+    break-even / heal / protect / audit / positions paths. Returns (ok, reason, state).
+    - TESTNET: skipped (info line), ok.
+    - PROD: today's (UTC; sync_session_state.get_start_of_day_utc(now)) fills from GET /fapi/v1/userTrades
+      (sync_session_state.fetch_day_fills) and the audit records give the per-trade list
+      (sync_session_state.day_trade_view / trade_outcomes.closed_trades_today), judged by
+      utils.daily_loss_gate.evaluate with the profile limits (user_profile.get_daily_loss_limits), the profile risk
+      and equity_now (the live wallet balance). open_positions: (SYMBOL, DIRECTION) pairs open now (the live
+      snapshot; read from positionRisk when None). Fail closed: MCP mode (the gateway does not serve userTrades), an
+      unreadable or truncated fill read, an unreadable audit, trades not countable per trade (counted_by != "trades")
+      or any exception refuses the opening. state: the evaluate() dict plus "is_yolo_order" (audit field).
+    """
+    is_yolo_order = bool(is_yolo_order)
+    try:
+        env = resolve_env(target_env)
+    except Exception as e:
+        env = None
+        env_error = e
+    if env == 'testnet':
+        print("ℹ️ Daily Loss Gate skipped (TESTNET).", file=sys.stderr)  # stderr: stdout carries the JSON result
+        return True, "Daily Loss Gate skipped (TESTNET).", {"skipped": "testnet", "is_yolo_order": is_yolo_order}
+
+    def refuse(reason):
+        return False, reason, {"blocked": True, "scope": "all", "reason": reason, "is_yolo_order": is_yolo_order}
+
+    def unreadable(detail):
+        return refuse(f"DAILY LOSS GATE: today's fills unreadable ({str(detail)[:200]}) — opening refused (fail closed)")
+
+    if env is None:
+        return unreadable(f"environment resolution failed: {env_error}")
+    try:
+        if uses_mcp_gateway(env):
+            return unreadable("MCP mode: the Binance agentic gateway does not serve /fapi/v1/userTrades")
+        import sync_session_state as sss
+        import user_profile as up
+        from utils import daily_loss_gate as dlg
+        start_ms = sss.get_start_of_day_utc(now)
+        fills, truncated = sss.fetch_day_fills(start_ms, env)
+        if not isinstance(fills, list):
+            return unreadable(fills)
+        if truncated:
+            return unreadable(f"truncated after {sss.DAY_FILLS_MAX_PAGES} pages of {sss.DAY_FILLS_LIMIT}, or a later "
+                              "page failed")
+        audit_path = os.path.join(_workspace_dir(), 'logs', 'trades_audit.jsonl')
+        try:
+            records = read_audit_tail(audit_path) if os.path.exists(audit_path) else []
+        except OSError as e:
+            return unreadable(f"trades audit unreadable: {e}")
+        if open_positions is None:
+            pos_res = send_signed_request('GET', '/fapi/v2/positionRisk', target_env=env)
+            if not isinstance(pos_res, list):
+                return unreadable(f"/fapi/v2/positionRisk query failed: {pos_res}")
+            open_positions = [(p["symbol"], p["side"]) for p in compute_exposure(pos_res)["active_positions"]]
+        view = sss.day_trade_view(records, fills, start_ms, env, open_positions)
+        if view.get("counted_by") != "trades":
+            return refuse(f"DAILY LOSS GATE: today's trades cannot be counted per trade ({view.get('day_error')}): "
+                          "the consecutive-SL streak is unverifiable — opening refused (fail closed)")
+        net, other_asset = dlg.day_net_realized(fills)
+        state = dlg.evaluate(net, view.get("trades") or [], risk_pct=profile_risk_fraction(prof),
+                             equity_now=equity_now, is_yolo_order=is_yolo_order, **up.get_daily_loss_limits(prof))
+        state["is_yolo_order"] = is_yolo_order
+        if other_asset:
+            state["non_usdt_commission"] = True  # left out of the USDT sum; those trades have gross R only
+        if state.get("blocked"):
+            return False, state.get("reason"), state
+        return True, None, state
+    except Exception as e:
+        return unreadable(f"{type(e).__name__}: {e}")
+
+
 # Issue #202: score metadata on the entry audit record (audit only; never a gate input). Never named `provenance`
 # (stamp_trade_record owns that key).
 SCORE_AUDIT_KEYS = ('score', 'score_tier', 'score_components', 'score_source', 'score_missing_reason',
-                    'dossier_tier', 'dossier_score', 'dossier_sha256')
+                    'dossier_tier', 'dossier_score', 'dossier_sha256', 'score_schema_version')
 
 
 def score_audit_fields(meta):
@@ -1888,7 +2004,10 @@ def build_score_meta(cand, symbol, direction):
             score = row.get('confidence')
             meta.update(score=int(score) if isinstance(score, (int, float)) and not isinstance(score, bool) else None,
                         score_tier=row.get('tier'), score_components=row.get('score_components'),
-                        score_source='radar_snapshot')
+                        score_source='radar_snapshot',
+                        score_schema_version=(row.get('score_schema_version')
+                                              if isinstance(row.get('score_schema_version'), int)
+                                              and not isinstance(row.get('score_schema_version'), bool) else None))
     except Exception as e:
         meta['score_missing_reason'] = f"error ({type(e).__name__})"
     return meta
@@ -2091,12 +2210,14 @@ def update_pending_entries(mutate, base_dir=None):
 
 def register_resting_entry(kind, entry_id, symbol, direction, entry_side, exit_side, target_env, price, total_qty,
                            sl_price, tp1_price, tp2_price, leverage, is_yolo, margin_usdt, prearm=None,
-                           tick_size=None, step_size=None, gate2_loss_cap_usdt=None, *, score_meta=None):
+                           tick_size=None, step_size=None, gate2_loss_cap_usdt=None, *, score_meta=None,
+                           daily_loss_gate=None):
     """Records a resting entry in logs/pending_entries.json (schema v2; `prearm`: the prearm_resting_entry_stop
     fields; tick_size / step_size: the symbol filters used for rounding, stored when given for the half-tick
     registry match of Gate 1 and the total_qty check, issue #126; gate2_loss_cap_usdt: the Gate 2 loss cap at
     placement, stored when positive, bounds the equity-drift tolerance of the protect-pending re-check, issue #156;
-    score_meta: the SCORE_AUDIT_KEYS copied into the fill's audit record, issue #202).
+    score_meta: the SCORE_AUDIT_KEYS copied into the fill's audit record, issue #202; daily_loss_gate: the Daily
+    Loss Gate state at placement, copied into the fill's audit record, issue #207).
     Returns (key, record); raises on failure."""
     now = int(time.time())
     key = pending_entry_key(target_env, symbol, entry_id)
@@ -2126,6 +2247,8 @@ def register_resting_entry(kind, entry_id, symbol, direction, entry_side, exit_s
     record.update(prearm or {})
     if score_meta is not None:
         record['score_meta'] = score_audit_fields(score_meta)
+    if daily_loss_gate is not None:
+        record['daily_loss_gate'] = daily_loss_gate
     update_pending_entries(lambda entries: entries.__setitem__(key, record))
     return key, record
 
@@ -3716,6 +3839,8 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out, run_ctx=None
             'pending_entry_key': key,
         }
         record.update(score_audit_fields(rec.get('score_meta')))
+        if isinstance(rec.get('daily_loss_gate'), dict):
+            record['daily_loss_gate'] = rec['daily_loss_gate']  # issue #207: state at placement
         record.update(fill_quality_fields(is_long, entry_px, target_p, tp1_p, tp2_p))
         try:
             append_trade_audit_record(record, rec.get('margin_usdt'))
@@ -3891,6 +4016,16 @@ def execute_complete_trade(
                         "error": (f"GUARDRAIL: Margin of {margin_usdt} USDT exceeds max cap of {sizing_cap:.2f} USDT "
                                   f"({max_margin_ratio*100:.0f}% of equity {sizing_equity:.2f} = min(wallet balance, "
                                   "balance + unrealized PnL)) on REAL network.")}
+    # 1b''. Daily Loss Gate (issue #207): opening orders only, before any write. PROD reads today's fills live and
+    # fails closed; it reuses the snapshot's open positions (TP1 partials of open trades are not closed trades).
+    # Effective YOLO = the --is-yolo flag or a YOLO dossier candidate.
+    daily_ok, daily_reason, daily_state = check_daily_loss_gate(
+        target_env, is_yolo or _dossier_candidate_is_yolo(_eval_cand), prof, account_equity,
+        open_positions=([(p["symbol"], p["side"]) for p in live_snapshot["exposure"]["active_positions"]]
+                        if live_snapshot else None))
+    if not daily_ok:
+        return {"success": False, "hard_gate_rejection": True, "daily_loss_gate_rejection": True,
+                "error": daily_reason, "daily_loss_gate": daily_state}
     # 1c. Max open positions (Gate 0A, Issue #38): open positions + pending resting entries, checked before any write
     # (check_mechanical_gates re-checks it after sizing).
     slots_ok, slots_err = check_max_open_positions(prof, target_env, live=live_snapshot)
@@ -3999,7 +4134,7 @@ def execute_complete_trade(
                 kind, entry_id, symbol, direction, entry_side, exit_side, target_env, price, total_qty,
                 sl_p, tp1_p, tp2_p, effective_leverage, is_yolo, margin_usdt, prearm=prearm,
                 tick_size=filters.get('tickSize'), step_size=filters.get('stepSize'),
-                gate2_loss_cap_usdt=placement_loss_cap(), score_meta=score_meta)
+                gate2_loss_cap_usdt=placement_loss_cap(), score_meta=score_meta, daily_loss_gate=daily_state)
             return key, rec, None
         except Exception as e:
             cancelled, cancel_res = cancel_resting_entry(symbol, kind, entry_id, target_env=target_env)
@@ -4309,6 +4444,7 @@ def execute_complete_trade(
             'target_env': target_env
         }
         record.update(score_audit_fields(score_meta))
+        record['daily_loss_gate'] = daily_state  # issue #207: the gate state this entry passed
         append_trade_audit_record(record, margin_usdt)
 
         return {

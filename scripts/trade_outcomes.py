@@ -51,7 +51,8 @@ orders without the algo id, so stops are matched by price).
   leg times are in ms.
 summarize_closed_today (used by sync_session_state.py): the same matching on the day's fills already fetched (no
 request, no klines): per-trade closed / wins / losses / scratches (|R| < 0.05) and R sums; an entry before the day
-counts with partial_history (today's legs, audit entry).
+counts with partial_history (today's legs, audit entry). closed_trades_today (issue #207) is the same matching as a
+per-trade list (exit time, R, YOLO), read by the Daily Loss Gate (utils/daily_loss_gate.py).
 
 Output: logs/trade_outcomes.jsonl (rewritten atomically each run, one JSON line per trade, each stamped with the
 run's "env" and "since" so offline readers such as trading_scorecard.py can filter and date it; --output must
@@ -457,7 +458,8 @@ def kline_excursion(symbol, direction, entry, risk, entry_ms, exit_ms, legs, env
     return mfe_r, mae_r, mfe_ts
 
 
-SCORE_FIELDS = ("score", "score_tier", "score_components", "dossier_tier", "dossier_score", "dossier_sha256")
+SCORE_FIELDS = ("score", "score_tier", "score_components", "dossier_tier", "dossier_score", "dossier_sha256",
+                "score_schema_version")
 
 
 def score_fields(rec):
@@ -495,7 +497,7 @@ def resolve_trade(rec, fills, consumed, trail_stops, next_start_ms, env, klines=
            "entry_vwap": round(entry_vwap, 10) if entry_vwap else None, "entry_match": match["match"], "sl_price": sl,
            "initial_risk": round(risk, 10) if risk else None, "total_qty": total_qty, "filled_qty": filled_qty,
            "tp1_price": _num(rec.get("tp1_price")), "tp2_price": _num(rec.get("tp2_price")),
-           "is_yolo": bool(rec.get("is_yolo")), **score_fields(rec)}
+           "is_yolo": _record_is_yolo(rec), **score_fields(rec)}
     if match["match"] == "no_entry_fill":
         out.update(status="no_entry_fill", filled_qty=None, legs=[], exit_ts=None, realized_r_gross=None,
                    realized_r_net=None, entry_commission_included=False, tp1_filled=False, exit_reason=None)
@@ -602,7 +604,7 @@ def build_outcomes(env, since_ts, symbol=None, klines=True, now_ms=None):
                                "entry_ts": int(_num(r.get("timestamp")) * 1000), "audit_ts": _num(r.get("timestamp")),
                                "entry_price": _num(r.get("entry_price")),
                                "sl_price": _num(r.get("sl_price")), "total_qty": _num(r.get("total_qty")),
-                               "is_yolo": bool(r.get("is_yolo")), **score_fields(r),
+                               "is_yolo": _record_is_yolo(r), **score_fields(r),
                                "status": "fills_unavailable", "error": err})
             continue
         readable += 1
@@ -627,16 +629,20 @@ def _trade_r(t):
     return t.get("realized_r_net") if t.get("realized_r_net") is not None else t.get("realized_r_gross")
 
 
-def summarize_closed_today(entries, fills, day_start_ms, env, open_positions=None):
-    """Per-trade closed-today figures from the day's userTrades already fetched (fills since day_start_ms, any
-    symbol) and the audit records (entries: raw trades_audit records, filtered here to env's entry records): the
-    resolve_trade matching and consumption with klines disabled and no request. A trade counts when it is closed and
-    its final exit leg is at or after day_start_ms. An entry whose fills precede the window (partial_history) is
-    resolved from today's legs and the audit entry and counts when its legs close the audit qty, or when it has a
-    leg today and open_positions (set of (SYMBOL, DIRECTION) open now) is given and holds no such position.
-    Returns {"trades_closed", "wins", "losses", "scratches" (|R| < SCRATCH_R), "realized_r_net_sum",
-    "realized_r_gross_sum", "fills_closed" (fills with a non-zero realizedPnl), "partial_history" (count)}. R per
-    trade: realized_r_net, else realized_r_gross; a trade without R is classed by its legs' realizedPnl - commission."""
+def _record_is_yolo(rec):
+    """A YOLO audit entry: is_yolo (the CLI flag), a 'yolo' dossier tier, or the Daily Loss Gate's effective YOLO flag
+    (issue #207: the gate treats a dossier-YOLO candidate as YOLO even without --is-yolo). Used for every outcome
+    row, so dossier-YOLO trades never enter the Tier S calibration buckets (merge_store skips is_yolo rows)."""
+    gate = rec.get("daily_loss_gate") if isinstance(rec.get("daily_loss_gate"), dict) else {}
+    return (bool(rec.get("is_yolo")) or "yolo" in str(rec.get("dossier_tier") or "").lower()
+            or gate.get("is_yolo_order") is True)
+
+
+def closed_trades_today(entries, fills, day_start_ms, env, open_positions=None):
+    """Per-trade list of the trades closed today (issue #207; the summarize_closed_today matching, which uses it):
+    [{"symbol", "direction", "is_yolo", "exit_ms", "realized_r_net" (None unless every commission is USDT),
+    "realized_r_gross", "net_pnl_usdt" (legs' realizedPnl - commission), "partial_history"}], by exit time. Fills of a
+    symbol without an audit entry give no trade (their USDT stays in the fill sums of the callers)."""
     fills = [f for f in fills or [] if isinstance(f, dict)]
     by_symbol_fills = {}
     for f in sorted(fills, key=lambda f: (_fill_ms(f), int(_num(f.get("id"), 0)))):
@@ -645,9 +651,7 @@ def summarize_closed_today(entries, fills, day_start_ms, env, open_positions=Non
     for rec in entries or []:
         if _is_entry_record(rec, env):
             by_symbol.setdefault(str(rec["symbol"]).upper(), []).append(rec)
-    out = {"trades_closed": 0, "wins": 0, "losses": 0, "scratches": 0, "realized_r_net_sum": 0.0,
-           "realized_r_gross_sum": 0.0, "fills_closed": sum(1 for f in fills if _num(f.get("realizedPnl"), 0.0) != 0),
-           "partial_history": 0}
+    out = []
     for sym, sym_fills in by_symbol_fills.items():
         recs = sorted(by_symbol.get(sym, []), key=lambda r: _num(r.get("timestamp"), 0))
         if not recs:
@@ -666,20 +670,50 @@ def summarize_closed_today(entries, fills, day_start_ms, env, open_positions=Non
                 closed = (sym, t["direction"]) not in open_positions
             if not closed or not t.get("legs") or t["legs"][-1]["time"] < day_start_ms:
                 continue
-            out["trades_closed"] += 1
-            out["partial_history"] += int(partial)
-            r_value = _trade_r(t)
-            if r_value is None:
-                pnl = sum(l["realized_pnl"] - l["commission"] for l in t["legs"])
-                kind = "wins" if pnl > 0 else "losses" if pnl < 0 else "scratches"
-            else:
-                kind = "scratches" if abs(r_value) < SCRATCH_R else "wins" if r_value > 0 else "losses"
-            out[kind] += 1
-            out["realized_r_net_sum"] += t.get("realized_r_net") or 0.0
-            out["realized_r_gross_sum"] += t.get("realized_r_gross") or 0.0
+            out.append({"symbol": sym, "direction": t["direction"], "is_yolo": _record_is_yolo(r),
+                        "exit_ms": t["legs"][-1]["time"], "realized_r_net": t.get("realized_r_net"),
+                        "realized_r_gross": t.get("realized_r_gross"),
+                        "net_pnl_usdt": sum(l["realized_pnl"] - l["commission"] for l in t["legs"]),
+                        "partial_history": partial})
+    out.sort(key=lambda t: (t["exit_ms"], t["symbol"]))
+    return out
+
+
+def summarize_trade_list(trades, fills):
+    """summarize_closed_today's figures from a closed_trades_today list and the day's fills."""
+    fills = [f for f in fills or [] if isinstance(f, dict)]
+    out = {"trades_closed": 0, "wins": 0, "losses": 0, "scratches": 0, "realized_r_net_sum": 0.0,
+           "realized_r_gross_sum": 0.0, "fills_closed": sum(1 for f in fills if _num(f.get("realizedPnl"), 0.0) != 0),
+           "partial_history": 0}
+    for t in trades:
+        out["trades_closed"] += 1
+        out["partial_history"] += int(t["partial_history"])
+        r_value = _trade_r(t)
+        if r_value is None:
+            pnl = t["net_pnl_usdt"]
+            kind = "wins" if pnl > 0 else "losses" if pnl < 0 else "scratches"
+        else:
+            kind = "scratches" if abs(r_value) < SCRATCH_R else "wins" if r_value > 0 else "losses"
+        out[kind] += 1
+        out["realized_r_net_sum"] += t.get("realized_r_net") or 0.0
+        out["realized_r_gross_sum"] += t.get("realized_r_gross") or 0.0
     out["realized_r_net_sum"] = round(out["realized_r_net_sum"], 4)
     out["realized_r_gross_sum"] = round(out["realized_r_gross_sum"], 4)
     return out
+
+
+def summarize_closed_today(entries, fills, day_start_ms, env, open_positions=None):
+    """Per-trade closed-today figures from the day's userTrades already fetched (fills since day_start_ms, any
+    symbol) and the audit records (entries: raw trades_audit records, filtered here to env's entry records): the
+    resolve_trade matching and consumption with klines disabled and no request. A trade counts when it is closed and
+    its final exit leg is at or after day_start_ms. An entry whose fills precede the window (partial_history) is
+    resolved from today's legs and the audit entry and counts when its legs close the audit qty, or when it has a
+    leg today and open_positions (set of (SYMBOL, DIRECTION) open now) is given and holds no such position.
+    Returns {"trades_closed", "wins", "losses", "scratches" (|R| < SCRATCH_R), "realized_r_net_sum",
+    "realized_r_gross_sum", "fills_closed" (fills with a non-zero realizedPnl), "partial_history" (count)}. R per
+    trade: realized_r_net, else realized_r_gross; a trade without R is classed by its legs' realizedPnl - commission.
+    Built on closed_trades_today (issue #207), the per-trade list the Daily Loss Gate reads."""
+    return summarize_trade_list(closed_trades_today(entries, fills, day_start_ms, env, open_positions), fills)
 
 
 def _inside_logs(path):

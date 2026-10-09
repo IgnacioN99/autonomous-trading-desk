@@ -9,7 +9,9 @@ Verifies:
 3. API Credentials and Permissions (Testnet / Mainnet)
 4. Available Capital and USDT Balance
 5. Forensic Orphan Position Audit (Fail CLOSED if position lacks Stop Loss on ledger)
-6. State Ledger Freshness (session_state.json)
+6. State Ledger Freshness (session_state.json), plus WARNs for closed_today_summary.counted_by != "trades" and the
+   cached Daily Loss Gate state (issue #207)
+6b. Score calibration store (logs/score_calibration.json) stale or missing with PROD closed trades (WARN only, #207)
 7. Barbell YOLO scan health (logs/yolo_scan_health.json; WARN only, when yolo_slot_enabled)
 8. Position guardian loop liveness (check_guardian_alive; WARN only, with the install_guardian_service.py hint)
 9. Python dependencies of the scanners (numpy, pydantic, statsmodels; WARN only)
@@ -501,6 +503,80 @@ def ledger_resting_mismatch_warning(state, target_env: str):
             "--protect-pending or the position guardian.")
 
 
+def ledger_counted_by_warning(state, target_env: str):
+    """Issue #207 (#212 request): WARN text when the same-env ledger's closed_today_summary.counted_by is present and
+    not "trades" (per-fill counts or unreadable fills: the day's closed-trade counts are not per trade), else None."""
+    if not isinstance(state, dict) or pt.norm_env(state.get("target_env")) != pt.norm_env(target_env):
+        return None
+    closed = state.get("closed_today_summary") or {}
+    counted_by = closed.get("counted_by") if isinstance(closed, dict) else None
+    if counted_by is None or counted_by == "trades":
+        return None
+    detail = closed.get("trade_summary_error") or closed.get("fills_error") or "no detail"
+    return (f"Ledger sync: today's closed trades are counted_by={counted_by} (not per trade: {str(detail)[:160]}); "
+            "win/loss counts may be wrong and the Daily Loss Gate refuses PROD openings until they are countable.")
+
+
+def daily_loss_gate_line(state, target_env: str):
+    """Issue #207: ("ok" | "warn", text) for the Daily Loss Gate state cached by the ledger sync (the executor
+    re-reads the exchange). A missing state or another env's ledger is a WARN (sync required); TESTNET is "info"
+    (the executor skips the gate there)."""
+    if pt.norm_env(target_env) == "testnet":
+        return "info", "Daily Loss Gate skipped (TESTNET)."
+    if not isinstance(state, dict) or pt.norm_env(state.get("target_env")) != pt.norm_env(target_env):
+        return "warn", "Daily Loss Gate state unknown (no same-env ledger): run sync_session_state.py."
+    gate = state.get("daily_loss_gate")
+    text = sss.format_daily_loss_gate(gate)
+    if not isinstance(gate, dict) or gate.get("blocked") is not False or gate.get("scope"):
+        return "warn", f"Daily Loss Gate: {text}"
+    return "ok", f"Daily Loss Gate: {text}"
+
+
+def calibration_store_warning(base_dir: str, target_env: str, now: float = None):
+    """Issue #207 (#204 note): WARN text when logs/score_calibration.json is older than score_calibration.MAX_AGE_S,
+    or missing while PROD closed trades exist (logs/trade_outcomes.jsonl closed PROD rows, or closed trades in the
+    PROD ledger), else None. PROD only; never critical."""
+    if pt.norm_env(target_env) != "prod":
+        return None
+    try:
+        from utils import score_calibration as scal
+    except Exception as e:
+        return f"Score calibration module unavailable ({type(e).__name__}): autonomous Tier S will always ask."
+    hint = "autonomous Tier S will always ask; rerun python3 scripts/trading_scorecard.py"
+    path = scal.store_path(base_dir)
+    now = time.time() if now is None else now
+    if os.path.exists(path):
+        cal = scal.load_calibration(base_dir) or {}
+        try:
+            age = now - float(cal.get("generated_at_ts"))
+        except (TypeError, ValueError):
+            return f"logs/score_calibration.json unreadable or malformed: {hint}."
+        if age > scal.MAX_AGE_S:
+            return (f"logs/score_calibration.json is stale ({int(age // 86400)} d old, max "
+                    f"{scal.MAX_AGE_S // 86400} d): {hint}.")
+        return None
+    closed = False
+    try:
+        with open(os.path.join(base_dir, "logs", "trade_outcomes.jsonl"), "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(row, dict) and pt.norm_env(row.get("env")) == "prod" and row.get("status") == "closed":
+                    closed = True
+                    break
+    except OSError:
+        pass
+    state = _read_session_state() or {}
+    if pt.norm_env(state.get("target_env")) == "prod":
+        try:
+            closed = closed or int((state.get("closed_today_summary") or {}).get("closed_trades_count") or 0) > 0
+        except (TypeError, ValueError):
+            pass
+    return f"logs/score_calibration.json is missing while PROD closed trades exist: {hint}." if closed else None
+
+
 def run_doctor(target_env: str = None, auto_heal: bool = False) -> int:
     target_env = resolve_env(target_env)
     start_time = time.time()
@@ -747,6 +823,20 @@ def run_doctor(target_env: str = None, auto_heal: bool = False) -> int:
         if mismatch_warning:
             warnings.append(mismatch_warning)
             print(f"⚠️  [STATE LEDGER] {mismatch_warning}")
+        # Issue #207: per-trade counting quality and the Daily Loss Gate state (WARN only, never critical)
+        counted_warning = ledger_counted_by_warning(_read_session_state(), target_env)
+        if counted_warning:
+            warnings.append(counted_warning)
+            print(f"⚠️  [STATE LEDGER] {counted_warning}")
+        gate_level, gate_msg = daily_loss_gate_line(_read_session_state(), target_env)
+        if gate_level == "warn":
+            warnings.append(gate_msg)
+            print(f"⚠️  [DAILY LOSS GATE] {gate_msg}")
+        elif gate_level == "info":
+            print(f"ℹ️  [DAILY LOSS GATE] {gate_msg}")
+        else:
+            ok_items.append(gate_msg)
+            print(f"✅ [DAILY LOSS GATE] {gate_msg}")
     else:
         warnings.append("session_state.json does not exist yet. Run `sync_session_state.py`.")
         print("⚠️  [STATE LEDGER] session_state.json does not exist. Run `sync_session_state.py`.")
@@ -780,6 +870,15 @@ def run_doctor(target_env: str = None, auto_heal: bool = False) -> int:
     else:
         ok_items.append(msg)
         print(f"✅ [GUARDIAN] {msg}")
+
+    # 5c'. Score calibration store freshness (WARN only, never critical; issue #207)
+    try:
+        calib_msg = calibration_store_warning(os.path.dirname(sss.LOGS_DIR), target_env)
+    except Exception as e:
+        calib_msg = f"Score calibration store check failed ({type(e).__name__})."
+    if calib_msg:
+        warnings.append(calib_msg)
+        print(f"⚠️  [CALIBRATION] {calib_msg}")
 
     # 5d. Python dependencies of the scanners (WARN only, never critical; issue #135)
     level, msg = check_dependencies()
