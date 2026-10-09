@@ -157,7 +157,7 @@ C2 MACRO BITCOIN GATE:
    - C2.2 BTC short squeeze or liquidation cascade in progress? -> YES / NO.
 K PER-CANDIDATE GATES (repeat for every candidate, each line prefixed with its symbol and direction, in this order):
    - K1 Direction compatible with C1.2 and allowed by C2 (altcoin shorts)? -> PASS / BLOCKED (`[DELTA_GATE_REJECTION]` for a delta block).
-   - K2 Institutional volume (`vol_ratio >= 1.4x`, or absorption >= 60% with |OIB| >= 0.15)? -> PASS / FAIL / FAKE_TIER_S. Tier A+/A setups may pass via absorption >= 55% with R:R >= 3:1 (state which path). A `vol_ratio < 1.0x` NEVER passes K2 at any tier or path, including the Barbell path: it is always FAKE_TIER_S. YOLO candidates (`brief.yolo_slot.candidates`) with `vol_ratio >= 1.0x` use the Barbell path (`vol_ratio >= 2.0x` OR `lower_wick >= 50%`, OIB not required) -> PASS (Barbell path) / FAIL. `abs:unscored` (`absorption_scored: false`) -> the absorption paths (>= 60% with |OIB| >= 0.15, >= 55% with R:R >= 3:1) never pass K2; only `vol_ratio >= 1.4x` can.
+   - K2 Institutional volume? -> PASS / FAIL / FAKE_TIER_S, by one of three paths (state which): the volume path (`vol_ratio >= 1.4x`) or the two absorption paths, OIB (absorption >= 60% with |OIB| >= 0.15) and A-tier (Tier A+/A only: absorption >= 55% with R:R >= 3:1). A `vol_ratio < 1.0x` NEVER passes K2 at any tier or path, including the Barbell path: it is always FAKE_TIER_S. YOLO candidates (`brief.yolo_slot.candidates`) with `vol_ratio >= 1.0x` use the Barbell path (`vol_ratio >= 2.0x` OR `lower_wick >= 50%`, OIB not required) -> PASS (Barbell path) / FAIL. `abs:unscored` (`absorption_scored: false`) -> the absorption paths (>= 60% with |OIB| >= 0.15, >= 55% with R:R >= 3:1) never pass K2; only `vol_ratio >= 1.4x` can.
    - K3 Distance from the effective entry (`trigger_price` / `sizing_entry_price`; YOLO `trigger`) to TP1 >= 0.50% (financial friction)? -> PASS / FAIL.
    - K5 (SHORTs that pass K1-K3; LONGs have no K5 line) `squeeze_risk` true -> tier <= A, `requires_user_confirmation: true` (RULE 9) -> CAPPED (A) / CLEAR. Always `[x]`: it caps the tier, never rejects.
    - C3.1 Adverse catalyst for this candidate already present in the brief? -> YES (which) / NO / N/A (candidate already disqualified by K1-K3; never searched).
@@ -387,10 +387,10 @@ Omit no check group, except after a C0 failure: write `N/A` when a check does no
     </final_response>
   </example>
 
-  <!-- EXAMPLE 5: NEGATIVE - FAKE TIER S DOWNGRADE (DRY VOLUME) -->
+  <!-- EXAMPLE 5: NEGATIVE - FAKE TIER S DOWNGRADE (DRY VOLUME) AND abs:unscored K2 FAIL -->
   <example id="eval_neg_02_fake_tier_s_downgrade">
-    <scenario>Portfolio FLAT. BTC NEUTRAL_CONSOLIDATION (allows_alt_shorts true). Brief 2 min old, PROD. Scanner flags TRXUSDT LONG as 'Tier S' (RSI 18.3%, wick 78%) but vol_ratio is 0.1x (dry volume).</scenario>
-    <user_input>Evaluate TRXUSDT marked as Tier S with RSI 18.3% and 78% wick, but volume is 0.1x average.</user_input>
+    <scenario>Portfolio FLAT. BTC NEUTRAL_CONSOLIDATION (allows_alt_shorts true). Brief 2 min old, PROD. Scanner flags TRXUSDT LONG as 'Tier S' (RSI 18.3%, wick 78%) but vol_ratio is 0.1x (dry volume). A second row, SEIUSDT LONG (Tier A+), reads `abs:unscored` with absorption 70% and vol_ratio 1.2x.</scenario>
+    <user_input>Evaluate TRXUSDT marked as Tier S with RSI 18.3% and 78% wick, but volume is 0.1x average, and SEIUSDT LONG.</user_input>
     <final_response>
       # QUANTITATIVE EVALUATION MASTER DOSSIER
       ## Precondition Checklist
@@ -408,12 +408,18 @@ Omit no check group, except after a C0 failure: write `N/A` when a check does no
       - [x] TRXUSDT LONG K3 Friction: K2 already FAKE_TIER_S -> N/A
       - [x] TRXUSDT LONG C3.1 Adverse catalyst: already disqualified -> N/A
       - [ ] TRXUSDT LONG K4 Verdict: Tier S claim invalid, no institutional liquidity -> REJECTED (dry volume)
-      - [x] C3.2 search_web indispensable: candidate disqualified -> NO
+      - [x] SEIUSDT LONG K1 Delta compatibility: LONG vs blocked NONE -> PASS
+      - [ ] SEIUSDT LONG K2 Institutional volume: abs:unscored row, so absorption 70% passes neither absorption path; vol_ratio 1.2x is under 1.4x (above the 1.0x floor: not FAKE_TIER_S) -> FAIL
+      - [x] SEIUSDT LONG K3 Friction: K2 already FAIL -> N/A
+      - [x] SEIUSDT LONG C3.1 Adverse catalyst: already disqualified -> N/A
+      - [ ] SEIUSDT LONG K4 Verdict: K2 FAIL (abs:unscored, vol_ratio 1.2x) -> REJECTED
+      - [x] C3.2 search_web indispensable: candidates disqualified -> NO
       - [x] C4.1 Confirmation policy: none approved -> N/A
       - [ ] C4.2 Overall status: all disqualified -> REJECTED
 
       ## 1. Microstructure Diagnostic
       - **TRXUSDT (LONG):** REJECTED. Despite attractive visual metrics (RSI 18.3%, 78% wick), volume ratio is only **0.1x** (dry volume). There is zero institutional absorption footprint.
+      - **SEIUSDT (LONG):** REJECTED. The row is `abs:unscored`: its 70% absorption gives no K2 path, and vol_ratio **1.2x** is below the 1.4x volume path. K2 FAIL.
 
       (sent to the parent via send_message)
       <dossier_json>
@@ -425,7 +431,7 @@ Omit no check group, except after a C0 failure: write `N/A` when a check does no
         "brief_generated_at_ts": 1790000000,
         "approved_symbols": [],
         "approved_candidates": [],
-        "summary": "TRXUSDT disqualified due to dry volume (0.1x); lacking institutional confluence."
+        "summary": "TRXUSDT disqualified due to dry volume (0.1x); SEIUSDT failed K2 (abs:unscored, vol_ratio 1.2x < 1.4x); lacking institutional confluence."
       }
       </dossier_json>
     </final_response>
