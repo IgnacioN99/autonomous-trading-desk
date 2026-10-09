@@ -49,6 +49,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from utils.atomic_writer import atomic_write_json, path_inside_dir, same_file
 from utils.env_resolver import resolve_env
+from utils.lessons import read_active_lessons  # shared active-lesson reader (issue #187)
 from utils.position_timing import norm_env
 from utils import score_calibration as scal
 
@@ -99,14 +100,7 @@ def _read_jsonl(path):
 
 
 def load_insights_records() -> list:
-    records = []
-    superseded = set()
-    for obj in _read_jsonl(os.path.join(_logs_dir(), "trade_insights.jsonl")):
-        if obj.get("superseded"):
-            superseded.add(obj.get("id"))
-        else:
-            records.append(obj)
-    return [r for r in records if r.get("id") not in superseded]
+    return read_active_lessons(os.path.join(_logs_dir(), "trade_insights.jsonl"))
 
 
 def _norm_tier(raw):

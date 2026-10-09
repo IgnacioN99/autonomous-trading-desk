@@ -15,10 +15,11 @@ import tempfile
 import time
 from typing import Any, Dict, Optional
 
-def atomic_write_json(filepath: str, data: Any, indent: int = 2) -> bool:
+def atomic_write_json(filepath: str, data: Any, indent: int = 2, separators: Optional[tuple] = None) -> bool:
     """
     Writes data to a JSON file in a 100% atomic manner.
     Creates a temporary file in the same directory and executes os.replace.
+    separators: json.dump separators (None = the json default for the indent).
     """
     filepath = os.path.abspath(filepath)
     dirname = os.path.dirname(filepath)
@@ -28,7 +29,7 @@ def atomic_write_json(filepath: str, data: Any, indent: int = 2) -> bool:
     prefix = f".{os.path.basename(filepath)}.tmp_"
     try:
         with tempfile.NamedTemporaryFile("w", dir=dirname, prefix=prefix, delete=False, encoding="utf-8") as tf:
-            json.dump(data, tf, indent=indent, ensure_ascii=False)
+            json.dump(data, tf, indent=indent, separators=separators, ensure_ascii=False)
             tf.flush()
             os.fsync(tf.fileno())
             temp_name = tf.name
