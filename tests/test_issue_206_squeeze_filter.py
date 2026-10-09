@@ -713,7 +713,7 @@ class TestEvaluatorPrompt(unittest.TestCase):
             self.assertIn("## 2. Approved Quantitative Basket", head, dossier["approved_symbols"])
             self.assertIn("## 6. Execution Verdict", head, dossier["approved_symbols"])
             self.assertLess(head.index("## 2. Approved Quantitative Basket"), head.index("## 6. Execution Verdict"))
-        self.assertEqual(approved, 4)
+        self.assertEqual(approved, 5)  # issue #223 added the downgraded NEARUSDT LONG (EXAMPLE 14)
 
     def test_squeezed_short_few_shot(self):
         self.assertNotIn("eval_neg_08_squeeze_short_tier_a", self.text)

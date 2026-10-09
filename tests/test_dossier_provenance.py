@@ -25,31 +25,21 @@ from unittest.mock import patch
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS_DIR = os.path.join(BASE_DIR, "scripts")
-if SCRIPTS_DIR not in sys.path:
-    sys.path.insert(0, SCRIPTS_DIR)
+TESTS_DIR = os.path.join(BASE_DIR, "tests")
+for _p in (SCRIPTS_DIR, TESTS_DIR):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from utils import dossier_provenance as dp  # noqa: E402
 import record_evaluation as rec  # noqa: E402
 import prime_evaluator_brief as peb  # noqa: E402
+from dossier_checklist_fixture import checklist_for  # noqa: E402  (shared fixture, issue #223)
 
 PARENT_ID = "11111111-2222-3333-4444-555555555555"
 
 
 def iso(ts: int) -> str:
     return datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def checklist_for(payload: dict) -> str:
-    """Precondition Checklist consistent with the payload (issue #27): K1-K4/C3.1 [x] per approved candidate
-    and a C4.2 line carrying the raw status."""
-    lines = ["## Precondition Checklist", "- [x] C0.2 Brief age: 1 min -> PASS"]
-    for c in payload.get("approved_candidates") or []:
-        prefix = f"{str(c['symbol']).upper()} {str(c['direction']).upper()}" + (" (YOLO)" if c.get("is_yolo") else "")
-        lines += [f"- [x] {prefix} {check} gate: brief value -> PASS" for check in ("K1", "K2", "K3", "C3.1")]
-        lines.append(f"- [x] {prefix} K4 Verdict: K1-K3 PASS -> APPROVED (Tier S)")
-    lines.append(f"- [{'x' if payload.get('status') != 'REJECTED' else ' '}] C4.2 Overall status: verdict -> "
-                 f"{payload.get('status')}")
-    return "\n".join(lines) + "\n\n## 1. Basket\n"
 
 
 def dossier_text(payload: dict, header: str = "# QUANTITATIVE EVALUATION MASTER DOSSIER\n", checklist=True) -> str:
