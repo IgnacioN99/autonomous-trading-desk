@@ -300,7 +300,9 @@ class TestExecutorDossierIntegration(_TempWorkspace):
              patch("execute_futures_trade.send_signed_request") as mock_send, \
              patch("execute_futures_trade.setup_margin_and_leverage") as mock_setup, \
              patch("execute_futures_trade.get_symbol_filters", return_value=None) as mock_filters, \
-             patch("quant_risk_engine.get_account_equity", return_value=1000.0):
+             patch("quant_risk_engine.get_account_equity", return_value=1000.0), \
+             patch("user_profile.load_user_profile", return_value=dict(PROFILE, _profile_source="user")):
+            # Issue #180: the profile is the user's (PROD rejects an example/default fallback before the filters)
             res = eft.execute_complete_trade(symbol="SOLUSDT", direction="LONG", leverage=3, margin_usdt=10.0, **kw)
         return res, mock_send, mock_setup, mock_filters
 

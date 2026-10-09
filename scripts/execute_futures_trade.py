@@ -89,11 +89,12 @@ JSON schemas (stable; extra keys may be added, existing keys are never renamed):
                 "success": bool,
                 "dry_run": bool, "detail": {...}}],
       "errors": [{"key", "symbol", "stage", "error"}],
-      "warnings"?: [{"key", "symbol", "stage": "loss_cap_check" | "qty_check" | "loss_cap_drift" | "registry_lock" |
-                     "deferral_report", "warning"}]}   # check deferred / drift tolerated / not errors
+      "warnings"?: [{"key", "symbol", "stage": "loss_cap_check" | "loss_cap_profile" | "qty_check" | "loss_cap_drift" |
+                     "registry_lock" | "deferral_report", "warning"}]}   # check deferred / drift tolerated / not errors
       (issue #118 loss cap; issue #126 total_qty: a record whose total_qty is below margin_usdt x leverage / price
       x 0.98 minus one stepSize is untrusted, pending_record_mismatch; issue #156: 3 consecutive deferred runs of a
-      record (check_deferrals) file a HIGH issue; pending_tp_placed detail has fill_quality_flags)
+      record (check_deferrals) file a HIGH issue, issue #180: the first for a filled record deferred on a non-user
+      profile (loss_cap_profile); pending_tp_placed detail has fill_quality_flags)
   trade deployment: {"success": bool, "symbol", "direction", "leverage", "entry_price", "total_qty",
       "sl_price", "tp1_price", "tp2_price", ..., "error"?: str, "hard_gate_rejection"?: bool}
       Resting entries (untriggered STOP_MARKET via the algo order API, resting LIMIT) return
@@ -3194,7 +3195,8 @@ def protect_pending_entries(target_env=None, dry_run=False, keys=None):
         placement, live cap x PENDING_DRIFT_CAP_TOLERANCE 1.2) stays trusted (TPs placed) with a "loss_cap_drift"
         warning; above that bound, a resting entry, a YOLO record or a record without the stored cap: breach as above. Consecutive runs with a
         deferred loss-cap or qty check are counted in check_deferrals (reset by a run without deferral); the
-        PENDING_DEFERRAL_REPORT_AFTER-th files one HIGH issue (report_agent_issue). Deferrals stay warnings.
+        PENDING_DEFERRAL_REPORT_AFTER-th files one HIGH issue (report_agent_issue). Issue #180: a FILLED record
+        deferred on a non-user profile (stage "loss_cap_profile") files it on the first. Deferrals stay warnings.
     Any query error keeps the record (fail closed). dry_run reports the decisions without any write. A missing
     registry reads as empty (never blocks this risk-reducing path).
     Returns {"ok", "env", "dry_run", "actions": [{"type", "key", "symbol", "success", "dry_run", "detail"}],
@@ -3310,6 +3312,13 @@ def pending_entry_order_mismatches(rec, kind, order, is_long, filters=None):
     return out
 
 
+def fallback_profile_source(prof):
+    """Issue #180: the `_profile_source` stamped by user_profile.load_user_profile when the profile did not come from
+    config/user_profile.json ("example" / "default"), else None. A missing key (or a non-dict) is None: not a fallback."""
+    source = prof.get('_profile_source') if isinstance(prof, dict) else None
+    return source if source is not None and source != 'user' else None
+
+
 def _pending_loss_cap_problem(rec, position, target_env, run_ctx):
     """Issue #118 (PROD): record_loss_cap_problem with live inputs. The reference is the record's
     trigger_or_limit_price (the check is about the record, not the fill's slippage). Standard records read the wallet
@@ -3322,7 +3331,8 @@ def _pending_loss_cap_problem(rec, position, target_env, run_ctx):
     live cap x PENDING_DRIFT_CAP_TOLERANCE), it stays trusted with a "loss_cap_drift" warning. A resting entry, a
     YOLO record, or a record without the stored cap is governed by the live cap alone.
     Returns (problem_or_None, warning_or_None, warning_stage): stage "loss_cap_check" for a deferral (a failed read
-    or a non-user profile; never blocks), "loss_cap_drift" for a tolerated drift."""
+    or a non-user profile; never blocks), "loss_cap_profile" for a non-user profile deferral of a FILLED record
+    (issue #180: reported on the first deferral), "loss_cap_drift" for a tolerated drift."""
     try:
         import user_profile as up
         prof = up.load_user_profile()
@@ -3332,10 +3342,11 @@ def _pending_loss_cap_problem(rec, position, target_env, run_ctx):
     is_yolo = _truthy(rec.get('is_yolo'))
     if not is_yolo:
         # The YOLO margin cap reads neither the profile nor equity: only standard records defer on them.
-        source = prof.get('_profile_source') if isinstance(prof, dict) else None
-        if source is not None and source != 'user':
+        source = fallback_profile_source(prof)
+        if source is not None:
             return None, (f"SL distance vs loss cap check deferred to the next run: the user profile was not read "
-                          f"from config/user_profile.json (source: {source})"), 'loss_cap_check'
+                          f"from config/user_profile.json (source: {source})"), \
+                ('loss_cap_profile' if position is not None else 'loss_cap_check')
         if 'equity' not in run_ctx:
             try:
                 import quant_risk_engine as qre
@@ -3489,16 +3500,18 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out, run_ctx=None
             logger.warning(f"{sym} {key}: {cap_warning}")
             out.setdefault("warnings", []).append({"key": key, "symbol": sym, "stage": cap_stage,
                                                    "warning": cap_warning})
-            if cap_stage == 'loss_cap_check':
-                deferred.append("loss_cap_check")
+            if cap_stage in ('loss_cap_check', 'loss_cap_profile'):
+                deferred.append(cap_stage)
     if entry_open or position is not None:
         # Issue #156: consecutive runs with a deferred loss-cap / qty check are counted on the record
         # (check_deferrals); reaching PENDING_DEFERRAL_REPORT_AFTER files one HIGH issue. A run where none was
-        # deferred resets it. Never blocks (registry lock failures are warnings).
+        # deferred resets it. Never blocks (registry lock failures are warnings). Issue #180: a non-user profile
+        # deferral of a FILLED record (loss_cap_profile) also files one on the first consecutive deferral.
         if deferred:
             n_deferrals = int(_to_float(rec.get('check_deferrals'))) + 1
             save_before_stop(check_deferrals=n_deferrals)
-            if n_deferrals == PENDING_DEFERRAL_REPORT_AFTER and not dry_run:
+            if (n_deferrals == PENDING_DEFERRAL_REPORT_AFTER
+                    or ('loss_cap_profile' in deferred and n_deferrals == 1)) and not dry_run:
                 report_err = _report_check_deferrals(sym, key, target_env, n_deferrals, deferred)
                 if report_err:
                     out.setdefault("warnings", []).append({"key": key, "symbol": sym, "stage": "deferral_report",
@@ -3979,6 +3992,16 @@ def execute_complete_trade(
         profile_unreadable = True
         print(f"⚠️ user profile unreadable ({type(e).__name__}: {e}); default limits applied (Daily Loss Gate, "
               "sizing).", file=sys.stderr)
+    # Issue #180 (PROD, every opening incl. YOLO, before sizing and any write): a profile that did not come from
+    # config/user_profile.json (fallback "example" / "default") would size and cap the order with limits that are not
+    # the user's. A profile without the marker (or a loader exception, above) is not rejected here.
+    fallback_source = fallback_profile_source(prof)
+    if is_prod and fallback_source is not None:
+        return {"success": False, "hard_gate_rejection": True,
+                "error": (f"MECHANICAL HARD GATE REJECTION: FAIL-CLOSED — the user profile was not read from "
+                          f"config/user_profile.json (fallback profile: {fallback_source}); its risk and margin limits "
+                          "are not the user's. Create config/user_profile.json via onboarding "
+                          "(python3 scripts/user_profile.py --setup). Order blocked.")}
 
     # Dynamic margin scaling: if margin_usdt is None or default 100.0, scale dynamically
     margin_defaulted = margin_usdt is None or margin_usdt == 100.0
@@ -4278,8 +4301,9 @@ def execute_complete_trade(
     def placement_loss_cap():
         """Issue #156 (PROD): the Gate 2 loss cap at placement (pure monetary_loss_cap on the values Gate 2 used:
         equity, profile, the snapshot's uPnL, effective entry, qty, leverage), stored in the record. None when it
-        cannot be computed (the record then has no stored cap: no drift tolerance)."""
-        if not is_prod:
+        cannot be computed or the profile is a fallback (issue #180; the record then has no stored cap: no drift
+        tolerance)."""
+        if not is_prod or fallback_profile_source(prof) is not None:
             return None
         try:
             unrealized = unrealized_pnl_total(live_snapshot["exposure"]) if live_snapshot else 0.0
@@ -5180,12 +5204,21 @@ def _report_leftover_stop_abort(symbol, target_env, sl_order, abort_exit):
 def _report_check_deferrals(symbol, key, target_env, count, stages):
     """HIGH issue (issue #156) when the protect-pending loss-cap / qty checks of a record were deferred `count`
     consecutive runs. Never raises; returns None when filed, else the error text (the caller adds a warning).
-    error_detail is stable per symbol so the reporter's 24h fingerprint dedups repeats."""
+    error_detail is stable per symbol (and per loss_cap_profile stage, issue #180) so the reporter's 24h fingerprint
+    dedups repeats."""
     try:
         import report_agent_issue
+        if 'loss_cap_profile' in stages:
+            # No count in this title: a repeat at PENDING_DEFERRAL_REPORT_AFTER keeps the fingerprint (24h dedup)
+            title = (f"protect-pending: loss-cap check of filled {symbol} deferred: profile not read from "
+                     "config/user_profile.json")
+            detail = f"{symbol} filled record loss-cap check deferred: non-user profile"
+        else:
+            title = f"protect-pending: record checks of {symbol} deferred {count} consecutive runs"
+            detail = f"{symbol} pending record loss-cap/qty check deferred repeatedly"
         report_agent_issue.report_issue(
-            title=f"protect-pending: record checks of {symbol} deferred {count} consecutive runs",
-            error_detail=f"{symbol} pending record loss-cap/qty check deferred repeatedly",
+            title=title,
+            error_detail=detail,
             category="risk_gate", severity="HIGH",
             agent_name="execute_futures_trade.protect_pending_entries",
             affected_files="scripts/execute_futures_trade.py:_protect_pending_entry",

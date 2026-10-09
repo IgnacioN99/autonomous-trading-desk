@@ -15,6 +15,8 @@ Verifies:
 7. Barbell YOLO scan health (logs/yolo_scan_health.json; WARN only, when yolo_slot_enabled)
 8. Position guardian loop liveness (check_guardian_alive; WARN only, with the install_guardian_service.py hint)
 9. Python dependencies of the scanners (numpy, pydantic, statsmodels; WARN only)
+User profile: not onboarded = critical; PROD also fails when config/user_profile.json is missing or unreadable
+(a fallback example/default profile, issue #180).
 
 Usage:
   python3 scripts/trading_doctor.py [--env testnet|mainnet] [--heal]
@@ -269,6 +271,18 @@ def check_guardian_service(target_env: str) -> tuple:
                                 f"{hint}")
     return "warn", (f"Position guardian loop not alive ({why}). {impact}; MARKET entries do not need the guardian. "
                     f"{hint}")
+
+
+def check_user_profile_source(profile, target_env: str) -> tuple:
+    """Issue #180: where the loaded user profile came from (`_profile_source` stamped by
+    user_profile.load_user_profile). Returns (level, message), level "ok" or "critical". "critical" only in PROD for
+    a present source other than "user" (config/user_profile.json missing or unreadable: the executor rejects every
+    PROD opening). TESTNET and a profile without the marker: "ok"."""
+    source = eft.fallback_profile_source(profile)
+    if source is not None and is_prod_environment(target_env):
+        return "critical", (f"config/user_profile.json is missing or unreadable: the {source} profile was loaded "
+                            "instead and PROD entries are rejected. Run 'python3 scripts/user_profile.py --setup'.")
+    return "ok", f"User profile source: {source or 'user'}."
 
 
 DEPENDENCY_MODULES = ("numpy", "pydantic", "statsmodels")
@@ -694,6 +708,10 @@ def run_doctor(target_env: str = None, auto_heal: bool = False) -> int:
         else:
             ok_items.append(f"User Profile calibrated (Risk: {risk_pct:.2f}% equity, Mode: {profile.get('operating_mode')})")
             print(f"✅ [USER PROFILE] Calibrated: {risk_pct:.2f}% risk per trade ({profile.get('operating_mode')})")
+        source_level, source_msg = check_user_profile_source(profile, target_env)
+        if source_level == "critical":
+            critical_failures.append(f"User profile: {source_msg}")
+            print(f"🚨 [USER PROFILE] {source_msg}")
     except Exception as e:
         critical_failures.append(f"User profile error: {e}")
         print(f"🚨 [USER PROFILE] Could not load profile: {e}")
