@@ -117,7 +117,8 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    issue #202) <- scripts/trading_scorecard.py; logs/trade_outcomes.jsonl (the store's only input) <-
    scripts/trade_outcomes.py; logs/trades_audit.jsonl (entry ledger, the outcomes' source) <-
    scripts/execute_futures_trade.py; logs/primed_brief.json and logs/primed_brief_scores.json (evaluator brief and
-   its radar scores) <- scripts/prime_evaluator_brief.py. File tools targeting them are denied: relative, absolute and Windows paths, NTFS aliases
+   its radar scores) <- scripts/prime_evaluator_brief.py; logs/gate_denials.jsonl (delta-gate denials of approved
+   candidates for the shadow desk, see 11) <- this hook itself (issue #261). File tools targeting them are denied: relative, absolute and Windows paths, NTFS aliases
    (trailing dot/space, ::$DATA streams) and targets whose os.path.realpath / samefile is a protected file
    (symlinked directory, hard link).
    Shell commands. The program of a sub-command is found past VAR=value / VAR+=value assignments, shell keywords
@@ -321,7 +322,10 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    Every invocation refreshes logs/hook_heartbeat.json (best effort, never alters the decision). The file is
    ground truth (8) written only by this hook from Python: an agent command that merely names it outside a
    read-only program is denied like the other ground-truth files (report_issue.sh: pass such text through
-   --context-file / --output-file).
+   --context-file / --output-file). Likewise, after a Delta-Neutral denial (5) of a dossier-approved candidate the
+   hook appends one line to logs/gate_denials.jsonl (issue #261: symbol, direction, dossier prices / score / sha,
+   cached delta and book; record-only, best effort, bounded size, never alters the decision); the shadow tracker
+   turns it into a DELTA_GATE_POST_APPROVAL shadow row. Executor-only denials are not recorded.
 
 Target latency: < 15ms (plus dossier provenance re-verification on trade openings, and reading / judging the shell
 script files a command runs).
@@ -778,6 +782,8 @@ TRANSCRIPT_ROOT_OVERRIDE_RE = re.compile(
 # trades_audit.jsonl (the executor's entry ledger, also read by Gate 0A and the exit manager) is its source.
 # primed_brief.json (the evaluator's only input, read with the Read tool, which stays allowed) and
 # primed_brief_scores.json (the radar scores the recorder joins into the dossier for the calibrated-bucket gate).
+# gate_denials.jsonl is appended by this guard from Python on a delta-gate denial of an approved candidate
+# (_record_gate_denial, issue #261) and read by scripts/shadow_tracker.py; a forged line would forge shadow rows.
 GROUND_TRUTH_FILES = {
     "logs/session_state.json": "`python3 scripts/sync_session_state.py`",
     "logs/guardian_state.json": "`python3 scripts/loops/position_guardian_loop.py`",
@@ -788,6 +794,7 @@ GROUND_TRUTH_FILES = {
     "logs/trades_audit.jsonl": "`python3 scripts/execute_futures_trade.py` (entry audit records and failsafe-abort events)",
     "logs/primed_brief.json": "`python3 scripts/prime_evaluator_brief.py`",
     "logs/primed_brief_scores.json": "`python3 scripts/prime_evaluator_brief.py`",
+    "logs/gate_denials.jsonl": "`scripts/hooks/pre_trade_guard.py` itself (delta-gate denials of approved candidates)",
 }
 GROUND_TRUTH_BASENAMES = {path.rsplit("/", 1)[-1].lower(): path for path in GROUND_TRUTH_FILES}
 GROUND_TRUTH_RE = re.compile("|".join(re.escape(n) for n in GROUND_TRUTH_BASENAMES), re.IGNORECASE)
@@ -5965,6 +5972,85 @@ def _pending_entry_symbols(base_dir: str, env: str) -> Tuple[set, Optional[str]]
             if isinstance(r, dict) and r.get("target_env") == env and r.get("symbol")}, None
 
 
+# Issue #261: delta-gate denials of approved candidates, appended for the shadow desk (scripts/shadow_tracker.py)
+GATE_DENIALS_LOG = "logs/gate_denials.jsonl"
+GATE_DENIAL_GATE = "DELTA_GATE_POST_APPROVAL"
+GATE_DENIAL_MAX_BYTES = 4096
+GATE_DENIAL_BOOK_MAX_ITEMS = 25
+GATE_DENIAL_DEDUPE_TAIL_BYTES = 16384
+
+
+def _record_gate_denial(base_dir: str, env: str, now_ts: int, symbol: Optional[str], direction: Optional[str],
+                        cand: Optional[dict], state: dict, delta_bias: Any, age_seconds: Any) -> None:
+    """Record-only (issue #261): append one JSON line to logs/gate_denials.jsonl for a Delta-Neutral denial of a
+    dossier-approved candidate, after the decision is made. Never raises and never changes the decision: stdlib
+    only, no network, no lock, no fsync, one write of at most GATE_DENIAL_MAX_BYTES (the book is dropped and
+    flagged when it does not fit). Without a dossier candidate (cand None, TESTNET --bypass-eval-gate) nothing is
+    written. Book: the cached session state's active_positions and the same-env logs/pending_entries.json records,
+    trimmed to the fields the tracker's book_from_sources reads (a registry read error goes to book_error). Skips an event whose (dossier_sha256, symbol,
+    direction) is already in the file's tail (best effort; the tracker's dedupe is authoritative)."""
+    try:
+        if not isinstance(cand, dict) or not symbol or not direction:
+            return
+        sha = cand.get("dossier_sha256") if isinstance(cand.get("dossier_sha256"), str) else None
+        path = os.path.join(base_dir, *GATE_DENIALS_LOG.split("/"))
+        if sha and os.path.exists(path):
+            with open(path, "rb") as f:
+                f.seek(max(0, os.path.getsize(path) - GATE_DENIAL_DEDUPE_TAIL_BYTES))
+                tail = f.read().decode("utf-8", "replace")
+            for line in tail.splitlines():
+                try:
+                    prev = json.loads(line)
+                except ValueError:
+                    continue
+                if (isinstance(prev, dict) and prev.get("dossier_sha256") == sha and prev.get("symbol") == symbol
+                        and prev.get("direction") == direction):
+                    return
+        portfolio = state.get("portfolio_exposure") if isinstance(state.get("portfolio_exposure"), dict) else {}
+        book = []
+        for p in state.get("active_positions") or []:
+            if isinstance(p, dict) and p.get("symbol"):
+                book.append(dict({k: p.get(k) for k in ("symbol", "direction", "notional_usdt", "entry_order_id",
+                                                        "entry_time_ts")}, kind="position"))
+        book_error = None
+        registry = os.path.join(base_dir, "logs", "pending_entries.json")
+        try:
+            if os.path.exists(registry):
+                with open(registry, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                entries = data.get("entries") if isinstance(data, dict) else None
+                if not isinstance(entries, dict):
+                    raise ValueError("pending entries registry malformed")
+                for r in entries.values():
+                    if isinstance(r, dict) and r.get("target_env") == env and r.get("symbol"):
+                        meta = r.get("score_meta") if isinstance(r.get("score_meta"), dict) else {}
+                        book.append(dict({k: r.get(k) for k in ("symbol", "direction", "entry_id",
+                                                                "trigger_or_limit_price", "total_qty",
+                                                                "placed_at_ts", "target_env")},
+                                         kind="resting",
+                                         score_meta={k: meta.get(k) for k in ("score", "dossier_score")}))
+        except Exception as e:
+            book_error = f"{type(e).__name__}: {e}"[:200]
+        event = {"ts": now_ts, "env": env, "gate": GATE_DENIAL_GATE, "symbol": symbol, "direction": direction,
+                 "score": cand.get("score"), "tier": cand.get("tier"), "dossier_sha256": sha,
+                 "entry": cand.get("entry"), "stop_loss": cand.get("stop_loss"), "tp1": cand.get("tp1"),
+                 "tp2": cand.get("tp2"), "is_yolo": cand.get("is_yolo"), "source": "session_state_cache",
+                 "session_state_ts": state.get("last_updated_ts"), "age_seconds": age_seconds,
+                 "delta_bias": delta_bias, "net_notional_delta_usdt": portfolio.get("net_notional_delta_usdt"),
+                 "book": book[:GATE_DENIAL_BOOK_MAX_ITEMS],
+                 "book_truncated": len(book) > GATE_DENIAL_BOOK_MAX_ITEMS, "book_error": book_error}
+        line = json.dumps(event, ensure_ascii=False, default=str) + "\n"
+        if len(line.encode("utf-8")) > GATE_DENIAL_MAX_BYTES:
+            event.update(book=[], book_truncated=True)
+            line = json.dumps(event, ensure_ascii=False, default=str) + "\n"
+            if len(line.encode("utf-8")) > GATE_DENIAL_MAX_BYTES:
+                return
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass
+
+
 def evaluate_trade_opening(cmd: str, args: dict, mcp_args: dict, base_dir: str,
                            conversation_id: Optional[str], env_hint_cmd: str = "",
                            tokens: Optional[List[str]] = None) -> Tuple[str, str]:
@@ -6092,6 +6178,7 @@ def evaluate_trade_opening(cmd: str, args: dict, mcp_args: dict, base_dir: str,
         return "deny", f"🚨 FAIL-CLOSED (Direction Gate): {dir_err} Order blocked."
 
     # GATE 1: MANDATORY CLEAN-ROOM EVALUATOR (provenance-verified dossier)
+    cand = None
     if not has_bypass_eval:
         ok, dossier_reason, cand = check_dossier(target_sym, trade_dir, env, base_dir, conversation_id, now_ts=now_ts)
         if not ok:
@@ -6207,12 +6294,17 @@ def evaluate_trade_opening(cmd: str, args: dict, mcp_args: dict, base_dir: str,
         if not delta_bias or delta_bias == "UNKNOWN":
             delta_bias = portfolio.get("delta_bias", "NEUTRAL")
         if delta_bias == "LONG_HEAVY" and trade_dir == "LONG":
+            # Issue #261: record-only, after the decision; never changes it
+            with contextlib.suppress(Exception):
+                _record_gate_denial(base_dir, env, now_ts, target_sym, trade_dir, cand, state, delta_bias, age_seconds)
             return "deny", (
                 "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Delta-Neutral Hard Gate): "
                 f"Portfolio is bullishly unbalanced (Delta: +${portfolio.get('net_notional_delta_usdt', 0):.2f} USDT / LONG_HEAVY). "
                 "Opening additional Longs without Short hedging is strictly prohibited."
             )
         if delta_bias == "SHORT_HEAVY" and trade_dir == "SHORT":
+            with contextlib.suppress(Exception):
+                _record_gate_denial(base_dir, env, now_ts, target_sym, trade_dir, cand, state, delta_bias, age_seconds)
             return "deny", (
                 "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Delta-Neutral Hard Gate): "
                 f"Portfolio is bearishly unbalanced (Delta: -${abs(portfolio.get('net_notional_delta_usdt', 0)):.2f} USDT / SHORT_HEAVY). "
