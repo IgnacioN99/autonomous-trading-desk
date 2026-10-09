@@ -9,12 +9,25 @@ it never touches the exchange, the ledger or any desk runtime file).
       deterministic "routing" block ({"route": quick|build|deep, "risk": low|medium|high, "reason": ...})
       computed from its labels and title by classify_issue(), and write the fixer binding marker
       <worktree>/logs/issue_work/fixer_binding.json ({"issue", "worktree", "branch", "created_ts",
-      "session_id": null}); scripts/hooks/issue_fixer_guard.py claims it for the first fixer session.
+      "session_id": null}); scripts/hooks/issue_fixer_guard.py claims it for the first fixer session. It also
+      writes the issue's heartbeat key to <main checkout>/logs/issue_work_keys/<N>.key (32 random bytes as hex,
+      mode 0600 where the filesystem honours it; gitignored), the second main-checkout write after the routing
+      log.
   check-guard <worktree> --since <epoch_s>
       Read <worktree>/logs/issue_work/guard_heartbeat.json (written by issue_fixer_guard.py on every decision) and
-      print {"ok", "heartbeat_ts", "since", "session_id"}: exit 0 when the heartbeat exists and ts >= since, else
-      exit 2 (the guard did not run, e.g. the Claude Code build ignored the fixer's frontmatter hook). session_id
-      is the one the last hook payload carried (null if none).
+      print {"ok", "heartbeat_ts", "since", "session_id", "signed", "sig_ok", "binding_claim", "issue"} plus a
+      "warning" when there is one: exit 0 when the heartbeat exists, ts >= since and, if the issue has a key, its
+      HMAC verifies; else exit 2 (the guard did not run, e.g. the Claude Code build ignored the fixer's
+      frontmatter hook, or the heartbeat is unsigned, tampered with or from another worktree). The issue number
+      comes from the binding marker, else from the -wt-issue-<N> directory name; a legacy worktree without a key
+      reports `signed: false`, `sig_ok: null` and passes on the timestamp alone. A main checkout that cannot be
+      resolved fails closed. session_id is the one the last hook payload carried (null if none);
+      binding_claim: failed still exits 0 with "warning": "binding claim failed".
+  rebind <N> [--force]
+      Reset the binding marker's session_id to null, so the guard binds the worktree to the next session that
+      works in it (orchestrator only: the fixer cannot run this script). Without --force it refuses (exit 2)
+      while the heartbeat is younger than REBIND_LIVE_SECONDS and carries a session id: a session may still be
+      working there.
   record-route <N> --from <json file>
       Validate the orchestrator's route record (final route, fixer/auditor models and efforts per round,
       escalations, approved round, merged) and append one JSON line to logs/issue_routing.jsonl in the MAIN
@@ -26,22 +39,31 @@ it never touches the exchange, the ledger or any desk runtime file).
         files.txt    changed and new files
         checks.json  compileall, sync_claude_assets --check and unittest discover: exit code, duration, summary
         checks.log   the tail of each check's output
+      The checks run with a scrubbed environment (check_env): no BINANCE_*, NOTION_*, GITHUB_*, GMAIL_*, GH_*,
+      ENV_FILE, BINANCE_MCP_OAUTH_PATH or GEMINI_API_KEY, and HOME set to a fresh temporary directory. Only those
+      variables and HOME are scrubbed; any other variable is inherited. The fixer's own test runs are not
+      scrubbed (a hook cannot change a command's environment).
   cleanup <N> [--force]
-      Once the PR of fix/issue-<N>-* is merged (or with --force), remove the worktree and delete the local branch.
-      It never deletes remote branches (GitHub deletes merged head branches, and a push would re-arm the
-      pr-review hook).
+      Once the PR of fix/issue-<N>-* is merged (or with --force), remove the worktree, delete the local branch and
+      the issue's heartbeat key. It never deletes remote branches (GitHub deletes merged head branches, and a
+      push would re-arm the pr-review hook).
 
 Every command prints one JSON document. Exit codes: 0 ok (review-context also exits 0 when checks fail: read
 `checks_ok`), 1 failure, 2 invalid arguments (including an invalid or unreadable record-route file) or, for
-check-guard, a missing or stale heartbeat.
+check-guard, a missing, stale or unverified heartbeat and, for rebind, a session that still looks live.
 """
 
 import argparse
+import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
+import site
 import subprocess
 import sys
+import tempfile
 import time
 
 WORK_DIR = os.path.join("logs", "issue_work")
@@ -52,6 +74,16 @@ LOG_TAIL_LINES = 120
 ROUTING_LOG = os.path.join("logs", "issue_routing.jsonl")
 BINDING_FILE = "fixer_binding.json"  # read and claimed by scripts/hooks/issue_fixer_guard.py
 HEARTBEAT_FILE = "guard_heartbeat.json"  # written by scripts/hooks/issue_fixer_guard.py
+# Per-issue heartbeat keys in the MAIN checkout (gitignored); the guard signs SIGNED_FIELDS with them. Both must
+# match scripts/hooks/issue_fixer_guard.py (KEYS_DIR, SIGNED_FIELDS, heartbeat_signature).
+KEYS_DIR = os.path.join("logs", "issue_work_keys")
+SIGNED_FIELDS = ("ts", "worktree", "issue", "decision", "session_id", "binding_claim")
+BINDING_CLAIMS = {"claimed", "already_bound", "failed", "n/a"}
+WORKTREE_ISSUE_RE = re.compile(r"-wt-issue-(\d+)$")
+REBIND_LIVE_SECONDS = 600
+# Environment the review-context checks never inherit: credentials reach desk code only through these
+SCRUBBED_ENV_PREFIXES = ("BINANCE_", "NOTION_", "GITHUB_", "GMAIL_", "GH_")  # GH_: gh reads GH_TOKEN itself
+SCRUBBED_ENV_NAMES = {"ENV_FILE", "BINANCE_MCP_OAUTH_PATH", "GEMINI_API_KEY"}  # GEMINI: run_pr_audit.py
 
 ROUTES = ("quick", "build", "deep")  # ascending rank: a final route may upgrade, never downgrade
 DEEP_LABELS = {"cat:risk_gate", "severity:high", "severity:critical"}
@@ -84,6 +116,10 @@ class WorkspaceError(Exception):
 
 class RouteRecordError(WorkspaceError):
     """Invalid record-route input (exit 2)."""
+
+
+class RebindRefused(WorkspaceError):
+    """rebind without --force while a session looks live in the worktree (exit 2)."""
 
 
 def run(cmd: list, cwd: str = None, check: bool = True, timeout: int = 300) -> subprocess.CompletedProcess:
@@ -164,29 +200,137 @@ def cmd_init(issue: int, slug: str, base: str, cwd: str = None) -> dict:
     with open(os.path.join(work, BINDING_FILE), "w", encoding="utf-8") as f:
         json.dump({"issue": issue, "worktree": path, "branch": branch, "created_ts": int(time.time()),
                    "session_id": None}, f, indent=2)
+    key_file = _write_issue_key(repo, issue)
     head = run(["git", "rev-parse", "--short", "HEAD"], cwd=path).stdout.strip()
     return {"ok": True, "issue": issue, "title": data.get("title"), "worktree": path, "branch": branch,
             "base": base, "head": head, "work_dir": work, "issue_file": os.path.join(work, "issue.json"),
-            "routing": data["routing"]}
+            "routing": data["routing"], "key_file": key_file}
+
+
+def _key_path(repo: str, issue: int) -> str:
+    return os.path.join(repo, KEYS_DIR, f"{issue}.key")
+
+
+def _write_issue_key(repo: str, issue: int) -> str:
+    """A fresh heartbeat key for the issue (a stale one from an earlier run is replaced). Mode 0600; DrvFs mounts
+    such as /mnt/c may not honour it."""
+    keys = os.path.join(repo, KEYS_DIR)
+    os.makedirs(keys, mode=0o700, exist_ok=True)
+    path = _key_path(repo, issue)
+    if os.path.lexists(path):
+        os.remove(path)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="ascii") as f:
+        f.write(secrets.token_hex(32) + "\n")
+    os.chmod(path, 0o600)  # exactly 0600, whatever the umask
+    return path
+
+
+def _read_json(path: str):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
 
 
 # --------------------------------------------------------------------------------------------------
 # check-guard
 # --------------------------------------------------------------------------------------------------
+def heartbeat_signature(key: bytes, beat: dict) -> str:
+    """Same computation as scripts/hooks/issue_fixer_guard.py heartbeat_signature."""
+    message = json.dumps({k: beat.get(k) for k in SIGNED_FIELDS}, sort_keys=True, separators=(",", ":"))
+    return hmac.new(key, message.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _worktree_issue(path: str):
+    """The issue number from the worktree's binding marker, else from its -wt-issue-<N> name (None if neither)."""
+    marker = _read_json(os.path.join(path, WORK_DIR, BINDING_FILE))
+    issue = marker.get("issue") if isinstance(marker, dict) else None
+    if isinstance(issue, int) and not isinstance(issue, bool):
+        return issue
+    match = WORKTREE_ISSUE_RE.search(os.path.basename(os.path.normpath(path)))
+    return int(match.group(1)) if match else None
+
+
 def cmd_check_guard(path: str, since: int) -> dict:
-    """ok when the fixer guard wrote its heartbeat in this worktree at or after `since` (epoch seconds). Also
-    reports the heartbeat's session_id: the id the hook payload carried (null when it carried none)."""
-    try:
-        with open(os.path.join(path, WORK_DIR, HEARTBEAT_FILE), encoding="utf-8") as f:
-            beat = json.load(f)
-        ts, session_id = beat.get("ts"), beat.get("session_id")
-    except (OSError, ValueError, AttributeError):
-        ts = session_id = None
+    """ok when the fixer guard wrote its heartbeat in this worktree at or after `since` (epoch seconds) and, when
+    the issue has a key in the main checkout, the heartbeat's HMAC verifies for this worktree and issue. Also
+    reports the heartbeat's session_id (the id the hook payload carried, null when it carried none) and
+    binding_claim."""
+    beat = _read_json(os.path.join(path, WORK_DIR, HEARTBEAT_FILE))
+    beat = beat if isinstance(beat, dict) else {}
+    ts, session_id, claim = beat.get("ts"), beat.get("session_id"), beat.get("binding_claim")
     if isinstance(ts, bool) or not isinstance(ts, int):
         ts = None
     if not isinstance(session_id, str):
         session_id = None
-    return {"ok": ts is not None and ts >= since, "heartbeat_ts": ts, "since": since, "session_id": session_id}
+    if claim not in BINDING_CLAIMS:
+        claim = None
+    sig = beat.get("sig")
+    signed = beat.get("signed") is True and isinstance(sig, str)
+    issue, warnings, sig_ok = _worktree_issue(path), [], None
+    try:
+        repo = main_repo_root(path)
+    except (WorkspaceError, OSError, subprocess.SubprocessError) as e:
+        repo = None
+        warnings.append(f"cannot resolve the main checkout ({e}); the signature cannot be checked")
+    if repo and issue is not None and os.path.lexists(_key_path(repo, issue)):
+        sig_ok = False
+        try:
+            with open(_key_path(repo, issue), encoding="ascii") as f:
+                key = bytes.fromhex(f.read().strip())
+        except (OSError, ValueError) as e:
+            key = b""
+            warnings.append(f"unreadable heartbeat key ({e})")
+        if key and signed:
+            same_tree = (isinstance(beat.get("worktree"), str)
+                         and os.path.realpath(beat["worktree"]) == os.path.realpath(path))
+            sig_ok = (same_tree and beat.get("issue") == issue
+                      and hmac.compare_digest(sig.encode("utf-8"), heartbeat_signature(key, beat).encode("ascii")))
+        if not sig_ok:
+            warnings.append("heartbeat signature missing or invalid")
+    if claim == "failed":
+        warnings.append("binding claim failed")
+    out = {"ok": ts is not None and ts >= since and repo is not None and sig_ok is not False, "heartbeat_ts": ts,
+           "since": since, "session_id": session_id, "signed": signed, "sig_ok": sig_ok, "binding_claim": claim,
+           "issue": issue}
+    if warnings:
+        out["warning"] = "; ".join(warnings)
+    return out
+
+
+# --------------------------------------------------------------------------------------------------
+# rebind
+# --------------------------------------------------------------------------------------------------
+def cmd_rebind(issue: int, force: bool = False, cwd: str = None) -> dict:
+    """Resets the binding marker's session_id to null. Refuses without `force` while the heartbeat is younger than
+    REBIND_LIVE_SECONDS and carries a session id (the bound session, or another one, may still be working)."""
+    repo = main_repo_root(cwd)
+    path = worktree_path(repo, issue)
+    marker_file = os.path.join(path, WORK_DIR, BINDING_FILE)
+    marker = _read_json(marker_file)
+    if not isinstance(marker, dict):
+        raise WorkspaceError(f"no readable binding marker at {marker_file}")
+    beat = _read_json(os.path.join(path, WORK_DIR, HEARTBEAT_FILE))
+    beat = beat if isinstance(beat, dict) else {}
+    beat_session, beat_ts = beat.get("session_id"), beat.get("ts")
+    age = (int(time.time()) - beat_ts
+           if isinstance(beat_ts, int) and not isinstance(beat_ts, bool) else None)
+    live = isinstance(beat_session, str) and bool(beat_session) and age is not None and age < REBIND_LIVE_SECONDS
+    if live and not force:
+        raise RebindRefused(f"the guard heartbeat of {path} is {age}s old and carries session {beat_session} "
+                            f"(bound: {marker.get('session_id')}); confirm no other session works there, then "
+                            "pass --force")
+    previous = marker.get("session_id")
+    marker["session_id"] = None
+    tmp = f"{marker_file}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(marker, f, indent=2)
+    os.replace(tmp, marker_file)
+    return {"ok": True, "issue": issue, "worktree": path, "previous_session_id": previous, "forced": force,
+            "heartbeat_session_id": beat_session if isinstance(beat_session, str) else None,
+            "heartbeat_age_s": age}
 
 
 # --------------------------------------------------------------------------------------------------
@@ -294,6 +438,21 @@ def _summary(name: str, output: str) -> str:
     return lines[-1] if lines else ""
 
 
+def check_env(home: str) -> dict:
+    """The environment of the review-context checks: the current one minus the listed credential variables
+    (SCRUBBED_ENV_PREFIXES, SCRUBBED_ENV_NAMES), with HOME set to `home` (a fresh empty directory). Only those
+    variables and HOME are scrubbed; every other variable (PATH, LANG, TZ, the Python variables, and any
+    credential not listed) is inherited. PYTHONUSERBASE keeps pointing at the real user site-packages, so
+    user-installed dependencies still import."""
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(SCRUBBED_ENV_PREFIXES) and k not in SCRUBBED_ENV_NAMES}
+    user_base = site.getuserbase()
+    if user_base:
+        env.setdefault("PYTHONUSERBASE", user_base)
+    env["HOME"] = home
+    return env
+
+
 def cmd_review_context(path: str, python: str = None) -> dict:
     path = os.path.abspath(path)
     if run(["git", "rev-parse", "--is-inside-work-tree"], cwd=path, check=False).stdout.strip() != "true":
@@ -314,17 +473,20 @@ def cmd_review_context(path: str, python: str = None) -> dict:
         f.write("\n".join(names + [f"A\t{rel}  (untracked)" for rel in new_files]) + "\n")
 
     results, log_parts = [], []
-    for name, cmd in _checks(python or sys.executable):
-        start = time.time()
-        try:
-            res = subprocess.run(cmd, cwd=path, capture_output=True, text=True, timeout=CHECK_TIMEOUT_SECONDS)
-            code, output = res.returncode, (res.stdout or "") + (res.stderr or "")
-        except subprocess.TimeoutExpired as e:
-            code, output = 124, f"TIMEOUT after {CHECK_TIMEOUT_SECONDS}s\n{e.stdout or ''}{e.stderr or ''}"
-        results.append({"name": name, "command": " ".join(cmd[1:]), "exit_code": code, "ok": code == 0,
-                        "duration_s": round(time.time() - start, 1), "summary": _summary(name, output)})
-        tail = "\n".join(output.splitlines()[-LOG_TAIL_LINES:])
-        log_parts.append(f"===== {name} (exit {code}) =====\n{tail}\n")
+    with tempfile.TemporaryDirectory(prefix="issue_review_home_") as home:
+        env = check_env(home)
+        for name, cmd in _checks(python or sys.executable):
+            start = time.time()
+            try:
+                res = subprocess.run(cmd, cwd=path, capture_output=True, text=True, timeout=CHECK_TIMEOUT_SECONDS,
+                                     env=env)
+                code, output = res.returncode, (res.stdout or "") + (res.stderr or "")
+            except subprocess.TimeoutExpired as e:
+                code, output = 124, f"TIMEOUT after {CHECK_TIMEOUT_SECONDS}s\n{e.stdout or ''}{e.stderr or ''}"
+            results.append({"name": name, "command": " ".join(cmd[1:]), "exit_code": code, "ok": code == 0,
+                            "duration_s": round(time.time() - start, 1), "summary": _summary(name, output)})
+            tail = "\n".join(output.splitlines()[-LOG_TAIL_LINES:])
+            log_parts.append(f"===== {name} (exit {code}) =====\n{tail}\n")
     with open(os.path.join(review, "checks.log"), "w", encoding="utf-8") as f:
         f.write("\n".join(log_parts))
     checks_ok = all(r["ok"] for r in results)
@@ -363,7 +525,13 @@ def cmd_cleanup(issue: int, force: bool = False, cwd: str = None) -> dict:
     run(["git", "worktree", "remove", "--force", path], cwd=repo)
     run(["git", "branch", "-D", branch], cwd=repo, check=False)
     run(["git", "worktree", "prune"], cwd=repo, check=False)
-    return {"ok": True, "issue": issue, "removed_worktree": path, "deleted_branch": branch}
+    try:
+        os.remove(_key_path(repo, issue))
+        removed_key = True
+    except FileNotFoundError:
+        removed_key = False
+    return {"ok": True, "issue": issue, "removed_worktree": path, "deleted_branch": branch,
+            "removed_key": removed_key}
 
 
 def main(argv: list = None) -> int:
@@ -385,7 +553,11 @@ def main(argv: list = None) -> int:
                                                  "else 2")
     p_guard.add_argument("worktree")
     p_guard.add_argument("--since", type=int, required=True, help="epoch seconds (the fixer launch time)")
-    p_clean = sub.add_parser("cleanup", help="Remove a merged issue worktree and its local branch")
+    p_rebind = sub.add_parser("rebind", help="Reset the fixer binding of an issue worktree (orchestrator only)")
+    p_rebind.add_argument("issue", type=int)
+    p_rebind.add_argument("--force", action="store_true",
+                          help="rebind even though the heartbeat shows a session active in the last 10 minutes")
+    p_clean = sub.add_parser("cleanup", help="Remove a merged issue worktree, its local branch and its key")
     p_clean.add_argument("issue", type=int)
     p_clean.add_argument("--force", action="store_true")
     args = parser.parse_args(argv)
@@ -400,9 +572,11 @@ def main(argv: list = None) -> int:
             out = cmd_check_guard(args.worktree, args.since)
             print(json.dumps(out, indent=2))
             return 0 if out["ok"] else 2
+        elif args.command == "rebind":
+            out = cmd_rebind(args.issue, force=args.force)
         else:
             out = cmd_cleanup(args.issue, force=args.force)
-    except RouteRecordError as e:
+    except (RouteRecordError, RebindRefused) as e:
         print(json.dumps({"ok": False, "error": str(e)}))
         return 2
     except (WorkspaceError, subprocess.TimeoutExpired, ValueError, OSError) as e:

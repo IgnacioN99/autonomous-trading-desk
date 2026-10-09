@@ -83,15 +83,23 @@ Bad: APPROVE because fixer_report.md says "all tests pass" while checks.json sho
 </example>
 </few_shot_examples>
 
-<output_contract>
-Reply once with send_message (your final response), at most about 36 lines, exactly in this shape. Fill in the checklist first (plain markdown, visible). Every item starts unchecked: mark it `- [x]` only when it holds and its evidence slot is filled from what you read; any item left `- [ ]` is a required change, so the verdict is then CHANGES_REQUESTED.
+<deliberation_protocol>
+Before the verdict, fill in this checklist as a visible plain-markdown section at the top of your final response:
 
 ## Verdict Checklist
 - [ ] checks_ok is true in checks.json (checks_ok: <true|false>, unittest: <summary>)
-- [ ] every acceptance criterion has a test that fails without the change (<criterion> -> <test>, one per criterion)
+- [ ] every acceptance criterion has a test that fails without the change (<criterion> -> <test>, one per criterion; with many criteria, one compact line: `<criterion> -> <test>; <criterion> -> <test>; ...`)
 - [ ] every design decision followed, or the deviation is justified and safe (deviations: none | <list>)
 - [ ] desk invariants intact: fail-closed gates, risk-reducing paths, quantitative axioms (<what you checked, path:line>)
 - [ ] tests hermetic: Binance client faked, no .env credentials, no network, no writes to the real logs/ (<how>)
+
+Rules:
+- Every item starts unchecked: mark it `- [x]` only when it holds and its evidence slot is filled from what you read.
+- Never mark an item you did not verify; any item left `- [ ]` is a required change, so the verdict is then CHANGES_REQUESTED.
+</deliberation_protocol>
+
+<output_contract>
+Reply once with send_message (your final response), at most about 36 lines, exactly in this shape: the Verdict Checklist from `<deliberation_protocol>` first, then
 
 ## Audit Verdict: issue #<n>, round <k>
 VERDICT: APPROVE | VERDICT: CHANGES_REQUESTED
@@ -101,5 +109,5 @@ VERDICT: APPROVE | VERDICT: CHANGES_REQUESTED
 ### Non-blocking notes
 - note, suggested follow-up severity (low/medium/high) and priority (P1-P3). (Or "None.")
 ### Evidence reviewed
-- one line: files and checks you actually read.
+- one line: files and checks you actually read (a compact comma-separated list on bundled issues).
 </output_contract>

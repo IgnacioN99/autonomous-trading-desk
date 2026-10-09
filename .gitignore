@@ -32,6 +32,7 @@ logs/guardian_task.xml
 logs/evaluations/*
 logs/pr_review/
 logs/issue_work/
+logs/issue_work_keys/
 !logs/.gitkeep
 !logs/evaluations/.gitkeep
 
