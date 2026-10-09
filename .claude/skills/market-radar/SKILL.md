@@ -15,6 +15,7 @@ description: >-
 > `.claude/agents/`); a subagent's final response comes back to you, together with its `agentId`. Where the
 > agy wording says `invoke_subagent` use the Agent tool, `conversationId` means the Claude Code `agentId`, and
 > `view_file` means Read. Run the scripts from the repo root with Bash.
+> Load sibling skills (e.g. `market-radar`) with the Skill tool; do not grep or Read their `SKILL.md`.
 
 # Market Radar (read-only analytics)
 

@@ -25,7 +25,7 @@ agy mechanics to Claude Code.
   response, `view_file` = Read, `grep_search` = Grep, `list_dir` = Glob, `search_web` = WebSearch,
   `read_url_content` = WebFetch, `run_command` = Bash (or PowerShell, Claude Code on Windows), file writes =
   Write / Edit / MultiEdit / NotebookEdit, agy `conversationId` = Claude `agentId` (subagent) or `session_id`
-  (main session).
+  (main session), loading a skill = Skill tool.
 - Hooks (`.claude/settings.json`): PreToolUse `pre_trade_guard.py` on Bash, PowerShell, MCP and file writes
   (Write, Edit, MultiEdit, NotebookEdit; deny = exit 2); PowerShell commands get the same decisions as Bash plus
   a stricter check on protected paths (only read-only cmdlets such as Get-Content may name them; encoded commands
