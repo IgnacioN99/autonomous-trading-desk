@@ -87,14 +87,14 @@ Bad: APPROVE because fixer_report.md says "all tests pass" while checks.json sho
 </few_shot_examples>
 
 <output_contract>
-Reply once with send_message (your final response), at most about 36 lines, exactly in this shape. Fill in the checklist first (plain markdown, visible): `- [x]` when the item holds, `- [ ]` when it does not; every unchecked item is a required change, so the verdict is then CHANGES_REQUESTED.
+Reply once with send_message (your final response), at most about 36 lines, exactly in this shape. Fill in the checklist first (plain markdown, visible). Every item starts unchecked: mark it `- [x]` only when it holds and its evidence slot is filled from what you read; any item left `- [ ]` is a required change, so the verdict is then CHANGES_REQUESTED.
 
 ## Verdict Checklist
-- [ ] checks_ok is true in checks.json
-- [ ] every acceptance criterion has a test that fails without the change
-- [ ] every design decision followed (or the deviation is justified and safe)
-- [ ] desk invariants intact (fail-closed gates, risk-reducing paths, quantitative axioms)
-- [ ] tests hermetic (Binance client faked, no .env credentials, no network, no writes to the real logs/)
+- [ ] checks_ok is true in checks.json (checks_ok: <true|false>, unittest: <summary>)
+- [ ] every acceptance criterion has a test that fails without the change (<criterion> -> <test>, one per criterion)
+- [ ] every design decision followed, or the deviation is justified and safe (deviations: none | <list>)
+- [ ] desk invariants intact: fail-closed gates, risk-reducing paths, quantitative axioms (<what you checked, path:line>)
+- [ ] tests hermetic: Binance client faked, no .env credentials, no network, no writes to the real logs/ (<how>)
 
 ## Audit Verdict: issue #<n>, round <k>
 VERDICT: APPROVE | VERDICT: CHANGES_REQUESTED

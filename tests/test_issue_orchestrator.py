@@ -922,15 +922,29 @@ class TestGeneratorWriteAgents(unittest.TestCase):
         # #130.1: the guard exists only under Claude Code
         self.assertNotIn("A guard confines you", fixer)
         self.assertIn("Under Claude Code a guard (`scripts/hooks/issue_fixer_guard.py`) enforces these limits; "
-                      "under agy no guard runs and these limits are yours to respect", fixer)
-        # #130.2: visible checklists, the auditor's before its VERDICT line
-        for item in ("## Fixer Checklist", "- [x] design.md read and followed", "- [x] narrow tests run",
-                     "- [x] full gate run (command + result)",
-                     "- [x] new tests hermetic (Binance client faked, no .env read)"):
+                      "under agy no guard runs: if a command or edit falls outside these limits, do NOT run it.", fixer)
+        self.assertNotIn("these limits are yours to respect", fixer)
+        # #130.2: visible checklists, the fixer's inside <deliberation_protocol>, every item unchecked with its
+        # evidence slot; the auditor's before its VERDICT line
+        for item in ("<deliberation_protocol>", "</deliberation_protocol>", "## Fixer Checklist",
+                     "- [ ] design.md read and followed (deviations: none | <list>)",
+                     "- [ ] narrow tests run: `<command>` -> <N> tests, <OK|FAILED>",
+                     "- [ ] full gate run: `<command>` -> <N> tests, <OK|FAILED>",
+                     "- [ ] new tests hermetic (Binance client faked, no .env read): <how>",
+                     "Mark an item `[x]` only with its evidence on that line",
+                     "Never mark an item you did not verify."):
             self.assertIn(item, fixer)
+        self.assertNotIn("- [x] design.md read and followed", fixer)
+        self.assertNotIn("- [x]", fixer)
+        block_start, block_end = fixer.index("<deliberation_protocol>"), fixer.index("</deliberation_protocol>")
+        self.assertLess(block_start, fixer.index("## Fixer Checklist"))
+        self.assertLess(fixer.index("## Fixer Checklist"), block_end)
+        self.assertLess(block_end, fixer.index("<output_contract>"))
         self.assertLess(fixer.index("## Fixer Checklist"), fixer.index("## Fixer Report: issue #<n>"))
-        for item in ("## Verdict Checklist", "checks_ok is true", "every acceptance criterion has a test",
-                     "every design decision followed", "desk invariants intact", "tests hermetic"):
+        for item in ("## Verdict Checklist", "- [ ] checks_ok is true", "checks_ok: <true|false>",
+                     "unittest: <summary>", "- [ ] every acceptance criterion has a test",
+                     "- [ ] every design decision followed", "- [ ] desk invariants intact", "- [ ] tests hermetic",
+                     "any item left `- [ ]` is a required change"):
             self.assertIn(item, auditor)
         self.assertLess(auditor.index("## Verdict Checklist"),
                         auditor.index("VERDICT: APPROVE | VERDICT: CHANGES_REQUESTED"))
@@ -947,6 +961,9 @@ class TestGeneratorWriteAgents(unittest.TestCase):
         step_7a = skill.split("   a. Run `python3 scripts/dev/issue_workspace.py review-context", 1)[1].split("\n")[0]
         self.assertIn("`checks_ok: false`", step_7a)
         self.assertIn("straight back to the fixer", step_7a)
+        self.assertIn("BEFORE any audit (never audit a red suite)", step_7a)
+        self.assertIn("counts toward the 3-round budget", step_7a)
+        self.assertNotIn("together with the audit", step_7a)
         self.assertIn("issue_workspace.py check-guard <WORKTREE> --since <launch_ts>", skill)
         self.assertIn("a confinement policy, not a sandbox", skill)
         # A binding denial after an escalation or a restarted / resumed orchestrator session has a remedy
