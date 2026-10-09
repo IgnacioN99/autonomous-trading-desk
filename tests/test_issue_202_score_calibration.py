@@ -289,6 +289,7 @@ class TestBriefSidecar(_Workspace):
         rows = {r["symbol"]: r for r in side["rows"]}
         self.assertEqual(rows["SOLUSDT"], {"symbol": "SOLUSDT", "direction": "LONG", "confidence": 85,
                                            "tier": "Tier S (x)", "tier_s_eligible": True,
+                                           "squeeze_risk": False,  # issue #206: audit flag
                                            "score_components": self.COMPONENTS, "reasons": ["RSI", "Wick"]})
         self.assertEqual(rows["PEPEUSDT"]["direction"], "LONG")
         opp = brief["filtered_opportunities"][0]
@@ -1180,7 +1181,9 @@ class TestPromptAndDocs(unittest.TestCase):
         for shot in ("FILUSDT Tier S, confidence 95 = score 95", "SOLUSDT Tier A+, confidence 70 = score 70",
                      "Tier A), confidence 60 = score 60"):
             self.assertIn(shot, text)
-        self.assertEqual(text.count('"score": '), 4)  # the three shot dossiers + the contract's sample YOLO item
+        # the four shot dossiers (#206 added the squeezed RLCUSDT SHORT) + the contract's sample YOLO item
+        self.assertEqual(text.count('"score": '), 5)
+        self.assertIn("RLCUSDT Tier A, confidence 64 = score 64", text)
         self.assertIn('"leverage": 5, "score": null, "is_yolo": true', text)
         self.assertIn("stays the raw radar `confidence` even when RULE 3 downgrades the tier; never adjust it", text)
         self.assertNotIn("Maximum Conviction", text)

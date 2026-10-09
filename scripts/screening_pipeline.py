@@ -32,6 +32,7 @@ from utils.env_resolver import resolve_env
 from utils.gate_limits import MIN_TP1_DISTANCE, YOLO_MAX_LOSS_MARGIN_FRACTION
 from utils import yolo_scan_health
 from utils import rate_limit_guard
+from utils import squeeze_filter as sqf
 
 # Barbell YOLO slot (issue #52): the memecoin scanner runs concurrently under a hard time budget so it can
 # never block or break the standard scan (prime_evaluator_brief.py gives the whole pipeline 60 s).
@@ -75,6 +76,7 @@ class MacroContext(BaseModel):
     btc_tape_imbalance: float
     allows_alt_shorts: bool
     macro_warning: Optional[str] = None
+    btc_data_ok: bool = True  # False: BTC data unavailable (error path, empty micro, rate limit; issue #206)
 
 class CandidateSetup(BaseModel):
     symbol: str
@@ -110,6 +112,16 @@ class CandidateSetup(BaseModel):
     absorption_scored: bool = True  # False: the wick/taker candles did not match, absorption gave no score (#135)
     score_components: Dict[str, int] = {}  # radar points per factor, sum == confidence (issue #202, audit only)
     tier_s_eligible: bool = False  # radar volume-or-wick rule (issue #134), kept for the audit sidecar (#202)
+    # Issue #206: squeeze filter (utils/squeeze_filter.py). A flagged SHORT is capped at Tier A by the radar; a LONG
+    # is only flagged. macro_short_check names the path a non-BTC SHORT passed the macro gate on.
+    funding_rate_pct: Optional[float] = None
+    squeeze_risk: bool = False
+    squeeze_reasons: List[str] = []
+    long_crowding_risk: bool = False
+    macro_short_check: Optional[str] = None
+    funding_rate_8h_pct: Optional[float] = None  # funding_rate_pct normalized to 8h (squeeze thresholds use it)
+    funding_interval_h: Optional[int] = None  # symbol's funding interval (fundingInfo; 8h default)
+    alt_short_climax_ok: bool = False  # radar's exact vol_ratio >= 2.5 (unrounded); missing = False (fail closed)
 
 class StatArbPair(BaseModel):
     pair: str
@@ -176,10 +188,16 @@ class MarketScreeningPayload(BaseModel):
     # 429/418 ban is active (issue #91.1): the payload then carries no candidates.
     market_data_status: Optional[str] = None
     run_id: Optional[str] = None  # DESK_SCAN_RUN_ID echoed back to prime_evaluator_brief.py (issue #91.6)
+    # Issue #206: non-BTC SHORTs dropped by the macro rule ({symbol, direction, reason}, at most 10)
+    macro_rejected_shorts: List[dict] = []
+    # Issue #206: set when /fapi/v1/fundingInfo failed and every symbol's funding was read as 8h
+    funding_info_warning: Optional[str] = None
 
 # ==========================================
 # 2. DETERMINISTIC EXECUTION PIPELINE
 # ==========================================
+
+BTC_DATA_UNAVAILABLE_WARNING = "⚠️ MACRO ALERT: BTC data unavailable. Altcoin Short orders prohibited."
 
 def fetch_macro_btc() -> MacroContext:
     """Queries Bitcoin microstructure and tape to validate macro regime."""
@@ -191,9 +209,13 @@ def fetch_macro_btc() -> MacroContext:
         cur_price = float(ticker.get("price", 0)) if isinstance(ticker, dict) else 0.0
 
         regime = btc_micro.get("regime", "UNKNOWN")
-        allows_shorts = regime != "SHORT_SQUEEZE"
+        # Issue #206: empty BTC micro data (regime UNKNOWN) blocks altcoin shorts like the error path below
+        btc_data_ok = regime != "UNKNOWN"
+        allows_shorts = regime not in ("SHORT_SQUEEZE", "UNKNOWN")
         warning = None
-        if not allows_shorts:
+        if not btc_data_ok:
+            warning = BTC_DATA_UNAVAILABLE_WARNING
+        elif not allows_shorts:
             warning = "⚠️ MACRO ALERT: Bitcoin in aggressive Short Squeeze. Altcoin Short orders prohibited."
 
         return MacroContext(
@@ -207,7 +229,8 @@ def fetch_macro_btc() -> MacroContext:
             btc_tape_bias=btc_tape.get("live_bias", "BALANCED"),
             btc_tape_imbalance=btc_tape.get("imbalance_pct", 0.0),
             allows_alt_shorts=allows_shorts,
-            macro_warning=warning
+            macro_warning=warning,
+            btc_data_ok=btc_data_ok,
         )
     except rate_limit_guard.RateLimitedError:
         raise  # the whole run reports market data UNAVAILABLE
@@ -222,7 +245,10 @@ def fetch_macro_btc() -> MacroContext:
             btc_oi_z_score=0.0,
             btc_tape_bias="UNKNOWN",
             btc_tape_imbalance=0.0,
-            allows_alt_shorts=True
+            # Issue #206: no BTC data, no altcoin shorts (fail closed)
+            allows_alt_shorts=False,
+            macro_warning=BTC_DATA_UNAVAILABLE_WARNING,
+            btc_data_ok=False,
         )
 
 def _profile_standard_sizing():
@@ -234,6 +260,40 @@ def _profile_standard_sizing():
         return lev, float(prof.get("max_margin_ratio", 0.30))
     except Exception:
         return 3, 0.30
+
+def _optional_float(value) -> Optional[float]:
+    """A finite float, else None."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+MACRO_REJECTED_SHORTS_MAX = 10
+
+def apply_alt_short_macro_gate(rows: List[dict], macro: MacroContext) -> Tuple[List[dict], List[dict]]:
+    """Macro rule for altcoin shorts, a hard gate (issue #206) on the radar rows, before the enrichment slice so
+    lower-ranked rows replace the dropped SHORTs. A non-BTC SHORT stays only when BTC rejects resistance or the row's
+    exact `alt_short_climax_ok` is True (utils/squeeze_filter.alt_short_macro_reason). Pure: reads only the row and
+    the macro, sets `macro_short_check` on kept alt SHORTs. Returns the kept rows (radar order) and the dropped
+    SHORTs ({symbol, direction, reason}, at most MACRO_REJECTED_SHORTS_MAX)."""
+    kept: List[dict] = []
+    rejected: List[dict] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        symbol = row.get("symbol")
+        if row.get("direction") != "SHORT" or symbol == sqf.BTC_SYMBOL:
+            kept.append(row)
+            continue
+        reason = sqf.alt_short_macro_reason(symbol, row.get("alt_short_climax_ok"), macro, row.get("vol_ratio"))
+        if reason is not None:
+            if len(rejected) < MACRO_REJECTED_SHORTS_MAX:
+                rejected.append({"symbol": symbol, "direction": "SHORT", "reason": reason})
+            continue
+        row["macro_short_check"] = "btc_rejection" if sqf.btc_rejects_resistance(macro) else "climax>=2.5x"
+        kept.append(row)
+    return kept, rejected
 
 def enrich_and_size_candidate(c: dict, target_env: Optional[str] = None) -> Optional[CandidateSetup]:
     """Calculates volatility parity sizing and encapsulates into Pydantic model."""
@@ -315,6 +375,14 @@ def enrich_and_size_candidate(c: dict, target_env: Optional[str] = None) -> Opti
             absorption_scored=c.get("absorption_scored") is True,
             score_components={str(k): int(v) for k, v in (c.get("score_components") or {}).items()},
             tier_s_eligible=c.get("tier_s_eligible") is True,
+            alt_short_climax_ok=c.get("alt_short_climax_ok") is True,
+            funding_rate_pct=_optional_float(micro.get("funding_rate_pct")),
+            squeeze_risk=c.get("squeeze_risk") is True,
+            squeeze_reasons=[str(r) for r in (c.get("squeeze_reasons") or [])],
+            long_crowding_risk=c.get("long_crowding_risk") is True,
+            macro_short_check=c.get("macro_short_check"),
+            funding_rate_8h_pct=_optional_float(c.get("funding_rate_8h_pct")),
+            funding_interval_h=c.get("funding_interval_h") if isinstance(c.get("funding_interval_h"), int) else None,
         )
     except Exception as e:
         sym = c.get("symbol") if isinstance(c, dict) else None
@@ -483,7 +551,7 @@ def _rate_limited_macro(text: str) -> MacroContext:
     """Placeholder macro block of a run without market data (fixed text; alt shorts not allowed)."""
     return MacroContext(btc_price=0.0, btc_regime="UNKNOWN", btc_regime_desc=text, btc_absorption="NONE",
                         btc_taker_ratio=1.0, btc_cvd_30v=0.0, btc_oi_z_score=0.0, btc_tape_bias="UNKNOWN",
-                        btc_tape_imbalance=0.0, allows_alt_shorts=False, macro_warning=text)
+                        btc_tape_imbalance=0.0, allows_alt_shorts=False, macro_warning=text, btc_data_ok=False)
 
 def execute_screening_pipeline(top_pairs_count: int = 80, target_env: Optional[str] = None,
                                include_yolo: bool = True) -> MarketScreeningPayload:
@@ -530,11 +598,13 @@ def _run_screening_pipeline(top_pairs_count: int, target_env: Optional[str],
     # If a non-YOLO task raises after the scan started, stop the scan from issuing further requests.
     standard_scan_done = False
     rate_limited = False
+    macro_rejected_shorts: List[dict] = []
+    funding_status: dict = {}  # filled by the radar: fundingInfo fallback warning (issue #206)
     try:
         rate_limit_guard.raise_if_banned()  # a ban persisted by an earlier run: no Binance call in this run
         with ThreadPoolExecutor(max_workers=5) as executor:
             f_macro = executor.submit(fetch_macro_btc)
-            f_radar = executor.submit(bmr.scan_all_liquid_pairs, top_pairs_count)
+            f_radar = executor.submit(bmr.scan_all_liquid_pairs, top_pairs_count, funding_status=funding_status)
             f_statarb = executor.submit(qre.scan_coingrated_market_pairs)
             f_funding = executor.submit(fa.scan_top_funding_opportunities, 20_000_000, 3)
             f_news = executor.submit(fetch_news_summary)
@@ -545,10 +615,13 @@ def _run_screening_pipeline(top_pairs_count: int, target_env: Optional[str],
             raw_funding = f_funding.result()
             news_data = f_news.result()
 
+        # Macro gate for altcoin shorts on the radar rows first (issue #206), so lower-ranked rows fill the slots
+        gated_rows, macro_rejected_shorts = apply_alt_short_macro_gate(raw_candidates, macro_data)
+
         # Filter and type candidate setups (top 6 balanced)
         parsed_candidates: List[CandidateSetup] = []
         with ThreadPoolExecutor(max_workers=6) as c_exec:
-            futures = [c_exec.submit(enrich_and_size_candidate, c, target_env) for c in raw_candidates[:10]]
+            futures = [c_exec.submit(enrich_and_size_candidate, c, target_env) for c in gated_rows[:10]]
             for fut in as_completed(futures):
                 res = fut.result()
                 if res:
@@ -626,6 +699,7 @@ def _run_screening_pipeline(top_pairs_count: int, target_env: Optional[str],
     if rate_limited:
         macro_data = _rate_limited_macro(rate_limit_guard.unavailable_text())
         portfolio_ctx, top_candidates, stat_arb_list, raw_funding, news_data = None, [], [], None, []
+        macro_rejected_shorts = []
 
     # Barbell YOLO Slot Status (bounded wait; any failure or timeout leaves the slot empty)
     if f_yolo is not None:
@@ -646,7 +720,7 @@ def _run_screening_pipeline(top_pairs_count: int, target_env: Optional[str],
     market_data_status = None
     if rate_limited or rate_limit_guard.is_banned():
         market_data_status = rate_limit_guard.unavailable_text()
-        top_candidates, stat_arb_list, raw_funding = [], [], None
+        top_candidates, stat_arb_list, raw_funding, macro_rejected_shorts = [], [], None, []
         if yolo_slot.status in ("ACTIVE", "INACTIVE"):  # no YOLO candidate either; DISABLED is kept as is
             yolo_status, yolo_slot = _yolo_unavailable(YOLO_RATE_LIMITED_REASON)
     if include_yolo:
@@ -670,6 +744,8 @@ def _run_screening_pipeline(top_pairs_count: int, target_env: Optional[str],
         untrusted_external_content=True,
         market_data_status=market_data_status,
         run_id=run_id,
+        macro_rejected_shorts=macro_rejected_shorts,
+        funding_info_warning=funding_status.get("warning"),
     )
 
 def _exit_without_waiting_for_yolo(code: int) -> None:

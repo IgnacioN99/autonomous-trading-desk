@@ -72,7 +72,7 @@ Whenever the user explicitly requests crypto trading operations, Binance Futures
      * **Tier A+ (score 65-79):** Obvious absorption $\ge 55\%$, clean support/resistance, and R:R $\ge 3:1$.
      * **Tier A (score 55-64, hedge):** Robust setups to balance portfolio delta.
    - **Financial Friction & Commission Filter:** Automatically disqualify any trade where distance to TP1 is less than 3.5x roundtrip transaction cost ($TP1 - \text{Entry} < 3.5 \times (\text{Taker Roundtrip} + \text{Spread}) \approx 0.50\%$), ensuring fees never consume the statistical edge.
-   - **Macro Rule for Altcoin Shorts:** Prohibit altcoin shorts on technical overbought alone if Bitcoin is undergoing an aggressive volume breakout or vertical short squeeze. To short an altcoin, Bitcoin must display simultaneous resistance rejection or the altcoin pair must show exhausted climax volume ($\ge 2.5\times$).
+   - **Macro Rule for Altcoin Shorts:** No altcoin shorts on overbought alone if BTC is in a volume breakout or vertical short squeeze. Screener-enforced: alt shorts need BTC resistance rejection (bearish absorption or falling OI) or climax volume ($\ge 2.5\times$). SHORT squeeze risk (OI z ≥ 2, funding ≤ -0.01%/8h or no micro data) caps at Tier A.
    - **True Delta-Neutral Portfolio Architecture ($\Delta \approx 0$):** Balance the basket taking into account individual asset betas relative to BTC ($\sum w_i \beta_{i/BTC} \approx 0$), combining exhaustion shorts with support longs or cointegrated spreads.
    - **Barbell YOLO Moonshot Slot (Strict Asymmetric Convexity):**
      * **Barbell Philosophy (Nassim Taleb):** 90% of capital allocated to rigorous quantitative and Stat-Arb strategies, and 10% strictly ring-fenced for convex moonshots.

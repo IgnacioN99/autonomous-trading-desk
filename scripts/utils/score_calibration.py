@@ -284,8 +284,15 @@ def tier_s_confirmation_required(cand: Any, env: str, profile: Any, base_dir: st
                                  now: Optional[float] = None) -> Optional[str]:
     """Message when an otherwise fast-tracked Tier S candidate needs the user's confirmation because its dossier
     score bucket is not calibrated; None when the check does not apply (not PROD, flag off, not Tier S) or the
-    bucket is calibrated. Callers invoke it only for unconfirmed, non-YOLO candidates that would not already ask."""
-    if _norm_env(env) != "prod" or not candidate_is_tier_s(cand):
+    bucket is calibrated. Callers invoke it only for unconfirmed, non-YOLO candidates that would not already ask.
+    Checked first, for any tier and whatever the profile: a radar-flagged squeeze SHORT (squeeze_confirmation_required,
+    issue #206)."""
+    if _norm_env(env) != "prod":
+        return None
+    squeeze_msg = squeeze_confirmation_required(cand, env, base_dir)  # any tier, whatever the profile (#206)
+    if squeeze_msg:
+        return squeeze_msg
+    if not candidate_is_tier_s(cand):
         return None
     require, min_trades = calibration_policy(profile)
     if not require:
@@ -312,12 +319,28 @@ def tier_s_confirmation_required(cand: Any, env: str, profile: Any, base_dir: st
 DOSSIER_REL_PATH = os.path.join("logs", "evaluations", "latest_dossier.json")
 
 
-def radar_snapshot_matches(cand: dict, base_dir: str) -> Tuple[bool, str]:
-    """(True, reason) only when the stored latest dossier record carries radar_snapshots["SYMBOL|DIRECTION"] (joined
-    by record_evaluation.py from the brief's radar rows) whose `confidence` equals the dossier `score` exactly, so the
-    evaluator cannot pick a calibrated bucket by writing a different score. The record is bound to the dossier the
-    gate validated: its provenance sha256 must equal the candidate's `dossier_sha256` (else `dossier_changed`, as
-    in the executor's read_radar_snapshot). Any read problem is not a match."""
+SQUEEZE_CONFIRMATION_REASON = "squeeze_risk SHORT: user confirmation required"
+
+
+def squeeze_confirmation_message() -> str:
+    """The single message both gates emit for a radar-flagged squeeze SHORT (issue #206)."""
+    return f"{SQUEEZE_CONFIRMATION_REASON}: ask the user and rerun with --confirmed (RULE 9: at most Tier A)."
+
+
+def squeeze_confirmation_required(cand: Any, env: str, base_dir: str) -> Optional[str]:
+    """Mechanical backstop for evaluator RULE 9 (issue #206): in PROD, an otherwise fast-tracked candidate whose
+    radar snapshot (bound to the validated dossier) has `squeeze_risk: true` needs the user's confirmation, whatever
+    its tier label and whatever `require_calibrated_tier_s` says. A missing or unreadable snapshot does not trigger
+    it (the calibration gate handles that case)."""
+    if _norm_env(env) != "prod" or not isinstance(cand, dict):
+        return None
+    row, _ = _radar_snapshot_row(cand, base_dir)
+    return squeeze_confirmation_message() if isinstance(row, dict) and row.get("squeeze_risk") is True else None
+
+
+def _radar_snapshot_row(cand: dict, base_dir: str) -> Tuple[Optional[dict], str]:
+    """(row, "") for the stored latest dossier record's radar_snapshots["SYMBOL|DIRECTION"], bound to the validated
+    dossier by its provenance sha256; (None, reason) on any read problem or mismatch."""
     key = f"{str(cand.get('symbol') or '').upper()}|{str(cand.get('direction') or '').upper()}"
     try:
         with open(os.path.join(base_dir, DOSSIER_REL_PATH), "r", encoding="utf-8") as f:
@@ -326,13 +349,25 @@ def radar_snapshot_matches(cand: dict, base_dir: str) -> Tuple[bool, str]:
         prov = record.get("provenance") if isinstance(record, dict) else None
         stored_sha = prov.get("sha256") if isinstance(prov, dict) else None
     except Exception:
-        return False, "radar_snapshot_unreadable"
+        return None, "radar_snapshot_unreadable"
     if not cand.get("dossier_sha256") or stored_sha != cand.get("dossier_sha256"):
-        return False, "dossier_changed"
+        return None, "dossier_changed"
     entry = snaps.get(key) if isinstance(snaps, dict) else None
     row = entry.get("radar_snapshot") if isinstance(entry, dict) else None
     if not isinstance(row, dict):
-        return False, "radar_snapshot_missing"
+        return None, "radar_snapshot_missing"
+    return row, ""
+
+
+def radar_snapshot_matches(cand: dict, base_dir: str) -> Tuple[bool, str]:
+    """(True, reason) only when the stored latest dossier record carries radar_snapshots["SYMBOL|DIRECTION"] (joined
+    by record_evaluation.py from the brief's radar rows) whose `confidence` equals the dossier `score` exactly, so the
+    evaluator cannot pick a calibrated bucket by writing a different score. The record is bound to the dossier the
+    gate validated: its provenance sha256 must equal the candidate's `dossier_sha256` (else `dossier_changed`, as
+    in the executor's read_radar_snapshot). Any read problem is not a match."""
+    row, reason = _radar_snapshot_row(cand, base_dir)
+    if row is None:
+        return False, reason
     dossier_score, radar_score = _int_score(cand.get("score")), _num(row.get("confidence"))
     if dossier_score is None or radar_score is None or radar_score != int(radar_score) \
             or int(radar_score) != dossier_score:

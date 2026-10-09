@@ -33,6 +33,7 @@ SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
 from utils.yolo_scan_health import RUN_ID_ENV, YOLO_DISABLED_STATUS  # stdlib-only module (no pipeline import)
+from utils.squeeze_filter import SQUEEZE_REASON_PREFIX  # stdlib-only (issue #206)
 
 BASE_DIR = os.path.dirname(SCRIPTS_DIR)
 LOGS_DIR = os.path.join(BASE_DIR, "logs")
@@ -325,7 +326,7 @@ def assemble_primed_brief(target_env: str = "prod", out_path: Optional[str] = No
         },
         "macro_btc": screening.get("macro", {
             "btc_price": state.get("macro_btc", {}).get("price_usdt", 0.0),
-            "allows_alt_shorts": True
+            "allows_alt_shorts": False  # no BTC context: no altcoin shorts (fail closed, issue #206)
         }),
         "filtered_opportunities": [_brief_opportunity(o) for o in screening.get("top_candidates", [])],
         "stat_arb_pairs": screening.get("actionable_stat_arb", []),
@@ -343,6 +344,11 @@ def assemble_primed_brief(target_env: str = "prod", out_path: Optional[str] = No
         brief["pending_entries_status"] = "UNREADABLE"
     if sync_failed:
         brief["state_sync"] = "FAILED"
+    # Issue #206: altcoin SHORTs the screener's macro gate dropped (symbols only), so a thin radar is not read as quiet
+    rejected_shorts = [r.get("symbol") for r in (screening.get("macro_rejected_shorts") or [])
+                       if isinstance(r, dict) and r.get("symbol")]
+    if rejected_shorts:
+        brief["macro_rejected_shorts"] = rejected_shorts
 
     # Atomic write: the evaluator subagent reads logs/primed_brief.json with view_file
     _write_json(BRIEF_FILE, brief)
@@ -354,11 +360,26 @@ def assemble_primed_brief(target_env: str = "prod", out_path: Optional[str] = No
 
 
 # Audit-only fields (issue #202): kept out of the evaluator's brief (token budget) and written to the sidecar.
-_SIDECAR_ONLY_KEYS = ("score_components", "tier_s_eligible")
+# alt_short_climax_ok (issue #206) is a pipeline-only gate input: kept out of the brief, not written to the sidecar.
+_SIDECAR_ONLY_KEYS = ("score_components", "tier_s_eligible", "alt_short_climax_ok")
+
+
+# Issue #206 flags reach the brief only when set (token budget): these values are dropped from a row.
+_DROP_WHEN_UNSET = {"squeeze_risk": False, "squeeze_reasons": [], "long_crowding_risk": False,
+                    "macro_short_check": None, "funding_rate_pct": None}
+# The 8h-normalized funding and the interval add nothing for an 8h symbol (normalized == raw)
+_FUNDING_8H_KEYS = ("funding_rate_8h_pct", "funding_interval_h")
 
 
 def _brief_opportunity(o: Any) -> Any:
-    return {k: v for k, v in o.items() if k not in _SIDECAR_ONLY_KEYS} if isinstance(o, dict) else o
+    if not isinstance(o, dict):
+        return o
+    out = {k: v for k, v in o.items() if k not in _SIDECAR_ONLY_KEYS
+           and not (k in _DROP_WHEN_UNSET and v == _DROP_WHEN_UNSET[k] and type(v) is type(_DROP_WHEN_UNSET[k]))}
+    if out.get("funding_interval_h") in (None, 8):
+        for k in _FUNDING_8H_KEYS:
+            out.pop(k, None)
+    return out
 
 
 def scores_sidecar_path() -> str:
@@ -374,6 +395,7 @@ def _write_scores_sidecar(screening: Any, yolo_slot: dict, generated_at_ts: int,
         cands += [dict(c, direction=c.get("direction") or "LONG") for c in (yolo_slot.get("candidates") or [])]
         rows = [{"symbol": c.get("symbol"), "direction": c.get("direction"), "confidence": c.get("confidence"),
                  "tier": c.get("tier"), "tier_s_eligible": c.get("tier_s_eligible"),
+                 "squeeze_risk": c.get("squeeze_risk") is True,
                  "score_components": c.get("score_components"), "reasons": c.get("reasons")}
                 for c in cands if isinstance(c, dict) and c.get("symbol")]
         _write_json(scores_sidecar_path(), {"generated_at_ts": generated_at_ts, "env": str(target_env).upper(),
@@ -441,10 +463,19 @@ def format_markdown_brief(brief: dict) -> str:
         for o in opps:
             trig = o.get('trigger_price')
             # abs:unscored: the wick/taker candles did not match, so absorption gave no confluence (issue #135)
-            factors = (["abs:unscored"] if o.get('absorption_scored') is False else []) + o.get('reasons', [])[:2]
+            # SQZ: SHORT squeeze risk, capped at Tier A; LONG-CROWD: crowded LONG, flag only (issue #206). With SQZ
+            # shown, the radar's "Squeeze risk" reason line is left out so the two factors show real confluences.
+            sqz = o.get('squeeze_risk') is True
+            shown = [r for r in o.get('reasons', []) if not (sqz and str(r).startswith(SQUEEZE_REASON_PREFIX))]
+            factors = ((["SQZ"] if sqz else [])
+                       + (["LONG-CROWD"] if o.get('long_crowding_risk') is True else [])
+                       + (["abs:unscored"] if o.get('absorption_scored') is False else []) + shown[:2])
             lines.append(f"| **{o.get('symbol')}** | {o.get('direction')} | {_tier_label(o)} | score {o.get('confidence')} | {o.get('current_price')} | {trig if trig is not None else '-'} | {o.get('sl_price')} | {o.get('tp1_price')} / {o.get('tp2_price')} | {o.get('rr_ratio')}R | ${o.get('target_dollar_risk', default_risk)} | {'; '.join(factors)} |")
     else:
         lines.append("*(No intraday setups passing institutional microstructure filter)*")
+    if brief.get("macro_rejected_shorts"):
+        rej = brief["macro_rejected_shorts"]
+        lines.append(f"**Macro-rejected alt SHORTs ({len(rej)}):** {', '.join(str(s) for s in rej)}")
     lines.append("")
 
     yolo = brief.get("yolo_slot")
