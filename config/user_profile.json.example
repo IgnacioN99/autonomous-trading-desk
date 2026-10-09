@@ -11,6 +11,8 @@
   "daily_stop_r": 3.0,
   "max_consecutive_sl": 2,
   "yolo_max_daily_losses": 1,
+  "recheck_max_drift_r": 0.25,
+  "recheck_max_age_seconds": 1800,
   "yolo_slot_enabled": false,
   "yolo_equity_pct": 0.005,
   "overnight_mode": "ZERO_OVERNIGHT_RISK",
