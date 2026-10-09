@@ -623,7 +623,11 @@ class TestEvaluatorPromptReadsYoloCandidates(unittest.TestCase):
         self.assertIn("with `vol_ratio >= 1.0x` use the Barbell path (`vol_ratio >= 2.0x` OR `lower_wick >= 50%`, "
                       "OIB not required) -> PASS (Barbell path) / FAIL.", k2)
         rule6 = text.split("- RULE 6")[1].split("- RULE 7")[0]
-        self.assertIn(invariant, rule6)
+        # Issue #76.4: the invariant sentence lives in K2 only; RULE 6 points at it
+        self.assertNotIn(invariant, rule6)
+        self.assertIn("Below the 1.0x floor see the K2 invariant (always FAKE_TIER_S).", rule6)
+        self.assertIn("climax volume $\\ge 2.0\\times$ (`vol_ratio`) OR buyer absorption $\\ge 50\\%$ (`lower_wick`)",
+                      rule6)
         self.assertIn("-> PASS (Barbell path) / FAIL.", rule6)
         self.assertIn("`vol_ratio >= 1.0x` AND (climax volume", rule6)
         self.assertNotIn("EXCEPTION: candidates from", text)

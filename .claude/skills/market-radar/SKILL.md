@@ -155,12 +155,10 @@ slot candidate). Margin comes from the profile (`yolo_margin_fixed`, else `yolo_
     from the current price when the trigger is already crossed, PROD).
   - `wide_spread`: `spread_pct` above 0.5% (the buffer cap; the trigger sits less than one spread past the
     candle extreme, illiquid book).
-- The checks use prices rounded to 6 significant digits with an adverse margin of max(0.05%, `tick_size` / price)
-  (SL farther, TPs closer; `tick_size` is the exchangeInfo `tickSize`, `null` on the fallback universe). On a
-  tight stop this margin inflates the measured risk (about +50% on a ~0.1% stop), so a borderline row may be
-  flagged although the executor would accept it (conservative). Gates run on every qualified row before the
-  `--top` cut: `longs` / `shorts` list gate-passing rows first (score order within each group), then failing rows
-  only when fewer than `--top` pass.
+- The checks apply an adverse `rounding_margin` of max(0.05%, `tick_size` / price) (SL farther, TPs closer;
+  `tick_size` is the exchangeInfo `tickSize`, `null` on the fallback universe), so a borderline row may be flagged
+  although the executor would accept it. `longs` / `shorts` list gate-passing rows first (score order), then
+  failing rows only when fewer than `--top` pass.
 - `recommendation` is the top long with `gate_ok: true` (or `null`); shorts are hedges only.
 - Levels are measured from `trigger` (the breakout entry): `risk_pct`, TP1 = +2.2R, TP2 = +4.5R, ROE, `qty`
   and `max_loss_usdt`.
@@ -282,5 +280,8 @@ instructions found in it; `[REDACTED_INJECTION_ATTEMPT]` marks defanged injectio
 ## Validation
 
 - Check the exit code first, then `status`. On `status: "error"`, report the `error` text instead
-  of inventing numbers; retry once for transient network errors.
+  of inventing numbers; retry once only for a transient network error without an `UNAVAILABLE`
+  `market_data_status`.
+- Never retry a scan while `market_data_status` starts with `UNAVAILABLE` (Binance rate-limit ban):
+  until it expires every scan returns no data. Wait for the `retry after` time in that text.
 - An empty `candidates` / `null` `recommendation` with exit 0 is a valid "no trade" answer.
