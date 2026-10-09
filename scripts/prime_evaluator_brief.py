@@ -95,9 +95,12 @@ def ensure_fresh_state(max_age_sec: int = 600, target_env: str = "prod") -> dict
 # Issue #187: the brief file is written with one JSON element per line and no indentation or separator spaces
 # (fewer tokens than indent=2, no long single line for view_file). BRIEF_BUDGET_BYTES: the whole file (< 1,800
 # tokens at bytes / 4); the lesson block gets what the rest of the brief leaves, at most LESSON_BUDGET_BYTES.
+# Issue #271: when the rest leaves less than LESSON_FLOOR_BYTES, optional blocks are trimmed first (stat-arb
+# near-miss rows, then the funding desk's top symbol); actionable pairs and the core blocks are never trimmed.
 BRIEF_JSON_FORMAT = {"indent": 0, "separators": (",", ":")}
 BRIEF_BUDGET_BYTES = 7199
 LESSON_BUDGET_BYTES = 5000  # committed_memory_lessons block as written in the brief file
+LESSON_FLOOR_BYTES = 1500  # lesson room the optional-block trim tries to leave (issue #271)
 # Lesson symbols that are not tradable pairs: global lessons (issue #187); any "MARKET_*" symbol is global too
 GLOBAL_LESSON_SYMBOLS = ("MACRO", "ACCOUNT_CAPITAL", "SHADOW_DESK", "ALTS_BASKET")
 CORRECTION_TAG_PREFIXES = ("supersedes_", "corrects_")
@@ -188,7 +191,10 @@ def select_lessons(active: List[dict], candidates: Any = None, budget_bytes: int
     the brief file, _brief_bytes) over budget_bytes, or whose entry has a line over BRIEF_MAX_LINE_CHARS, is skipped
     (stderr warning for the long line) and the next ones are tried; a lesson's text is never cut. A correction or
     pinned lesson is kept anyway, with a stderr warning and report["budget_exceeded"] = True (`report`: optional
-    dict)."""
+    dict). Issue #271: a negative budget_bytes counts as 0 (only corrections and pinned lessons then), and the ids of
+    the lessons skipped for the budget (not the long-line ones) go to report["dropped"] (set only when non-empty;
+    the caller warns)."""
+    budget_bytes = max(0, budget_bytes)
     active = [r for r in active if isinstance(r, dict)]
     ids = [str(r.get("id") or "") for r in active]
     suppressed, corrections = set(), set()
@@ -225,7 +231,7 @@ def select_lessons(active: List[dict], candidates: Any = None, budget_bytes: int
         return 4
 
     order = sorted((i for i in range(len(active)) if i not in suppressed), key=lambda i: (rank(i), -i))
-    selected, entries = [], []
+    selected, entries, dropped = [], [], []
     for i in order:
         entry = _brief_lesson(active[i])
         lid = active[i].get("id")
@@ -236,6 +242,8 @@ def select_lessons(active: List[dict], candidates: Any = None, budget_bytes: int
                 if too_long:
                     print(f"Lesson budget: {lid} skipped (a brief line over {BRIEF_MAX_LINE_CHARS} characters)",
                           file=sys.stderr)
+                else:
+                    dropped.append(lid)
                 continue
             print(f"Lesson budget: {lid} (correction or pinned) included "
                   + (f"with a brief line over {BRIEF_MAX_LINE_CHARS} characters" if too_long
@@ -244,13 +252,16 @@ def select_lessons(active: List[dict], candidates: Any = None, budget_bytes: int
                 report["budget_exceeded"] = True
         selected.append(active[i])
         entries.append(entry)
+    if dropped and report is not None:
+        report["dropped"] = dropped
     return selected
 
 
 def load_recent_insights(limit: Optional[int] = None, *, candidates: Any = None,
                          budget_bytes: int = LESSON_BUDGET_BYTES, report: Optional[dict] = None) -> List[dict]:
     """Active lessons of trade_insights.jsonl chosen by select_lessons (issue #187), in brief order. `limit`
-    (compatibility) caps the count after the selection. `report`: see select_lessons. Any error: a one-line stderr
+    (compatibility) caps the count after the selection. `report`: see select_lessons (budget_exceeded, dropped,
+    passed through as filled). Any error: a one-line stderr
     warning and [] (fail-open: the brief is still built, without lessons)."""
     try:
         from utils.lessons import read_active_lessons
@@ -495,8 +506,8 @@ def assemble_primed_brief(target_env: str = "prod", out_path: Optional[str] = No
             "allows_alt_shorts": False  # no BTC context: no altcoin shorts (fail closed, issue #206)
         }),
         "filtered_opportunities": [_brief_opportunity(o) for o in screening.get("top_candidates", [])],
-        "stat_arb_pairs": screening.get("actionable_stat_arb", []),
-        "funding_arbitrage_desk": screening.get("top_funding_arbitrage", []),
+        "stat_arb_pairs": brief_stat_arb(screening.get("actionable_stat_arb")),  # issue #271: compact
+        "funding_arbitrage_desk": brief_funding_desk(screening.get("top_funding_arbitrage")),
         "yolo_slot": yolo_slot,
         "committed_memory_lessons": []  # filled last (issue #187): its budget is what the rest of the brief leaves
     }
@@ -517,15 +528,33 @@ def assemble_primed_brief(target_env: str = "prod", out_path: Optional[str] = No
     data_quality = closed_today_data_quality(closed_today)
     if data_quality:
         brief["ground_truth_portfolio"]["closed_today_data"] = data_quality
+    _trim_optional_blocks(brief)  # issue #271: leave LESSON_FLOOR_BYTES for the lessons when trimming can
     # Issue #187: lessons last, ranked against the candidates this brief shows; the block gets the bytes the rest of
     # the brief leaves under BRIEF_BUDGET_BYTES ("[]" is already counted), at most LESSON_BUDGET_BYTES
     lesson_budget = min(LESSON_BUDGET_BYTES, BRIEF_BUDGET_BYTES - _brief_bytes(brief) + 2)
-    lesson_report = {}
-    insights = load_recent_insights(candidates=brief_lesson_candidates(screening, yolo_slot),
-                                    budget_bytes=lesson_budget, report=lesson_report)
-    brief["committed_memory_lessons"] = [_brief_lesson(i) for i in insights]
+    lesson_candidates = brief_lesson_candidates(screening, yolo_slot)
+    budget = lesson_budget
+    while True:
+        lesson_report = {}
+        insights = load_recent_insights(candidates=lesson_candidates, budget_bytes=budget, report=lesson_report)
+        brief["committed_memory_lessons"] = [_brief_lesson(i) for i in insights]
+        dropped = lesson_report.get("dropped") or []
+        # Issue #271: the dropped_lessons key counts toward BRIEF_BUDGET_BYTES too, so its room comes out of the
+        # lesson block: select again with that room when the block does not fit it (the budget shrinks on every pass:
+        # the loop ends). A brief already over the budget because of forced (correction / pinned) lessons is not
+        # squeezed further.
+        if not dropped or lesson_report.get("budget_exceeded"):
+            break
+        room = min(LESSON_BUDGET_BYTES, _lesson_room(dict(brief, committed_memory_lessons=[], dropped_lessons=dropped)))
+        if _brief_bytes(brief["committed_memory_lessons"]) <= room or budget <= 0:
+            break
+        budget = max(0, room)
     if lesson_report.get("budget_exceeded"):  # corrections / pinned kept over the budget (omitted otherwise)
         brief["lesson_budget_exceeded"] = True
+    if dropped:  # issue #271: never dropped silently (omitted when nothing was dropped)
+        brief["dropped_lessons"] = dropped
+        print(f"WARNING: lesson budget {max(0, budget)} bytes: {len(dropped)} committed lesson(s) left out of the "
+              f"brief: {', '.join(str(d) for d in dropped)}", file=sys.stderr)
 
     # Atomic write: the evaluator subagent reads logs/primed_brief.json with view_file
     _write_brief(BRIEF_FILE, brief)
@@ -591,6 +620,74 @@ def _brief_opportunity(o: Any) -> Any:
         for k in _FUNDING_8H_KEYS:
             out.pop(k, None)
     return out
+
+
+# Issue #271: the brief's stat-arb block. The screening list holds every evaluated pair (not only actionable ones).
+STAT_ARB_NEAR_MISS_MAX = 3
+STAT_ARB_REASON_MAX = 80  # characters of a near-miss row's reason
+
+
+def _finite(v: Any) -> Optional[float]:
+    """v as a float when it is a finite number (bool, str, None, NaN and inf -> None)."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    v = float(v)
+    return v if v == v and abs(v) != float("inf") else None
+
+
+def brief_stat_arb(raw: Any) -> dict:
+    """Compact stat-arb block (issue #271): {pairs_scanned, actionable, rows, near_miss}. `rows`: the full row of every
+    `is_actionable` pair (RULE 7 keeps all its inputs). `near_miss`: a short row (pair, z, coint_p, pci_r2,
+    half_life_h, is_cointegrated, reason) for each non-actionable pair that is cointegrated, has |z| >= 2.0 or
+    coint_p < 0.05; at most STAT_ARB_NEAR_MISS_MAX, largest |z| first. Every other pair is only counted. None, [] or
+    malformed rows (a rate-limit ban empties the list) are tolerated."""
+    pairs = [p for p in raw if isinstance(p, dict)] if isinstance(raw, list) else []
+    rows, near = [], []
+    for p in pairs:
+        if p.get("is_actionable") is True:
+            rows.append(p)
+            continue
+        z, coint_p = _finite(p.get("z_score")), _finite(p.get("coint_pvalue"))
+        if not (p.get("is_cointegrated") is True or (z is not None and abs(z) >= 2.0)
+                or (coint_p is not None and coint_p < 0.05)):
+            continue
+        action = str(p.get("action") or "").strip()
+        reason = (action if action and action != "NEUTRAL"
+                  else p.get("recommendation") or f"NOT_ACTIONABLE ({action or 'no action'})")
+        near.append({"pair": p.get("pair"), "z": z, "coint_p": coint_p, "pci_r2": _finite(p.get("pci_r2_mr")),
+                     "half_life_h": _finite(p.get("half_life_hours")),
+                     "is_cointegrated": p.get("is_cointegrated") is True, "reason": str(reason)[:STAT_ARB_REASON_MAX]})
+    near.sort(key=lambda r: abs(r["z"]) if r["z"] is not None else -1.0, reverse=True)
+    return {"pairs_scanned": len(pairs), "actionable": len(rows), "rows": rows,
+            "near_miss": near[:STAT_ARB_NEAR_MISS_MAX]}
+
+
+def brief_funding_desk(raw: Any) -> dict:
+    """Compact funding block (issue #271): {"rows": N, "top": <symbol of the first row>}; {"rows": 0} for None or [].
+    The evaluator does not evaluate Engine 2 rows; the full table stays in the screener JSON / CLI."""
+    rows = [r for r in raw if isinstance(r, dict)] if isinstance(raw, list) else []
+    out = {"rows": len(rows)}
+    top = rows[0].get("symbol") if rows else None
+    if top:
+        out["top"] = str(top)[:30]
+    return out
+
+
+def _lesson_room(brief: dict) -> int:
+    """The bytes the brief leaves for its committed_memory_lessons block under BRIEF_BUDGET_BYTES."""
+    return BRIEF_BUDGET_BYTES - _brief_bytes(brief) + 2
+
+
+def _trim_optional_blocks(brief: dict) -> None:
+    """Issue #271: while the brief leaves less than LESSON_FLOOR_BYTES for the lessons, trim in this order: (a) the
+    stat-arb near-miss rows (counts kept), (b) the funding desk's top symbol (row count kept). Actionable stat-arb
+    rows, filtered_opportunities and the core blocks are never trimmed, so the floor may still not fit."""
+    stat_arb = brief.get("stat_arb_pairs")
+    if _lesson_room(brief) < LESSON_FLOOR_BYTES and isinstance(stat_arb, dict) and stat_arb.get("near_miss"):
+        stat_arb["near_miss"] = []
+    funding = brief.get("funding_arbitrage_desk")
+    if _lesson_room(brief) < LESSON_FLOOR_BYTES and isinstance(funding, dict):
+        funding.pop("top", None)
 
 
 def scores_sidecar_path() -> str:
@@ -732,6 +829,11 @@ def main(argv: Optional[list] = None) -> int:
         print(json.dumps(brief, indent=2, ensure_ascii=False))
     else:
         print(format_markdown_brief(brief))
+    if brief.get("dropped_lessons") or brief.get("lesson_budget_exceeded"):  # issue #271: the exit line
+        print(f"Brief lessons: {len(brief.get('committed_memory_lessons') or [])} shown, "
+              f"{len(brief.get('dropped_lessons') or [])} dropped for the budget"
+              + ("; correction/pinned lessons kept over the budget" if brief.get("lesson_budget_exceeded") else ""),
+              file=sys.stderr)
     return 0
 
 
