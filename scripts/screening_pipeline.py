@@ -109,7 +109,7 @@ class CandidateSetup(BaseModel):
     reasons: List[str]
     sizing_entry_price: Optional[float] = None  # entry the sizing was computed from (trigger, else current price)
     tier_code: Optional[str] = None  # radar tier code (S / A+ / A / B+), kept for the brief (issue #135)
-    absorption_scored: bool = True  # False: the wick/taker candles did not match, absorption gave no score (#135)
+    absorption_scored: bool = False  # True only when the radar scored absorption on matched candles (#135, #165)
     score_components: Dict[str, int] = {}  # radar points per factor, sum == confidence (issue #202, audit only)
     tier_s_eligible: bool = False  # radar volume-or-wick rule (issue #134), kept for the audit sidecar (#202)
     # Issue #206: squeeze filter (utils/squeeze_filter.py). A flagged SHORT is capped at Tier A by the radar; a LONG

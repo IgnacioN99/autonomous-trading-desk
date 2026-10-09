@@ -90,18 +90,22 @@ sorted by confidence. `--top 0` (default) returns all of them.
 - `lower_wick` / `upper_wick` come from ONE closed candle (sum ≤ 100) opening at `wick_candle_open_time` (ms);
   `vol_ratio` is that same candle's volume vs the 20 before it. `micro.wick_candle_mismatch` (candle not in the
   micro fetch) or `micro.taker_candle_matched` not `true` (no taker row for it) → no absorption bonus, reason says
-  so, and the brief row shows `abs:unscored`. Taker lag: Binance publishes a period's `takerlongshortRatio` row
+  so, and the brief row shows `abs:unscored`; a row without micro data is `absorption_scored: false` too (reason
+  `absorption not scored (no microstructure data)`). On an `abs:unscored` row the evaluator's absorption paths
+  never pass K2; only `vol_ratio` ≥ 1.4x can. Taker lag: Binance publishes a period's `takerlongshortRatio` row
   (stamped with the period open time; `buyVol`/`sellVol` = the kline's taker buy volume and the rest) only some
   time after the candle closes, so right after a close absorption reads `NONE` until the row appears.
 - Regime text labels each value's period: `ΔP(forming)` (forming candle), `OI(latest)`, `Taker(closed)`.
 - Prices are floats (unrounded); `micro` is `null` when order-flow data was unavailable.
 - `roe_est_pct` = `risk_pct × rr × leverage_standard` (informational).
 - All levels are measured from `trigger` (the effective entry): `risk_pct = |trigger − sl| / trigger`, TP1 =
-  1.8R (or EMA 20 if farther), TP2 = 4.0R and `rr`. The binding friction checks are executor Gate 3 and
-  evaluator K3 (the radar has none). `price` is informational. `trigger_distance_pct` is signed: > 0 = the
-  trigger is beyond the price in the trade direction. It is never crossed at scan time (the trigger is built
-  from the forming high/low); if the price crosses it before execution, the executor enters at the current price
-  and its gates measure from there. `risk_pct` floor 1.4% (below it the SL is widened to 1.5%); ceiling 5.0%:
+  1.8R (or EMA 20 if farther, never past TP2), TP2 = 4.0R and `rr`. The binding friction checks are executor
+  Gate 3 and evaluator K3 (the radar has none). `price` is informational. `trigger_distance_pct` is signed: > 0 =
+  the trigger is beyond the price in the trade direction. It is never crossed at scan time (the trigger is built
+  beyond the more extreme high/low of the forming and the closed wick candle, × 1.0005 / × 0.9995); if the price
+  crosses it before execution, the executor enters at the current price and its gates measure from there: in
+  PROD it rejects an R:R to TP2 below 3:1 from that price and clamps an explicit standard margin to the Gate 2
+  loss cap. `risk_pct` floor 1.4% (below it the SL is widened to 1.5%); ceiling 5.0%:
   rows above it are dropped from the output with a stderr count (TP2 out of intraday reach). The pipeline drops
   rows whose SL or TP2 is on the wrong side of the trigger (stderr line).
 
@@ -147,7 +151,8 @@ slot candidate). Margin comes from the profile (`yolo_margin_fixed`, else `yolo_
   - `friction` (executor GATE 3): TP1 ≥ 0.35% from the trigger.
   - `loss_cap` (executor GATE 2 YOLO): loss at SL ≤ 35% of the isolated margin (SL distance × leverage ≤ 0.35;
     a fractional leverage is rounded up). The scanner skips the executor's 3.75 USDT minimum cap (stricter).
-  - `rr_tp1` / `rr_tp2`: TP1 ≥ 1.8R and TP2 ≥ 3:1. These are desk floors, not executor gates.
+  - `rr_tp1` / `rr_tp2`: TP1 ≥ 1.8R and TP2 ≥ 3:1. These are desk floors, not executor gates (except TP2 ≥ 3:1
+    from the current price when the trigger is already crossed, PROD).
   - `wide_spread`: `spread_pct` above 0.5% (the buffer cap; the trigger sits less than one spread past the
     candle extreme, illiquid book).
 - The checks apply an adverse `rounding_margin` of max(0.05%, `tick_size` / price) (SL farther, TPs closer;

@@ -244,8 +244,8 @@ def analyze_symbol(symbol, interval="15m"):
             sl = entry * 0.988
             risk_pct = 1.2
 
-        tp1 = max(ema20, entry * (1 + risk_pct * 1.8 / 100)) # Minimum 1.8R to EMA 20
         tp2 = entry * (1 + risk_pct * 4.0 / 100) # 4.0R structural
+        tp1 = min(max(ema20, entry * (1 + risk_pct * 1.8 / 100)), tp2) # Minimum 1.8R to EMA 20, capped at TP2 (#165)
         rr = (tp2 - entry) / (entry - sl) if (entry - sl) > 0 else 4.0
     elif score_short >= 45 and score_short > score_long:
         direction = "SHORT"
@@ -258,8 +258,8 @@ def analyze_symbol(symbol, interval="15m"):
         if risk_pct < 1.0:
             sl = entry * 1.012
             risk_pct = 1.2
-        tp1 = min(ema20, entry * (1 - risk_pct * 1.8 / 100))
         tp2 = entry * (1 - risk_pct * 4.0 / 100)
+        tp1 = max(min(ema20, entry * (1 - risk_pct * 1.8 / 100)), tp2)
         rr = (entry - tp2) / (sl - entry) if (sl - entry) > 0 else 4.0
     else:
         return None

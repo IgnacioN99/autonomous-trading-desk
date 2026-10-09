@@ -343,7 +343,7 @@ class TestCandidateSetupKeepsRadarFlags(unittest.TestCase):
     def test_defaults_keep_existing_constructors(self):
         fields = sp.CandidateSetup.model_fields
         self.assertIsNone(fields["tier_code"].default)
-        self.assertIs(fields["absorption_scored"].default, True)
+        self.assertIs(fields["absorption_scored"].default, False)   # #165: fail-closed default
 
     # ---- #140 wrong-side rows and #141.4 logged drops ----
 
