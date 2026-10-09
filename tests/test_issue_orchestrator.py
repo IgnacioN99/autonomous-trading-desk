@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -60,6 +61,24 @@ ALLOWED = [
     "cd {wt} && mkdir -p tests/fixtures && cp a b",
     "cd {wt}\npython3 -m unittest tests.test_x",
     "cd {wt}/scripts && cd .. && ls",
+    # #129: quoted patterns are literal; reads of the stdlib and the temp dir; writes inside the worktree
+    "cd {wt} && grep -rn '/fapi/v1/order' scripts",
+    'cd {wt} && grep -rn "/fapi/v1/order" scripts',
+    "cd {wt} && sed -n '/a/,/b/p' scripts/app.py",
+    "cd {wt} && grep -n 'print $1' scripts/app.py",
+    "cd {wt} && cat {stdlib}/__init__.py",
+    "cd {wt} && ls /tmp",
+    "cd {wt} && python3 -m unittest tests.test_x > /tmp/issue_fixer_out.txt 2>&1",
+    "cd {wt} && echo notes > logs/issue_work/notes.md",
+    "cd {wt} && cd scripts && ls && cd .. && git status",
+    "cd {wt} && LC_ALL=C TZ=UTC python3 -m unittest tests.test_x",
+    "cd {wt} && python3 -m unittest \\\n  tests.test_x",
+    "cd {wt} && git status # show the changes; rm -rf / is only a comment here",
+    "cd {wt} && grep -n 'a#b' scripts/app.py",
+    "cd {wt} && ls x#y; git status",
+    'cd {wt} && python3 -m unittest tests.test_x; echo "exit=$?"',
+    "cd {wt} && echo $? && printf '%s\\n' \"$?\"",
+    "cd {wt} && git ls-files | xargs wc -l",
 ]
 
 DENIED = [
@@ -123,6 +142,89 @@ DENIED = [
     ("cd {wt} && echo x > {main}/scripts/hooks/issue_fixer_guard.py", "main checkout"),
     ("cd {wt} && sed -i s/x/y/ \"$CLAUDE_PROJECT_DIR\"/scripts/hooks/issue_fixer_guard.py", "CLAUDE_PROJECT_DIR"),
     ("cd {wt} && cat ~/.gitconfig", "home-directory"),
+    # #129.1-3: launchers, builtins, archivers and environment variables
+    ("cd {wt} && setsid sh -c x", "not available"),
+    ("cd {wt} && flock f sh -c x", "not available"),
+    ("cd {wt} && ionice sh", "not available"),
+    ("cd {wt} && tar --checkpoint-action=exec=x -cf a.tar f", "not available"),
+    ("cd {wt} && zip -TT x a.zip f", "not available"),
+    ("cd {wt} && GIT_EXTERNAL_DIFF=x git diff", "environment variable GIT_EXTERNAL_DIFF"),
+    ("cd {wt} && LD_PRELOAD=x ls", "environment variable LD_PRELOAD"),
+    ("cd {wt} && PAGER=x; git log", "only assigns"),
+    ("cd {wt} && export PAGER=x && git log", "not available"),
+    ("cd {wt} && env BASH_ENV=x ls", "environment variable BASH_ENV"),
+    ("cd {wt} && env -C / ls", "env -C"),
+    ("cd {wt} && pushd scripts", "not available"),
+    ("cd {wt} && if true; then ls; fi", "compound"),
+    ("cd {wt} && {{ ls; }}", "compound"),
+    # #129.4: python scripts resolve inside the issue worktree
+    ("cd {wt} && python3 tests/../scripts/trading_doctor.py", "only tests"),
+    ("cd {wt} && python3 {wt2}/tests/x.py", "another issue worktree"),
+    # #129.5: expansions, globs and braces
+    ("cd {wt} && cat {wt}/*/../../trading/x", "main checkout"),
+    ("cd {wt} && cp a {wt}/{{b,../x}}", "brace expansion"),
+    ("cd {wt} && echo x > $PWD/../x", "expansion"),
+    ("cd {wt} && echo x > $OLDPWD/x", "expansion"),
+    ("cd {wt} && cat \"$HOME\"/x", "expansion"),
+    ("cd {wt} && cat $'\\x2e\\x2e'/x", "expansion"),
+    ("cd {wt} && cat ~root/x", "tilde expansion"),
+    ("cd {wt} && rm -f tests/*.py", "glob"),
+    # #129.5 and .8: writes outside the worktree or to protected files
+    ("cd {wt} && tee /etc/x", "outside the issue worktree"),
+    ("cd {wt} && cp a {home}/.claude/settings.json", "home directory"),
+    ("cd {wt} && echo x > /tmp/../etc/y", "outside the issue worktree"),
+    ("cd {wt} && sed -i s/a/b/ {wt}/.claude/settings.json", ".claude/"),
+    ("cd {wt} && sort -o .agents/hooks.json f", "hook configuration"),
+    ("cd {wt} && ln -s ../x y", "not available"),
+    ("cd {wt} && echo x > logs/issue_work/guard_heartbeat.json", "written only by"),
+    ("cd {wt} && cp a logs/issue_work/fixer_binding.json", "written only by"),
+    ("cd {wt} && find . -name fixer_binding.json -delete", "find -exec"),
+    ("cd {wt} && cat list | xargs rm", "xargs"),
+    ("cd {wt} && ls;>/etc/x", "outside the issue worktree"),
+    ("cd {wt} && ls &&>x git push", "read-only git"),
+    # #129.5: cd must keep the tracked directory equal to the real one
+    ("cd {wt} && (cd scripts) && cp a ../x", "subshell"),
+    ("cd {wt} && false && cd scripts; cp a ../x", "conditional cd"),
+    ("cd {wt} && ls || cd scripts", "next to ||"),
+    ("cd {wt} && cd scripts | ls", "pipeline"),
+    ("cd {wt} && cd nonexistent && ls", "not an existing directory"),
+    ("cd {wt} && cd -", "not allowed"),
+    ("cd {wt} && command cd ..", "plain `cd"),
+    ("cd {wt}/nonexistent; ls", "must start with `cd"),
+    # escapes, comments and continuations must not merge lines into one segment
+    ("cd {wt} && echo \\\"\ngit push", "read-only git"),
+    ("cd {wt} && ls # \"\ngit push", "read-only git"),
+    ("cd {wt} && ls # \"\ngit push\n\"", "unparseable"),
+    ("cd {wt} && ls \\\\\ngit push", "read-only git"),
+    # a `#` starts a comment only at a word start; a carriage return is an ordinary character, as in bash
+    ("cd {wt} && ls x\\ #; git push", "read-only git"),
+    ("cd {wt} && ls x\\;#; git push", "read-only git"),
+    ("cd {wt} && ls x\r#; git push", "read-only git"),
+    ("cd {wt} && ls \\\r\ngit push", "read-only git"),
+    ("cd {wt}\ncd scripts\r\ncp a ../trading/README.md", "not an existing directory"),
+    # globs: unknown programs (they may write) take none; the directory part before the glob is checked
+    ("cd {wt} && unlink ../[^x]rading/scripts/hooks/issue_fixer_guard.py", "may write"),
+    ("cd {wt} && mkdir -p tests/x && unlink tests/x/../../../[t]rading/scripts/hooks/issue_fixer_guard.py",
+     "may write"),
+    ("cd {wt} && shred tests/*.py", "may write"),
+    ("cd {wt} && cat {main}/scripts/[^h]ooks/x", "main checkout"),
+    # xargs feeds only read-only programs (its arguments come from stdin)
+    ("cd {wt} && echo ../trading/scripts/hooks/issue_fixer_guard.py | xargs unlink", "xargs"),
+    ("cd {wt} && echo -i s/a/b/ /etc/x | xargs sed", "xargs"),
+    ("cd {wt} && echo -o /etc/x f | xargs sort", "xargs"),
+    ("cd {wt} && echo a b | xargs uniq", "xargs"),
+    ("cd {wt} && echo --output=/etc/x | xargs git log", "xargs"),
+    ("cd {wt} && ls | xargs env", "xargs"),
+    ("cd {wt} && ls | xargs timeout 5", "xargs"),
+    # `$?` only as echo/printf text, never in a path, a cd or a redirection
+    ("cd {wt} && cat tests/$?", "expansion"),
+    ("cd {wt} && echo x > tests/$?", "expansion"),
+    ("cd {wt} && cd $?", "expansion"),
+    ("cd {wt}/$?; ls", "expansion"),
+    # #129.6: one command, one worktree
+    ("cd {wt} && cd {wt2}", "leaves the issue worktree"),
+    ("cd {wt} && cat {wt2}/README.md", "another issue worktree"),
+    ("cd {wt} && cp README.md {wt2}/x", "another issue worktree"),
 ]
 
 
@@ -135,6 +237,10 @@ class TestIssueFixerGuard(unittest.TestCase):
         cls.wt = os.path.join(cls.tmp, "trading-wt-issue-7")
         _git(cls.main, "worktree", "add", "-q", cls.wt, "-b", "fix/issue-7-x")
         os.makedirs(os.path.join(cls.wt, "scripts"), exist_ok=True)
+        # A second issue worktree (another session's)
+        cls.wt2 = os.path.join(cls.tmp, "trading-wt-issue-8")
+        _git(cls.main, "worktree", "add", "-q", cls.wt2, "-b", "fix/issue-8-y")
+        os.makedirs(os.path.join(cls.wt2, "tests"), exist_ok=True)
         cls.conf = guard.Confinement.from_project_dir(cls.main)
 
     @classmethod
@@ -142,7 +248,8 @@ class TestIssueFixerGuard(unittest.TestCase):
         subprocess.run(["rm", "-rf", cls.tmp], check=False)
 
     def fmt(self, cmd):
-        return cmd.format(wt=self.wt, main=self.main)
+        return cmd.format(wt=self.wt, main=self.main, wt2=self.wt2, home=os.path.expanduser("~"),
+                          stdlib=os.path.dirname(json.__file__))
 
     def run_hook(self, payload, project_dir=None):
         stdin = io.StringIO(payload if isinstance(payload, str) else json.dumps(payload))
@@ -226,6 +333,191 @@ class TestIssueFixerGuard(unittest.TestCase):
             res = subprocess.run([sys.executable, str(script)], input=payload, capture_output=True, text=True,
                                  env=env)
             self.assertEqual(res.returncode, expected, command)
+
+    # ----- #129: denylist and environment allowlist -----
+    def test_launchers_builtins_and_archivers_are_denied(self):
+        for prog in ("setsid", "flock", "ionice", "chrt", "taskset", "unshare", "nsenter", "chroot", "runuser",
+                     "sg", "faketime", "tar", "zip", "unzip", "patch", "ln", "export", "declare", "typeset",
+                     "alias", "set", "trap", "shopt", "builtin", "eval", "exec", "source", "."):
+            with self.subTest(prog=prog):
+                self.assertIn("not available", guard.evaluate(f"cd {self.wt} && {prog} x", self.conf))
+
+    def test_environment_variables_need_the_allowlist(self):
+        for name in sorted(guard.ENV_ALLOWED):
+            with self.subTest(name=name):
+                self.assertEqual(guard.evaluate(f"cd {self.wt} && {name}=1 git status", self.conf), "")
+                self.assertEqual(guard.evaluate(f"cd {self.wt} && env {name}=1 git status", self.conf), "")
+        for name in ("GIT_PAGER", "PAGER", "EDITOR", "PYTHONPATH", "PYTHONSTARTUP", "GIT_CONFIG_COUNT",
+                     "BASH_ENV", "LD_PRELOAD", "CDPATH"):
+            with self.subTest(name=name):
+                self.assertIn(f"environment variable {name}",
+                              guard.evaluate(f"cd {self.wt} && {name}=x git status", self.conf))
+                self.assertIn(f"environment variable {name}",
+                              guard.evaluate(f"cd {self.wt} && env {name}=x git status", self.conf))
+                self.assertIn("only assigns", guard.evaluate(f"cd {self.wt} && {name}=x && git status", self.conf))
+
+    def test_quoting_analysis_agrees_with_the_shell_split(self):
+        cases = ['cd {wt} && grep -n "a b" \'c d\' e\\ f', "cd {wt} && echo ''", 'cd {wt} && echo "x\\"y"',
+                 "cd {wt} && ls>/dev/null 2>&1|tail -1"]
+        for cmd in cases:
+            with self.subTest(cmd=cmd):
+                prepared = guard._unquoted_newlines_to_separators(self.fmt(cmd))
+                self.assertEqual([w.text for w in guard._scan_words(prepared)], guard._shlex_tokens(prepared))
+                self.assertEqual(guard.evaluate(self.fmt(cmd), self.conf), "")
+        # `$` inside single quotes is literal; inside double quotes or escaped it is checked or literal
+        self.assertEqual(guard.evaluate(f"cd {self.wt} && grep -n '$HOME' scripts", self.conf), "")
+        self.assertEqual(guard.evaluate(f"cd {self.wt} && grep -n \\$HOME scripts", self.conf), "")
+        self.assertIn("expansion", guard.evaluate(f'cd {self.wt} && grep -n "$HOME" scripts', self.conf))
+
+    # ----- #129.8: protected files -----
+    def test_running_guard_and_work_files_are_protected(self):
+        copy = os.path.realpath(os.path.join(self.wt, "scripts", "hooks", "issue_fixer_guard.py"))
+
+        def edit(path, tool="Edit"):
+            return {"tool_name": tool, "tool_input": {"file_path": path}}
+
+        bash_writes = ("sed -i s/a/b/ scripts/hooks/issue_fixer_guard.py", "echo x > scripts/hooks/issue_fixer_guard.py",
+                       "cp a scripts/hooks/issue_fixer_guard.py", "rm scripts/hooks/issue_fixer_guard.py")
+        # Session launched from the main checkout: the worktree copy is not the running guard and stays editable
+        with mock.patch.object(guard, "RUNNING_GUARD", os.path.join(self.main, "scripts", "hooks",
+                                                                    "issue_fixer_guard.py")):
+            self.assertEqual(guard.evaluate_payload(edit(copy), self.conf), "")
+            for cmd in bash_writes:
+                self.assertEqual(guard.evaluate(f"cd {self.wt} && {cmd}", self.conf), "", cmd)
+        # Session launched from the worktree: its copy is the running guard
+        with mock.patch.object(guard, "RUNNING_GUARD", copy):
+            for tool in ("Edit", "Write", "MultiEdit"):
+                self.assertIn("running guard", guard.evaluate_payload(edit(copy, tool), self.conf))
+            for cmd in bash_writes:
+                self.assertIn("running guard", guard.evaluate(f"cd {self.wt} && {cmd}", self.conf), cmd)
+        for name in ("guard_heartbeat.json", "fixer_binding.json"):
+            for tree in (self.wt, self.wt2):
+                path = os.path.join(tree, "logs", "issue_work", name)
+                for tool in ("Edit", "Write", "MultiEdit"):
+                    self.assertIn("written only by", guard.evaluate_payload(edit(path, tool), self.conf))
+            self.assertIn("written only by", guard.evaluate(f"cd {self.wt} && tee -a logs/issue_work/{name}",
+                                                            self.conf))
+        # Reading them stays allowed
+        self.assertEqual(guard.evaluate(f"cd {self.wt} && cat logs/issue_work/fixer_binding.json", self.conf), "")
+
+    # ----- #129.6: binding -----
+    def _bind(self, tree, session_id=None, worktree=None):
+        work = os.path.join(tree, "logs", "issue_work")
+        os.makedirs(work, exist_ok=True)
+        marker = os.path.join(work, "fixer_binding.json")
+        Path(marker).write_text(json.dumps({"issue": 8, "worktree": worktree or tree, "branch": "fix/issue-8-y",
+                                            "created_ts": 1, "session_id": session_id}))
+        self.addCleanup(lambda: os.path.exists(marker) and os.remove(marker))
+        return marker
+
+    def test_binding_marker_is_claimed_by_the_first_session(self):
+        marker = self._bind(self.wt2)
+        bash = {"tool_name": "Bash", "tool_input": {"command": f"cd {self.wt2} && git status"}}
+
+        def bound():
+            return json.loads(Path(marker).read_text())["session_id"]
+
+        # No session id: no claim and no session check
+        self.assertEqual(self.run_hook(bash), (0, ""))
+        self.assertIsNone(bound())
+        # A denied call never claims
+        self.assertEqual(self.run_hook({"tool_name": "Bash", "session_id": "sess-A",
+                                        "tool_input": {"command": f"cd {self.wt2} && git push"}})[0], 2)
+        self.assertIsNone(bound())
+        # The first allowed call with a session id claims the worktree; the same session keeps working
+        self.assertEqual(self.run_hook(dict(bash, session_id="sess-A"))[0], 0)
+        self.assertEqual(bound(), "sess-A")
+        self.assertEqual(self.run_hook(dict(bash, session_id="sess-A"))[0], 0)
+        # Another session is denied, through Bash and the edit tools
+        code, err = self.run_hook(dict(bash, session_id="sess-B"))
+        self.assertEqual(code, 2)
+        self.assertIn("bound to another session", err)
+        write = {"tool_name": "Write", "tool_input": {"file_path": f"{self.wt2}/tests/test_x.py"},
+                 "session_id": "sess-B"}
+        self.assertIn("bound to another session", guard.evaluate_payload(write, self.conf))
+        self.assertEqual(guard.evaluate_payload(dict(write, session_id="sess-A"), self.conf), "")
+        self.assertEqual(bound(), "sess-A")
+        # A marker that names another worktree, or an unreadable one, denies (fail closed)
+        self._bind(self.wt2, worktree=self.wt)
+        self.assertIn("names another worktree", guard.evaluate_payload(bash, self.conf))
+        Path(marker).write_text("{not json")
+        self.assertIn("unreadable binding marker", guard.evaluate_payload(bash, self.conf))
+        Path(marker).write_text("[1]")
+        self.assertIn("malformed binding marker", guard.evaluate_payload(bash, self.conf))
+
+    def test_legacy_worktree_without_marker_is_accepted_unbound(self):
+        marker = os.path.join(self.wt, "logs", "issue_work", "fixer_binding.json")
+        self.assertFalse(os.path.exists(marker))
+        for sid in ("sess-X", "sess-Y", None):
+            payload = {"tool_name": "Bash", "tool_input": {"command": f"cd {self.wt} && git status"}}
+            if sid:
+                payload["session_id"] = sid
+            self.assertEqual(self.run_hook(payload)[0], 0)
+        self.assertFalse(os.path.exists(marker))
+
+    # ----- #129.7: heartbeat -----
+    def test_heartbeat_written_by_main_on_every_decision(self):
+        hb = os.path.join(self.wt, "logs", "issue_work", "guard_heartbeat.json")
+        if os.path.exists(hb):
+            os.remove(hb)
+        ok = {"tool_name": "Bash", "tool_input": {"command": f"cd {self.wt} && git status"}, "session_id": "s1"}
+        # evaluate and evaluate_payload stay pure
+        self.assertEqual(guard.evaluate(ok["tool_input"]["command"], self.conf), "")
+        self.assertEqual(guard.evaluate_payload(ok, self.conf), "")
+        self.assertFalse(os.path.exists(hb))
+        before = int(time.time())
+        self.assertEqual(self.run_hook(ok), (0, ""))
+        beat = json.loads(Path(hb).read_text())
+        self.assertEqual({k: beat[k] for k in ("tool", "decision", "reason", "session_id")},
+                         {"tool": "Bash", "decision": "allow", "reason": None, "session_id": "s1"})
+        self.assertGreaterEqual(beat["ts"], before)
+        self.assertEqual(self.run_hook({"tool_name": "Bash",
+                                        "tool_input": {"command": f"cd {self.wt} && git push"}})[0], 2)
+        beat = json.loads(Path(hb).read_text())
+        self.assertEqual(beat["decision"], "deny")
+        self.assertIn("read-only git", beat["reason"])
+        self.assertIsNone(beat["session_id"])
+        self.assertEqual(self.run_hook({"tool_name": "Write", "tool_input": {"file_path": f"{self.wt}/.claude/x"}})[0],
+                         2)
+        self.assertEqual(json.loads(Path(hb).read_text())["tool"], "Write")
+        # No worktree resolved: nothing is written
+        os.remove(hb)
+        self.assertEqual(self.run_hook({"tool_name": "Bash", "tool_input": {"command": "git status"}})[0], 2)
+        self.assertFalse(os.path.exists(hb))
+        # A write error never changes the decision
+        with mock.patch.object(guard, "_atomic_write_json", side_effect=OSError("disk full")):
+            self.assertEqual(self.run_hook(ok), (0, ""))
+            self.assertEqual(self.run_hook(dict(ok, tool_input={"command": f"cd {self.wt} && git push"}))[0], 2)
+
+    def test_main_denies_when_the_evaluation_crashes(self):
+        hb = os.path.join(self.wt, "logs", "issue_work", "guard_heartbeat.json")
+        ok = {"tool_name": "Bash", "tool_input": {"command": f"cd {self.wt} && git status"}, "session_id": "s1"}
+        self.assertEqual(self.run_hook(ok), (0, ""))
+        with mock.patch.object(guard, "evaluate_payload", side_effect=RuntimeError("boom")):
+            code, err = self.run_hook(ok)
+        self.assertEqual(code, 2)
+        self.assertIn("internal guard error (RuntimeError: boom)", err)
+        self.assertIn("BLOCKED by issue_fixer_guard", err)
+        beat = json.loads(Path(hb).read_text())
+        self.assertEqual((beat["decision"], beat["session_id"]), ("deny", "s1"))
+
+    def test_check_guard_reads_the_guard_heartbeat(self):
+        tree = tempfile.mkdtemp()
+        self.addCleanup(subprocess.run, ["rm", "-rf", tree], check=False)
+
+        def check(since):
+            buf = io.StringIO()
+            with mock.patch("sys.stdout", buf):
+                code = iw.main(["check-guard", tree, "--since", str(since)])
+            return code, json.loads(buf.getvalue())
+
+        self.assertEqual(check(100), (2, {"ok": False, "heartbeat_ts": None, "since": 100, "session_id": None}))
+        guard.write_heartbeat(tree, "Bash", "", "s1")
+        ts = json.loads(Path(tree, "logs", "issue_work", "guard_heartbeat.json").read_text())["ts"]
+        self.assertEqual(check(ts), (0, {"ok": True, "heartbeat_ts": ts, "since": ts, "session_id": "s1"}))
+        self.assertEqual(check(ts + 1)[0], 2)  # stale: written before the fixer launch
+        Path(tree, "logs", "issue_work", "guard_heartbeat.json").write_text("{bad")
+        self.assertEqual(check(0)[0], 2)
 
 
 class TestIssueWorkspaceReviewContext(unittest.TestCase):
@@ -327,6 +619,16 @@ class TestIssueWorkspaceInitCleanup(unittest.TestCase):
             self.assertEqual(issue["routing"]["route"], "build")
             self.assertEqual(issue["routing"]["risk"], "medium")
             self.assertEqual(out["routing"], issue["routing"])
+            # The fixer binding marker, unclaimed, which the guard accepts and claims for the first session
+            marker = json.loads(Path(out["work_dir"], "fixer_binding.json").read_text())
+            self.assertIsInstance(marker["created_ts"], int)
+            self.assertEqual(marker, {"issue": 7, "worktree": out["worktree"], "branch": "fix/issue-7-fix-thing",
+                                      "created_ts": marker["created_ts"], "session_id": None})
+            tree = guard.Confinement.from_project_dir(self.repo).worktree_of(out["worktree"])
+            guard.check_binding(tree, "sess-A")
+            guard.claim_binding(tree, "sess-A")
+            with self.assertRaises(guard.Denied):
+                guard.check_binding(tree, "sess-B")
             # A second init for the same issue refuses to reuse the worktree
             with self.assertRaises(iw.WorkspaceError):
                 iw.cmd_init(7, "again", "origin/main", cwd=self.repo)
@@ -611,6 +913,46 @@ class TestGeneratorWriteAgents(unittest.TestCase):
         auditor = (REPO_ROOT / ".agents" / "agents" / "issue_auditor" / "agent.md").read_text(encoding="utf-8")
         self.assertIn("VERDICT: APPROVE", auditor)
         self.assertIn("VERDICT: CHANGES_REQUESTED", auditor)
+
+    def test_issue_prompts_state_guard_scope_checklists_and_axioms(self):
+        def source(name):
+            return (REPO_ROOT / ".agents" / "agents" / name / "agent.md").read_text(encoding="utf-8")
+
+        fixer, auditor = source("issue_fixer"), source("issue_auditor")
+        # #130.1: the guard exists only under Claude Code
+        self.assertNotIn("A guard confines you", fixer)
+        self.assertIn("Under Claude Code a guard (`scripts/hooks/issue_fixer_guard.py`) enforces these limits; "
+                      "under agy no guard runs and these limits are yours to respect", fixer)
+        # #130.2: visible checklists, the auditor's before its VERDICT line
+        for item in ("## Fixer Checklist", "- [x] design.md read and followed", "- [x] narrow tests run",
+                     "- [x] full gate run (command + result)",
+                     "- [x] new tests hermetic (Binance client faked, no .env read)"):
+            self.assertIn(item, fixer)
+        self.assertLess(fixer.index("## Fixer Checklist"), fixer.index("## Fixer Report: issue #<n>"))
+        for item in ("## Verdict Checklist", "checks_ok is true", "every acceptance criterion has a test",
+                     "every design decision followed", "desk invariants intact", "tests hermetic"):
+            self.assertIn(item, auditor)
+        self.assertLess(auditor.index("## Verdict Checklist"),
+                        auditor.index("VERDICT: APPROVE | VERDICT: CHANGES_REQUESTED"))
+        # #130.3: the quantitative axioms in the auditor's invariants
+        invariants = auditor.split("<invariants_and_rules>", 1)[1].split("</invariants_and_rules>", 1)[0]
+        for axiom in ("risk_pct_equity", "1.8R", "4.0R", "+0.2%", "+2.0 × ATR_15m", "-3.34", "1,000", "10-day",
+                      "trading_risk_reviewer/agent.md"):
+            self.assertIn(axiom, invariants)
+        # #130.5: credentials reminder in both prompts
+        for text in (fixer, auditor):
+            self.assertIn("never reads `.env` credentials", text)
+        # #130.4 and #129.7: red checks go back to the fixer; the guard heartbeat is checked
+        skill = (REPO_ROOT / ".agents" / "skills" / "issue-orchestrator" / "SKILL.md").read_text(encoding="utf-8")
+        step_7a = skill.split("   a. Run `python3 scripts/dev/issue_workspace.py review-context", 1)[1].split("\n")[0]
+        self.assertIn("`checks_ok: false`", step_7a)
+        self.assertIn("straight back to the fixer", step_7a)
+        self.assertIn("issue_workspace.py check-guard <WORKTREE> --since <launch_ts>", skill)
+        self.assertIn("a confinement policy, not a sandbox", skill)
+        # A binding denial after an escalation or a restarted / resumed orchestrator session has a remedy
+        recovery = next(line for line in skill.splitlines() if "bound to another session" in line)
+        for text in ("step 7c", "restarted or resumed", "`session_id` to null"):
+            self.assertIn(text, recovery)
 
     def test_skill_is_generated_and_names_every_subagent(self):
         skill = (REPO_ROOT / ".claude" / "skills" / "issue-orchestrator" / "SKILL.md").read_text(encoding="utf-8")

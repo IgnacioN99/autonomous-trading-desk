@@ -51,8 +51,13 @@ Audit, in this order:
 2. Acceptance criteria: each criterion of the issue (and each required test in design.md) is implemented and covered by a test that would fail without the change.
 3. Design compliance: each design.md decision is followed; any deviation is justified in fixer_report.md and safe.
 4. Correctness: LONG/SHORT and buy/sell mirroring, units (seconds vs milliseconds, percent vs fraction, signed quantities), boundary values, empty or malformed inputs, races between reads and writes, exception paths.
-5. Desk invariants: PROD order gates fail closed on uncertainty; risk-reducing paths (close, break-even, orphan heal, protect pending) are never newly blocked; stops never loosen; TESTNET unchanged unless the design says so; no new path places or modifies orders outside `scripts/execute_futures_trade.py`.
-6. Test quality: tests are hermetic (no real network, no writes to the real `logs/`), assert the intended behaviour rather than passing vacuously, and no existing test or assertion was deleted, skipped or weakened to get green.
+5. Desk invariants: PROD order gates fail closed on uncertainty; risk-reducing paths (close, break-even, orphan heal, protect pending) are never newly blocked; stops never loosen; TESTNET unchanged unless the design says so; no new path places or modifies orders outside `scripts/execute_futures_trade.py`. The quantitative axioms (from `.agents/agents/trading_risk_reviewer/agent.md`) are never relaxed silently:
+   - Volatility parity sizing: position size derived from a constant monetary risk, Margin = Maximum Monetary Risk / (Distance to SL (%) × Leverage); the standard loss is capped at `risk_pct_equity` × equity (user profile, `config/user_profile.json`); flat or arbitrary sizing is prohibited.
+   - Risk/Reward: a minimum 3:1 R:R towards the structural target (TP2); TP1 (30% of the position) at +1.8R, TP2 (70% of the position) at +4.0R.
+   - True Net Break-Even: in standard intraday the SL only moves to True Net Break-Even after a minimum expansion of +2.0 × ATR_15m or a TP1 fill, and the Break-Even price includes the taker roundtrip fee buffer (+0.2%), never the exact entry price; on YOLO memecoins only after TP1 is confirmed filled.
+   - Trailing activation gate: exactly as defined under "Trailing Activation Gate" in `.agents/agents/trading_risk_reviewer/agent.md` (same thresholds as AGENTS.md Layer 8).
+   - Stat-arb: Engle-Granger with MacKinnon (2010) critical values (p < 0.05, t < -3.34) over ≥ 1,000 hourly bars, and a 10-day dynamic beta (240h) to size leg B (Notional_B = Notional_A × beta).
+6. Test quality: tests are hermetic (no real network, no writes to the real `logs/`; `unittest` in an issue worktree runs with that worktree's environment, so every new test fakes the Binance client and never reads `.env` credentials), assert the intended behaviour rather than passing vacuously, and no existing test or assertion was deleted, skipped or weakened to get green.
 7. Scope and docs: no unrelated changes; docs and docstrings the change makes stale are updated; generated `.claude/` files match their `.agents/` sources.
 A finding is a required change only if it is a real defect against items 1-7. Style preferences, optional hardening and pre-existing problems the change does not touch are non-blocking notes.
 </invariants_and_rules>
@@ -82,7 +87,14 @@ Bad: APPROVE because fixer_report.md says "all tests pass" while checks.json sho
 </few_shot_examples>
 
 <output_contract>
-Reply once with send_message (your final response), at most about 30 lines, exactly in this shape:
+Reply once with send_message (your final response), at most about 36 lines, exactly in this shape. Fill in the checklist first (plain markdown, visible): `- [x]` when the item holds, `- [ ]` when it does not; every unchecked item is a required change, so the verdict is then CHANGES_REQUESTED.
+
+## Verdict Checklist
+- [ ] checks_ok is true in checks.json
+- [ ] every acceptance criterion has a test that fails without the change
+- [ ] every design decision followed (or the deviation is justified and safe)
+- [ ] desk invariants intact (fail-closed gates, risk-reducing paths, quantitative axioms)
+- [ ] tests hermetic (Binance client faked, no .env credentials, no network, no writes to the real logs/)
 
 ## Audit Verdict: issue #<n>, round <k>
 VERDICT: APPROVE | VERDICT: CHANGES_REQUESTED

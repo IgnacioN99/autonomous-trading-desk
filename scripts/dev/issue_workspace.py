@@ -7,7 +7,14 @@ it never touches the exchange, the ledger or any desk runtime file).
       git fetch origin; create the sibling worktree <repo>-wt-issue-<N> on a new branch fix/issue-<N>-<slug> from
       <base>; dump the open issue (gh issue view) to <worktree>/logs/issue_work/issue.json, with a
       deterministic "routing" block ({"route": quick|build|deep, "risk": low|medium|high, "reason": ...})
-      computed from its labels and title by classify_issue().
+      computed from its labels and title by classify_issue(), and write the fixer binding marker
+      <worktree>/logs/issue_work/fixer_binding.json ({"issue", "worktree", "branch", "created_ts",
+      "session_id": null}); scripts/hooks/issue_fixer_guard.py claims it for the first fixer session.
+  check-guard <worktree> --since <epoch_s>
+      Read <worktree>/logs/issue_work/guard_heartbeat.json (written by issue_fixer_guard.py on every decision) and
+      print {"ok", "heartbeat_ts", "since", "session_id"}: exit 0 when the heartbeat exists and ts >= since, else
+      exit 2 (the guard did not run, e.g. the Claude Code build ignored the fixer's frontmatter hook). session_id
+      is the one the last hook payload carried (null if none).
   record-route <N> --from <json file>
       Validate the orchestrator's route record (final route, fixer/auditor models and efforts per round,
       escalations, approved round, merged) and append one JSON line to logs/issue_routing.jsonl in the MAIN
@@ -25,7 +32,8 @@ it never touches the exchange, the ledger or any desk runtime file).
       pr-review hook).
 
 Every command prints one JSON document. Exit codes: 0 ok (review-context also exits 0 when checks fail: read
-`checks_ok`), 1 failure, 2 invalid arguments (including an invalid or unreadable record-route file).
+`checks_ok`), 1 failure, 2 invalid arguments (including an invalid or unreadable record-route file) or, for
+check-guard, a missing or stale heartbeat.
 """
 
 import argparse
@@ -42,6 +50,8 @@ SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 CHECK_TIMEOUT_SECONDS = 1800
 LOG_TAIL_LINES = 120
 ROUTING_LOG = os.path.join("logs", "issue_routing.jsonl")
+BINDING_FILE = "fixer_binding.json"  # read and claimed by scripts/hooks/issue_fixer_guard.py
+HEARTBEAT_FILE = "guard_heartbeat.json"  # written by scripts/hooks/issue_fixer_guard.py
 
 ROUTES = ("quick", "build", "deep")  # ascending rank: a final route may upgrade, never downgrade
 DEEP_LABELS = {"cat:risk_gate", "severity:high", "severity:critical"}
@@ -151,10 +161,32 @@ def cmd_init(issue: int, slug: str, base: str, cwd: str = None) -> dict:
     data["routing"] = classify_issue(data.get("title"), data.get("labels"))
     with open(os.path.join(work, "issue.json"), "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+    with open(os.path.join(work, BINDING_FILE), "w", encoding="utf-8") as f:
+        json.dump({"issue": issue, "worktree": path, "branch": branch, "created_ts": int(time.time()),
+                   "session_id": None}, f, indent=2)
     head = run(["git", "rev-parse", "--short", "HEAD"], cwd=path).stdout.strip()
     return {"ok": True, "issue": issue, "title": data.get("title"), "worktree": path, "branch": branch,
             "base": base, "head": head, "work_dir": work, "issue_file": os.path.join(work, "issue.json"),
             "routing": data["routing"]}
+
+
+# --------------------------------------------------------------------------------------------------
+# check-guard
+# --------------------------------------------------------------------------------------------------
+def cmd_check_guard(path: str, since: int) -> dict:
+    """ok when the fixer guard wrote its heartbeat in this worktree at or after `since` (epoch seconds). Also
+    reports the heartbeat's session_id: the id the hook payload carried (null when it carried none)."""
+    try:
+        with open(os.path.join(path, WORK_DIR, HEARTBEAT_FILE), encoding="utf-8") as f:
+            beat = json.load(f)
+        ts, session_id = beat.get("ts"), beat.get("session_id")
+    except (OSError, ValueError, AttributeError):
+        ts = session_id = None
+    if isinstance(ts, bool) or not isinstance(ts, int):
+        ts = None
+    if not isinstance(session_id, str):
+        session_id = None
+    return {"ok": ts is not None and ts >= since, "heartbeat_ts": ts, "since": since, "session_id": session_id}
 
 
 # --------------------------------------------------------------------------------------------------
@@ -349,6 +381,10 @@ def main(argv: list = None) -> int:
                               "approved_round, escalations, merged")
     p_rev =sub.add_parser("review-context", help="Write the diff and check results for the auditor")
     p_rev.add_argument("worktree")
+    p_guard = sub.add_parser("check-guard", help="Exit 0 if the fixer guard heartbeat is at or after --since, "
+                                                 "else 2")
+    p_guard.add_argument("worktree")
+    p_guard.add_argument("--since", type=int, required=True, help="epoch seconds (the fixer launch time)")
     p_clean = sub.add_parser("cleanup", help="Remove a merged issue worktree and its local branch")
     p_clean.add_argument("issue", type=int)
     p_clean.add_argument("--force", action="store_true")
@@ -360,6 +396,10 @@ def main(argv: list = None) -> int:
             out = cmd_record_route(args.issue, args.src)
         elif args.command == "review-context":
             out = cmd_review_context(args.worktree)
+        elif args.command == "check-guard":
+            out = cmd_check_guard(args.worktree, args.since)
+            print(json.dumps(out, indent=2))
+            return 0 if out["ok"] else 2
         else:
             out = cmd_cleanup(args.issue, force=args.force)
     except RouteRecordError as e:
