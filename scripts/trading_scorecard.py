@@ -279,7 +279,31 @@ def _shadow():
         if not os.path.exists(os.path.join(_logs_dir(), "shadow_trades.jsonl")):
             return {}
         import shadow_tracker
-        return shadow_tracker.calculate_efficacy_metrics()
+        metrics = shadow_tracker.calculate_efficacy_metrics()
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+    regret = _shadow_delta_regret()
+    if regret is not None:
+        metrics["delta_regret"] = regret
+    return metrics
+
+
+def _shadow_delta_regret():
+    """Conservative delta-gate regret summary (issue #251, shadow_analytics.regret_report on logs/), None without
+    resolved DELTA_GATE / DUPLICATE_RESTING rows; never raises (an error is returned as {"error"})."""
+    try:
+        import shadow_analytics as sa
+        logs = _logs_dir()
+        resolved = sa.load_jsonl(os.path.join(logs, "shadow_resolved.jsonl"))
+        if not any(sa.row_gate(r)[0] in sa.REGRET_GATES for r in resolved if isinstance(r, dict)):
+            return None
+        rep = sa.regret_report(resolved, sa.load_jsonl(os.path.join(logs, "guardian_actions.jsonl")),
+                               sa.load_jsonl(os.path.join(logs, "trade_outcomes.jsonl")),
+                               sa.load_jsonl(os.path.join(logs, "trades_audit.jsonl")))
+        out = {k: rep["conservative"][k] for k in ("mean_regret_r", "ci95_low", "ci95_high", "n", "n_clusters",
+                                                     "insufficient_sample")}
+        out["blocker_unresolved"] = rep["counts"]["blocker_unresolved"]
+        return out
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
 
@@ -428,6 +452,16 @@ def format_scorecard_report(sc: dict) -> str:
         lines.append(f"  • Capital Saved: +${sd.get('capital_saved_usdt', 0.0)} USDT | Missed Alpha: -${sd.get('missed_alpha_usdt', 0.0)} USDT")
         net_fe = sd.get('net_filter_edge_usdt', 0.0)
         lines.append(f"  • Net Filter Edge: {net_fe:+.2f} USDT")
+        dr = sd.get("delta_regret")
+        if dr and "error" in dr:
+            lines.append(f"  • Delta-gate regret unavailable: {dr['error']}")
+        elif dr:
+            ci = "-" if dr["ci95_low"] is None else f"[{dr['ci95_low']:+.3f}, {dr['ci95_high']:+.3f}]"
+            mean = "-" if dr["mean_regret_r"] is None else f"{dr['mean_regret_r']:+.3f}R"
+            lines.append(f"  • Delta-gate regret (conservative, gross shadow R - net blocker R): {mean} | 95% CI {ci} | "
+                         f"n={dr['n']} | n_clusters={dr['n_clusters']} | unresolved blockers "
+                         f"{dr['blocker_unresolved']}{' | insufficient_sample' if dr['insufficient_sample'] else ''} "
+                         f"(scripts/shadow_analytics.py)")
 
     lines.append("=" * 70)
     return "\n".join(lines)

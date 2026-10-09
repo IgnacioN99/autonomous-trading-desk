@@ -9,6 +9,15 @@ Monitors discarded or disqualified candidates against live market klines:
 3. Computes Filter Efficacy Ratio (FER): TN / (TN + FN).
 4. Persists results to logs/shadow_trades.jsonl and logs/shadow_resolved.jsonl without risking capital or consuming LLM tokens.
 
+Rejection reason (issue #251): the dossier may carry `rejected_candidates: [{symbol, direction, score, gate, detail}]`
+(gate in GATE_ENUM). A candidate with a typed entry gets gate_source "dossier"; without one the vol_ratio heuristic
+stays as a flagged fallback (gate_source "heuristic_vol_ratio"). Malformed entries are dropped or mapped to OTHER and
+flagged (normalize_rejected_candidates), never refused. Rows also carry score, dossier_sha256 (one registration per
+dossier_sha256 + symbol + direction, resolved rows included) and, for DELTA_GATE / DUPLICATE_RESTING, a best-effort
+snapshot of the blocking positions / resting entries ("blockers") and of the whole book ("book") read from
+logs/pending_entries.json, logs/session_state.json and logs/trades_audit.jsonl. Report-only: nothing here gates an
+order. Regret and the policy replay are computed in scripts/shadow_analytics.py.
+
 Usage:
   python3 scripts/shadow_tracker.py --register-from-eval
   python3 scripts/shadow_tracker.py --audit
@@ -33,6 +42,16 @@ SHADOW_TRADES_FILE = os.path.join(LOGS_DIR, "shadow_trades.jsonl")
 SHADOW_RESOLVED_FILE = os.path.join(LOGS_DIR, "shadow_resolved.jsonl")
 DOSSIER_FILE = os.path.join(LOGS_DIR, "evaluations", "latest_dossier.json")
 BRIEF_FILE = os.path.join(LOGS_DIR, "primed_brief.json")
+PENDING_ENTRIES_FILE = os.path.join(LOGS_DIR, "pending_entries.json")
+SESSION_STATE_FILE = os.path.join(LOGS_DIR, "session_state.json")
+TRADES_AUDIT_FILE = os.path.join(LOGS_DIR, "trades_audit.jsonl")
+
+# Typed rejection reasons of the dossier's rejected_candidates (issue #251). K5 squeeze risk only caps a tier.
+GATE_ENUM = ("DELTA_GATE", "MACRO_SHORT", "DUPLICATE_RESTING", "DRY_VOLUME", "FRICTION", "CATALYST_DOWNGRADE",
+             "UNREADABLE_BOOK", "DAILY_LOSS_GATE", "OTHER")
+GATE_FALLBACK = "OTHER"
+BLOCKER_GATES = ("DELTA_GATE", "DUPLICATE_RESTING")
+GATE_DETAIL_MAX_CHARS = 300
 
 # Intraday Desk Constraints & Statistical Hygiene
 MAX_TRIGGER_WAIT_SECONDS = 5400    # 90 min max to breach trigger (matches limit cancellation rule)
@@ -88,18 +107,32 @@ def register_shadow_trade(
     vol_ratio: float = 1.0,
     rejection_reason: str = "Manual rejection",
     rejection_category: str = "GENERIC_FILTER",
-    target_dollar_risk: float = 1.50
+    target_dollar_risk: float = 1.50,
+    gate: Optional[str] = None,
+    gate_detail: Optional[str] = None,
+    gate_source: Optional[str] = None,
+    score: Optional[float] = None,
+    dossier_sha256: Optional[str] = None,
+    extra: Optional[dict] = None
 ) -> Optional[dict]:
-    """Registers a rejected setup into shadow_trades.jsonl if not already active."""
+    """Registers a rejected setup into shadow_trades.jsonl if not already active.
+    With dossier_sha256: at most one row per (dossier_sha256, symbol, direction), also after it resolved (issue #251);
+    without it: no second active/pending row for the symbol within 60 minutes. extra: additional row keys (blockers)."""
     os.makedirs(LOGS_DIR, exist_ok=True)
     existing = load_jsonl(SHADOW_TRADES_FILE)
-    
-    # Avoid duplicate active/pending trade for same symbol registered in last 60 minutes
+
     now_ts = int(time.time())
-    for t in existing:
-        if t.get("symbol") == symbol and t.get("status") in ["PENDING_TRIGGER", "ACTIVE"]:
-            if now_ts - t.get("registered_at_ts", 0) < 3600:
+    if dossier_sha256:
+        key = (dossier_sha256, symbol.upper().strip(), direction.upper().strip())
+        for t in existing + load_jsonl(SHADOW_RESOLVED_FILE):
+            if (t.get("dossier_sha256"), t.get("symbol"), str(t.get("direction") or "").upper()) == key:
                 return None
+    else:
+        # Avoid duplicate active/pending trade for same symbol registered in last 60 minutes
+        for t in existing:
+            if t.get("symbol") == symbol and t.get("status") in ["PENDING_TRIGGER", "ACTIVE"]:
+                if now_ts - t.get("registered_at_ts", 0) < 3600:
+                    return None
 
     now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     trade_id = f"shadow_{symbol}_{now_ts}"
@@ -118,6 +151,11 @@ def register_shadow_trade(
         "vol_ratio": float(vol_ratio),
         "rejection_reason": rejection_reason,
         "rejection_category": rejection_category,
+        "gate": gate,
+        "gate_detail": gate_detail,
+        "gate_source": gate_source,
+        "score": score,
+        "dossier_sha256": dossier_sha256,
         "target_dollar_risk": float(target_dollar_risk),
         "status": "PENDING_TRIGGER",
         "activated_at_utc": None,
@@ -134,9 +172,156 @@ def register_shadow_trade(
         "last_checked_price": float(current_price),
         "last_checked_ts": now_ts
     }
+    for k, v in (extra or {}).items():
+        trade.setdefault(k, v)
 
     atomic_append_jsonl(SHADOW_TRADES_FILE, trade)
     return trade
+
+
+def _to_float(value) -> Optional[float]:
+    """float(value) for a finite number (never a bool), else None."""
+    if isinstance(value, bool):
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if f == f and f not in (float("inf"), float("-inf")) else None
+
+
+def normalize_rejected_candidates(raw) -> tuple:
+    """(entries, flags) of the dossier's optional rejected_candidates (issue #251). Never raises and never refuses:
+    a non-dict entry or one without a symbol is dropped (flagged), an unknown / missing gate becomes GATE_FALLBACK
+    (flagged, original kept in gate_raw), a non-numeric score becomes None, a direction other than LONG / SHORT
+    becomes None (the entry then matches by symbol only). Each entry: {symbol, direction, score, gate, detail, flags}."""
+    flags: List[str] = []
+    try:
+        if raw is None:
+            return [], flags
+        if not isinstance(raw, list):
+            return [], [f"rejected_candidates_not_a_list:{type(raw).__name__}"]
+        out = []
+        for i, item in enumerate(raw):
+            if not isinstance(item, dict):
+                flags.append(f"entry_{i}_not_a_dict")
+                continue
+            sym = item.get("symbol")
+            if not isinstance(sym, str) or not sym.strip():
+                flags.append(f"entry_{i}_without_symbol")
+                continue
+            entry_flags = []
+            direction = str(item.get("direction") or "").upper().strip()
+            if direction not in ("LONG", "SHORT"):
+                entry_flags.append("invalid_direction")
+                direction = None
+            gate_raw = item.get("gate")
+            gate = str(gate_raw).upper().strip() if isinstance(gate_raw, str) else None
+            entry = {"symbol": sym.upper().strip(), "direction": direction}
+            if gate not in GATE_ENUM:
+                entry_flags.append("missing_gate" if gate_raw is None else "unknown_gate")
+                entry["gate_raw"] = None if gate_raw is None else str(gate_raw)[:60]
+                gate = GATE_FALLBACK
+            score = _to_float(item.get("score"))
+            if score is None and item.get("score") is not None:
+                entry_flags.append("invalid_score")
+            detail = item.get("detail")
+            entry.update(score=score, gate=gate,
+                         detail=detail.strip()[:GATE_DETAIL_MAX_CHARS] if isinstance(detail, str) else "",
+                         flags=entry_flags)
+            out.append(entry)
+        return out, flags
+    except Exception as e:  # never refuse a dossier over its optional field
+        return [], flags + [f"normalize_error:{type(e).__name__}"]
+
+
+def _env_name(value) -> str:
+    v = str(value or "").strip().lower()
+    return "prod" if v == "mainnet" else v
+
+
+def _latest_audit_by_symbol(path: str) -> Dict[str, dict]:
+    """Latest non-event entry record (with total_qty) per symbol of logs/trades_audit.jsonl (missing file: {})."""
+    latest: Dict[str, dict] = {}
+    for rec in load_jsonl(path):
+        if isinstance(rec, dict) and not rec.get("event") and "total_qty" in rec and rec.get("symbol"):
+            latest[str(rec["symbol"]).upper()] = rec
+    return latest
+
+
+def snapshot_book(target_env: Optional[str] = None) -> dict:
+    """Best-effort snapshot of the book at registration time (issue #251), read-only:
+    resting entries of logs/pending_entries.json (of target_env when given; a symbol with an open position counts as
+    the position, as in sync_session_state) and active_positions of logs/session_state.json, each as
+    {symbol, direction, kind: "position" | "resting", score, entry_id, notional, since_ts, audit_ts}. Resting score:
+    score_meta.score (else dossier_score); position score / audit_ts: the latest trades_audit.jsonl entry record of
+    the symbol in the same direction, else None. A missing file is an empty source. Any read error: {"items": [],
+    "error": "..."}; never raises."""
+    try:
+        state = {}
+        if os.path.exists(SESSION_STATE_FILE):
+            with open(SESSION_STATE_FILE, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            if not isinstance(state, dict):
+                raise ValueError("session_state malformed")
+        state_env = _env_name(state.get("target_env"))
+        if target_env and state and state_env and state_env != _env_name(target_env):
+            raise ValueError(f"session_state env {state_env} != dossier env {_env_name(target_env)}")
+        entries = {}
+        if os.path.exists(PENDING_ENTRIES_FILE):
+            with open(PENDING_ENTRIES_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict) or not isinstance(data.get("entries"), dict):
+                raise ValueError("pending entries registry malformed")
+            entries = data["entries"]
+        audit = _latest_audit_by_symbol(TRADES_AUDIT_FILE)
+
+        items = []
+        open_symbols = set()
+        for p in state.get("active_positions") or []:
+            if not isinstance(p, dict) or not p.get("symbol"):
+                continue
+            sym = str(p["symbol"]).upper()
+            direction = str(p.get("direction") or "").upper()
+            open_symbols.add(sym)
+            rec = audit.get(sym)
+            if rec is not None and str(rec.get("direction") or "").upper() != direction:
+                rec = None
+            items.append({"symbol": sym, "direction": direction, "kind": "position",
+                          "score": _to_float(rec.get("score")) if rec else None,
+                          "entry_id": None if p.get("entry_order_id") is None else str(p.get("entry_order_id")),
+                          "notional": _to_float(p.get("notional_usdt")),
+                          "since_ts": _to_float(p.get("entry_time_ts")),
+                          "audit_ts": _to_float(rec.get("timestamp")) if rec else None})
+        for rec in entries.values():
+            if not isinstance(rec, dict) or not rec.get("symbol"):
+                continue
+            if target_env and rec.get("target_env") and _env_name(rec.get("target_env")) != _env_name(target_env):
+                continue
+            sym = str(rec["symbol"]).upper()
+            if sym in open_symbols:
+                continue
+            meta = rec.get("score_meta") if isinstance(rec.get("score_meta"), dict) else {}
+            score = _to_float(meta.get("score"))
+            price, qty = _to_float(rec.get("trigger_or_limit_price")), _to_float(rec.get("total_qty"))
+            items.append({"symbol": sym, "direction": str(rec.get("direction") or "").upper(), "kind": "resting",
+                          "score": score if score is not None else _to_float(meta.get("dossier_score")),
+                          "entry_id": None if rec.get("entry_id") is None else str(rec.get("entry_id")),
+                          "notional": abs(price * qty) if price is not None and qty is not None else None,
+                          "since_ts": _to_float(rec.get("placed_at_ts")), "audit_ts": None})
+        return {"items": items, "error": None, "session_state_ts": _to_float(state.get("last_updated_ts"))}
+    except Exception as e:
+        return {"items": [], "error": f"{type(e).__name__}: {e}"[:200], "session_state_ts": None}
+
+
+def blockers_for(gate: str, symbol: str, direction: str, book: dict) -> List[dict]:
+    """The snapshot items that block a candidate: DELTA_GATE -> same direction; DUPLICATE_RESTING -> same symbol."""
+    items = book.get("items") or []
+    if gate == "DELTA_GATE":
+        return [dict(i) for i in items if i.get("direction") == direction]
+    if gate == "DUPLICATE_RESTING":
+        return [dict(i) for i in items if i.get("symbol") == symbol]
+    return []
 
 def register_from_evaluation() -> int:
     """Reads latest evaluation brief and dossier, auto-registering rejected setups."""
@@ -167,6 +352,17 @@ def register_from_evaluation() -> int:
     approved_symbols = set(dossier_data.get("approved_symbols", []))
     dossier_status = dossier_data.get("status", "").upper()
 
+    # Issue #251: typed rejection reasons (optional; malformed entries are flagged, never refused)
+    raw_payload = dossier_data.get("raw_payload") if isinstance(dossier_data.get("raw_payload"), dict) else {}
+    provenance = dossier_data.get("provenance") if isinstance(dossier_data.get("provenance"), dict) else {}
+    dossier_sha256 = provenance.get("sha256") if isinstance(provenance.get("sha256"), str) else None
+    typed, typed_flags = normalize_rejected_candidates(raw_payload.get("rejected_candidates"))
+    typed_by_key = {}
+    for c in typed:
+        typed_by_key.setdefault((c["symbol"], c["direction"]), c)
+    target_env = raw_payload.get("target_env") or dossier_data.get("target_env")
+    book = None
+
     for o in opps:
         sym = o.get("symbol", "").upper()
         # If dossier rejected all or sym not approved, register for shadow tracking
@@ -180,9 +376,39 @@ def register_from_evaluation() -> int:
                 cat = "DELTA_GATE_OR_MACRO"
                 reason = "Rejected by delta gate or macro regime"
 
+            direction = str(o.get("direction", "LONG")).upper().strip()
+            tc = typed_by_key.get((sym, direction)) or typed_by_key.get((sym, None))
+            extra = {}
+            if tc is not None:
+                gate, gate_source, gate_detail = tc["gate"], "dossier", tc["detail"]
+                reason = f"[{gate}] {gate_detail}".strip()
+                score = tc["score"] if tc["score"] is not None else _to_float(o.get("confidence"))
+                flags = tc["flags"] + typed_flags
+            else:
+                # Fallback for dossiers without a typed entry for this candidate (flagged by gate_source)
+                gate = "DRY_VOLUME" if vol < 1.0 else GATE_FALLBACK
+                gate_source, gate_detail = "heuristic_vol_ratio", reason
+                score = _to_float(o.get("confidence"))
+                flags = typed_flags
+            if flags:
+                extra["gate_flags"] = flags
+            if _to_float(o.get("notional_usdt")):
+                extra["notional_usdt"] = _to_float(o.get("notional_usdt"))
+            if gate in BLOCKER_GATES:
+                if book is None:
+                    book = snapshot_book(target_env)
+                extra["blockers"] = blockers_for(gate, sym, direction, book)
+                extra["book"] = [{k: i.get(k) for k in ("symbol", "direction", "kind", "score", "notional",
+                                                        "since_ts", "entry_id")} for i in book.get("items") or []]
+                extra["book_session_state_ts"] = book.get("session_state_ts")
+                if not target_env:
+                    extra["book_env_unfiltered"] = True  # no dossier env: resting entries of every env included
+                if book.get("error"):
+                    extra["blockers_error"] = book["error"]
+
             res = register_shadow_trade(
                 symbol=sym,
-                direction=o.get("direction", "LONG"),
+                direction=direction,
                 trigger_price=float(o.get("trigger_price", o.get("current_price", 0))),
                 sl_price=float(o.get("sl_price", 0)),
                 tp1_price=float(o.get("tp1_price", 0)),
@@ -191,7 +417,13 @@ def register_from_evaluation() -> int:
                 vol_ratio=vol,
                 rejection_reason=reason,
                 rejection_category=cat,
-                target_dollar_risk=float(o.get("target_dollar_risk", 1.50))
+                target_dollar_risk=float(o.get("target_dollar_risk", 1.50)),
+                gate=gate,
+                gate_detail=gate_detail,
+                gate_source=gate_source,
+                score=score,
+                dossier_sha256=dossier_sha256,
+                extra=extra
             )
             if res:
                 registered_count += 1
@@ -361,6 +593,16 @@ def audit_shadow_trades() -> dict:
         "total_resolved": len(load_jsonl(SHADOW_RESOLVED_FILE))
     }
 
+def row_gate(row: dict) -> tuple:
+    """(gate, gate_source) of a shadow row; a row written before issue #251 maps its vol_ratio category
+    (DRY_VOLUME_FAKE_TIER_S -> DRY_VOLUME, anything else -> OTHER) with source "legacy_category"."""
+    gate = row.get("gate")
+    if isinstance(gate, str) and gate:
+        return gate, str(row.get("gate_source") or "unknown")
+    return ("DRY_VOLUME" if row.get("rejection_category") == "DRY_VOLUME_FAKE_TIER_S" else GATE_FALLBACK,
+            "legacy_category")
+
+
 def calculate_efficacy_metrics(rolling_window: int = ROLLING_WINDOW_SIZE) -> dict:
     """Calculates Filter Efficacy Ratio (FER) all-time, clean intraday (<=4h), and rolling window."""
     resolved = load_jsonl(SHADOW_RESOLVED_FILE)
@@ -403,6 +645,14 @@ def calculate_efficacy_metrics(rolling_window: int = ROLLING_WINDOW_SIZE) -> dic
     r_missed = sum(r.get("simulated_pnl_usdt", 0) for r in recent_slice if r.get("classification") == "FALSE_NEGATIVE")
     rolling_net_edge = r_saved - r_missed
 
+    # 4. Resolved rows by rejection gate (issue #251; rows without "gate" predate it: legacy vol_ratio category)
+    gate_counts: Dict[str, int] = {}
+    gate_source_counts: Dict[str, int] = {}
+    for r in resolved:
+        gate, source = row_gate(r)
+        gate_counts[gate] = gate_counts.get(gate, 0) + 1
+        gate_source_counts[source] = gate_source_counts.get(source, 0) + 1
+
     return {
         "active_shadow_trades": len(active),
         "total_resolved": len(resolved),
@@ -424,6 +674,8 @@ def calculate_efficacy_metrics(rolling_window: int = ROLLING_WINDOW_SIZE) -> dic
         "rolling_capital_saved_usdt": round(r_saved, 2),
         "rolling_missed_alpha_usdt": round(r_missed, 2),
         "rolling_net_edge_usdt": round(rolling_net_edge, 2),
+        "gate_counts": gate_counts,
+        "gate_source_counts": gate_source_counts,
         "active_trades": active,
         "recent_resolved": resolved[-5:]
     }

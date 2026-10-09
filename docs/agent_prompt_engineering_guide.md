@@ -432,6 +432,8 @@ Query B: "Based on the balance fetched 10 seconds ago, what is my free margin?"
 
 > [!IMPORTANT]
 > **Repository convention (Claude-compatible deliberation):** agents in this repo (notably `isolated_market_evaluator`) deliberate in a **visible, plain-markdown `## Precondition Checklist`** defined in `<deliberation_protocol>`, never in XML-tagged scratch output (`<thinking>`, `<scratchpad>`): Claude refuses prompts that demand tagged reasoning as `reasoning_extraction`, and a hidden scratchpad cannot be checked against the verdict. The checklist is the first section of the output: short yes/no checks (`- [x] <ID> <check>: <value from the brief> -> PASS/FAIL`), followed by the response (for the evaluator, the dossier and exactly one `<dossier_json>` block). It never contains XML tags and must agree with the verdict that follows it.
+>
+> **Typed rejection reason (issue #251):** the evaluator's `<dossier_json>` may carry an optional `rejected_candidates` list (`{symbol, direction, score, gate, detail}`, `gate` from a fixed enum: `DELTA_GATE`, `MACRO_SHORT`, `DUPLICATE_RESTING`, `DRY_VOLUME`, `FRICTION`, `CATALYST_DOWNGRADE`, `UNREADABLE_BOOK`, `DAILY_LOSS_GATE`, `OTHER`; output contract item 7). It is the authoritative reason written at emission time, read only by the shadow desk (`scripts/shadow_tracker.py`, which falls back to its flagged `vol_ratio` heuristic without it); no gate reads it, and a malformed entry is mapped to `OTHER` or dropped, never refused by the recorder.
 
 ## 4.1 Strict Separation Between Inner Deliberation and External Action Dispatch
 

@@ -1190,8 +1190,10 @@ class TestPromptAndDocs(unittest.TestCase):
                      "Tier A), confidence 60 = score 60"):
             self.assertIn(shot, text)
         # the five shot dossiers (#206 added the squeezed RLCUSDT SHORT, #223 the downgraded NEARUSDT LONG) + the
-        # contract's sample YOLO item
-        self.assertEqual(text.count('"score": '), 6)
+        # contract's sample YOLO item (issue #251: the rejected_candidates items, lines with a "gate", counted apart)
+        rejected = [l for l in text.splitlines() if '"gate": ' in l]
+        self.assertEqual(text.count('"score": ') - sum(l.count('"score": ') for l in rejected), 6)
+        self.assertEqual(sum(l.count('"score": null') for l in rejected), 7)
         self.assertIn("RLCUSDT Tier A, confidence 64 = score 64", text)
         self.assertIn("NEARUSDT Tier A, confidence 72 = score 72", text)
         self.assertIn('"leverage": 5, "score": null, "is_yolo": true', text)
