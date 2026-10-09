@@ -51,6 +51,8 @@ The review runs in the CURRENT session. Each domain reviewer is a read-only agy 
    `python3 scripts/ci/assemble_review.py --pr <n> --from-subagent <id>=<conversationId> ...`
    It copies each `### Verdict: <id>` section from the subagent transcript into
    `logs/pr_review/report.md` and computes the `### Final Consolidated Verdict` mechanically.
+   Rows agy truncated in `transcript.jsonl` are read from the sibling `transcript_full.jsonl` (paired by
+   `step_index`, cross-checked); if that fails, the reviewer is reported as an error, never guessed.
 6. **Verify:** `python3 scripts/ci/verify_review.py logs/pr_manifest.json logs/pr_review/report.md`
    - exit 0: all approved. exit 1: complete, changes required (still post it).
    - exit 2: missing/inconclusive reviewers. Re-invoke ONLY those reviewers once (one `invoke_subagent`

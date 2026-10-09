@@ -17,6 +17,11 @@ Canonical flow (PROD and TESTNET):
 The recorder reads the <dossier_json> block the subagent itself emitted in its transcript and
 stores a provenance stamp (source, transcript path, step, sha256) that every consumer re-verifies.
 Claude Code transcripts must carry agentType "isolated_market_evaluator" in their meta.json.
+Truncated agy rows are resolved from transcript_full.jsonl (paired by step_index; dossier_provenance.py).
+The message carrying the block must hold a '## Precondition Checklist' consistent with it (C4.2 = status,
+K1-K4 and C3.1 checked for every approved candidate; dossier_provenance.check_precondition_checklist):
+an inconsistent APPROVED dossier is refused in PROD (exit 2) and recorded with a warning in TESTNET;
+REJECTED/NEUTRAL dossiers are always recorded, with a warning.
 Dossiers typed by hand are NOT accepted in PROD.
 
 Legacy manual paths (TESTNET only, stored as schema_version 1 / source "manual_testnet"):
@@ -277,6 +282,19 @@ def _record_extracted(
                 f"Dossier was evaluated for {dossier_env.upper()} but this recording targets {env.upper()}. "
                 "Re-run the brief and evaluator for the correct environment (or pass --env)."
             )
+
+    problems = dp.check_precondition_checklist(extracted.get("final_text") or "", extracted.get("dossier") or {})
+    if problems:
+        detail = "; ".join(problems)
+        if record.get("status") == "APPROVED" and env == "prod":
+            raise RecordRefused(
+                f"The evaluator's Precondition Checklist does not match its dossier: {detail}. "
+                "Re-run the evaluator subagent."
+            )
+        # TESTNET APPROVED, or REJECTED/NEUTRAL in any env: record with a warning. A refused REJECTED/NEUTRAL
+        # record would leave an older APPROVED latest_dossier.json live (and skip shadow enrollment); it
+        # authorizes nothing, so recording it is the fail-closed choice.
+        print(f"⚠️ CHECKLIST WARNING ({env.upper()}, status {record.get('status')}): {detail}", file=sys.stderr)
 
     record["target_env"] = env
     dossier_file = _persist(record, base, shadow=shadow)

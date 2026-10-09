@@ -183,6 +183,8 @@ class TestGeneratedClaudeAssets(unittest.TestCase):
                     if symbol in line and re.search(r"\b(K1|K2|K3|K4|K5|C3\.1)\b", line):
                         self.assertTrue(line.strip().startswith("- [x]"), line)
             self.assertEqual([c["symbol"] for c in dossier["approved_candidates"]], dossier["approved_symbols"])
+            # The recorder's checker (issue #27) accepts every few-shot as-is.
+            self.assertEqual(dp.check_precondition_checklist(final, dossier), [], final)
 
     def test_claude_skills(self):
         for skill in gen.SKILLS:
