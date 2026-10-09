@@ -374,6 +374,9 @@ Omit no check group, except after a C0 failure: write `N/A` when a check does no
         "brief_generated_at_ts": 1790000000,
         "approved_symbols": [],
         "approved_candidates": [],
+        "rejected_candidates": [
+          {"symbol": "WLFIUSDT", "direction": "LONG", "score": null, "gate": "DELTA_GATE", "detail": "K1 BLOCKED: LONG_HEAVY"}
+        ],
         "summary": "All Long candidates disqualified by LONG_HEAVY Delta Gate."
       }
       </dossier_json>
@@ -424,6 +427,10 @@ Omit no check group, except after a C0 failure: write `N/A` when a check does no
         "brief_generated_at_ts": 1790000000,
         "approved_symbols": [],
         "approved_candidates": [],
+        "rejected_candidates": [
+          {"symbol": "TRXUSDT", "direction": "LONG", "score": null, "gate": "DRY_VOLUME", "detail": "K2 FAKE_TIER_S: vol_ratio 0.1x < 1.0x"},
+          {"symbol": "SEIUSDT", "direction": "LONG", "score": null, "gate": "OTHER", "detail": "K2 FAIL: abs:unscored, vol_ratio 1.2x < 1.4x"}
+        ],
         "summary": "TRXUSDT disqualified due to dry volume (0.1x); SEIUSDT failed K2 (abs:unscored, vol_ratio 1.2x < 1.4x); lacking institutional confluence."
       }
       </dossier_json>
@@ -469,6 +476,9 @@ Omit no check group, except after a C0 failure: write `N/A` when a check does no
         "brief_generated_at_ts": 1790000000,
         "approved_symbols": [],
         "approved_candidates": [],
+        "rejected_candidates": [
+          {"symbol": "UNIUSDT", "direction": "SHORT", "score": null, "gate": "CATALYST_DOWNGRADE", "detail": "C3.1 adverse catalyst: CME lists UNI futures"}
+        ],
         "summary": "UNIUSDT rejected due to adverse institutional catalyst in the brief."
       }
       </dossier_json>
@@ -513,6 +523,9 @@ Omit no check group, except after a C0 failure: write `N/A` when a check does no
         "brief_generated_at_ts": 1790000000,
         "approved_symbols": [],
         "approved_candidates": [],
+        "rejected_candidates": [
+          {"symbol": "1000PEPEUSDT", "direction": "LONG", "score": null, "gate": "DELTA_GATE", "detail": "K1 BLOCKED: LONG_HEAVY (YOLO)"}
+        ],
         "summary": "YOLO LONG disqualified by LONG_HEAVY Delta Gate; YOLO slot empty."
       }
       </dossier_json>
@@ -598,6 +611,9 @@ Omit no check group, except after a C0 failure: write `N/A` when a check does no
         "brief_generated_at_ts": 1790000000,
         "approved_symbols": [],
         "approved_candidates": [],
+        "rejected_candidates": [
+          {"symbol": "ADAUSDT", "direction": "SHORT", "score": null, "gate": "UNREADABLE_BOOK", "detail": "K1 BLOCKED: pending_entries_status UNREADABLE (C1.2 BOTH)"}
+        ],
         "summary": "Resting-entry exposure UNREADABLE: every directional entry blocked (C1.2 BOTH)."
       }
       </dossier_json>
@@ -639,6 +655,9 @@ Omit no check group, except after a C0 failure: write `N/A` when a check does no
         "brief_generated_at_ts": 1790000000,
         "approved_symbols": [],
         "approved_candidates": [],
+        "rejected_candidates": [
+          {"symbol": "DOTUSDT", "direction": "LONG", "score": null, "gate": "DELTA_GATE", "detail": "K1 BLOCKED: LONG_HEAVY incl. resting entries"}
+        ],
         "summary": "DOTUSDT Long blocked: book LONG_HEAVY once resting entries count."
       }
       </dossier_json>
@@ -865,6 +884,7 @@ Your response must begin directly with the `# QUANTITATIVE EVALUATION MASTER DOS
    - `approved_symbols`: list of approved symbols (empty unless APPROVED).
    - `approved_candidates`: list (empty unless APPROVED); each item MUST include `symbol` (e.g. "FILUSDT"), `direction` (`"LONG"` | `"SHORT"`), `tier` (`"S"` | `"A+"` | `"A"`), `entry`, `stop_loss`, `tp1`, `tp2` (numbers), `leverage` (integer: `leverage_standard` from the risk profile; YOLO: the candidate's, capped as below), `is_yolo` (bool), `requires_user_confirmation` (bool: false only for Tier S fast-track, true for Tier A+/A), `score` (the brief `confidence` copied exactly: never estimated, never omitted; `null` only for a YOLO candidate without one; alias `conviction_pct`). `entry` = the effective entry: the candidate's `trigger_price` (= `sizing_entry_price`), never `current_price`. YOLO candidates: `is_yolo: true`, `tier: "A"`, `leverage` = the candidate's `leverage`, never above `brief.risk_profile.leverage_yolo` (if they differ, use the lower), `requires_user_confirmation: true`, `entry` = the candidate's `trigger`. Optional: `thesis`.
      Sample YOLO item: `{"symbol": "1000PEPEUSDT", "direction": "LONG", "tier": "A", "entry": 0.0124, "stop_loss": 0.0119, "tp1": 0.0136, "tp2": 0.0148, "leverage": 5, "score": null, "is_yolo": true, "requires_user_confirmation": true}` (`score`: the candidate's brief `confidence` when present, else `null`)
+   - `rejected_candidates` (optional, shadow-desk attribution only; no gate reads it): one item per disqualified candidate, `{"symbol", "direction", "score", "gate", "detail"}`. `score`: the brief `confidence` when present, else `null`. `gate`: the first failing check, one of `"DELTA_GATE"` (K1 BLOCKED by a heavy book), `"UNREADABLE_BOOK"` (K1 BLOCKED because C1.2 is BOTH), `"MACRO_SHORT"` (C2 forbids the alt SHORT), `"DUPLICATE_RESTING"` (K4: duplicate of a resting entry or open position), `"DRY_VOLUME"` (K2 FAKE_TIER_S, vol_ratio < 1.0x), `"FRICTION"` (K3), `"CATALYST_DOWNGRADE"` (C3.1 adverse catalyst), `"DAILY_LOSS_GATE"` (C1.3 ACTIVE), `"OTHER"` (anything else, e.g. a K2 FAIL at vol_ratio >= 1.0x). K5 squeeze risk only caps a tier: never a `gate`. `detail`: one short line naming the check. An unknown `gate` is recorded as `"OTHER"`; omitting the field is valid.
    - `summary`: one-line verdict (prefixed with `STALE_BRIEF:`, `ENV_MISMATCH:`, `DAILY_LOSS_GATE:` or `BRIEF_FILE_UNAVAILABLE:` when applicable). A market data outage uses `MARKET_DATA_UNAVAILABLE:` plus the retry time (input brief item 5).
 8. DELIVERY: send the complete Master Dossier, including the `<dossier_json>` block, to the parent with a single `send_message` call as your final action. The parent records it with `python3 scripts/record_evaluation.py --from-subagent <conversationId>`, which reads the block from your transcript; a dossier the parent types by hand is rejected in PROD. The `## Precondition Checklist` and the `<dossier_json>` block must be in the same final message (one `send_message` call); a checklist sent in an earlier message is not read and an APPROVED dossier is then refused in PROD.
 </output_contract>
