@@ -52,6 +52,23 @@ class TestYoloPositiveFewShot(unittest.TestCase):
         self.assertEqual(cand["tier"], "A")
         self.assertEqual(cand["entry"], trigger)
         self.assertEqual(cand["leverage"], min(cand_lev, yolo_lev))
+        # Issue #76.1: the candidate's own sl/tp1/tp2, stop on the losing side, TP2 >= 3.0R
+        for key, field in (("sl", "stop_loss"), ("tp1", "tp1"), ("tp2", "tp2")):
+            level = float(re.search(rf"\b{key} ([\d.]+)", user_input).group(1))
+            self.assertEqual(cand[field], level, field)
+        sign = 1 if cand["direction"] == "LONG" else -1
+        risk = sign * (cand["entry"] - cand["stop_loss"])
+        self.assertGreater(risk, 0, "the stop must be on the losing side of the entry")
+        self.assertGreater(sign * (cand["tp1"] - cand["entry"]), 0)
+        self.assertGreaterEqual(sign * (cand["tp2"] - cand["entry"]) / risk, 3.0)
+
+    def test_pos_03_k2_evidence_and_execution_verdict(self):
+        shot = self._shot()
+        k2 = next(line for line in shot.splitlines() if "(YOLO) K2 Institutional volume (Barbell path)" in line)
+        self.assertIn("1.0x floor", k2)
+        self.assertIn("lower_wick 41% < 50%", k2)
+        verdict = shot.split("## 6. Execution Verdict")[1].split("<dossier_json>")[0]
+        self.assertIn("PENDING USER CONFIRMATION", verdict)
 
     def test_pos_03_checklist_barbell_k2_and_section_5(self):
         shot = self._shot()
