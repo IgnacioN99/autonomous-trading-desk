@@ -103,7 +103,8 @@ JSON schemas (stable; extra keys may be added, existing keys are never renamed):
       "placed" | "rejected:<code-or-text>" | "skipped:mcp" | "skipped:crossed", "prearm_algo_id"); the guardian
       verifies it at fill and is the fallback; it is cancelled (by algo id) when the entry ends without a position.
       Issue #157: a rejected (except -2021) or unverified pre-arm adds "prearm_anomaly": {"status", "message"} and
-      files a MEDIUM issue (the entry is kept). A MARKET entry's SL is verified by its own algo id only (an id-less
+      files a MEDIUM issue (the entry is kept). Issue #232: an API rejection also adds "prearm_reject_msg" (the
+      Binance msg, <= 200 chars; in the registry record, the message and the issue context). A MARKET entry's SL is verified by its own algo id only (an id-less
       placement response: by a stop at the SL within one tick that was not listed before the placement); a -4130 on
       that placement with no such stop (a leftover closePosition stop) auto-destructs and files a HIGH issue.
       In PROD every new entry is rejected while an opening order rests on the exchange without a registry record
@@ -174,7 +175,7 @@ except Exception:  # pragma: no cover - exercised only on broken installs
 # GATE 2 (YOLO loss cap) and GATE 3 (friction floor) limits, shared with the YOLO scanner and the screening
 # pipeline (scripts/utils/gate_limits.py, issue #64).
 from utils.gate_limits import (MIN_RR_TP2_CROSSED, MIN_TP1_DISTANCE, PENDING_DRIFT_CAP_TOLERANCE,
-                               YOLO_MAX_LOSS_MARGIN_FRACTION, YOLO_MIN_LOSS_CAP_USDT)
+                               RISK_CLAMP_HAIRCUT, YOLO_MAX_LOSS_MARGIN_FRACTION, YOLO_MIN_LOSS_CAP_USDT)
 # Portfolio delta classification shared with sync_session_state.py; PROD gates apply it to the live exchange view.
 from utils.portfolio_exposure import (compute_exposure, book_exposure, project_order, resting_opening_legs,
                                       unrealized_pnl_total, LONG_HEAVY, SHORT_HEAVY)
@@ -1551,7 +1552,8 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
     (execute_complete_trade, no explicit --margin) is sized on the same min(wallet, wallet + uPnL), so open losses
     size the order down instead of making Gate 2 reject it; an explicit margin is the user's and is not re-sized,
     except (issue #201) on a crossed trigger that enters at the current price: there the standard qty is clamped so
-    the loss at SL fits 98% of this cap (margin recomputed from the clamped qty) before Gate 2 runs.
+    the loss at SL, measured from the worse of the last price and the book side the MARKET order hits (issue #236),
+    fits RISK_CLAMP_HAIRCUT (98%) of this cap (margin recomputed from the clamped qty) before Gate 2 runs.
     Gate 0A and Gate 1 read the registry captured in the snapshot (issue #127). TESTNET skips Gate 1 and keeps the
     10000 fallback. `exchange_ticks` ({symbol: tickSize}, issue #160) caps the registry tick_size used to match
     quantity-less resting orders to their records (record_price_tolerances).
@@ -2036,6 +2038,27 @@ def _enters_at_limit(order_type, limit_price):
     return str(order_type).upper() == 'LIMIT' and bool(limit_price)
 
 
+def _crossed_entry_reference(symbol, is_long, last_price, target_env=None):
+    """Issue #236 (PROD crossed trigger): price the crossed-trigger R:R gate and the risk clamp are measured from.
+    One GET /fapi/v1/ticker/bookTicker (no retry, read only): the book side a MARKET order hits (best ask for a LONG,
+    best bid for a SHORT), kept only when it is the WORSE entry (max(ask, last) for a LONG, min(bid, last) for a
+    SHORT), so the gate is never looser than from the last price. A failed read, a non-dict answer, a missing,
+    non-finite or non-positive bid/ask, or a crossed book (ask < bid) is unavailable: last price.
+    Returns (reference_price, "book" | "last", book_side_price or None)."""
+    try:
+        book = send_signed_request('GET', '/fapi/v1/ticker/bookTicker', {'symbol': symbol}, target_env=target_env)
+    except Exception:
+        book = None
+    if not isinstance(book, dict) or _is_api_error(book):
+        return last_price, "last", None
+    bid, ask = _to_float(book.get('bidPrice')), _to_float(book.get('askPrice'))
+    # Sanity bound: both sides finite and positive, and an uncrossed book (ask >= bid).
+    if not (math.isfinite(bid) and math.isfinite(ask) and bid > 0 and ask > 0 and ask >= bid):
+        return last_price, "last", None
+    side_price = ask if is_long else bid
+    return (max(side_price, last_price) if is_long else min(side_price, last_price)), "book", side_price
+
+
 def _notional_below(qty, price, min_notional):
     """qty x price < min_notional, compared in Decimal (issue #165): a product that equals minNotional exactly is
     not below it, whatever float rounding says."""
@@ -2146,7 +2169,8 @@ def append_trade_audit_record(record, margin_usdt):
 # Issue #36: on KEYS (HMAC) the planned SL is also pre-armed at placement as a closePosition STOP_MARKET when it is
 # not crossed (prearm_resting_entry_stop); the guardian then verifies it at fill and stays the fallback.
 # Schema v2 record fields: prearm_status ("placed" | "rejected:<code-or-text>" | "skipped:mcp" |
-# "skipped:crossed"), prearm_algo_id / prearm_price (an algo id was returned), sl_close_position: true and
+# "skipped:crossed"), prearm_reject_msg (Binance msg of an API rejection, issue #232), prearm_algo_id /
+# prearm_price (an algo id was returned), sl_close_position: true and
 # sl_qty: null (verified pre-arm, covers any size). v1 records have none of them: not pre-armed.
 # Issue #156 (optional, no version bump): gate2_loss_cap_usdt (PROD Gate 2 cap at placement; bounds the drift
 # tolerance of the filled-record loss-cap re-check) and check_deferrals (consecutive runs with a deferred check).
@@ -2291,6 +2315,18 @@ def _rejection_text(res):
     return str(text)[:120] or "unknown"
 
 
+def _api_reject_msg(res):
+    """Issue #232: the Binance `msg` of an API error response (a negative numeric `code`), whitespace collapsed,
+    <= 200 chars; None otherwise. Only the message text: never the rest of the response."""
+    if not isinstance(res, dict):
+        return None
+    code = res.get('code')
+    if code is None or not str(code).lstrip('-').isdigit() or int(code) >= 0:
+        return None
+    msg = " ".join(str(res.get('msg') or '').split())[:200]
+    return msg or None
+
+
 def prearm_resting_entry_stop(symbol, exit_side, sl_price, ref_price, target_env=None, tick_size=None):
     """
     Issue #36: pre-arms the planned Stop Loss of a resting entry right after the entry is placed, as a closePosition
@@ -2302,7 +2338,8 @@ def prearm_resting_entry_stop(symbol, exit_side, sl_price, ref_price, target_env
       - sl_price is on the protective side of ref_price (the current last price; the stop has no workingType, i.e.
         CONTRACT_PRICE): below it for a SELL stop (LONG), above it for a BUY stop (SHORT).
     Never blocks the entry. Returns the v2 registry fields: {"prearm_status": "placed" | "rejected:<code-or-text>" |
-    "skipped:mcp" | "skipped:crossed"}, plus prearm_algo_id / prearm_price (the listed trigger once verified, else
+    "skipped:mcp" | "skipped:crossed"}, plus prearm_reject_msg (issue #232: the Binance msg of an API rejection,
+    <= 200 chars, absent when there is none), plus prearm_algo_id / prearm_price (the listed trigger once verified, else
     the requested sl_price) when an algo id was returned (cancelled
     with the entry) and sl_close_position: True / sl_qty: None once verified on /fapi/v1/openAlgoOrders
     (wait_for_stop_confirmation: by algo id, falling back to a trigger match within one tick; only the MARKET-entry
@@ -2328,7 +2365,11 @@ def _prearm_resting_entry_stop(symbol, exit_side, sl_price, ref_price, target_en
         placement = {"error": f"placement exception: {e}"}
     placed_id = _order_id(placement) if isinstance(placement, dict) and not _is_api_error(placement) else None
     if placed_id is None:
-        return {'prearm_status': f"rejected:{_rejection_text(placement)}"}
+        rejected = {'prearm_status': f"rejected:{_rejection_text(placement)}"}
+        reject_msg = _api_reject_msg(placement)
+        if reject_msg:
+            rejected['prearm_reject_msg'] = reject_msg   # issue #232: the status keeps only the code
+        return rejected
     fields = {'prearm_algo_id': placed_id, 'prearm_price': sl_price}
     verified, info = wait_for_stop_confirmation(symbol, exit_side, sl_price, algo_id=placed_id, tick_size=tick_size,
                                                 target_env=target_env)
@@ -2346,7 +2387,8 @@ def _prearm_note(prearm, sl_price):
     if status == 'rejected:unverified':
         return (f"Stop Loss pre-arm may exist (unverified, algo id {prearm.get('prearm_algo_id')}); the guardian "
                 "verifies or places it at fill. ")
-    return f"Stop Loss not pre-armed ({status}). "
+    reject_msg = prearm.get('prearm_reject_msg')   # issue #232: Binance message of the rejection, when present
+    return f"Stop Loss not pre-armed ({status}). " + (f'Binance message: "{reject_msg}". ' if reject_msg else "")
 
 
 def _prearm_anomaly(prearm):
@@ -4015,19 +4057,30 @@ def execute_complete_trade(
     # Crossed-trigger R:R gate (issue #165, PROD): a trigger already crossed sends the order in at the current price
     # (MARKET dispatch: anything but a LIMIT with a limit price, _enters_at_limit), so R:R to TP2 is re-measured from
     # it (Decimal on the submitted prices). A LIMIT with a price enters at that price and is not concerned. TESTNET
-    # only warns.
+    # only warns. Issue #236 (PROD): the gate and the risk clamp (1e) are measured from gate_ref, the worse of the last
+    # price and the book side the MARKET order hits (_crossed_entry_reference; last when the book is unavailable),
+    # with signed distances, so a TP2 or SL on the wrong side of gate_ref rejects. effective_entry is not changed.
+    # Defaulted levels (no SL/TP given: 2% / 6% from the entry) can land just below 3.0 after tick rounding (a LONG:
+    # round_price rounds down, the SL away from the entry and TP2 towards it); such an order rejects (fail closed).
     crossed_market_entry = trigger_p is not None and trigger_breached and not limit_entry
+    gate_ref, entry_reference, book_side_price = effective_entry, None, None
+    if crossed_market_entry and is_prod:
+        gate_ref, entry_reference, book_side_price = _crossed_entry_reference(symbol, is_long, effective_entry,
+                                                                              target_env=target_env)
     if crossed_market_entry:
-        risk_dist = abs(Decimal(str(effective_entry)) - Decimal(str(sl_p)))
-        reward_dist = abs(Decimal(str(tp2_p)) - Decimal(str(effective_entry)))
+        d_ref, d_sl, d_tp2 = Decimal(str(gate_ref)), Decimal(str(sl_p)), Decimal(str(tp2_p))
+        risk_dist = (d_ref - d_sl) if is_long else (d_sl - d_ref)
+        reward_dist = (d_tp2 - d_ref) if is_long else (d_ref - d_tp2)
         crossed_rr = (reward_dist / risk_dist) if risk_dist > 0 and reward_dist > 0 else None
         if crossed_rr is None or crossed_rr < Decimal(str(MIN_RR_TP2_CROSSED)):
             # Truncated (never rounded up to a passing-looking 3.000)
             rr_txt = (f"{crossed_rr.quantize(Decimal('0.001'), rounding=ROUND_DOWN)}:1" if crossed_rr is not None
-                      else "undefined (zero distance)")
-            rr_msg = (f"Trigger {trigger_p} already crossed (current price {cur_price}): the order would enter at the "
-                      f"current price, and R:R to TP2 from there is {rr_txt} (SL {sl_p}, TP2 {tp2_p}), below the "
-                      f"{MIN_RR_TP2_CROSSED}:1 minimum.")
+                      else "undefined (zero or wrong-side distance)")
+            book_txt = (f", measured from the best {'ask' if is_long else 'bid'} {gate_ref}"
+                        if entry_reference == "book" and gate_ref != effective_entry else "")
+            rr_msg = (f"Trigger {trigger_p} already crossed (current price {cur_price}{book_txt}): the order would "
+                      f"enter at the current price, and R:R to TP2 from there is {rr_txt} (SL {sl_p}, TP2 {tp2_p}), "
+                      f"below the {MIN_RR_TP2_CROSSED}:1 minimum.")
             if is_prod:
                 return {"success": False, "hard_gate_rejection": True,
                         "error": (f"MECHANICAL HARD GATE REJECTION: {rr_msg} Re-plan the levels from the current "
@@ -4104,8 +4157,8 @@ def execute_complete_trade(
 
     # 1e. Risk-cap clamp (issue #201, PROD standard order with an explicit margin and a crossed trigger): the margin was
     # sized for the trigger, but the order enters at the current price, further from the SL. The qty is capped so the
-    # loss at SL fits the Gate 2 cap (monetary_loss_cap on Gate 2's inputs) less a 2% haircut for Gate 2's own equity
-    # re-read. Gate 2 still runs unchanged.
+    # loss at SL from gate_ref (issue #236: the worse of last and the book side) fits the Gate 2 cap (monetary_loss_cap
+    # on Gate 2's inputs) x RISK_CLAMP_HAIRCUT, a haircut for Gate 2's own equity re-read. Gate 2 still runs unchanged.
     clamp_max_qty = None
     clamp_cap = None
     if crossed_market_entry and is_prod and not is_yolo and not margin_defaulted:
@@ -4118,7 +4171,8 @@ def execute_complete_trade(
         clamp_cap = monetary_loss_cap(float(account_equity), prof, is_testnet=False, is_yolo=False,
                                       ref=effective_entry, total_qty=0.0, leverage=leverage,
                                       unrealized=clamp_unrealized)[0]
-        clamp_max_qty = round_step(clamp_cap * 0.98 / abs(effective_entry - sl_p), filters['stepSize'],
+        # gate_ref - SL is > 0 here: the crossed R:R gate above rejected a zero or wrong-side distance in PROD.
+        clamp_max_qty = round_step(clamp_cap * RISK_CLAMP_HAIRCUT / abs(gate_ref - sl_p), filters['stepSize'],
                                    filters['precision_qty'])
 
     min_notional = filters.get('minNotional', 5.0)
@@ -4129,18 +4183,20 @@ def execute_complete_trade(
     def size_entry(lev):
         """Entry qty from margin x lev at the effective entry, capped at clamp_max_qty (issue #201), with the one-step
         minNotional bump (never above the clamp). Quantities vs minNotional compare in Decimal (issue #165).
-        Returns (total_qty, clamped, unclamped_qty, error_result or None)."""
+        `clamped` compares the step-rounded quantities (issue #236): an excess of less than one step is not a clamp.
+        The minQty / minNotional rejects, clamped or not, are local exchange-filter rejects with no
+        hard_gate_rejection flag (issue #236: one shape for all of them). Returns (total_qty, clamped, unclamped_qty, error_result or None)."""
         raw_qty = margin_usdt * lev / effective_entry
         unclamped_qty = round_step(raw_qty, filters['stepSize'], filters['precision_qty'])
-        clamped = clamp_max_qty is not None and raw_qty > clamp_max_qty
+        clamped = clamp_max_qty is not None and clamp_max_qty < unclamped_qty
         qty = clamp_max_qty if clamped else unclamped_qty
         if _notional_below(qty, notional_ref, min_notional) and not clamped:
             bumped_qty = round_step(qty + filters['stepSize'], filters['stepSize'], filters['precision_qty'])
             if not _notional_below(bumped_qty, notional_ref, min_notional) and (
                     clamp_max_qty is None or bumped_qty <= clamp_max_qty):
                 qty = bumped_qty
-        clamp_note = (f" after the Gate 2 risk clamp (qty {unclamped_qty} -> {qty}: the loss at SL from the current "
-                      f"price {effective_entry} must fit the cap)") if clamped else ""
+        clamp_note = (f" after the Gate 2 risk clamp (qty {unclamped_qty} -> {qty}: the loss at SL from the reference "
+                      f"price {gate_ref} ({entry_reference}) must fit the cap)") if clamped else ""
         if qty < filters['minQty']:
             return qty, clamped, unclamped_qty, {
                 "success": False,
@@ -4198,7 +4254,8 @@ def execute_complete_trade(
         # Issue #126 invariant: the margin recorded (pending / audit) stays qty x price / leverage
         margin_usdt = round(total_qty * effective_entry / effective_leverage, 8)
         print(f"[RISK CLAMP] qty {unclamped_qty} -> {total_qty} to fit the Gate 2 cap (crossed trigger {trigger_p}, "
-              f"entry at {effective_entry}, SL {sl_p}, loss cap {clamp_cap:.4f} USDT x 0.98; margin now "
+              f"entry at {effective_entry}, measured from {gate_ref} ({entry_reference}), SL {sl_p}, loss cap "
+              f"{clamp_cap:.4f} USDT x {RISK_CLAMP_HAIRCUT}; margin now "
               f"{margin_usdt} USDT)", file=sys.stderr)
 
     # 4. MECHANICAL HARD GATES VERIFICATION (incl. liquidation gate with the confirmed effective leverage)
@@ -4315,6 +4372,8 @@ def execute_complete_trade(
                                     "verifies the stop; unfilled after "
                                     f"{PENDING_ENTRY_TIMEOUT_SECONDS // 60} min it is cancelled.")
                     }
+                    if prearm.get('prearm_reject_msg'):
+                        result["prearm_reject_msg"] = prearm['prearm_reject_msg']   # issue #232
                     # Issue #157: a rejected / unverified pre-arm is reported (the entry is kept).
                     anomaly = _prearm_anomaly(prearm)
                     if anomaly:
@@ -4384,6 +4443,8 @@ def execute_complete_trade(
         }
         if prearm:
             result.update(prearm_status=prearm['prearm_status'], prearm_algo_id=prearm.get('prearm_algo_id'))
+            if prearm.get('prearm_reject_msg'):
+                result["prearm_reject_msg"] = prearm['prearm_reject_msg']   # issue #232
             anomaly = _prearm_anomaly(prearm)   # issue #157: reported, the entry is kept
             if anomaly:
                 result["prearm_anomaly"] = anomaly
@@ -4552,6 +4613,14 @@ def execute_complete_trade(
         }
         record.update(score_audit_fields(score_meta))
         record['daily_loss_gate'] = daily_state  # issue #207: the gate state this entry passed
+        if crossed_market_entry and is_prod:
+            # Issue #236: the reference the crossed R:R gate and the risk clamp were measured from ("book" / "last"),
+            # the book side read (if any) and the realized entry slippage vs the reference in % (> 0 = filled worse).
+            slip = (actual_entry_price - gate_ref) if is_long else (gate_ref - actual_entry_price)
+            record.update(entry_reference=entry_reference, entry_reference_price=gate_ref,
+                          entry_slippage_pct=round(slip / gate_ref * 100.0, 6))
+            if book_side_price is not None:
+                record['book_side_price'] = book_side_price
         if profile_unreadable:
             record['profile_unreadable'] = True  # round 4: sized and gated on the default profile
         append_trade_audit_record(record, margin_usdt)

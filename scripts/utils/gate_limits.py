@@ -27,3 +27,7 @@ MIN_TP1_DISTANCE = 0.0035
 # Crossed-trigger R:R gate (PROD, issue #165): when the trigger is already crossed at execution time, the order
 # enters at the current price; R:R to TP2 from that price (|TP2 - price| / |price - SL|) must be at least this.
 MIN_RR_TP2_CROSSED = 3.0
+
+# Crossed-trigger risk clamp (PROD, issue #201): an explicit standard margin is clamped so the loss at SL fits this
+# fraction of the Gate 2 loss cap; the 2% haircut absorbs Gate 2's own equity re-read (issue #236).
+RISK_CLAMP_HAIRCUT = 0.98
