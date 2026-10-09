@@ -23,13 +23,15 @@ from unittest.mock import patch
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS_DIR = os.path.join(BASE_DIR, "scripts")
 HOOKS_DIR = os.path.join(SCRIPTS_DIR, "hooks")
-for _p in (SCRIPTS_DIR, HOOKS_DIR):
+TESTS_DIR = os.path.join(BASE_DIR, "tests")
+for _p in (SCRIPTS_DIR, HOOKS_DIR, TESTS_DIR):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
 import pre_trade_guard  # noqa: E402
 import post_trade_sync  # noqa: E402
 from utils import dossier_provenance as dp  # noqa: E402
+from dossier_checklist_fixture import checklist_for  # noqa: E402  (the PROD gate re-checks it, issue #223)
 
 GUARD_SCRIPT = os.path.join(HOOKS_DIR, "pre_trade_guard.py")
 DEAD_PROXY = "http://127.0.0.1:9"
@@ -116,11 +118,12 @@ class GuardHarness(unittest.TestCase):
         created = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         cand = {"symbol": symbol, "direction": direction, "tier": "Tier S", "leverage": 3, "score": 85}
         cand.update(extra or {})
-        block = json.dumps({"status": "APPROVED", "summary": "test", "approved_candidates": [cand]})
+        payload = {"status": "APPROVED", "summary": "test", "approved_candidates": [cand]}
+        block = json.dumps(payload)
         steps = [
             {"source": "SYSTEM", "type": "USER_INPUT", "content": f"Subagent invoked sender={parent}", "step_index": 0},
             {"source": "MODEL", "type": "PLANNER_RESPONSE", "step_index": 1, "created_at": created,
-             "content": f"Master Dossier\n<dossier_json>\n{block}\n</dossier_json>"},
+             "content": f"Master Dossier\n{checklist_for(payload)}<dossier_json>\n{block}\n</dossier_json>"},
         ]
         transcript = os.path.join(conv_dir, "transcript.jsonl")
         with open(transcript, "w", encoding="utf-8") as f:
@@ -426,10 +429,12 @@ class TestDossierProvenance(GuardHarness):
         conv_dir = os.path.join(self.brain, EVALUATOR_CONV_ID, ".system_generated", "logs")
         os.makedirs(conv_dir, exist_ok=True)
         created = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        block = json.dumps({"status": "APPROVED", "target_env": "PROD", "summary": "test",
-                            "approved_candidates": [{"symbol": "BTCUSDT", "direction": "LONG", "tier": "Tier S",
-                                                     "leverage": 3, "score": 85}]})
-        message = "Master Dossier — régimen σ\n" * 30 + f"<dossier_json>\n{block}\n</dossier_json>"
+        payload = {"status": "APPROVED", "target_env": "PROD", "summary": "test",
+                   "approved_candidates": [{"symbol": "BTCUSDT", "direction": "LONG", "tier": "Tier S",
+                                            "leverage": 3, "score": 85}]}
+        block = json.dumps(payload)
+        message = ("Master Dossier — régimen σ\n" * 30 + checklist_for(payload)
+                   + f"<dossier_json>\n{block}\n</dossier_json>")
         encoded = json.dumps(message, ensure_ascii=False)
         removed = len(encoded.encode("utf-8")) - len(encoded[:50].encode("utf-8"))
         system = {"source": "SYSTEM", "type": "USER_INPUT", "content": f"Subagent invoked sender={PARENT_CONV_ID}",

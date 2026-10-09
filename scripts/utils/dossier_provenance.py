@@ -27,8 +27,9 @@ Every consumer (pre_trade_guard.py hook, execute_futures_trade.py) re-verifies t
 the transcript before allowing an order, so a dossier typed by the main agent is rejected.
 
 Single source of truth for dossier validation: validate_dossier_for_trade().
-check_precondition_checklist() compares the evaluator's visible checklist with its block; only the recorder
-calls it (record time), using the extraction's final_text, which is never stored nor hashed.
+check_precondition_checklist() compares the evaluator's visible checklist with its block, using the extraction's
+final_text, which is never stored nor hashed: the recorder calls it at record time, and rebuild_verified_record
+re-runs it on the re-extracted transcript at trade time for APPROVED dossiers (PROD, require_provenance).
 """
 
 import datetime
@@ -499,7 +500,7 @@ def extract_dossier_from_transcript(path: str) -> Dict[str, Any]:
         "sha256": sha256_text(raw),
         "dossier": dossier,
         # Message carrying the block (resolved text for truncated rows), for check_precondition_checklist at
-        # record time. Never stored in the record nor hashed.
+        # record and trade time. Never stored in the record nor hashed.
         "final_text": final_text,
         "step_index": step.get("step_index"),
         "created_at_ts": _parse_created_at(step.get("created_at")),
@@ -703,14 +704,34 @@ def normalize_status(status: Any) -> Tuple[str, bool]:
 
 
 # =============================================================================
-# Precondition Checklist vs dossier (issue #27, checked by record_evaluation.py at record time only)
+# Precondition Checklist vs dossier (issue #27; record time in record_evaluation.py, trade time in
+# rebuild_verified_record, issue #223)
 # =============================================================================
 CHECKLIST_HEADING_RE = re.compile(r"^\s*##\s+Precondition Checklist\s*$")
 CHECKLIST_END_RE = re.compile(r"^\s*#{1,2}\s|<dossier_json>")
 C42_LINE_RE = re.compile(r"C4\.2 Overall status:.*->\s*(\S+)")
 CANDIDATE_CHECK_RE = re.compile(
-    r"^\s*-\s*\[([ xX])\]\s+(\S+)\s+(\S+)(?:\s+\(YOLO\))?\s+(K1|K2|K3|K4|C3\.1)(?=\s|$)")
+    r"^\s*-\s*\[([ xX])\]\s+(\S+)\s+(\S+)(?:\s+\(YOLO\))?\s+(K1|K2|K3|K4|C3\.1)(?=\s|$)(.*)$")
 APPROVED_CANDIDATE_CHECKS = ("K1", "K2", "K3", "K4", "C3.1")
+APPROVED_K4_RESULTS = ("APPROVED", "DOWNGRADED")
+CHECKLIST_TOKEN_STRIP = ".,;:!?()[]*`'\""
+
+
+K4_VERDICTS = APPROVED_K4_RESULTS + ("REJECTED",)
+
+
+def _k4_result_token(rest: str) -> str:
+    """K4 verdict of a checklist line, from the first word (punctuation stripped, upper-cased) after each '->'.
+    REJECTED after any '->' wins (fail closed: no approved K4 line names it). Otherwise the last APPROVED or
+    DOWNGRADED, so arrows in the evidence or the tier note ('-> DOWNGRADED (Tier A+ -> A)') do not hide it.
+    No verdict: the word after the last '->' ('' if none)."""
+    tokens = []
+    for part in rest.split("->")[1:]:
+        words = part.split()
+        tokens.append(words[0].strip(CHECKLIST_TOKEN_STRIP).upper() if words else "")
+    if "REJECTED" in tokens:
+        return "REJECTED"
+    return next((t for t in reversed(tokens) if t in K4_VERDICTS), tokens[-1] if tokens else "")
 
 
 def check_precondition_checklist(text: str, dossier: dict) -> list:
@@ -719,7 +740,10 @@ def check_precondition_checklist(text: str, dossier: dict) -> list:
     Region: from the heading to the next '# '/'## ' heading, the <dossier_json> block or the end of the text.
     Rules: exactly one 'C4.2 Overall status: ... -> <STATUS>' line whose status equals the dossier status (both
     normalized with normalize_status); every approved candidate has '[x]' K1, K2, K3, K4 and C3.1 lines prefixed
-    exactly '<SYMBOL> <DIRECTION>' (optionally '(YOLO)'). Lines of other candidates and other ids are ignored."""
+    exactly '<SYMBOL> <DIRECTION>' (optionally '(YOLO)'), and every K4 line of it has the verdict '-> APPROVED ...'
+    or '-> DOWNGRADED ...' (_k4_result_token; REJECTED, PASS or no verdict is a problem). Lines of other
+    candidates and other ids are ignored. Called by record_evaluation.py (record time) and, in PROD, by
+    rebuild_verified_record (trade time)."""
     lines = str(text or "").splitlines()
     start = next((i for i, line in enumerate(lines) if CHECKLIST_HEADING_RE.match(line)), None)
     if start is None:
@@ -737,17 +761,20 @@ def check_precondition_checklist(text: str, dossier: dict) -> list:
     if len(c42) != 1:
         problems.append(f"expected exactly one 'C4.2 Overall status' line in the checklist, found {len(c42)}")
     else:
-        token = c42[0].group(1).strip(".,;:!?()[]*`'\"")
+        token = c42[0].group(1).strip(CHECKLIST_TOKEN_STRIP)
         c42_status = normalize_status(token)[0]
         if c42_status != status:
             problems.append(f"C4.2 Overall status '{token}' does not match the dossier status '{status}'")
 
     marks = {}
+    k4_results = {}
     for line in region:
         m = CANDIDATE_CHECK_RE.match(line)
         if m:
             key = (m.group(2).upper(), m.group(3).upper(), m.group(4))
             marks.setdefault(key, []).append(m.group(1).lower() == "x")
+            if m.group(4) == "K4":
+                k4_results.setdefault(key[:2], []).append(_k4_result_token(m.group(5)))
     candidates = dossier.get("approved_candidates")
     for cand in candidates if isinstance(candidates, list) else []:
         if not isinstance(cand, dict):
@@ -762,6 +789,10 @@ def check_precondition_checklist(text: str, dossier: dict) -> list:
                 problems.append(f"approved {symbol} {direction}: no {check} line in the checklist")
             elif not all(seen):
                 problems.append(f"approved {symbol} {direction}: {check} is not checked [x]")
+        for token in k4_results.get((symbol, direction), []):
+            if token not in APPROVED_K4_RESULTS:
+                problems.append(f"approved {symbol} {direction}: K4 result '{token or 'MISSING'}' is not "
+                                f"APPROVED or DOWNGRADED")
     return problems
 
 
@@ -853,7 +884,9 @@ def _verdict_fingerprint(record: dict) -> tuple:
 def rebuild_verified_record(record: dict) -> Tuple[bool, str, Optional[dict]]:
     """Re-reads the subagent transcript, checks the stored hash, and rebuilds the record from what the
     evaluator actually emitted. Any hand edit to verdict fields (status, symbols, directions, timestamps)
-    makes the stored record differ from the rebuilt one and fails verification."""
+    makes the stored record differ from the rebuilt one and fails verification. An APPROVED dossier also
+    needs a consistent Precondition Checklist in the message carrying its block (check_precondition_checklist);
+    there is no legacy exemption (records expire after TTL_SECONDS)."""
     prov = record.get("provenance")
     if not isinstance(prov, dict) or prov.get("source") not in SUBAGENT_SOURCES:
         return False, (
@@ -892,6 +925,12 @@ def rebuild_verified_record(record: dict) -> Tuple[bool, str, Optional[dict]]:
     rebuilt = build_record_from_extraction(extracted, record.get("recorded_at_ts"))
     if _verdict_fingerprint(rebuilt) != _verdict_fingerprint(record):
         return False, "Dossier verdict fields differ from what the evaluator subagent emitted (edited record).", None
+    # Trade-time re-check of the evaluator's checklist (issue #223): also catches a record that skipped the
+    # recorder (e.g. a placed file pointing at a real transcript). REJECTED/NEUTRAL authorize nothing.
+    if rebuilt.get("status") == "APPROVED":
+        problems = check_precondition_checklist(extracted.get("final_text") or "", extracted.get("dossier") or {})
+        if problems:
+            return False, f"precondition checklist inconsistent: {'; '.join(problems)}", None
     return True, "Provenance verified against evaluator transcript.", rebuilt
 
 
@@ -928,7 +967,8 @@ def validate_dossier_for_trade(
     """
     Single gate used by the PreToolUse hook and the execution engine.
     PROD (require_provenance=True): schema v2, signed by isolated_market_evaluator, provenance hash
-    verified against the subagent transcript, fresh (< TTL since the evaluator emitted it), APPROVED,
+    verified against the subagent transcript (whose checklist must agree with the block, issue #223),
+    fresh (< TTL since the evaluator emitted it), APPROVED,
     symbol approved, and direction equal to the approved candidate direction.
     TESTNET: provenance and direction are only enforced when present.
     Returns (ok, reason, candidate).

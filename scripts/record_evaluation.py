@@ -19,9 +19,10 @@ stores a provenance stamp (source, transcript path, step, sha256) that every con
 Claude Code transcripts must carry agentType "isolated_market_evaluator" in their meta.json.
 Truncated agy rows are resolved from transcript_full.jsonl (paired by step_index; dossier_provenance.py).
 The message carrying the block must hold a '## Precondition Checklist' consistent with it (C4.2 = status,
-K1-K4 and C3.1 checked for every approved candidate; dossier_provenance.check_precondition_checklist):
-an inconsistent APPROVED dossier is refused in PROD (exit 2) and recorded with a warning in TESTNET;
-REJECTED/NEUTRAL dossiers are always recorded, with a warning.
+K1-K4 and C3.1 checked and K4 APPROVED/DOWNGRADED for every approved candidate;
+dossier_provenance.check_precondition_checklist): an inconsistent APPROVED dossier is refused in PROD (exit 2)
+and recorded with a warning in TESTNET; REJECTED/NEUTRAL dossiers are always recorded, with a warning.
+The PROD trade gate re-runs the same check on the transcript (dossier_provenance.rebuild_verified_record).
 Dossiers typed by hand are NOT accepted in PROD.
 
 Legacy manual paths (TESTNET only, stored as schema_version 1 / source "manual_testnet"):
