@@ -18,6 +18,13 @@ snapshot of the blocking positions / resting entries ("blockers") and of the who
 logs/pending_entries.json, logs/session_state.json and logs/trades_audit.jsonl. Report-only: nothing here gates an
 order. Regret and the policy replay are computed in scripts/shadow_analytics.py.
 
+Hook denials (issue #261): when pre_trade_guard.py denies a dossier-approved candidate on the Delta-Neutral gate it
+appends one event to logs/gate_denials.jsonl (its own ground-truth log: dossier prices / score / sha and the cached
+book, source session_state_cache). register_from_gate_denials (run first by --register-from-eval, i.e. at every
+record_evaluation.py) turns recent events into DELTA_GATE_POST_APPROVAL rows (gate_source "hook_denial", blockers
+and book via book_from_sources, registered_at_ts = the denial time), once per dossier_sha256 + symbol + direction.
+Denials by the executor's own Gate 1 (live book) are not recorded.
+
 Usage:
   python3 scripts/shadow_tracker.py --register-from-eval
   python3 scripts/shadow_tracker.py --audit
@@ -30,6 +37,7 @@ import json
 import time
 import datetime
 import argparse
+import collections
 import urllib.request
 from typing import Dict, Any, List, Optional
 
@@ -45,13 +53,18 @@ BRIEF_FILE = os.path.join(LOGS_DIR, "primed_brief.json")
 PENDING_ENTRIES_FILE = os.path.join(LOGS_DIR, "pending_entries.json")
 SESSION_STATE_FILE = os.path.join(LOGS_DIR, "session_state.json")
 TRADES_AUDIT_FILE = os.path.join(LOGS_DIR, "trades_audit.jsonl")
+GATE_DENIALS_FILE = os.path.join(LOGS_DIR, "gate_denials.jsonl")
 
 # Typed rejection reasons of the dossier's rejected_candidates (issue #251). K5 squeeze risk only caps a tier.
+# DELTA_GATE_POST_APPROVAL (issue #261) is assigned by the hook's denial log, never by the evaluator.
 GATE_ENUM = ("DELTA_GATE", "MACRO_SHORT", "DUPLICATE_RESTING", "DRY_VOLUME", "FRICTION", "CATALYST_DOWNGRADE",
-             "UNREADABLE_BOOK", "DAILY_LOSS_GATE", "OTHER")
+             "UNREADABLE_BOOK", "DAILY_LOSS_GATE", "OTHER", "DELTA_GATE_POST_APPROVAL")
 GATE_FALLBACK = "OTHER"
-BLOCKER_GATES = ("DELTA_GATE", "DUPLICATE_RESTING")
+POST_APPROVAL_GATE = "DELTA_GATE_POST_APPROVAL"
+BLOCKER_GATES = ("DELTA_GATE", "DUPLICATE_RESTING", POST_APPROVAL_GATE)
 GATE_DETAIL_MAX_CHARS = 300
+GATE_DENIAL_MAX_AGE_SECONDS = 86400  # older events would expire at once in the kline audit (24 h)
+GATE_DENIAL_TAIL_LINES = 500
 
 # Intraday Desk Constraints & Statistical Hygiene
 MAX_TRIGGER_WAIT_SECONDS = 5400    # 90 min max to breach trigger (matches limit cancellation rule)
@@ -113,15 +126,18 @@ def register_shadow_trade(
     gate_source: Optional[str] = None,
     score: Optional[float] = None,
     dossier_sha256: Optional[str] = None,
-    extra: Optional[dict] = None
+    extra: Optional[dict] = None,
+    registered_at_ts: Optional[int] = None
 ) -> Optional[dict]:
     """Registers a rejected setup into shadow_trades.jsonl if not already active.
     With dossier_sha256: at most one row per (dossier_sha256, symbol, direction), also after it resolved (issue #251);
-    without it: no second active/pending row for the symbol within 60 minutes. extra: additional row keys (blockers)."""
+    without it: no second active/pending row for the symbol within 60 minutes. extra: additional row keys (blockers).
+    registered_at_ts: the rejection's own time when it is registered later (issue #261: the kline audit starts
+    there), else now."""
     os.makedirs(LOGS_DIR, exist_ok=True)
     existing = load_jsonl(SHADOW_TRADES_FILE)
 
-    now_ts = int(time.time())
+    now_ts = int(registered_at_ts) if registered_at_ts else int(time.time())
     if dossier_sha256:
         key = (dossier_sha256, symbol.upper().strip(), direction.upper().strip())
         for t in existing + load_jsonl(SHADOW_RESOLVED_FILE):
@@ -134,7 +150,7 @@ def register_shadow_trade(
                 if now_ts - t.get("registered_at_ts", 0) < 3600:
                     return None
 
-    now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    now_utc = datetime.datetime.fromtimestamp(now_ts, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     trade_id = f"shadow_{symbol}_{now_ts}"
 
     trade = {
@@ -240,23 +256,65 @@ def _env_name(value) -> str:
     return "prod" if v == "mainnet" else v
 
 
-def _latest_audit_by_symbol(path: str) -> Dict[str, dict]:
-    """Latest non-event entry record (with total_qty) per symbol of logs/trades_audit.jsonl (missing file: {})."""
+def _latest_audit_by_symbol(path: str, until_ts: Optional[float] = None) -> Dict[str, dict]:
+    """Latest non-event entry record (with total_qty) per symbol of logs/trades_audit.jsonl (missing file: {});
+    with until_ts, records timestamped later are ignored (a later trade is not the blocker of an older event)."""
     latest: Dict[str, dict] = {}
     for rec in load_jsonl(path):
         if isinstance(rec, dict) and not rec.get("event") and "total_qty" in rec and rec.get("symbol"):
+            ts = _to_float(rec.get("timestamp"))
+            if until_ts is not None and ts is not None and ts > until_ts:
+                continue
             latest[str(rec["symbol"]).upper()] = rec
     return latest
 
 
+def book_from_sources(state: dict, entries: dict, audit: Dict[str, dict], target_env: Optional[str] = None) -> list:
+    """Book items (pure, no file reads; issue #261 builds the hook's denial book with it): active_positions of the session state and the
+    resting entries of the registry's "entries" dict (of target_env when given; a symbol with an open position counts
+    as the position, as in sync_session_state), each as {symbol, direction, kind: "position" | "resting", score,
+    entry_id, notional, since_ts, audit_ts}. Resting score: score_meta.score (else dossier_score); position score /
+    audit_ts: audit[symbol] (the latest trades_audit.jsonl entry record) in the same direction, else None."""
+    items = []
+    open_symbols = set()
+    for p in state.get("active_positions") or []:
+        if not isinstance(p, dict) or not p.get("symbol"):
+            continue
+        sym = str(p["symbol"]).upper()
+        direction = str(p.get("direction") or "").upper()
+        open_symbols.add(sym)
+        rec = audit.get(sym)
+        if rec is not None and str(rec.get("direction") or "").upper() != direction:
+            rec = None
+        items.append({"symbol": sym, "direction": direction, "kind": "position",
+                      "score": _to_float(rec.get("score")) if rec else None,
+                      "entry_id": None if p.get("entry_order_id") is None else str(p.get("entry_order_id")),
+                      "notional": _to_float(p.get("notional_usdt")),
+                      "since_ts": _to_float(p.get("entry_time_ts")),
+                      "audit_ts": _to_float(rec.get("timestamp")) if rec else None})
+    for rec in entries.values():
+        if not isinstance(rec, dict) or not rec.get("symbol"):
+            continue
+        if target_env and rec.get("target_env") and _env_name(rec.get("target_env")) != _env_name(target_env):
+            continue
+        sym = str(rec["symbol"]).upper()
+        if sym in open_symbols:
+            continue
+        meta = rec.get("score_meta") if isinstance(rec.get("score_meta"), dict) else {}
+        score = _to_float(meta.get("score"))
+        price, qty = _to_float(rec.get("trigger_or_limit_price")), _to_float(rec.get("total_qty"))
+        items.append({"symbol": sym, "direction": str(rec.get("direction") or "").upper(), "kind": "resting",
+                      "score": score if score is not None else _to_float(meta.get("dossier_score")),
+                      "entry_id": None if rec.get("entry_id") is None else str(rec.get("entry_id")),
+                      "notional": abs(price * qty) if price is not None and qty is not None else None,
+                      "since_ts": _to_float(rec.get("placed_at_ts")), "audit_ts": None})
+    return items
+
+
 def snapshot_book(target_env: Optional[str] = None) -> dict:
-    """Best-effort snapshot of the book at registration time (issue #251), read-only:
-    resting entries of logs/pending_entries.json (of target_env when given; a symbol with an open position counts as
-    the position, as in sync_session_state) and active_positions of logs/session_state.json, each as
-    {symbol, direction, kind: "position" | "resting", score, entry_id, notional, since_ts, audit_ts}. Resting score:
-    score_meta.score (else dossier_score); position score / audit_ts: the latest trades_audit.jsonl entry record of
-    the symbol in the same direction, else None. A missing file is an empty source. Any read error: {"items": [],
-    "error": "..."}; never raises."""
+    """Best-effort snapshot of the book at registration time (issue #251), read-only: book_from_sources over
+    logs/session_state.json, logs/pending_entries.json and logs/trades_audit.jsonl. A missing file is an empty source.
+    Any read error: {"items": [], "error": "..."}; never raises."""
     try:
         state = {}
         if os.path.exists(SESSION_STATE_FILE):
@@ -274,59 +332,106 @@ def snapshot_book(target_env: Optional[str] = None) -> dict:
             if not isinstance(data, dict) or not isinstance(data.get("entries"), dict):
                 raise ValueError("pending entries registry malformed")
             entries = data["entries"]
-        audit = _latest_audit_by_symbol(TRADES_AUDIT_FILE)
-
-        items = []
-        open_symbols = set()
-        for p in state.get("active_positions") or []:
-            if not isinstance(p, dict) or not p.get("symbol"):
-                continue
-            sym = str(p["symbol"]).upper()
-            direction = str(p.get("direction") or "").upper()
-            open_symbols.add(sym)
-            rec = audit.get(sym)
-            if rec is not None and str(rec.get("direction") or "").upper() != direction:
-                rec = None
-            items.append({"symbol": sym, "direction": direction, "kind": "position",
-                          "score": _to_float(rec.get("score")) if rec else None,
-                          "entry_id": None if p.get("entry_order_id") is None else str(p.get("entry_order_id")),
-                          "notional": _to_float(p.get("notional_usdt")),
-                          "since_ts": _to_float(p.get("entry_time_ts")),
-                          "audit_ts": _to_float(rec.get("timestamp")) if rec else None})
-        for rec in entries.values():
-            if not isinstance(rec, dict) or not rec.get("symbol"):
-                continue
-            if target_env and rec.get("target_env") and _env_name(rec.get("target_env")) != _env_name(target_env):
-                continue
-            sym = str(rec["symbol"]).upper()
-            if sym in open_symbols:
-                continue
-            meta = rec.get("score_meta") if isinstance(rec.get("score_meta"), dict) else {}
-            score = _to_float(meta.get("score"))
-            price, qty = _to_float(rec.get("trigger_or_limit_price")), _to_float(rec.get("total_qty"))
-            items.append({"symbol": sym, "direction": str(rec.get("direction") or "").upper(), "kind": "resting",
-                          "score": score if score is not None else _to_float(meta.get("dossier_score")),
-                          "entry_id": None if rec.get("entry_id") is None else str(rec.get("entry_id")),
-                          "notional": abs(price * qty) if price is not None and qty is not None else None,
-                          "since_ts": _to_float(rec.get("placed_at_ts")), "audit_ts": None})
+        items = book_from_sources(state, entries, _latest_audit_by_symbol(TRADES_AUDIT_FILE), target_env)
         return {"items": items, "error": None, "session_state_ts": _to_float(state.get("last_updated_ts"))}
     except Exception as e:
         return {"items": [], "error": f"{type(e).__name__}: {e}"[:200], "session_state_ts": None}
 
 
 def blockers_for(gate: str, symbol: str, direction: str, book: dict) -> List[dict]:
-    """The snapshot items that block a candidate: DELTA_GATE -> same direction; DUPLICATE_RESTING -> same symbol."""
+    """The snapshot items that block a candidate: DELTA_GATE / DELTA_GATE_POST_APPROVAL -> same direction;
+    DUPLICATE_RESTING -> same symbol."""
     items = book.get("items") or []
-    if gate == "DELTA_GATE":
+    if gate in ("DELTA_GATE", POST_APPROVAL_GATE):
         return [dict(i) for i in items if i.get("direction") == direction]
     if gate == "DUPLICATE_RESTING":
         return [dict(i) for i in items if i.get("symbol") == symbol]
     return []
 
+
+def _trimmed_book(items: list) -> list:
+    return [{k: i.get(k) for k in ("symbol", "direction", "kind", "score", "notional", "since_ts", "entry_id")}
+            for i in items]
+
+
+def _register_gate_denial(ev, now_ts: int, seen: set) -> Optional[dict]:
+    """One logs/gate_denials.jsonl event -> a DELTA_GATE_POST_APPROVAL shadow row (None when skipped)."""
+    if not isinstance(ev, dict) or ev.get("gate") != POST_APPROVAL_GATE:
+        return None
+    ts = _to_float(ev.get("ts"))
+    if ts is None or ts > now_ts + 300 or now_ts - ts > GATE_DENIAL_MAX_AGE_SECONDS:
+        return None
+    sym = str(ev.get("symbol") or "").upper().strip()
+    direction = str(ev.get("direction") or "").upper().strip()
+    prices = [_to_float(ev.get(k)) for k in ("entry", "stop_loss", "tp1", "tp2")]
+    if not sym or direction not in ("LONG", "SHORT") or any(p is None or p <= 0 for p in prices):
+        return None
+    sha = ev.get("dossier_sha256") if isinstance(ev.get("dossier_sha256"), str) and ev.get("dossier_sha256") else None
+    if sha and (sha, sym, direction) in seen:
+        return None
+    env = ev.get("env") if isinstance(ev.get("env"), str) else None
+    raw = [i for i in ev.get("book") or [] if isinstance(i, dict)] if isinstance(ev.get("book"), list) else []
+    state = {"active_positions": [i for i in raw if i.get("kind") == "position"]}
+    entries = {str(n): i for n, i in enumerate(i for i in raw if i.get("kind") == "resting")}
+    book = {"items": book_from_sources(state, entries, _latest_audit_by_symbol(TRADES_AUDIT_FILE, until_ts=ts), env)}
+    net = _to_float(ev.get("net_notional_delta_usdt"))
+    detail = (f"hook denied {sym} {direction} after approval: delta_bias {ev.get('delta_bias')} (cached net delta "
+              f"{'?' if net is None else f'{net:+.2f}'} USDT, session_state age {ev.get('age_seconds')}s)")
+    extra = {"blockers": blockers_for(POST_APPROVAL_GATE, sym, direction, book),
+             "book": _trimmed_book(book["items"]),
+             "book_session_state_ts": _to_float(ev.get("session_state_ts")),
+             "book_source": str(ev.get("source") or "session_state_cache"),
+             "gate_event_env": env, "delta_bias_at_denial": ev.get("delta_bias"),
+             "net_notional_delta_usdt_at_denial": net, "session_state_age_seconds": _to_float(ev.get("age_seconds")),
+             "tier": ev.get("tier"), "is_yolo": ev.get("is_yolo")}
+    if ev.get("book_truncated"):
+        extra["book_truncated"] = True
+    if ev.get("book_error"):
+        extra["blockers_error"] = str(ev["book_error"])[:200]
+    entry, sl, tp1, tp2 = prices
+    row = register_shadow_trade(
+        symbol=sym, direction=direction, trigger_price=entry, sl_price=sl, tp1_price=tp1, tp2_price=tp2,
+        current_price=entry, rejection_reason=f"[{POST_APPROVAL_GATE}] {detail}"[:GATE_DETAIL_MAX_CHARS],
+        rejection_category=POST_APPROVAL_GATE, gate=POST_APPROVAL_GATE, gate_detail=detail[:GATE_DETAIL_MAX_CHARS],
+        gate_source="hook_denial", score=_to_float(ev.get("score")), dossier_sha256=sha, extra=extra,
+        registered_at_ts=int(ts))
+    if row and sha:
+        seen.add((sha, sym, direction))
+    return row
+
+
+def register_from_gate_denials(now_ts: Optional[int] = None) -> int:
+    """Registers the hook's delta-gate denials of approved candidates (logs/gate_denials.jsonl, issue #261) as
+    DELTA_GATE_POST_APPROVAL shadow rows: gate_source "hook_denial", blockers and book from the event's cached book
+    (book_from_sources; position scores from trades_audit records not newer than the event), registered_at_ts = the
+    denial time and trigger = current price = the dossier entry. Reads only the last GATE_DENIAL_TAIL_LINES lines and
+    events of the last GATE_DENIAL_MAX_AGE_SECONDS; skips events without valid dossier prices. Idempotent through
+    register_shadow_trade's dedupe. A missing or garbled file registers nothing; never raises."""
+    try:
+        if not os.path.exists(GATE_DENIALS_FILE):
+            return 0
+        with open(GATE_DENIALS_FILE, "r", encoding="utf-8", errors="replace") as f:
+            lines = list(collections.deque(f, maxlen=GATE_DENIAL_TAIL_LINES))
+        now = int(time.time()) if now_ts is None else int(now_ts)
+        seen = {(t.get("dossier_sha256"), t.get("symbol"), str(t.get("direction") or "").upper())
+                for t in load_jsonl(SHADOW_TRADES_FILE) + load_jsonl(SHADOW_RESOLVED_FILE)
+                if isinstance(t, dict) and t.get("dossier_sha256")}
+    except Exception:
+        return 0
+    count = 0
+    for line in lines:
+        try:
+            if _register_gate_denial(json.loads(line), now, seen):
+                count += 1
+        except Exception:
+            continue
+    return count
+
 def register_from_evaluation() -> int:
-    """Reads latest evaluation brief and dossier, auto-registering rejected setups."""
-    registered_count = 0
-    
+    """Reads latest evaluation brief and dossier, auto-registering rejected setups, and first the hook's recent
+    delta-gate denials of approved candidates (register_from_gate_denials, issue #261; also without a brief)."""
+    registered_count = register_from_gate_denials()
+
     # 1. Read candidates from primed brief
     brief_data = {}
     if os.path.exists(BRIEF_FILE):
@@ -338,7 +443,7 @@ def register_from_evaluation() -> int:
 
     opps = brief_data.get("filtered_opportunities", [])
     if not opps:
-        return 0
+        return registered_count
 
     # 2. Check latest dossier to see which were rejected or if all were rejected
     dossier_data = {}
@@ -398,8 +503,7 @@ def register_from_evaluation() -> int:
                 if book is None:
                     book = snapshot_book(target_env)
                 extra["blockers"] = blockers_for(gate, sym, direction, book)
-                extra["book"] = [{k: i.get(k) for k in ("symbol", "direction", "kind", "score", "notional",
-                                                        "since_ts", "entry_id")} for i in book.get("items") or []]
+                extra["book"] = _trimmed_book(book.get("items") or [])
                 extra["book_session_state_ts"] = book.get("session_state_ts")
                 if not target_env:
                     extra["book_env_unfiltered"] = True  # no dossier env: resting entries of every env included
