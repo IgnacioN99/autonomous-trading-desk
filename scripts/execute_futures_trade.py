@@ -106,8 +106,9 @@ JSON schemas (stable; extra keys may be added, existing keys are never renamed):
       Issue #157: a rejected (except -2021) or unverified pre-arm adds "prearm_anomaly": {"status", "message"} and
       files a MEDIUM issue (the entry is kept). Issue #232: an API rejection also adds "prearm_reject_msg" (the
       Binance msg, <= 200 chars; in the registry record, the message and the issue context). A MARKET entry's SL is verified by its own algo id only (an id-less
-      placement response: by a stop at the SL within one tick that was not listed before the placement); a -4130 on
-      that placement with no such stop (a leftover closePosition stop) auto-destructs and files a HIGH issue.
+      placement response: by a closePosition stop at the SL within one tick that was not listed before the entry;
+      issue #179: that read precedes the entry order, one short retry); a -4130 on that placement with no such stop
+      (a leftover closePosition stop) auto-destructs and files a HIGH issue.
       In PROD every new entry is rejected while an opening order rests on the exchange without a registry record
       (find_unregistered_resting_entries; the position guardian reports them as unknown_resting_entry).
       PROD gates are anchored to the exchange (issue #101): logs/session_state.json and logs/pending_entries.json
@@ -826,7 +827,8 @@ def verify_algo_stop_loss(symbol, exit_side, sl_price=None, target_env=None, alg
     Only real protective stops count (is_protective_stop): a resting conditional ENTRY on the same side
     (neither closePosition nor reduceOnly) never verifies as a Stop Loss.
     Issue #157: with algo_id, only the protective stop with that exact algo id counts (no price fallback), so a
-    leftover stop (e.g. an old pre-arm at the same price) never confirms another entry's stop.
+    leftover stop (e.g. an old pre-arm at the same price) never confirms another entry's stop (an id-less MARKET
+    placement is checked against the pre-entry snapshot in execute_complete_trade instead, issue #179).
     """
     target_env = resolve_env(target_env)
     try:
@@ -856,6 +858,7 @@ TAKE_PROFIT_ORDER_TYPES = ('TAKE_PROFIT_MARKET', 'TAKE_PROFIT')
 TRUE_NET_BE_FEE_BUFFER = 0.002          # True Net Break-Even: entry +/- 0.2% roundtrip taker fee buffer
 BE_MIN_EXPANSION_ATR = 2.0              # Anti-truncation: standard positions move to BE only after >= 2x ATR_15m
 STOP_VERIFY_RETRY_DELAYS = (0.8, 1.0, 1.2)  # Progressive verification (~3s) to absorb Mainnet indexing latency
+PRE_ENTRY_STOP_SNAPSHOT_RETRY_DELAYS = (0.3,)  # Issue #179: one short retry of the stop snapshot read before an entry
 ORPHAN_HEAL_SL_DISTANCE = 0.025         # Emergency stop distance for orphan positions (2.5%)
 CLOSE_RETRY_DELAYS = (0.3, 0.6, 1.0)    # close_position_market: backoff after each of the 3 close attempts
 
@@ -894,6 +897,13 @@ def _order_type(order):
 
 def _trigger_price(order):
     return _to_float(order.get('triggerPrice') or order.get('stopPrice') or 0)
+
+
+def _stop_trigger_tolerance(tick_size, price):
+    """Issue #179: the one trigger-match tolerance of the stop checks: one tick (x1.01) when the tick size is known,
+    else 0.05% of price. Placed triggers are tick-rounded, so one tick still matches them."""
+    tick = _to_float(tick_size)
+    return tick * 1.01 if tick > 0 else abs(_to_float(price)) * 0.0005
 
 
 def _order_id(order):
@@ -997,12 +1007,13 @@ def wait_for_stop_confirmation(symbol, exit_side, price, exclude_ids=(), algo_id
     """
     Progressive verification on /fapi/v1/openAlgoOrders that a protective stop at `price` exists and is not one
     of `exclude_ids` (the stops being replaced). Matches by algo id when known, otherwise by trigger price within
-    one tick (or 0.05%). A tight tolerance avoids mistaking the OLD stop for the new one.
+    one tick (0.05% when the tick size is unknown; _stop_trigger_tolerance). A tight tolerance avoids mistaking the
+    OLD stop for the new one.
     Returns (verified, order_or_None).
     """
     excluded = {str(x) for x in exclude_ids if x is not None}
     price = float(price)
-    tol = max(_to_float(tick_size) * 1.01, abs(price) * 0.0005)
+    tol = _stop_trigger_tolerance(tick_size, price)
     for delay in (0.0,) + tuple(retry_delays):
         if delay:
             time.sleep(delay)
@@ -2460,6 +2471,7 @@ def _ensure_entry_stop(symbol, exit_side, sl_price, prearm_algo_id=None, quantit
          (get_open_stop_orders_with_retry, issue #157) keeps a listed closePosition stop whose trigger is at sl_price
          within one tick or tighter (on MCP the listing folds reduceOnly into closePosition, so the flag cannot be
          told apart there); a looser or reduceOnly-only stop, an empty or a failed listing is unverified.
+    "Within one tick" is _stop_trigger_tolerance (0.05% when the tick size is unknown; issue #179).
     Returns {"verified", "source": "prearm" | "placed" | "kept" | None, "placement", "info"}.
     """
     if prearm_algo_id is not None:
@@ -2483,8 +2495,8 @@ def _ensure_entry_stop(symbol, exit_side, sl_price, prearm_algo_id=None, quantit
             if err is None:
                 is_long = str(exit_side).upper() == 'SELL'
                 sl = float(sl_price)
-                tol = _to_float(tick_size) * 1.01 if _to_float(tick_size) > 0 else abs(sl) * 0.0005
-                kept =[s for s in stops if _truthy(s.get('closePosition'))
+                tol = _stop_trigger_tolerance(tick_size, sl)
+                kept = [s for s in stops if _truthy(s.get('closePosition'))
                         and (abs(_trigger_price(s) - sl) <= tol or is_tighter_stop(_trigger_price(s), sl, is_long))]
                 if kept:
                     verified, info = True, tightest_stop(kept, is_long)
@@ -3681,7 +3693,7 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out, run_ctx=None
     entry_px = _to_float(position.get('entryPrice')) or _to_float(rec.get('trigger_or_limit_price'))
     filters = get_symbol_filters(sym, target_env=target_env)
     tick = filters.get('tickSize') if filters else None
-    tol = max(_to_float(tick) * 1.01, abs(sl_p) * 0.0005)
+    tol = _stop_trigger_tolerance(tick, sl_p)
 
     stops, err = get_open_stop_orders(sym, exit_side, target_env=target_env)
     if err:
@@ -3773,6 +3785,9 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out, run_ctx=None
     if mode in ('place', 'replace') and mark_p > 0 and ((mark_p <= sl_p) if is_long else (mark_p >= sl_p)):
         return crossed_close("mark_beyond_planned_sl")
 
+    # Issue #179: the listed trigger of a stop kept after -4130 in this run (stop_source "kept"; sl_price stays the
+    # planned SL). A later run (mode None) already audits the stop in force as sl_price (target_p = ex_p).
+    kept_trigger = None
     if mode and dry_run:
         act("pending_protect_sl", False, mode=mode, sl_price=target_p, planned_sl_price=sl_p, quantity=qty,
             old_stops=[stop_summary(s) for s in stops])
@@ -3785,6 +3800,8 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out, run_ctx=None
                                          tick_size=tick, target_env=target_env)
             placement, verified, stop_source = ensured["placement"], ensured["verified"], ensured["source"]
             new_stop = stop_summary(ensured["info"]) if verified else None
+            if stop_source == "kept":
+                kept_trigger = (new_stop or {}).get('trigger_price')
         else:
             rep = replace_protective_stop(sym, exit_side, target_p, qty_str, old_stops, target_env=target_env, tick_size=tick)
             placement, verified, new_stop = rep.get('placement'), bool(rep.get('success')), rep.get('new_stop')
@@ -3793,7 +3810,8 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out, run_ctx=None
                 fail("protect_sl_cancel_old", ce)
         act("pending_protect_sl", verified, mode=mode, sl_price=target_p, planned_sl_price=sl_p, quantity=qty,
             verified=verified, new_stop=new_stop, cancelled_old_stop_ids=cancelled_old, placement=placement,
-            coverage_unknown=(mode == 'resize' and bool(mcp) and not covered), stop_source=stop_source)
+            coverage_unknown=(mode == 'resize' and bool(mcp) and not covered), stop_source=stop_source,
+            **({"kept_trigger_price": kept_trigger} if stop_source == "kept" else {}))
         if not verified and mode in ('place', 'replace') and _is_immediate_trigger(placement):
             return crossed_close("sl_rejected_would_immediately_trigger", placement)
         if not verified and mode != 'place':
@@ -3922,6 +3940,8 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out, run_ctx=None
         record.update(score_audit_fields(rec.get('score_meta')))
         if isinstance(rec.get('daily_loss_gate'), dict):
             record['daily_loss_gate'] = rec['daily_loss_gate']  # issue #207: state at placement
+        if kept_trigger is not None:
+            record['kept_trigger_price'] = kept_trigger  # issue #179: the kept stop's trigger (sl_price = planned)
         record.update(fill_quality_fields(is_long, entry_px, target_p, tp1_p, tp2_p))
         try:
             append_trade_audit_record(record, rec.get('margin_usdt'))
@@ -4431,6 +4451,14 @@ def execute_complete_trade(
             'quantity': total_qty
         }
 
+    # Issue #179: ids of the protective stops that exist BEFORE this entry (read-only, one symbol-scoped read with one
+    # short retry), taken before the entry so it adds no unprotected time after a fill (MARKET, or a LIMIT that
+    # returns FILLED): the set cannot gain this trade's stop before its SL placement. None = unknown (read failed);
+    # rows without an id are left out (they can never be told apart as new).
+    pre_stops, pre_err = get_open_stop_orders_with_retry(symbol, exit_side, target_env=target_env,
+                                                         retry_delays=PRE_ENTRY_STOP_SNAPSHOT_RETRY_DELAYS)
+    pre_ids = None if pre_err else {str(_order_id(s)) for s in pre_stops if _order_id(s) is not None}
+
     entry_order = send_signed_request('POST', '/fapi/v1/order', entry_params, target_env=target_env)
     if not isinstance(entry_order, dict) or 'orderId' not in entry_order:
         return {"success": False, "error": f"Entry order failed: {entry_order}"}
@@ -4551,18 +4579,15 @@ def execute_complete_trade(
     # Enclose in try/except to guarantee emergency auto-destruct on ANY failure.
     try:
         # 9. Execute Hard Stop Loss (Algo Order, closePosition=true, reduceOnly=true)
-        # Ids of the protective stops that exist BEFORE this placement (one read, no retry delay before the stop is
-        # placed); None = unknown (read failed).
-        pre_stops, pre_err = get_open_stop_orders(symbol, exit_side, target_env=target_env)
-        pre_ids = None if pre_err else {str(_order_id(s)) for s in pre_stops}
         sl_order = place_algo_stop_loss(symbol, exit_side, sl_p, target_env=target_env)
 
         def verify_placed_stop():
             # Issue #157: verified by the algo id of THIS placement only (never by price), so a leftover stop on the
             # symbol (e.g. an old pre-arm at the same price) cannot confirm it. A placement without an id (lost
-            # response, error, -4130) is verified only by a stop listed now that was NOT listed before the placement
-            # (pre_ids) at sl_p within one tick: this trade's own stop whose response was lost. A pre-existing stop
-            # never counts; an unknown pre-placement listing or no such stop is unverified and auto-destructs
+            # response, error, -4130) is verified only by a closePosition stop (issue #179; a reduceOnly-only stop of
+            # another writer may not cover the position) listed now with an id that was NOT listed before the entry
+            # (pre_ids) at sl_p within one tick: this trade's own stop whose response was lost. A pre-existing or
+            # id-less stop never counts; an unknown pre-entry listing or no such stop is unverified and auto-destructs
             # (accepted, fail closed).
             placed_id = _order_id(sl_order) if isinstance(sl_order, dict) and not _is_api_error(sl_order) else None
             if placed_id is not None:
@@ -4572,9 +4597,11 @@ def execute_complete_trade(
             now_stops, now_err = get_open_stop_orders(symbol, exit_side, target_env=target_env)
             if now_err:
                 return False, None
-            tol = _to_float(filters.get('tickSize')) * 1.01 or abs(float(sl_p)) * 0.0005
+            tol = _stop_trigger_tolerance(filters.get('tickSize'), sl_p)
             for s in now_stops:
-                if str(_order_id(s)) not in pre_ids and abs(_trigger_price(s) - float(sl_p)) <= tol:
+                oid = _order_id(s)
+                if (oid is not None and str(oid) not in pre_ids and _truthy(s.get('closePosition'))
+                        and abs(_trigger_price(s) - float(sl_p)) <= tol):
                     return True, s
             return False, None
 
