@@ -230,14 +230,14 @@ class TestConditionalEntryRouting(ExecutorHarness):
         self.assertEqual([c for c in self.calls if c[0] == "POST" and c[1] == ORDER_ENDPOINT], [],
                          "conditional entries must never be sent to /fapi/v1/order (-4120)")
         algo = [c[2] for c in self.calls if c[0] == "POST" and c[1] == ALGO_ENDPOINT]
-        self.assertEqual(len(algo), 2, "the entry, then the issue #36 pre-armed stop (KEYS)")
+        self.assertEqual(len(algo), 1, "the entry only: no issue #36 pre-arm for a STOP_MARKET entry (issue #232)")
         self.assertEqual(algo[0], {"algoType": "CONDITIONAL", "symbol": "SOLUSDT", "side": "BUY", "type": "STOP_MARKET",
                                    "triggerPrice": 102.34, "quantity": 0.293, "closePosition": "false",
                                    "workingType": "CONTRACT_PRICE"})
         self.assertNotIn("reduceOnly", algo[0])
-        self.assertEqual(algo[1], {"algoType": "CONDITIONAL", "symbol": "SOLUSDT", "side": "SELL", "type": "STOP_MARKET",
-                                   "triggerPrice": 97.0, "closePosition": "true"})
+        self.assertEqual(res["prearm_status"], "skipped:no_position")
         self.assertIn("--protect-pending", res["message"])
+        self.assertIn("the guardian places it at fill", res["message"])
         self.assertNotIn("deferred to fill.", res["message"])
 
     def test_stop_market_registered_for_post_fill_protection(self):
@@ -273,9 +273,9 @@ class TestConditionalEntryRouting(ExecutorHarness):
         self.assertTrue(res["entry_cancelled"])
         self.assertIn("disk full", res["error"])
         cancels = [c[2] for c in self.calls if c[0] == "DELETE" and c[1] == ALGO_ENDPOINT]
-        # the entry, then its issue #36 pre-armed stop (by algo id; no position)
-        self.assertEqual(cancels, [{"symbol": "SOLUSDT", "algoId": 8}, {"symbol": "SOLUSDT", "algoId": 9}])
-        self.assertTrue(res["prearm_cancelled"])
+        # the entry only: a STOP_MARKET entry has no pre-armed stop (issue #232)
+        self.assertEqual(cancels, [{"symbol": "SOLUSDT", "algoId": 8}])
+        self.assertNotIn("prearm_cancelled", res)
 
     def test_registry_failure_cancels_limit_entry(self):
         with patch("execute_futures_trade.update_pending_entries", side_effect=IOError("disk full")):

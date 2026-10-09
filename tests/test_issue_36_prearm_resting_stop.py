@@ -85,34 +85,47 @@ class TestPrearmAtPlacement(ExecutorHarness):
     def algo_posts(self):
         return [c[2] for c in self.calls if c[0] == "POST" and c[1] == ALGO_ENDPOINT]
 
-    def test_long_stop_market_prearmed_and_recorded_v2(self):
+    def test_long_stop_market_not_prearmed_recorded_v2(self):
+        # Issue #232: Binance rejects a closePosition stop on a flat symbol (-4509); the guardian places it at fill.
         res = self.execute(order_type="STOP_MARKET", trigger_price=102.347)
         self.assertTrue(res["success"], res.get("error"))
-        self.assertEqual((res["prearm_status"], res["prearm_algo_id"]), ("placed", 9))
-        self.assertIn("Stop Loss pre-armed at 97.0", res["message"])
-        sent = self.algo_posts()
-        self.assertEqual([(s["side"], s["type"], s.get("closePosition")) for s in sent],
-                         [("BUY", "STOP_MARKET", "false"), ("SELL", "STOP_MARKET", "true")],
-                         "the entry is algo POST [0], the pre-arm [1]")
-        self.assertNotIn("quantity", sent[1])
-        self.assertNotIn("reduceOnly", sent[1])
+        self.assertEqual((res["prearm_status"], res["prearm_algo_id"]), ("skipped:no_position", None))
+        self.assertIn("Stop Loss not pre-armed (STOP_MARKET entry, no position yet): the guardian places it at fill.",
+                      res["message"])
+        self.assertNotIn("prearm_anomaly", res)
+        self.report.assert_not_called()
+        self.assertEqual([(s["side"], s["type"], s.get("closePosition")) for s in self.algo_posts()],
+                         [("BUY", "STOP_MARKET", "false")], "only the entry, no closePosition stop")
+        self.assertEqual([c for c in self.writes() if c[1] in (ALGO_ENDPOINT, ORDER_ENDPOINT)],
+                         [("POST", ALGO_ENDPOINT, self.algo_posts()[0])], "only the entry order is sent")
         rec = read_registry(self.ws)["testnet:SOLUSDT:8"]
-        self.assertEqual((rec["prearm_status"], rec["prearm_algo_id"], rec["prearm_price"]), ("placed", 9, 97.0))
-        self.assertIs(rec["sl_close_position"], True)
-        self.assertIn("sl_qty", rec)
-        self.assertIsNone(rec["sl_qty"])
+        self.assertEqual(rec["prearm_status"], "skipped:no_position")
+        for field in ("prearm_algo_id", "prearm_price", "sl_close_position", "sl_qty", "prearm_reject_msg"):
+            self.assertNotIn(field, rec)
         self.assertEqual(registry_file(self.ws)["schema_version"], 2)
         self.assertEqual(eft.PENDING_ENTRIES_SCHEMA_VERSION, 2)
 
-    def test_short_stop_market_prearmed_with_buy_stop_above(self):
+    def test_short_stop_market_not_prearmed(self):
         res = self.execute(order_type="STOP_MARKET", trigger_price=97.653, direction="SHORT", sl_price=103.0,
                            tp1_price=90.0, tp2_price=80.0)
         self.assertTrue(res["success"], res.get("error"))
-        self.assertEqual(res["prearm_status"], "placed")
-        sent = self.algo_posts()
-        self.assertEqual((sent[1]["side"], sent[1]["triggerPrice"], sent[1]["closePosition"]), ("BUY", 103.0, "true"))
+        self.assertEqual(res["prearm_status"], "skipped:no_position")
+        self.assertEqual([(s["side"], s.get("closePosition")) for s in self.algo_posts()], [("SELL", "false")])
         rec = read_registry(self.ws)["testnet:SOLUSDT:8"]
-        self.assertEqual((rec["direction"], rec["prearm_status"], rec["prearm_price"]), ("SHORT", "placed", 103.0))
+        self.assertEqual((rec["direction"], rec["prearm_status"]), ("SHORT", "skipped:no_position"))
+        self.assertNotIn("prearm_algo_id", rec)
+
+    def test_cancel_of_stop_market_entry_cancels_only_the_entry(self):
+        self.execute(order_type="STOP_MARKET", trigger_price=102.347)
+        rec = read_registry(self.ws)["testnet:SOLUSDT:8"]
+        fake = FakeExchange([], algos=[dict(entry_algo(algo_id=8, symbol="SOLUSDT", trigger=102.34),
+                                            quantity=str(rec["total_qty"]))])
+        res, ws, _ = run_protect(fake, dict(rec, expires_at_ts=0))
+        self.assertTrue(res["ok"], res["errors"])
+        self.assertEqual(types(res), ["pending_timeout_cancel"])
+        self.assertNotIn("prearm_cancelled", res["actions"][0]["detail"])
+        self.assertEqual(deletes(fake), [{"symbol": "SOLUSDT", "algoId": 8}], "the entry only")
+        self.assertEqual(read_registry(ws), {})
 
     def test_resting_limit_prearmed(self):
         res = self.execute(order_type="LIMIT", limit_price=98.767)
@@ -126,22 +139,45 @@ class TestPrearmAtPlacement(ExecutorHarness):
         self.assertLess(entry_index, prearm_index, "the pre-arm is placed after the entry")
         self.assertEqual(read_registry(self.ws)["testnet:SOLUSDT:7"]["prearm_status"], "placed")
 
+    def prearm_direct(self, sl_price, entry_type=None, exit_side="SELL", mcp=False):
+        """prearm_resting_entry_stop called directly (fake exchange, no placement expected for skipped:*)."""
+        with patch("execute_futures_trade.send_signed_request", side_effect=self.fake), \
+             patch("execute_futures_trade.uses_mcp_gateway", return_value=mcp), \
+             patch("execute_futures_trade.time.sleep", return_value=None):
+            if entry_type is None:
+                return eft.prearm_resting_entry_stop("SOLUSDT", exit_side, sl_price, 100.0, target_env="testnet")
+            return eft.prearm_resting_entry_stop("SOLUSDT", exit_side, sl_price, 100.0, target_env="testnet",
+                                                 entry_type=entry_type)
+
     def test_crossed_sl_skipped(self):
-        # LONG breakout: trigger 102.34 above the 100 price, SL 100.5 between them (already crossed)
+        # LONG: SL 100.5 above the 100 price (already crossed); SHORT: SL 99.5 below it. Default (LIMIT) path.
+        self.assertEqual(self.prearm_direct(100.5), {"prearm_status": "skipped:crossed"})
+        self.assertEqual(self.prearm_direct(99.5, exit_side="BUY"), {"prearm_status": "skipped:crossed"})
+        self.assertEqual(self.prearm_direct(100.5, entry_type="LIMIT"), {"prearm_status": "skipped:crossed"})
+        self.assertEqual(self.algo_posts(), [])
+
+    def test_skip_precedence_mcp_then_no_position_then_crossed(self):
+        # Issue #232: STOP_MARKET is skipped before the crossed check, MCP before both.
+        self.assertEqual(self.prearm_direct(100.5, entry_type="STOP_MARKET"), {"prearm_status": "skipped:no_position"})
+        self.assertEqual(self.prearm_direct(97.0, entry_type="stop_market"), {"prearm_status": "skipped:no_position"})
+        self.assertEqual(self.prearm_direct(100.5, entry_type="STOP_MARKET", mcp=True), {"prearm_status": "skipped:mcp"})
+        self.assertEqual(self.algo_posts(), [])
+        # Through the executor: a crossed STOP_MARKET SL is skipped:no_position
         res = self.execute(order_type="STOP_MARKET", trigger_price=102.347, sl_price=100.5)
         self.assertTrue(res["success"], res.get("error"))
-        self.assertEqual(res["prearm_status"], "skipped:crossed")
+        self.assertEqual(res["prearm_status"], "skipped:no_position")
         self.assertEqual(len(self.algo_posts()), 1, "only the entry")
         rec = read_registry(self.ws)["testnet:SOLUSDT:8"]
-        self.assertEqual(rec["prearm_status"], "skipped:crossed")
+        self.assertEqual(rec["prearm_status"], "skipped:no_position")
         self.assertNotIn("prearm_algo_id", rec)
         self.assertNotIn("sl_close_position", rec)
-        # SHORT: SL 99.5 below the 100 price
-        self.calls, self.open_algos = [], []
-        res = self.execute(order_type="STOP_MARKET", trigger_price=97.653, direction="SHORT", sl_price=99.5,
-                           tp1_price=90.0, tp2_price=80.0, symbol="ETHUSDT")
-        self.assertEqual(res["prearm_status"], "skipped:crossed")
-        self.assertEqual(len(self.algo_posts()), 1)
+
+    def test_default_entry_type_still_places(self):
+        # Direct callers without entry_type keep the issue #36 behaviour.
+        out = self.prearm_direct(97.0)
+        self.assertEqual((out["prearm_status"], out["prearm_algo_id"]), ("placed", 9))
+        self.assertEqual([(s["side"], s["triggerPrice"], s["closePosition"]) for s in self.algo_posts()],
+                         [("SELL", 97.0, "true")])
 
     def test_mcp_skipped(self):
         res = self.execute(order_type="STOP_MARKET", trigger_price=102.347, mcp=True)
@@ -158,14 +194,14 @@ class TestPrearmAtPlacement(ExecutorHarness):
                 self.calls.append((method, endpoint, dict(params)))
                 return dict(MINUS_2021)
             return self.fake(method, endpoint, params, target_env)
-        res = self.execute(order_type="STOP_MARKET", trigger_price=102.347, send=send)
+        res = self.execute(order_type="LIMIT", limit_price=98.767, send=send)
         self.assertTrue(res["success"], res.get("error"))
-        self.assertTrue(res["conditional_entry"])
+        self.assertTrue(res["pending_limit_entry"])
         self.assertEqual(res["prearm_status"], "rejected:-2021")
         self.assertIn("Stop Loss not pre-armed (rejected:-2021)", res["message"])
         self.assertEqual(self.writes()[-1][1], ALGO_ENDPOINT)
         self.assertEqual([c for c in self.calls if c[0] == "DELETE"], [], "a rejected pre-arm never cancels the entry")
-        rec = read_registry(self.ws)["testnet:SOLUSDT:8"]
+        rec = read_registry(self.ws)["testnet:SOLUSDT:7"]
         self.assertEqual(rec["prearm_status"], "rejected:-2021")
         self.assertNotIn("prearm_algo_id", rec)
         self.assertNotIn("sl_close_position", rec)
@@ -224,6 +260,19 @@ class TestPrearmAtFill(unittest.TestCase):
         res, ws, _ = run_protect(fake, make_record(prearm_status="rejected:-2021"))
         self.assertTrue(res["ok"], res["errors"])
         self.assertEqual([s["triggerPrice"] for s in posts(fake, ALGO_ENDPOINT)], [95.0])
+        self.assertEqual(read_registry(ws), {})
+
+    def test_stop_market_not_prearmed_gets_planned_stop_at_fill(self):
+        # Issue #232: a STOP_MARKET record with skipped:no_position (no prearm_algo_id): the planned SL is placed.
+        fake = FakeExchange([long_position(amt="12", entry="101.0", mark="101.5")])
+        res, ws, _ = run_protect(fake, make_record(kind="STOP_MARKET", prearm_status="skipped:no_position"))
+        self.assertTrue(res["ok"], res["errors"])
+        self.assertEqual(types(res), ["pending_protect_sl", "pending_tp_placed"])
+        detail = res["actions"][0]["detail"]
+        self.assertEqual((detail["mode"], detail["stop_source"]), ("place", "placed"))
+        self.assertTrue(res["actions"][0]["success"])
+        self.assertEqual([(s["triggerPrice"], s["closePosition"]) for s in posts(fake, ALGO_ENDPOINT)], [(95.0, "true")])
+        self.assertEqual(deletes(fake), [])
         self.assertEqual(read_registry(ws), {})
 
     def test_verified_prearm_kept_no_second_placement_no_resize(self):

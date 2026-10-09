@@ -417,7 +417,7 @@ class TestPrearmAnomalies(ExecutorHarness):
         return send
 
     def test_rejected_code_reported_entry_kept(self):
-        res = self.execute(order_type="STOP_MARKET", trigger_price=102.347,
+        res = self.execute(order_type="LIMIT", limit_price=98.767,
                            send=self.send_with_prearm({"code": -4045, "msg": "Reach max stop order limit."}))
         self.assertTrue(res["success"], res.get("error"))
         self.assertEqual(res["prearm_status"], "rejected:-4045")
@@ -427,7 +427,7 @@ class TestPrearmAnomalies(ExecutorHarness):
         kw = self.report.call_args.kwargs
         self.assertEqual((kw["severity"], kw["category"]), ("MEDIUM", "risk_gate"))
         self.assertIn("SOLUSDT", kw["title"])
-        self.assertIn("testnet:SOLUSDT:8", read_registry(self.ws))
+        self.assertIn("testnet:SOLUSDT:7", read_registry(self.ws))
         self.assertEqual([c for c in self.calls if c[0] == "DELETE"], [])
 
     def test_unverified_prearm_reported_with_may_exist_wording(self):
@@ -440,7 +440,7 @@ class TestPrearmAnomalies(ExecutorHarness):
         self.report.assert_called_once()
 
     def test_minus_2021_not_an_anomaly(self):
-        res = self.execute(order_type="STOP_MARKET", trigger_price=102.347, send=self.send_with_prearm(MINUS_2021))
+        res = self.execute(order_type="LIMIT", limit_price=98.767, send=self.send_with_prearm(MINUS_2021))
         self.assertEqual(res["prearm_status"], "rejected:-2021")
         self.assertIn("Stop Loss not pre-armed (rejected:-2021)", res["message"])
         self.assertNotIn("prearm_anomaly", res)
@@ -449,6 +449,10 @@ class TestPrearmAnomalies(ExecutorHarness):
     def test_skipped_mcp_and_placed_not_anomalies(self):
         res = self.execute(order_type="STOP_MARKET", trigger_price=102.347, mcp=True)
         self.assertEqual(res["prearm_status"], "skipped:mcp")
+        self.assertNotIn("prearm_anomaly", res)
+        self.report.assert_not_called()
+        res = self.execute(order_type="STOP_MARKET", trigger_price=102.347, symbol="BNBUSDT")   # KEYS (issue #232)
+        self.assertEqual(res["prearm_status"], "skipped:no_position")
         self.assertNotIn("prearm_anomaly", res)
         self.report.assert_not_called()
         res = self.execute(order_type="LIMIT", limit_price=98.767, symbol="ETHUSDT")
@@ -478,8 +482,13 @@ class TestPrearmPriceAndNote(unittest.TestCase):
         self.assertEqual(eft._prearm_note({"prearm_status": "rejected:-2021"}, 95.0),
                          "Stop Loss not pre-armed (rejected:-2021). ")
         self.assertIn("pre-armed at 95.0", eft._prearm_note({"prearm_status": "placed", "prearm_algo_id": 9}, 95.0))
+        self.assertEqual(eft._prearm_note({"prearm_status": "skipped:no_position"}, 95.0),
+                         "Stop Loss not pre-armed (STOP_MARKET entry, no position yet): the guardian places it at fill. ")
         self.assertIsNone(eft._prearm_anomaly({"prearm_status": "skipped:crossed"}))
+        self.assertIsNone(eft._prearm_anomaly({"prearm_status": "skipped:no_position"}))
+        self.assertIsNone(eft._prearm_anomaly({"prearm_status": "rejected:-4509"}))
         self.assertIsNone(eft._prearm_anomaly({"prearm_status": "placed"}))
+        self.assertEqual(eft._prearm_anomaly({"prearm_status": "rejected:-4045"})["status"], "rejected:-4045")
 
 
 # ---------------------------------------------------------------------------------------------

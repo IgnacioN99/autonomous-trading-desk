@@ -266,7 +266,8 @@ def check_guardian_service(target_env: str) -> tuple:
         pending = _prod_pending_summary(target_env)
         if pending:
             return "critical", (f"Position guardian loop not alive ({why}) with {pending} in logs/pending_entries.json: "
-                                "a filled entry can stay without its planned SL/TPs (MCP: no pre-armed SL). Run "
+                                "a filled entry can stay without its planned SL/TPs (STOP_MARKET entries, and "
+                                "MCP: no pre-armed SL). Run "
                                 "python3 scripts/execute_futures_trade.py --protect-pending now and start the loop. "
                                 f"{hint}")
     return "warn", (f"Position guardian loop not alive ({why}). {impact}; MARKET entries do not need the guardian. "
