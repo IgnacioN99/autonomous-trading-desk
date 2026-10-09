@@ -39,7 +39,8 @@ import quant_risk_engine as qre
 import sync_session_state as sss
 from utils import portfolio_exposure as pe
 from test_exit_management import FakeExchange, offline, long_position, stop, ALGO_ENDPOINT
-from test_pending_entries import make_record, write_registry, read_registry, entry_algo, write_guardian_state
+from test_pending_entries import (make_record, write_registry, read_registry, entry_algo, write_guardian_state,
+                                  allow_daily_loss_gate)
 
 SNAPSHOT_ENDPOINTS = ("/fapi/v1/openAlgoOrders", "/fapi/v1/openOrders", "/fapi/v2/positionRisk")   # #160 order
 PROFILE = {"max_open_positions": 3, "yolo_slot_enabled": True, "leverage_standard": 3, "leverage_yolo": 15,
@@ -169,6 +170,7 @@ class Workspace(unittest.TestCase):
              patch("execute_futures_trade.verify_algo_stop_loss", return_value=(True, {"algoId": 9})), \
              patch("quant_risk_engine.get_account_equity", return_value=10000.0), \
              patch("user_profile.load_user_profile", return_value=dict(PROFILE)), \
+             allow_daily_loss_gate(), \
              patch("provenance_stamp.stamp_trade_record", side_effect=lambda rec, **kw: rec):
             return eft.execute_complete_trade(**args)
 

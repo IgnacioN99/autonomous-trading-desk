@@ -96,9 +96,11 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    are denied, and so are agent-set transcript-root overrides (AGY_BRAIN_DIRS / CLAUDE_PROJECTS_DIRS);
    harness files (incl. .claude/agents/) and the gate modules (scripts/utils/gate_limits.py,
    scripts/execute_futures_trade.py, scripts/utils/portfolio_exposure.py, scripts/utils/env_resolver.py,
-   scripts/user_profile.py; issue #79; scripts/utils/score_calibration.py, issue #202) require explicit confirmation (force_ask) from the file tools and from shell
+   scripts/user_profile.py; issue #79; scripts/utils/score_calibration.py, issue #202; scripts/utils/daily_loss_gate.py,
+   scripts/utils/calibration_fallback.py, scripts/sync_session_state.py, scripts/trade_outcomes.py, issue #207) require explicit confirmation (force_ask) from the file tools and from shell
    writes (redirect target, cp / mv / tee / rm, sed -i / perl -i, git checkout / restore, inline code that writes,
-   PowerShell write cmdlets); running the executor or user_profile.py is never a write. So do file-tool writes to
+   PowerShell write cmdlets); running the executor, user_profile.py, sync_session_state.py or trade_outcomes.py is
+   never a write. So do file-tool writes to
    git config / hook files (GIT_EXEC_CONFIG_PATH_RE, see 8). File-tool content with trading primitives outside
    scripts/ and tests/ requires force_ask; scripts/ and tests/ of a linked git worktree of the same repository
    (its .git file and <common git dir>/worktrees/<name>/gitdir point at each other; issue #148) count as inside.
@@ -375,6 +377,16 @@ try:
     from utils import score_calibration as scal  # stdlib-only, reads the local store (issue #202)
 except ImportError:  # pragma: no cover - fail closed: an unconfirmed Tier S asks the user
     scal = None
+
+_GENERIC_FALLBACK_ASK = ("squeeze_risk SHORT / Tier S: user confirmation required (calibration modules unavailable): "
+                         "ask the user and rerun with --confirmed.")
+try:  # issue #207: the module-unavailable texts, shared with the executor (constants only)
+    from utils.calibration_fallback import TIER_S_FALLBACK_MESSAGE, SQUEEZE_FALLBACK_MESSAGE
+except Exception:  # pragma: no cover - a broken module never crashes the hook: still ask, with a generic text
+    TIER_S_FALLBACK_MESSAGE = SQUEEZE_FALLBACK_MESSAGE = _GENERIC_FALLBACK_ASK
+# An emptied text would turn the ask off (callers test `if calib_msg:`): never empty
+TIER_S_FALLBACK_MESSAGE = TIER_S_FALLBACK_MESSAGE or _GENERIC_FALLBACK_ASK
+SQUEEZE_FALLBACK_MESSAGE = SQUEEZE_FALLBACK_MESSAGE or _GENERIC_FALLBACK_ASK
 
 try:
     from utils.atomic_writer import atomic_write_json
@@ -966,15 +978,19 @@ HARNESS_PATH_CMD_RE = re.compile(
     r"\.agents[\\/]+agents[\\/]|\.claude[\\/]+agents[\\/]|\.claude[\\/]+settings|config[\\/]+user_profile\.json|"
     r"scripts[\\/]+report_issue\.sh|"
     # Gate modules never run as programs (issue #79): path and bare basename
-    r"(?<![\w-])(?:gate_limits|portfolio_exposure|env_resolver|score_calibration)\.py",
+    r"(?<![\w-])(?:gate_limits|portfolio_exposure|env_resolver|score_calibration|daily_loss_gate|"
+    r"calibration_fallback)\.py",
     re.IGNORECASE,
 )
-# Gate modules that are also run as programs (issue #79): only a write target counts, never the program being run
+# Gate modules that are also run as programs (issue #79; #207: the ledger sync and trade_outcomes feed the Daily Loss
+# Gate): only a write target counts, never the program being run
 # (python3 scripts/execute_futures_trade.py --close-position 2>&1 keeps its decision)
-GATE_PROGRAM_PATH_RE = re.compile(r"scripts[\\/]+(?:execute_futures_trade|user_profile)\.py", re.IGNORECASE)
+GATE_PROGRAM_PATH_RE = re.compile(
+    r"scripts[\\/]+(?:execute_futures_trade|user_profile|sync_session_state|trade_outcomes)\.py", re.IGNORECASE)
 # A whole token that is such a path (relative, ./, absolute or drive form): the script operand of an interpreter
-GATE_PROGRAM_TOKEN_RE = re.compile(r"(?:[^\s'\"();|&<>]*[\\/])?scripts[\\/]+(?:execute_futures_trade|user_profile)\.py",
-                                   re.IGNORECASE)
+GATE_PROGRAM_TOKEN_RE = re.compile(
+    r"(?:[^\s'\"();|&<>]*[\\/])?scripts[\\/]+(?:execute_futures_trade|user_profile|sync_session_state|trade_outcomes)"
+    r"\.py", re.IGNORECASE)
 # Python interpreters / launcher that run a gate module in PowerShell (python, python3.12, python.exe, py)
 PS_PYTHON_RUNNER_RE = re.compile(r"^(?:python[0-9.]*|py)(?:\.exe)?$")
 HARNESS_WRITE_REASON = ("Command modifies trading harness / gate modules (hooks, dossier provenance, profile, "
@@ -1068,6 +1084,10 @@ HARNESS_FILES = {
     "scripts/utils/env_resolver.py", "scripts/user_profile.py",
     # Issue #202: decides when an autonomous Tier S needs the user's confirmation
     "scripts/utils/score_calibration.py",
+    # Issue #207: the Daily Loss Gate decision, the module-unavailable ask texts, and the ledger sync /
+    # trade_outcomes matching that feed the gate (counted_by, closed_trades_today)
+    "scripts/utils/daily_loss_gate.py", "scripts/utils/calibration_fallback.py",
+    "scripts/sync_session_state.py", "scripts/trade_outcomes.py",
 }
 HARNESS_DIRS = ("scripts/hooks/", ".agents/agents/", ".claude/agents/")
 BRAIN_PATH_RE = re.compile(r"(?:^|/)\.gemini/[^/]+/brain(?:/|$)", re.IGNORECASE)
@@ -5897,13 +5917,34 @@ def _tier_s_calibration_message(cand: dict, env: str, user_prof: dict, base_dir:
     if scal is None:
         tokens = str(cand.get("tier") or "").upper().replace("TIER", " ").split()
         if tokens and tokens[0] == "S":
-            return ("Tier S score bucket not calibrated (calibration module unavailable): ask the user and rerun "
-                    "with --confirmed.")
-        return None
+            return TIER_S_FALLBACK_MESSAGE  # issue #207: one text shared with the executor
+        return _squeeze_fallback_message(cand, base_dir)  # issue #207: the squeeze backstop still asks
     try:
         return scal.tier_s_confirmation_required(cand, env, user_prof, base_dir, now=now_ts)
     except Exception as e:  # fail closed: ask the user (same text as the executor)
         return scal.confirmation_reason(cand.get("score"), f"calibration check failed ({type(e).__name__})")
+
+
+
+
+def _squeeze_fallback_message(cand: dict, base_dir: str) -> Optional[str]:
+    """Mirror of execute_futures_trade.squeeze_fallback_message (stdlib json): ask when the stored dossier record's
+    radar snapshot has squeeze_risk true, or (a SHORT) is missing or unbound, or the record cannot be read."""
+    try:
+        with open(os.path.join(base_dir, "logs", "evaluations", "latest_dossier.json"), "r", encoding="utf-8") as f:
+            record = json.load(f)
+        key = f"{str(cand.get('symbol') or '').upper()}|{str(cand.get('direction') or '').upper()}"
+        entry = (record.get("radar_snapshots") or {}).get(key)
+        row = entry.get("radar_snapshot") if isinstance(entry, dict) else None
+        bound = bool(cand.get("dossier_sha256")) and (record.get("provenance") or {}).get("sha256") == \
+            cand.get("dossier_sha256")
+    except Exception:
+        return SQUEEZE_FALLBACK_MESSAGE
+    if isinstance(row, dict) and row.get("squeeze_risk") is True:
+        return SQUEEZE_FALLBACK_MESSAGE
+    if str(cand.get("direction") or "").upper() == "SHORT" and not (isinstance(row, dict) and bound):
+        return SQUEEZE_FALLBACK_MESSAGE
+    return None
 
 
 def _pending_entry_symbols(base_dir: str, env: str) -> Tuple[set, Optional[str]]:
@@ -6081,9 +6122,12 @@ def evaluate_trade_opening(cmd: str, args: dict, mcp_args: dict, base_dir: str,
         if is_prod and isinstance(cand, dict) and not is_confirmed:
             calib_msg = _tier_s_calibration_message(cand, env, user_prof, base_dir, now_ts)
             if calib_msg:
-                # Issue #206: the same helper also asks for a radar-flagged squeeze SHORT (RULE 9 backstop)
-                header = ("Squeeze Risk SHORT" if scal is not None
-                          and calib_msg.startswith(scal.SQUEEZE_CONFIRMATION_REASON) else "Uncalibrated Tier S Score")
+                # Issue #206: the same helper also asks for a radar-flagged squeeze SHORT (RULE 9 backstop); issue
+                # #207: and for a SHORT without a usable radar snapshot, and in the module-unavailable fallback
+                squeeze_prefixes = (("squeeze_risk SHORT",) if scal is None
+                                    else (scal.SQUEEZE_CONFIRMATION_REASON, scal.SNAPSHOT_UNAVAILABLE_REASON))
+                header = ("Squeeze Risk SHORT" if calib_msg.startswith(squeeze_prefixes)
+                          else "Uncalibrated Tier S Score")
                 return "deny", (
                     f"🚨 BLOCKED BY PRE-TOOL-USE HOOK ({header}): {target_sym}: {calib_msg}\n"
                     + CONFIRM_RE_RUN_HINT

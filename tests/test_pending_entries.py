@@ -124,6 +124,19 @@ def posts(fake, endpoint):
     return [c[2] for c in fake.calls if c[0] == "POST" and c[1] == endpoint]
 
 
+# Issue #207: the PROD Daily Loss Gate reads today's userTrades, which these fake exchanges do not serve (a non-list
+# reply fails closed). Harnesses that exercise other gates allow it here; tests/test_issue_207_daily_loss_gate.py
+# covers the gate itself.
+DAILY_LOSS_GATE_ALLOW = (True, None, {"blocked": False, "scope": None, "reason": None, "day_net_realized_usdt": 0.0,
+                                      "day_loss_limit_usdt": 1.0, "consecutive_full_sl": 0, "yolo_full_losses": 0,
+                                      "is_yolo_order": False})
+
+
+def allow_daily_loss_gate():
+    """patch() of execute_futures_trade.check_daily_loss_gate that lets the order through (issue #207 fixture)."""
+    return patch("execute_futures_trade.check_daily_loss_gate", return_value=DAILY_LOSS_GATE_ALLOW)
+
+
 # ---------------------------------------------------------------------------------------------
 # Executor harness (execute_complete_trade with a fake exchange)
 # ---------------------------------------------------------------------------------------------
@@ -196,6 +209,7 @@ class ExecutorHarness(unittest.TestCase):
              patch("execute_futures_trade.enforce_evaluation_dossier",  # eval_result: issue #202 audit tests
                    return_value=getattr(self, "eval_result", (True, "ok", None))), \
              patch("execute_futures_trade.check_mechanical_gates", return_value=(True, None)), \
+             allow_daily_loss_gate(), \
              patch("execute_futures_trade.get_symbol_filters", return_value=dict(EX_FILTERS)), \
              patch("execute_futures_trade.uses_mcp_gateway", return_value=mcp), \
              patch("execute_futures_trade.subprocess.run", side_effect=FileNotFoundError("binance-cli")), \

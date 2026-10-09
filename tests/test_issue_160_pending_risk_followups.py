@@ -255,8 +255,11 @@ class TestHookPendingFollowups(unittest.TestCase):
         cmd = (f"python3 scripts/execute_futures_trade.py --symbol SOLUSDT --direction {direction} --leverage 3 "
                f"--env {env}")
         cand = {"symbol": "SOLUSDT", "direction": direction, "requires_user_confirmation": False}
+        # Issue #207: the candidate has no stored dossier record, so a SHORT would ask for its missing radar snapshot
+        # before the delta pre-check under test; that confirmation gate is covered in test_issue_206_squeeze_backstop.
         with patch("user_profile.load_user_profile", return_value=dict(self.PROFILE)), \
-             patch("pre_trade_guard.check_dossier", return_value=(True, "ok", cand)):
+             patch("pre_trade_guard.check_dossier", return_value=(True, "ok", cand)), \
+             patch("pre_trade_guard._tier_s_calibration_message", return_value=None):
             return pre_trade_guard.evaluate_trade_opening(cmd, {"CommandLine": cmd}, {}, self.ws, None)
 
     def test_max_open_positions_deny_explains_stale_records(self):

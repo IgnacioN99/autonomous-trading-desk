@@ -20,8 +20,9 @@ open / fills_unavailable rows and rows without realized R are excluded and count
    writes it on every run with PROD rows read from logs/trade_outcomes.jsonl, never from a custom --outcomes file;
    this script is its sole writer). Per bucket n, win rate, net expectancy, sd and lcb95 of net R,
    mean MFE, mean radar score, insufficient (n < MIN_SAMPLE) and calibrated (n >= profile
-   tier_s_calibration_min_trades and lcb95 = mean - 1.645 x sd / sqrt(n) > 0); YOLO rows are excluded; rows without a
-   dossier score count as unscored.
+   tier_s_calibration_min_trades and lcb95 = mean - t95(n-1) x sd / sqrt(n) > tier_s_calibration_min_lcb_r, default
+   +0.1R, issue #207); YOLO rows are excluded; rows without a dossier score count as unscored; rows of an older
+   score_schema_version (or none) are kept in the store but excluded from the buckets (excluded_schema).
 4. Loss-cause clusters from logs/trade_insights.jsonl (env-agnostic).
 5. Meta-improver: below MIN_SAMPLE resolved trades only an insufficient-sample line; above it R-based data notes only
    (never instructions: any change needs the user's explicit decision). The profit-factor note needs net R on every
@@ -242,29 +243,40 @@ def _min_trades():
         return scal.DEFAULT_MIN_TRADES
 
 
-def calibration_store(rows, now, min_trades):
+def _min_lcb_r():
+    """Profile tier_s_calibration_min_lcb_r (issue #207), the default when the profile cannot be read."""
+    try:
+        import user_profile as up
+        return scal.calibration_policy(up.load_user_profile(base_dir=_workspace_dir()))[2]
+    except Exception:
+        return scal.DEFAULT_MIN_LCB_R
+
+
+def calibration_store(rows, now, min_trades, min_lcb_r=scal.DEFAULT_MIN_LCB_R):
     """(store, has_prod_rows): the existing logs/score_calibration.json merged with this run's closed PROD rows.
     Without PROD rows the existing store is returned unchanged (None when missing or unreadable)."""
     existing = scal.load_calibration(_workspace_dir())
     prod_rows = [r for r in rows if norm_env(r.get("env")) == "prod"]
     if not prod_rows:
         return existing, False
-    return scal.merge_store(existing, prod_rows, now, min_trades), True
+    return scal.merge_store(existing, prod_rows, now, min_trades, min_lcb_r), True
 
 
-def _calibration_block(store, min_trades, written):
+def _calibration_block(store, min_trades, written, min_lcb_r=scal.DEFAULT_MIN_LCB_R):
     cal = store if isinstance(store, dict) and isinstance(store.get("buckets"), dict) \
-        else scal.build_calibration([], scal.STORE_ENV, min_trades)
+        else scal.build_calibration([], scal.STORE_ENV, min_trades, min_lcb_r)
     keys = ("n", "wins", "win_rate", "expectancy_r_net", "sd_r_net", "lcb95_r_net", "mean_mfe_r", "mean_radar_score",
             "insufficient",
             "calibrated")
     return {
         "basis": "dossier_score", "note": "heuristic score, not a probability", "env": scal.STORE_ENV,
         "store": scal.STORE_REL_PATH, "store_written": written, "generated_at_ts": cal.get("generated_at_ts"),
-        "min_trades": min_trades, "min_sample": MIN_SAMPLE,
+        "min_trades": min_trades, "min_lcb_r": min_lcb_r, "min_sample": MIN_SAMPLE,
+        "score_schema_version": scal.SCORE_SCHEMA_VERSION,
         "buckets": [dict({"bucket": label}, **{k: (cal["buckets"].get(label) or {}).get(k) for k in keys})
                     for label in scal.BUCKET_LABELS],
         "unscored": cal.get("unscored", 0), "out_of_range": cal.get("out_of_range", 0),
+        "excluded_schema": cal.get("excluded_schema", 0),
     }
 
 
@@ -323,8 +335,8 @@ def generate_scorecard(env, outcomes_path=None, now=None, write_calibration=Fals
         cause = i.get("root_cause", "GENERAL")
         cause_clusters[cause] = cause_clusters.get(cause, 0) + 1
 
-    min_trades = _min_trades()
-    store, has_prod = calibration_store(rows, now, min_trades)
+    min_trades, min_lcb_r = _min_trades(), _min_lcb_r()
+    store, has_prod = calibration_store(rows, now, min_trades, min_lcb_r)
     written = False
     # Only the guard-protected logs/trade_outcomes.jsonl may feed the store (a PROD gate input): any other
     # --outcomes file is reported but never persisted (issue #202 audit).
@@ -348,7 +360,7 @@ def generate_scorecard(env, outcomes_path=None, now=None, write_calibration=Fals
         "performance": performance,
         "tiers_breakdown": {t: {k: v for k, v in _r_stats(vals).items() if k in ("n", "win_rate_pct", "expectancy_r")}
                             for t, vals in by_tier.items()},
-        "score_calibration": _calibration_block(store, min_trades, written),
+        "score_calibration": _calibration_block(store, min_trades, written, min_lcb_r),
         "insights": {"env_agnostic": True, "loss_cause_clusters": cause_clusters},
         "recommendations": _recommendations(n, stats["expectancy_r"], stats["profit_factor_r"], cause_clusters,
                                             gross_fallback),
@@ -397,9 +409,10 @@ def format_scorecard_report(sc: dict) -> str:
                          f"{_fmt(b['expectancy_r_net'], '+.4f')}R | lcb95: {_fmt(b['lcb95_r_net'], '+.4f')}R | "
                          f"MFE: {_fmt(b['mean_mfe_r'], '.2f')}R | radar score: {_fmt(b['mean_radar_score'], '.1f')} | "
                          f"calibrated: {'yes' if b['calibrated'] else 'no'} ({flag})")
-        lines.append(f"  unscored: {cal['unscored']} | out of range: {cal['out_of_range']} | autonomous Tier S "
-                     f"needs a Tier S bucket (80-89 / 90-95) with n >= {cal['min_trades']} and a one-sided 95% "
-                     "lower bound of mean net R > 0")
+        lines.append(f"  unscored: {cal['unscored']} | out of range: {cal['out_of_range']} | older score schema "
+                     f"(not v{cal.get('score_schema_version')}, excluded): {cal.get('excluded_schema', 0)} | "
+                     f"autonomous Tier S needs a Tier S bucket (80-89 / 90-95) with n >= {cal['min_trades']} and a "
+                     f"one-sided 95% t lower bound of mean net R > {cal.get('min_lcb_r', scal.DEFAULT_MIN_LCB_R):g}R")
         lines.append("-" * 70)
     lines.append("🔬 LOSS ROOT CAUSE CLUSTERS (all envs):")
     for cause, cnt in sc["insights"]["loss_cause_clusters"].items():
