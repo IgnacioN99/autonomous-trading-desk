@@ -32,6 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import microstructure_engine as me
 from utils import rate_limit_guard
 from utils import squeeze_filter as sqf
+from utils.score_calibration import SCORE_SCHEMA_VERSION  # stdlib-only (issue #207)
 
 SUPPORTED_INTERVALS = ("5m", "15m", "1h")
 DEFAULT_INTERVAL = "15m"
@@ -353,6 +354,8 @@ def analyze_single_symbol(symbol, interval=DEFAULT_INTERVAL):
         # Exact (unrounded) climax part of the macro rule for altcoin shorts (issue #206), read by the pipeline gate
         "alt_short_climax_ok": bool(vol_ratio >= sqf.ALT_SHORT_CLIMAX_VOL),
         "score_components": score_components,
+        # Version of this score formula (issue #207): calibration buckets use only rows of the current version
+        "score_schema_version": SCORE_SCHEMA_VERSION,
         "reasons": reasons
     }
     # Issue #84: a stop this far from the trigger puts TP2 (4R) out of intraday reach. The row is flagged here and
@@ -362,10 +365,15 @@ def analyze_single_symbol(symbol, interval=DEFAULT_INTERVAL):
         row["disqualify_reason"] = f"risk_pct {risk_pct:.2f}% > {MAX_RISK_PCT}% intraday ceiling"
     return row
 
-def enrich_candidate_microstructure(cand, funding_intervals=None):
+def enrich_candidate_microstructure(cand, funding_intervals=None, funding_interval_unknown=False):
     """Order-flow enrichment of one radar row. `funding_intervals` ({symbol: hours} from fetch_funding_intervals)
-    normalizes funding to 8h for the squeeze thresholds (issue #206); a symbol not in it (or None) uses 8h."""
+    normalizes funding to 8h for the squeeze thresholds (issue #206); a symbol not in it (or None) uses 8h.
+    `funding_interval_unknown` (issue #207): fundingInfo failed, so every interval was read as 8h; a SHORT row is
+    marked `funding_interval_unknown: true`, and with a negative raw rate (it could be crowded on a shorter interval)
+    that is a squeeze reason."""
     sym = cand['symbol']
+    if funding_interval_unknown and cand.get('direction') == 'SHORT':
+        cand['funding_interval_unknown'] = True
     # Same wick candle as the scan, so the ORDER FLOW text and the wick fields describe one candle (issue #20)
     micro = me.get_symbol_microstructure(sym, period=cand.get('interval', DEFAULT_INTERVAL),
                                          wick_candle_open_time=cand.get('wick_candle_open_time'))
@@ -425,10 +433,12 @@ def enrich_candidate_microstructure(cand, funding_intervals=None):
         elif regime == 'SHORT_SQUEEZE':
             score += add("flow_regime", 10)
             reasons.append(f"🔬 ORDER FLOW: {micro['regime_desc']}")
-        # Penalize if funding rate is deeply negative (crowded short; raw per-interval rate, unchanged by #206)
-        if funding_rate < -0.015:
+        # Penalize if funding rate is deeply negative (crowded short). Per 8h, like the squeeze thresholds (issue
+        # #207): the normalized rate, the raw per-interval rate only when it could not be normalized.
+        funding_short = funding_8h if funding_8h is not None else funding_rate
+        if funding_short < -0.015:
             score += add("funding", -15)
-            reasons.append(f"⚠️ CROWDED: Negative funding ({funding_rate:.4f}%)")
+            reasons.append(f"⚠️ CROWDED: Negative funding ({funding_short:.4f}%/8h)")
 
     elif direction == 'LONG':
         # Strongly penalize if market is in active Short Build-Up (aggressive selling + rising OI)
@@ -441,10 +451,12 @@ def enrich_candidate_microstructure(cand, funding_intervals=None):
         elif regime == 'LONG_BUILDUP':
             score += add("flow_regime", 10)
             reasons.append(f"🔬 ORDER FLOW: {micro['regime_desc']}")
-        # Penalize if funding rate is excessively positive (crowded long)
-        if funding_rate > 0.035:
+        # Penalize if funding rate is excessively positive (crowded long). Per 8h like the SHORT one (issue #207):
+        # the normalized rate, the raw per-interval rate only when it could not be normalized.
+        funding_long = funding_8h if funding_8h is not None else funding_rate
+        if funding_long > 0.035:
             score += add("funding", -15)
-            reasons.append(f"⚠️ CROWDED: Excessive positive funding ({funding_rate:.4f}%)")
+            reasons.append(f"⚠️ CROWDED: Excessive positive funding ({funding_long:.4f}%/8h)")
 
     # Tier S still needs institutional volume or a >= 60% wick after the enrichment (issue #134): same cap as
     # analyze_single_symbol, unconditional since #165 (75-79 never stays on an ineligible row). A missing flag is
@@ -455,8 +467,11 @@ def enrich_candidate_microstructure(cand, funding_intervals=None):
     cand['confidence'] = max(20, min(95, score))
     _add_cap_component(comps, cand['confidence'])
     if direction == 'SHORT':
-        cand['confidence'] = _apply_squeeze_cap(cand, comps, cand['confidence'],
-                                                sqf.short_squeeze_reasons(squeeze_micro))
+        squeeze = sqf.short_squeeze_reasons(squeeze_micro)
+        raw_rate = sqf._finite(funding_rate)
+        if cand.get('funding_interval_unknown') and raw_rate is not None and raw_rate < 0:
+            squeeze = squeeze + ["funding_interval_unknown"]  # issue #207: maybe crowded on a shorter interval
+        cand['confidence'] = _apply_squeeze_cap(cand, comps, cand['confidence'], squeeze)
     elif direction == 'LONG':
         crowding = sqf.long_crowding_reasons(squeeze_micro)
         cand['long_crowding_risk'] = bool(crowding)
@@ -545,7 +560,8 @@ def scan_all_liquid_pairs(top_n=DEFAULT_UNIVERSE, interval=DEFAULT_INTERVAL, fun
 
     # Filter and enrich candidate microstructure concurrently
     with ThreadPoolExecutor(max_workers=8) as ex:
-        enriched_results = list(ex.map(lambda c: enrich_candidate_microstructure(c, funding_intervals), raw_results))
+        enriched_results = list(ex.map(lambda c: enrich_candidate_microstructure(
+            c, funding_intervals, funding_interval_unknown=bool(funding_warning)), raw_results))
 
     # Filter qualified candidates only (>= 55% confidence, risk_pct within the intraday ceiling, issue #84)
     qualified = [c for c in enriched_results if c['confidence'] >= 55 and not c.get('risk_pct_over_ceiling')]

@@ -13,7 +13,7 @@ Whenever the user explicitly requests crypto trading operations, Binance Futures
      * The desk operates primarily in **PROD (Mainnet Real)**. All scans, evaluations, diagnostics (`trading_doctor.py`) and ledger syncs (`sync_session_state.py`) target the environment resolved by `scripts/utils/env_resolver.py` (`BINANCE_API_ENV`).
      * TESTNET is strictly an isolated sandbox mode used only when `--env testnet` is explicitly passed by the user.
    - **Authentication Modes (`BINANCE_AUTH_MODE`):**
-     * `MCP`: Binance Agentic MCP Gateway (`agent.binance.com`) on an isolated agentic sub-account. Binance caps sub-accounts at 5x leverage (error `-4421`); the executor auto-clamps.
+     * `MCP`: Binance Agentic MCP Gateway (`agent.binance.com`) on an isolated agentic sub-account. Binance caps sub-accounts at 5x leverage (error `-4421`); the executor auto-clamps. No `userTrades`: the Daily Loss Gate refuses PROD openings.
      * `KEYS`: standard HMAC API keys. Use a futures-only key with withdrawals disabled and IP restriction.
    - **Layer 0: Pre-Flight Diagnostic, Onboarding Profiler & Health Sensor (`scripts/trading_doctor.py` & `scripts/user_profile.py`):**
      * Prior to any scanning or trading action, execute the Doctor and verify that the User Profile (`config/user_profile.json`) is calibrated. If uninitialized, prompt the user through an interactive onboarding interview to define risk tolerance (`risk_pct_equity`, default 0.5% of equity per trade), max margin ceiling (30%), leverage, overnight handling mode, and YOLO moonshot preference.
@@ -26,6 +26,7 @@ Whenever the user explicitly requests crypto trading operations, Binance Futures
        2. **Monetary Risk Gate:** Blocks orders whose loss at SL from the effective entry (limit/trigger if conditional) exceeds `risk_pct_equity` × min(wallet balance, balance + unrealized PnL) + buffer (default 0.5%, max 2.0%).
        3. **Financial Friction Gate:** Blocks orders whose TP1 is under 0.35% from the effective entry (taker fees would eat the edge).
        4. **Leverage Gate:** Standard orders use the profile's `leverage_standard`, YOLO orders `leverage_yolo`; absolute desk ceiling = profile `leverage_ceiling` (default 15x).
+       5. **Daily Loss Gate:** No entry once today's (UTC) net realized PnL ≤ -`daily_stop_r` x risk or after `max_consecutive_sl` full SLs (YOLO: `yolo_max_daily_losses`). PROD fails closed.
      * *Environment Operational Rule (PROD vs TESTNET Sandbox):* In **PROD (Mainnet Real)**, mechanical hard gates are 100% strict and inviolable (Fail-closed, zero exceptions). In **TESTNET**, explicit bypass or gate relaxation is permitted (Delta-Neutral, risk caps, friction) to allow testing, stress tests, concurrent runs, and new hypotheses freely without friction.
    - **Layer 3: Deterministic Context Packing (`scripts/prime_evaluator_brief.py`):**
      * *Information Density Optimization:* Compiles portfolio Ground Truth, macro BTC regime, filtered setups, committed lessons and the profile's `risk_profile` (risk per trade, leverage, YOLO margin) into an ultra-dense brief (< 1,800 tokens) written to `logs/primed_brief.json` with `generated_at_ts`.

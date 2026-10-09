@@ -227,6 +227,7 @@ def build_risk_profile(target_env: str, profile: Optional[dict] = None, equity: 
         "yolo_margin_usdt": yolo_margin,
         "autonomous_execution_tier_s": bool(profile.get("autonomous_execution_tier_s", False)),
         "overnight_mode": profile.get("overnight_mode"),
+        **up.get_daily_loss_limits(profile),  # issue #207: daily_stop_r, max_consecutive_sl, yolo_max_daily_losses
     }
 
 
@@ -349,6 +350,14 @@ def assemble_primed_brief(target_env: str = "prod", out_path: Optional[str] = No
                        if isinstance(r, dict) and r.get("symbol")]
     if rejected_shorts:
         brief["macro_rejected_shorts"] = rejected_shorts
+    # Issue #207 (PR #214 review): fundingInfo failed, every funding interval was read as 8h
+    if isinstance(screening, dict) and screening.get("funding_info_warning"):
+        brief["funding_info_warning"] = str(screening["funding_info_warning"])[:120]
+    # Issue #207: the ledger's Daily Loss Gate (the executor re-reads the exchange and is authoritative)
+    brief["daily_loss_gate"] = brief_daily_loss_gate(state, target_env)
+    data_quality = closed_today_data_quality(closed_today)
+    if data_quality:
+        brief["ground_truth_portfolio"]["closed_today_data"] = data_quality
 
     # Atomic write: the evaluator subagent reads logs/primed_brief.json with view_file
     _write_json(BRIEF_FILE, brief)
@@ -359,14 +368,47 @@ def assemble_primed_brief(target_env: str = "prod", out_path: Optional[str] = No
     return brief
 
 
+def brief_daily_loss_gate(state: Any, target_env: str) -> dict:
+    """Compact {blocked, scope, reason} of the ledger's daily_loss_gate (issue #207). A state of another environment
+    or without the key reads as blocked for every entry (fail closed; the executor re-reads the exchange)."""
+    gate = state.get("daily_loss_gate") if isinstance(state, dict) else None
+    same_env = isinstance(state, dict) and str(state.get("target_env", "")).lower() == str(target_env).lower()
+    if not same_env or not isinstance(gate, dict):
+        return {"blocked": True, "scope": "all", "reason": "unavailable: ledger has no daily_loss_gate state"}
+    blocked = gate.get("blocked") is not False
+    scope = gate.get("scope") if gate.get("scope") in ("all", "yolo") else ("all" if blocked else None)
+    # The reason only when blocked: an inactive gate's informational notes (unscored / unaudited trades) stay in the
+    # ledger cache and the doctor, never in the evaluator's brief
+    reason = gate.get("reason") if blocked else None
+    if isinstance(reason, str) and len(reason) > BRIEF_GATE_REASON_MAX:  # token budget
+        reason = reason[:BRIEF_GATE_REASON_MAX - 1] + "…"
+    return {"blocked": blocked, "scope": scope, "reason": reason}
+
+
+BRIEF_GATE_REASON_MAX = 200  # characters of daily_loss_gate.reason in the brief (cut ones end in "…")
+
+
+# Issue #187 / #212: closed-today data-quality keys reach the brief only when they differ from these defaults.
+CLOSED_TODAY_DEFAULTS = {"counted_by": "trades", "fills_closed": 0, "truncated": False,
+                         "trade_summary_error": None, "fills_error": None}
+
+
+def closed_today_data_quality(closed_today: Any) -> dict:
+    """The CLOSED_TODAY_DEFAULTS keys of the ledger's closed_today_summary whose value is not the default."""
+    closed_today = closed_today if isinstance(closed_today, dict) else {}
+    return {k: closed_today.get(k) for k, default in CLOSED_TODAY_DEFAULTS.items()
+            if closed_today.get(k, default) != default}
+
+
 # Audit-only fields (issue #202): kept out of the evaluator's brief (token budget) and written to the sidecar.
 # alt_short_climax_ok (issue #206) is a pipeline-only gate input: kept out of the brief, not written to the sidecar.
-_SIDECAR_ONLY_KEYS = ("score_components", "tier_s_eligible", "alt_short_climax_ok")
+# score_schema_version (issue #207): sidecar only (calibration input).
+_SIDECAR_ONLY_KEYS = ("score_components", "tier_s_eligible", "alt_short_climax_ok", "score_schema_version")
 
 
 # Issue #206 flags reach the brief only when set (token budget): these values are dropped from a row.
 _DROP_WHEN_UNSET = {"squeeze_risk": False, "squeeze_reasons": [], "long_crowding_risk": False,
-                    "macro_short_check": None, "funding_rate_pct": None}
+                    "macro_short_check": None, "funding_rate_pct": None, "funding_interval_unknown": False}
 # The 8h-normalized funding and the interval add nothing for an 8h symbol (normalized == raw)
 _FUNDING_8H_KEYS = ("funding_rate_8h_pct", "funding_interval_h")
 
@@ -393,10 +435,13 @@ def _write_scores_sidecar(screening: Any, yolo_slot: dict, generated_at_ts: int,
     try:
         cands = list(screening.get("top_candidates") or []) if isinstance(screening, dict) else []
         cands += [dict(c, direction=c.get("direction") or "LONG") for c in (yolo_slot.get("candidates") or [])]
-        rows = [{"symbol": c.get("symbol"), "direction": c.get("direction"), "confidence": c.get("confidence"),
-                 "tier": c.get("tier"), "tier_s_eligible": c.get("tier_s_eligible"),
-                 "squeeze_risk": c.get("squeeze_risk") is True,
-                 "score_components": c.get("score_components"), "reasons": c.get("reasons")}
+        rows = [dict({"symbol": c.get("symbol"), "direction": c.get("direction"), "confidence": c.get("confidence"),
+                      "tier": c.get("tier"), "tier_s_eligible": c.get("tier_s_eligible"),
+                      "squeeze_risk": c.get("squeeze_risk") is True,
+                      "score_components": c.get("score_components"), "reasons": c.get("reasons")},
+                     # issue #207: the radar score formula version, when the row carries one (calibration filter)
+                     **({"score_schema_version": c["score_schema_version"]}
+                        if isinstance(c.get("score_schema_version"), int) else {}))
                 for c in cands if isinstance(c, dict) and c.get("symbol")]
         _write_json(scores_sidecar_path(), {"generated_at_ts": generated_at_ts, "env": str(target_env).upper(),
                                             "rows": rows})
@@ -446,6 +491,13 @@ def format_markdown_brief(brief: dict) -> str:
                  + f" | **Delta incl. resting:** `{p.get('delta_bias_incl_resting', 'UNKNOWN')}`"
                  + (" | **Pending entries status:** `UNREADABLE`" if brief.get("pending_entries_status") else "")
                  + (" | **State sync:** `FAILED`" if brief.get("state_sync") else ""))
+    dlg = brief.get("daily_loss_gate") or {}
+    if dlg.get("blocked") or dlg.get("scope"):  # issue #207
+        lines.append(f"- **Daily Loss Gate:** `ACTIVE ({dlg.get('scope') or 'all'})` {dlg.get('reason') or ''}".rstrip())
+    if p.get("closed_today_data"):
+        lines.append(f"- **Closed-today data:** {json.dumps(p['closed_today_data'], ensure_ascii=False)}")
+    if brief.get("funding_info_warning"):
+        lines.append(f"- **Funding info:** {brief['funding_info_warning']}")
     lines.append("")
 
     if brief.get("committed_memory_lessons"):

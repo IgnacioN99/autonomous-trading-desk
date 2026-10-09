@@ -44,10 +44,19 @@ DEFAULT_PROFILE = {
     "operating_mode": "BALANCED_DELTA_NEUTRAL", # BALANCED_DELTA_NEUTRAL | CONSERVATIVE | AGGRESSIVE
     "autonomous_execution_tier_s": False, # Cold start: autonomous execution disabled by default; requires explicit opt-in
     # Issue #202: autonomous Tier S only in a calibrated score bucket (n >= min trades resolved PROD trades with
-    # a 95% lower bound of mean net R > 0, logs/score_calibration.json); otherwise ask the user. Validated by
-    # utils.score_calibration.calibration_policy (bool; int >= 1; anything else = the default).
+    # a one-sided 95% Student-t lower bound of mean net R above tier_s_calibration_min_lcb_r, issue #207;
+    # logs/score_calibration.json); otherwise ask the user. Validated by
+    # utils.score_calibration.calibration_policy (bool; int >= 1; number >= 0; anything else = the default).
     "require_calibrated_tier_s": True,
     "tier_s_calibration_min_trades": 30,
+    "tier_s_calibration_min_lcb_r": 0.1,
+    # Issue #207: Daily Loss Gate (executor, opening orders only; PROD strict). No new entry once today's (UTC) net
+    # realized PnL <= -daily_stop_r x risk_pct_equity x start-of-day equity, or after max_consecutive_sl full stops
+    # (<= -0.8R) in a row; YOLO entries also stop after yolo_max_daily_losses YOLO full losses. Validated by
+    # get_daily_loss_limits (an invalid value = the default; no value turns the gate off).
+    "daily_stop_r": 3.0,
+    "max_consecutive_sl": 2,
+    "yolo_max_daily_losses": 1,
     "yolo_slot_enabled": False,        # Barbell memecoin moonshot slot (10x-15x, $10 margin or 0.5% equity)
     "yolo_equity_pct": 0.005,          # 0.5% default margin for YOLO moonshots (e.g. $50 on $10k)
     "overnight_mode": "ZERO_OVERNIGHT_RISK", # ZERO_OVERNIGHT_RISK | CLOSE_ALL_AT_MARKET | SWING_STRUCTURAL_STOP
@@ -229,6 +238,24 @@ def get_exit_management(profile: Optional[Dict[str, Any]] = None) -> Dict[str, A
             out["profit_lock_steps"] = [{"mfe_r": float(s["mfe_r"]), "lock_r": float(s["lock_r"])}
                                         for s in raw["profit_lock_steps"]]
     out["warnings"] = warnings
+    return out
+
+
+DAILY_STOP_R_MAX = 20.0
+
+
+def get_daily_loss_limits(profile: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Daily Loss Gate limits (issue #207) from the profile: daily_stop_r (number, 0 < x <= DAILY_STOP_R_MAX),
+    max_consecutive_sl and yolo_max_daily_losses (int >= 1). A missing or invalid value falls back to its
+    DEFAULT_PROFILE value (conservative); none of them can disable the gate. Never raises."""
+    prof = profile if isinstance(profile, dict) else {}
+    out = {}
+    raw = prof.get("daily_stop_r", DEFAULT_PROFILE["daily_stop_r"])
+    out["daily_stop_r"] = (float(raw) if _is_number(raw) and 0 < raw <= DAILY_STOP_R_MAX
+                           else DEFAULT_PROFILE["daily_stop_r"])
+    for key in ("max_consecutive_sl", "yolo_max_daily_losses"):
+        raw = prof.get(key, DEFAULT_PROFILE[key])
+        out[key] = raw if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 1 else DEFAULT_PROFILE[key]
     return out
 
 

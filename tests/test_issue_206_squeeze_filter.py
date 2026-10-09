@@ -364,7 +364,11 @@ class TestScanFundingInfo(unittest.TestCase):
     def test_failure_falls_back_to_8h_with_warning(self):
         rows, status, _ = self.scan(urllib.error.URLError("down"))
         self.assertEqual({r["funding_interval_h"] for r in rows.values()}, {8})
-        self.assertFalse(rows["AAAUSDT"]["squeeze_risk"])
+        # Issue #207 (PR #214 review): with the interval unknown, a SHORT at a negative raw rate (-0.006%) may be
+        # crowded on a shorter interval: flagged funding_interval_unknown and capped as squeeze risk
+        self.assertTrue(rows["AAAUSDT"]["squeeze_risk"])
+        self.assertIn("funding_interval_unknown", rows["AAAUSDT"]["squeeze_reasons"])
+        self.assertIs(rows["AAAUSDT"]["funding_interval_unknown"], True)
         self.assertIn("fundingInfo unavailable", status["warning"])
 
     def test_rate_limit_ban_propagates(self):

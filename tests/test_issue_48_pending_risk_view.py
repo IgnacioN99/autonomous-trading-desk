@@ -115,8 +115,11 @@ class TestHookCountsPendingEntries(unittest.TestCase):
         cmd = (f"python3 scripts/execute_futures_trade.py --symbol SOLUSDT --direction {direction} --leverage 3 "
                f"--env {env}")
         cand = {"symbol": "SOLUSDT", "direction": direction, "requires_user_confirmation": False}
+        # Issue #207: the candidate has no stored dossier record, so a SHORT would ask for its missing radar snapshot
+        # before the delta pre-check under test; that confirmation gate is covered in test_issue_206_squeeze_backstop.
         with patch("user_profile.load_user_profile", return_value=dict(self.PROFILE)), \
-             patch("pre_trade_guard.check_dossier", return_value=(True, "ok", cand)):
+             patch("pre_trade_guard.check_dossier", return_value=(True, "ok", cand)), \
+             patch("pre_trade_guard._tier_s_calibration_message", return_value=None):
             return pre_trade_guard.evaluate_trade_opening(cmd, {"CommandLine": cmd}, {}, self.ws, None)
 
     def test_pending_symbols_take_slots(self):
@@ -442,6 +445,7 @@ class TestDefaultMarginSizedOnGate2Equity(t101.Workspace):
              patch("execute_futures_trade.enforce_evaluation_dossier", return_value=(True, "ok", None)), \
              patch("execute_futures_trade.get_symbol_filters", return_value=dict(EX_FILTERS)), \
              patch("execute_futures_trade.check_mechanical_gates", gates), \
+             tpe.allow_daily_loss_gate(), \
              patch("quant_risk_engine.get_account_equity", return_value=400.0), \
              patch("user_profile.load_user_profile", return_value=dict(PROFILE)):
             res = eft.execute_complete_trade(**args)

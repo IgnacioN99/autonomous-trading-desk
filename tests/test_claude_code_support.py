@@ -365,8 +365,14 @@ class TestClaudePRReviewHooks(unittest.TestCase):
         self.state_file = os.path.join(self.tmp, "logs", "pr_review_state.json")
         self.env = mock.patch.dict(os.environ, {state_mod.STATE_ENV: self.state_file})
         self.env.start()
+        # Hermetic git: a main checkout would otherwise resolve `gh pr create --fill` to main (never arms, #115)
+        self.git = mock.patch.object(post_hook, "_git",
+                                     side_effect=lambda args, directory=None:
+                                     "fix/checkout" if "--abbrev-ref" in args else "")
+        self.git.start()
 
     def tearDown(self):
+        self.git.stop()
         self.env.stop()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
@@ -438,7 +444,8 @@ class TestClaudePRReviewHooks(unittest.TestCase):
 
         res = self._run_settings_hook("post_pr_review_hook", {
             "session_id": SESSION, "hook_event_name": "PostToolUse", "tool_name": "Bash",
-            "tool_input": {"command": "gh pr create --fill"}, "tool_response": {"stdout": "https://x/pull/1"}})
+            "tool_input": {"command": "gh pr create --fill --head feat/x"},  # --head: checkout-independent
+            "tool_response": {"stdout": "https://x/pull/1"}})
         self.assertEqual((res.returncode, json.loads(res.stdout)), (0, {}))
         res = self._run_settings_hook("pr_review_stop_hook", {
             "session_id": SESSION, "hook_event_name": "Stop", "stop_hook_active": False})
