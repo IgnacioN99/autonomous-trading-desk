@@ -517,6 +517,18 @@ def ledger_resting_mismatch_warning(state, target_env: str):
             "--protect-pending or the position guardian.")
 
 
+def ledger_listing_warning(state, target_env: str):
+    """Issue #189: WARN text when the same-env ledger reports a failed order listing read (listing_read_error), else
+    None. The state stays valid: resting exposure is UNKNOWN and the SL / TP listings of that sync are empty."""
+    if not isinstance(state, dict) or pt.norm_env(state.get("target_env")) != pt.norm_env(target_env):
+        return None
+    read_error = state.get("listing_read_error")
+    if not read_error:
+        return None
+    return (f"Ledger sync: order listing read failed ({str(read_error)[:300]}); delta_bias_incl_resting is UNKNOWN "
+            "and positions may show no verified Stop Loss in the ledger. Re-run python3 scripts/sync_session_state.py.")
+
+
 def ledger_counted_by_warning(state, target_env: str):
     """Issue #207 (#212 request): WARN text when the same-env ledger's closed_today_summary.counted_by is present and
     not "trades" (per-fill counts or unreadable fills: the day's closed-trade counts are not per trade), else None."""
@@ -853,7 +865,11 @@ def run_doctor(target_env: str = None, auto_heal: bool = False) -> int:
             warnings.append(mismatch_warning)
             print(f"⚠️  [STATE LEDGER] {mismatch_warning}")
         # Issue #207: per-trade counting quality and the Daily Loss Gate state (WARN only, never critical)
-        ledger_state = _read_session_state()  # read once for both checks
+        ledger_state = _read_session_state()  # read once for the checks below
+        listing_warning = ledger_listing_warning(ledger_state, target_env)   # issue #189
+        if listing_warning:
+            warnings.append(listing_warning)
+            print(f"⚠️  [STATE LEDGER] {listing_warning}")
         counted_warning = ledger_counted_by_warning(ledger_state, target_env)
         if counted_warning:
             warnings.append(counted_warning)

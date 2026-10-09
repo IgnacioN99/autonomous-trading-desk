@@ -3,7 +3,7 @@
 test_issue_160_pending_risk_followups.py - Offline tests for the #160 follow-ups of the pending-risk view (#48).
 
 #160.1  doctor: a sync whose atomic write failed (state_write_error) is a failed sync (temporal audit skipped).
-#160.2  post-trade sync hook: sync_rc carries the sync exit code (synced stays "attempted").
+#160.2  post-trade sync hook: sync_rc carries the sync exit code (sync_attempted, renamed from synced in #189).
 #160.3  guardian: a failed crossed close already filed the P0; the later orphan heal of the same symbol in the same
         cycle still heals/closes but files no second P0.
 #160.4  hook: the Max Open Positions deny says how a stale registry record is cleared.
@@ -149,19 +149,19 @@ class TestPostTradeSyncRc(unittest.TestCase):
     def test_non_zero_exit_is_reported_in_sync_rc(self):
         res, err = self.run_hook(MagicMock(returncode=1))
         self.assertTrue(res["order_placed"])
-        self.assertTrue(res["synced"], "synced means the sync was attempted")
+        self.assertTrue(res["sync_attempted"], "the sync was attempted")
         self.assertEqual(res["sync_rc"], 1)
         self.assertIn("exited 1", err)
 
     def test_zero_exit_and_non_int_return_code(self):
         self.assertEqual(self.run_hook(MagicMock(returncode=0))[0]["sync_rc"], 0)
         res, _ = self.run_hook(MagicMock())   # a bare mock: returncode is not an int
-        self.assertTrue(res["synced"])
+        self.assertTrue(res["sync_attempted"])
         self.assertIsNone(res["sync_rc"])
 
     def test_no_order_has_no_sync_rc(self):
         res = pts.handle_post_trade_sync({"toolCall": {"name": "run_command", "args": {"CommandLine": "ls"}}})
-        self.assertEqual((res["synced"], res["sync_rc"]), (False, None))
+        self.assertEqual((res["sync_attempted"], res["sync_rc"]), (False, None))
 
 
 # =============================================================================
@@ -445,9 +445,9 @@ class TestTakeProfitIdsOnLockFailure(unittest.TestCase):
                             open_orders=open_orders)
 
     @staticmethod
-    def tp_order(order_id, price, side="SELL", reduce_only=True, order_type="LIMIT"):
+    def tp_order(order_id, price, side="SELL", reduce_only=True, order_type="LIMIT", qty="3", executed="0"):
         return {"orderId": order_id, "symbol": "BTCUSDT", "side": side, "type": order_type, "price": str(price),
-                "origQty": "3", "reduceOnly": reduce_only, "status": "NEW"}
+                "origQty": qty, "executedQty": executed, "reduceOnly": reduce_only, "status": "NEW"}
 
     def test_tp_save_is_retried_on_a_lock_error(self):
         write_registry(self.ws, make_record(sl_qty=10.0))
@@ -482,7 +482,7 @@ class TestTakeProfitIdsOnLockFailure(unittest.TestCase):
         self.assertFalse(rec.get("tp_placed"))
         self.assertEqual(len(posts(fake, ORDER_ENDPOINT)), 2)
         # the two TPs rest on the exchange (plus an unrelated reduce-only LIMIT and a non-reduce-only one)
-        fake.open_orders = [self.tp_order(501, 110.0), self.tp_order(502, 120.0), self.tp_order(503, 115.0),
+        fake.open_orders = [self.tp_order(501, 110.0), self.tp_order(502, 120.0, qty="7"), self.tp_order(503, 115.0),
                             self.tp_order(504, 110.0, reduce_only=False)]
         fake.calls = []
         res2 = self.protect(fake)
@@ -497,7 +497,7 @@ class TestTakeProfitIdsOnLockFailure(unittest.TestCase):
 
     def test_only_the_missing_tp_is_adopted(self):
         write_registry(self.ws, make_record(sl_qty=10.0, tp1_qty=3.0, tp2_qty=7.0, tp1_order_id=501))
-        fake = self.exchange(open_orders=[self.tp_order(501, 110.0), self.tp_order(502, 120.0)])
+        fake = self.exchange(open_orders=[self.tp_order(501, 110.0), self.tp_order(502, 120.0, qty="7")])
         res = self.protect(fake)
         self.assertTrue(res["ok"], res["errors"])
         self.assertEqual(posts(fake, ORDER_ENDPOINT), [])
@@ -521,16 +521,18 @@ class TestTakeProfitIdsOnLockFailure(unittest.TestCase):
         self.assertEqual(read_registry(self.ws), {})
 
     def test_find_resting_take_profits_matching(self):
-        orders = [self.tp_order(1, 110.05), self.tp_order(2, 110.2), self.tp_order(3, 120.0, side="BUY"),
-                  self.tp_order(4, 120.0, order_type="STOP_MARKET"), self.tp_order(5, 120.0)]
+        # Issue #189: half a tick (0.05); 110.06 just outside comes first, 110.04 inside
+        orders = [self.tp_order(6, 110.06), self.tp_order(1, 110.04), self.tp_order(2, 110.2),
+                  self.tp_order(3, 120.0, side="BUY"), self.tp_order(4, 120.0, order_type="STOP_MARKET"),
+                  self.tp_order(5, 120.0)]
         with patch("execute_futures_trade.send_signed_request", return_value=orders):
             found, err = eft.find_resting_take_profits("BTCUSDT", "SELL", {"tp1": 110.0, "tp2": 120.0}, 0.1)
             self.assertIsNone(err)
-            self.assertEqual(found, {"tp1": 1, "tp2": 5})   # within one tick; exit side LIMIT reduce-only only
+            self.assertEqual(found, {"tp1": 1, "tp2": 5})   # within half a tick; exit side LIMIT reduce-only only
             found, _ = eft.find_resting_take_profits("BTCUSDT", "SELL", {"tp1": 110.0}, 0.1, exclude_ids=[1])
             self.assertEqual(found, {})
             found, _ = eft.find_resting_take_profits("BTCUSDT", "SELL", {"tp1": 110.0}, None)
-            self.assertEqual(found, {}, "exact match without a tick")
+            self.assertEqual(found, {"tp1": 1}, "0.05% of price without a tick (0.055), never an exact compare")
 
 
 # =============================================================================
@@ -643,7 +645,9 @@ class TestEvaluatorPrompt(unittest.TestCase):
         self.assertIn("`state_sync: FAILED`", rule2)
         self.assertIn("= C1.2 BOTH, K1 BLOCKED", rule2)
         self.assertNotIn("C1 FAIL", self.text)
-        self.assertIn("an absent `pending_entries_status` / `state_sync` key means OK", rule2)
+        # Issue #189: the brief always emits both keys; a missing one fails closed (no longer "absent means OK")
+        self.assertNotIn("key means OK", rule2)
+        self.assertIn("a MISSING key (a brief from an older run) counts as the bad value", rule2)
 
     def test_generated_copy_is_in_sync(self):
         with open(self.GENERATED, "r", encoding="utf-8") as f:

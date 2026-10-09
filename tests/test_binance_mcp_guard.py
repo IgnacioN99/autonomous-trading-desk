@@ -417,7 +417,7 @@ class TestBinanceMCPGuard(unittest.TestCase):
 
         self.assertTrue(res["order_placed"])
         self.assertTrue(res["is_opening"])
-        self.assertTrue(res["synced"])
+        self.assertTrue(res["sync_attempted"])
         self.assertTrue(res["audit_healed"])
         mock_subprocess.assert_called_once()
         mock_audit.assert_called_once_with(target_env="testnet", auto_heal=True)
@@ -442,7 +442,7 @@ class TestBinanceMCPGuard(unittest.TestCase):
 
         self.assertTrue(res["order_placed"])
         self.assertFalse(res["is_opening"])
-        self.assertTrue(res["synced"])
+        self.assertTrue(res["sync_attempted"])
         self.assertFalse(res["audit_healed"])
         mock_subprocess.assert_called_once()
         mock_audit.assert_not_called()
@@ -463,7 +463,7 @@ class TestBinanceMCPGuard(unittest.TestCase):
 
         res = post_trade_sync.handle_post_trade_sync(payload)
         self.assertFalse(res["order_placed"])
-        self.assertFalse(res["synced"])
+        self.assertFalse(res["sync_attempted"])
     def test_unapproved_asset_rejection_empty_approved_list(self):
         """Verifies order is rejected fail-closed if dossier has empty approved_symbols list."""
         self._write_dossier([])  # Empty approved list

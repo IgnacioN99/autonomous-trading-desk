@@ -1568,7 +1568,8 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
     fits RISK_CLAMP_HAIRCUT (98%) of this cap (margin recomputed from the clamped qty) before Gate 2 runs.
     Gate 0A and Gate 1 read the registry captured in the snapshot (issue #127). TESTNET skips Gate 1 and keeps the
     10000 fallback. `exchange_ticks` ({symbol: tickSize}, issue #160) caps the registry tick_size used to match
-    quantity-less resting orders to their records (record_price_tolerances).
+    quantity-less resting orders to their records (record_price_tolerances); when given, records on symbols it does not
+    know match exactly (strict_ticks, issue #189).
     """
     ref = entry_price if entry_price else cur_price
     target_env = resolve_env(target_env)
@@ -1693,7 +1694,8 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
                    for source, kind, o in live_resting_opening_orders(live_snapshot)]
         try:
             legs = resting_opening_legs(resting, records,
-                                        price_tol_by_symbol=record_price_tolerances(records, exchange_ticks))
+                                        price_tol_by_symbol=record_price_tolerances(records, exchange_ticks,
+                                                                                    strict_ticks=True))
         except ValueError as e:
             return False, (f"MECHANICAL HARD GATE REJECTION: FAIL-CLOSED — {e}. The delta-neutral gate cannot "
                            "measure the portfolio. Order blocked.")
@@ -2120,12 +2122,16 @@ def place_take_profit_orders(symbol, exit_side, tp1_price, tp2_price, tp1_qty, t
     return placed[0], placed[1]
 
 
-def find_resting_take_profits(symbol, exit_side, wanted, tick_size=None, exclude_ids=(), target_env=None):
+def find_resting_take_profits(symbol, exit_side, wanted, tick_size=None, exclude_ids=(), target_env=None,
+                              quantities=None, step_size=None, record_tick=None, adopted_qty=None):
     """Issue #160 (read-only): reduce-only exit-side LIMIT orders already resting at the TP prices, so a record whose
-    TP ids were not persisted adopts them instead of placing duplicates. wanted: {name: price}; an order matches when
-    its price is within one tick (exact to 1e-9 relative without a tick); each order is adopted at most once and
-    exclude_ids are skipped. Returns ({name: orderId}, error_or_None); a failed GET /fapi/v1/openOrders?symbol= is
-    ({}, error)."""
+    TP ids were not persisted adopts them instead of placing duplicates. wanted: {name: price}; each order is adopted
+    at most once and exclude_ids are skipped. Returns ({name: orderId}, error_or_None); a failed
+    GET /fapi/v1/openOrders?symbol= is ({}, error).
+    Issue #189: an order matches when its price is within half a tick (tick_size, else the record's record_tick, else
+    0.05% of price). With quantities ({name: expected qty}) its remaining origQty - executedQty must also be within
+    max(step_size, 1%) of the expected qty; a price match with another quantity is not adopted (logged warning, the
+    caller places a new TP). adopted_qty, when a dict, receives {name: remaining qty} of the adopted orders."""
     try:
         res = send_signed_request('GET', '/fapi/v1/openOrders', {'symbol': symbol}, target_env=target_env)
     except Exception as e:
@@ -2134,11 +2140,16 @@ def find_resting_take_profits(symbol, exit_side, wanted, tick_size=None, exclude
         return {}, f"/fapi/v1/openOrders query for {symbol} failed: {res}"
     used = {str(i) for i in exclude_ids or ()}
     found = {}
+    tick = _to_float(tick_size) if _to_float(tick_size) > 0 else _to_float(record_tick)
     for name, price in (wanted or {}).items():
         price = _to_float(price)
         if price <= 0:
             continue
-        tol = _to_float(tick_size) * 1.01 if _to_float(tick_size) > 0 else abs(price) * 1e-9
+        tol = tick / 2.0 if tick > 0 else abs(price) * 0.0005
+        expected = _to_float(quantities[name]) if name in (quantities or {}) else None
+        # x(1 + 1e-9): a remaining quantity exactly one step away is not lost to float noise
+        qty_tol = max(_to_float(step_size), 0.01 * expected) * (1 + 1e-9) if expected is not None else None
+        mismatched = []
         for o in res:
             if not isinstance(o, dict) or str(_order_id(o)) in used or _order_id(o) is None:
                 continue
@@ -2146,9 +2157,18 @@ def find_resting_take_profits(symbol, exit_side, wanted, tick_size=None, exclude
                     and str(o.get('type') or '').upper() == 'LIMIT'
                     and str(o.get('side') or '').upper() == str(exit_side).upper()
                     and _truthy(o.get('reduceOnly')) and abs(_to_float(o.get('price')) - price) <= tol):
+                remaining = _to_float(o.get('origQty')) - _to_float(o.get('executedQty'))
+                if expected is not None and abs(remaining - expected) > qty_tol:
+                    mismatched.append(f"{_order_id(o)} ({remaining:g})")
+                    continue
                 found[name] = _order_id(o)
                 used.add(str(_order_id(o)))
+                if isinstance(adopted_qty, dict):
+                    adopted_qty[name] = remaining
                 break
+        if mismatched and name not in found:
+            logger.warning(f"{symbol} {name}: resting reduce-only LIMIT(s) {', '.join(mismatched)} at {price:g} not "
+                           f"adopted, remaining quantity differs from the expected {expected:g}; a new TP is placed")
     return found, None
 
 
@@ -2714,17 +2734,21 @@ def fetch_live_gate_snapshot(target_env):
     return snap, None
 
 
-def record_price_tolerances(records, exchange_ticks=None):
+def record_price_tolerances(records, exchange_ticks=None, strict_ticks=False):
     """Issue #126: {symbol: half a tick} from the tick_size stored in registry records at registration (exchangeInfo
     is not cached, so no extra read here). Records without a positive tick_size add nothing (exact match).
     Issue #160: the registry is editable, so a record's tick_size is capped at the exchange tick of its symbol when
-    exchange_ticks ({symbol: tickSize}, filters already fetched by the caller) knows it."""
+    exchange_ticks ({symbol: tickSize}, filters already fetched by the caller) knows it.
+    Issue #189: with strict_ticks and exchange_ticks given, a record whose symbol has no known exchange tick adds
+    nothing either (exact match: an editable tick is never trusted alone)."""
     known = {str(s).upper(): _to_float(t) for s, t in (exchange_ticks or {}).items()}
     out = {}
     for r in records or []:
         tick = _to_float((r or {}).get('tick_size')) if isinstance(r, dict) else 0.0
         if tick > 0 and known.get(str(r.get('symbol') or '').upper(), 0.0) > 0:
             tick = min(tick, known[str(r.get('symbol') or '').upper()])
+        elif strict_ticks and exchange_ticks is not None:
+            tick = 0.0
         if tick > 0:
             sym = str(r.get('symbol') or '').upper()
             out[sym] = min(out.get(sym, tick / 2.0), tick / 2.0)
@@ -3180,7 +3204,8 @@ def protect_pending_entries(target_env=None, dry_run=False, keys=None):
         Once the entry order is gone, TP1/TP2 are placed reduce-only from the ACTUAL position size (idempotent:
         placed TP ids are saved first and only a missing TP is retried; issue #160: that save and the audit_done save
         retry a registry lock error, and a missing TP id first adopts a reduce-only exit-side LIMIT already resting
-        at its price, find_resting_take_profits; a failed read places as before with a "tp_reconcile" warning),
+        at its price with its planned remaining quantity (issue #189), find_resting_take_profits; a failed read places
+        as before with a "tp_reconcile" warning),
         an audit record is appended (with
         realized_rr_tp2, tp1_distance_pct and fill_quality_flags, issue #39, log only) and the record dropped.
         A partially filled LIMIT keeps its record (remainder cancelled at expiry, TPs on a later run).
@@ -3880,15 +3905,19 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out, run_ctx=None
             return act("pending_tp_placed", False, tp1_price=tp1_p, tp1_qty=tp1_qty, tp2_price=tp2_p, tp2_qty=tp2_qty,
                        quantity=qty, place_tp1=need1, place_tp2=need2, fill_quality_flags=fill_flags)
         retried = ids['tp1_order_id'] is not None or ids['tp2_order_id'] is not None
-        adopted = []
+        adopted, adopted_qty = [], {}
         if need1 or need2:
             # Issue #160: TP ids lost to a failed save must not mean duplicate TPs: adopt the reduce-only exit-side
             # LIMIT orders already resting at the TP prices. A failed read places as before (never blocks protection).
             wanted = {name: price for name, price, need in (('tp1_order_id', tp1_p, need1),
                                                             ('tp2_order_id', tp2_p, need2)) if need}
+            # Issue #189: only a resting TP with the planned remaining quantity is adopted (half-tick price match).
             found, read_err = find_resting_take_profits(sym, exit_side, wanted, tick,
                                                         exclude_ids=[v for v in ids.values() if v is not None],
-                                                        target_env=target_env)
+                                                        target_env=target_env,
+                                                        quantities={'tp1_order_id': tp1_qty, 'tp2_order_id': tp2_qty},
+                                                        step_size=(filters or {}).get('stepSize'),
+                                                        record_tick=rec.get('tick_size'), adopted_qty=adopted_qty)
             if read_err:
                 out.setdefault("warnings", []).append({"key": key, "symbol": sym, "stage": "tp_reconcile",
                                                        "warning": f"{read_err}; TPs placed without the duplicate "
@@ -3908,7 +3937,7 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out, run_ctx=None
         save_retrying(tp1_qty=tp1_qty, tp2_qty=tp2_qty, tp_placed=tp_ok, **ids)
         act("pending_tp_placed", tp_ok, tp1_price=tp1_p, tp1_qty=tp1_qty, tp2_price=tp2_p, tp2_qty=tp2_qty, quantity=qty,
             retried=retried, record_dropped=tp_ok, fill_quality_flags=fill_flags, **ids,
-            **({"adopted_existing": adopted} if adopted else {}))
+            **({"adopted_existing": adopted, "adopted_qty": adopted_qty} if adopted else {}))
         if not tp_ok:
             return fail("take_profit", f"TP placement failed for {sym} (tp1={o1}, tp2={o2}); SL is in place, only the "
                                        "missing TP is retried next run.")

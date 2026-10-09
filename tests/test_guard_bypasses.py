@@ -1615,7 +1615,7 @@ class TestPostTradeSync(GuardHarness):
                 res = post_trade_sync.handle_post_trade_sync(self.cmd(c))
                 self.assertTrue(res["order_placed"], c)
                 self.assertFalse(res["is_opening"], c)
-                self.assertTrue(res["synced"], c)
+                self.assertTrue(res["sync_attempted"], c)
             mock_audit.assert_not_called()
             res = post_trade_sync.handle_post_trade_sync(
                 self.cmd("python3 scripts/execute_futures_trade.py --symbol BTCUSDT --direction LONG --env testnet"))

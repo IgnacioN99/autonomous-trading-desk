@@ -376,8 +376,8 @@ class TestBriefPendingEntries(unittest.TestCase):
                                       resting_entries=[{"symbol": "BTCUSDT", "dir": "LONG", "kind": "STOP_MARKET"}]))
         self.assertEqual(brief["pending_entries"], [{"symbol": "BTCUSDT", "dir": "LONG", "kind": "STOP_MARKET"}])
         self.assertEqual(brief["ground_truth_portfolio"]["delta_bias_incl_resting"], "LONG_HEAVY")
-        self.assertNotIn("pending_entries_status", brief)
-        self.assertNotIn("state_sync", brief)
+        self.assertEqual(brief["pending_entries_status"], "OK")   # issue #189: always emitted
+        self.assertEqual(brief["state_sync"], "OK")
         md = peb.format_markdown_brief(brief)
         self.assertIn("Pending Entries (1):** BTCUSDT (LONG STOP_MARKET)", md)
 
