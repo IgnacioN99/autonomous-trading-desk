@@ -303,11 +303,11 @@ class TestIssueWorkspaceInitCleanup(unittest.TestCase):
     def tearDown(self):
         subprocess.run(["rm", "-rf", self.tmp], check=False)
 
-    def fake_run(self, issue_state="OPEN", merged=True):
+    def fake_run(self, issue_state="OPEN", merged=True, title="T", labels=()):
         def run(cmd, cwd=None, check=True, timeout=300):
             if cmd[0] == "gh" and cmd[1:3] == ["issue", "view"]:
-                body = {"number": int(cmd[3]), "title": "T", "body": "B", "labels": [], "state": issue_state,
-                        "url": "u"}
+                body = {"number": int(cmd[3]), "title": title, "body": "B",
+                        "labels": [{"name": n} for n in labels], "state": issue_state, "url": "u"}
                 return subprocess.CompletedProcess(cmd, 0, json.dumps(body), "")
             if cmd[0] == "gh" and cmd[1:3] == ["pr", "list"]:
                 return subprocess.CompletedProcess(cmd, 0, json.dumps([{"number": 1}] if merged else []), "")
@@ -323,6 +323,10 @@ class TestIssueWorkspaceInitCleanup(unittest.TestCase):
             self.assertEqual(out["branch"], "fix/issue-7-fix-thing")
             issue = json.loads(Path(out["issue_file"]).read_text())
             self.assertEqual(issue["number"], 7)
+            # No labels and a neutral title: the deterministic triage falls to build/medium
+            self.assertEqual(issue["routing"]["route"], "build")
+            self.assertEqual(issue["routing"]["risk"], "medium")
+            self.assertEqual(out["routing"], issue["routing"])
             # A second init for the same issue refuses to reuse the worktree
             with self.assertRaises(iw.WorkspaceError):
                 iw.cmd_init(7, "again", "origin/main", cwd=self.repo)
@@ -332,6 +336,14 @@ class TestIssueWorkspaceInitCleanup(unittest.TestCase):
         self.assertFalse(os.path.exists(out["worktree"]))
         self.assertEqual(res["deleted_branch"], "fix/issue-7-fix-thing")
         self.assertNotIn("fix/issue-7", _git(self.repo, "branch"))
+
+    def test_init_routes_risk_gate_issue_to_deep(self):
+        with mock.patch.object(iw, "run", self.fake_run(labels=["bug", "cat:risk_gate"])):
+            out = iw.cmd_init(10, "gate", "origin/main", cwd=self.repo)
+            issue = json.loads(Path(out["issue_file"]).read_text())
+            iw.cmd_cleanup(10, force=True, cwd=self.repo)
+        self.assertEqual(issue["routing"], {"route": "deep", "risk": "high", "reason": "label cat:risk_gate"})
+        self.assertEqual(out["routing"], issue["routing"])
 
     def test_init_refuses_closed_issue_and_bad_slug(self):
         with mock.patch.object(iw, "run", self.fake_run(issue_state="CLOSED")):
@@ -348,6 +360,208 @@ class TestIssueWorkspaceInitCleanup(unittest.TestCase):
             self.assertTrue(os.path.exists(out["worktree"]))
             iw.cmd_cleanup(9, force=True, cwd=self.repo)
         self.assertFalse(os.path.exists(out["worktree"]))
+
+
+def _labels(*names):
+    return [{"name": n, "color": "x"} for n in names]
+
+
+class TestClassifyIssue(unittest.TestCase):
+    """Deterministic triage: deep/high, then quick/low, else build/medium (first match wins)."""
+
+    def route(self, title="Neutral title", labels=()):
+        out = iw.classify_issue(title, labels)
+        self.assertTrue(out["reason"])
+        self.assertEqual(out["risk"], {"deep": "high", "quick": "low", "build": "medium"}[out["route"]])
+        return out["route"]
+
+    def test_deep_labels(self):
+        for label in ("cat:risk_gate", "severity:high", "severity:critical"):
+            self.assertEqual(self.route(labels=_labels("bug", label)), "deep", label)
+        self.assertEqual(iw.classify_issue("x", _labels("severity:critical"))["reason"], "label severity:critical")
+
+    def test_deep_title_keywords(self):
+        for title in ("executor: rejects valid order", "execute_futures_trade crashes on --close-position",
+                      "pre_trade_guard denies sync", "Delta gate counts resting entries twice",
+                      "guardian loop skips BE", "stop verification retries too few", "Stop-loss verification",
+                      "issue_fixer_guard blocks pytest", "pre-trade hook timeout", "Hooks fail on Windows",
+                      "Gates relax in TESTNET", "evaluator prompt misses lessons",
+                      "isolated_market_evaluator rejects fresh brief"):
+            self.assertEqual(self.route(title=title), "deep", title)
+        self.assertEqual(iw.classify_issue("Delta gate double count", [])["reason"], "title keyword 'gate'")
+
+    def test_title_word_boundaries(self):
+        for title in ("aggregate stats", "safeguard docs", "hooking up colours", "gateway timeout",
+                      "executors list"):
+            self.assertEqual(self.route(title=title), "build", title)
+
+    def test_quick_rules(self):
+        self.assertEqual(self.route(labels=_labels("documentation")), "quick")
+        self.assertEqual(self.route(labels=_labels("severity:low", "cat:infra")), "quick")
+        self.assertEqual(self.route(labels=_labels("cat:tool_error", "severity:low")), "quick")
+        self.assertEqual(iw.classify_issue("x", _labels("severity:low", "cat:infra"))["reason"],
+                         "severity:low with cat:infra")
+        self.assertEqual(self.route(labels=_labels("severity:low")), "build")
+        self.assertEqual(self.route(labels=_labels("cat:infra")), "build")
+        self.assertEqual(self.route(labels=_labels("severity:low", "cat:quant_logic")), "build")
+
+    def test_first_match_order(self):
+        self.assertEqual(self.route(labels=_labels("documentation", "cat:risk_gate")), "deep")
+        self.assertEqual(self.route(title="gate wording", labels=_labels("documentation")), "deep")
+        self.assertEqual(self.route(title="guard", labels=_labels("severity:low", "cat:infra")), "deep")
+
+    def test_default_and_malformed_inputs(self):
+        self.assertEqual(iw.classify_issue("Neutral", []),
+                         {"route": "build", "risk": "medium", "reason": "default (no deep/quick rule matched)"})
+        for labels in (None, "cat:risk_gate", [{"nope": 1}, 3], {"name": "cat:risk_gate"}, [{"name": 5}]):
+            self.assertEqual(self.route(labels=labels), "build", labels)
+        self.assertEqual(self.route(title=None), "build")
+        self.assertEqual(self.route(title=42), "build")
+
+    def test_plain_strings_and_case_insensitive_labels(self):
+        self.assertEqual(self.route(labels=["Cat:Risk_Gate"]), "deep")
+        self.assertEqual(self.route(labels=[" DOCUMENTATION "]), "quick")
+        self.assertEqual(self.route(labels=[{"name": "Severity:LOW"}, "CAT:INFRA"]), "quick")
+
+
+class TestRecordRoute(unittest.TestCase):
+    """record-route on a real temp repo with a linked issue worktree; the log must land in the MAIN checkout."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.repo = _make_repo(self.tmp)
+        self.wt = iw.worktree_path(self.repo, 5)
+        _git(self.repo, "worktree", "add", "-q", self.wt, "-b", "fix/issue-5-x")
+        self.log = os.path.join(self.repo, "logs", "issue_routing.jsonl")
+        self.src = os.path.join(self.wt, "logs", "issue_work", "route_record.json")
+        os.makedirs(os.path.dirname(self.src))
+
+    def tearDown(self):
+        subprocess.run(["rm", "-rf", self.tmp], check=False)
+
+    def set_route_auto(self, route):
+        Path(self.wt, "logs", "issue_work", "issue.json").write_text(
+            json.dumps({"number": 5, "routing": {"route": route, "risk": "x", "reason": "r"}}))
+
+    def record(self, **overrides):
+        rec = {"route_final": "build", "upgrade_reason": None,
+               "fixer_models": [{"model": "sonnet", "effort": "medium"}, {"model": "opus", "effort": "medium"}],
+               "auditor_model": {"model": "opus", "effort": "high"}, "approved_round": 2,
+               "escalations": [{"round": 2, "kind": "capability"}], "merged": True}
+        rec.update(overrides)
+        Path(self.src).write_text(json.dumps(rec))
+        return rec
+
+    def main(self, *args):
+        real_root = iw.main_repo_root
+        buf = io.StringIO()
+        # main() resolves the repo from the process cwd: point it at the temp worktree, never the real checkout
+        with mock.patch.object(iw, "main_repo_root", lambda cwd=None: real_root(self.wt)), \
+                mock.patch("sys.stdout", buf):
+            code = iw.main(["record-route", "5", "--from", self.src, *args])
+        return code, json.loads(buf.getvalue())
+
+    def lines(self):
+        if not os.path.exists(self.log):
+            return []
+        return Path(self.log).read_text().splitlines()
+
+    def test_valid_record_appends_to_main_checkout(self):
+        self.set_route_auto("build")
+        self.record()
+        out = iw.cmd_record_route(5, self.src, cwd=self.wt)
+        self.assertEqual(os.path.realpath(out["log"]), os.path.realpath(self.log))
+        self.assertFalse(os.path.exists(os.path.join(self.wt, "logs", "issue_routing.jsonl")))
+        lines = self.lines()
+        self.assertEqual(len(lines), 1)
+        rec = json.loads(lines[0])
+        self.assertEqual(rec, out["record"])
+        self.assertEqual(rec["schema"], 1)
+        self.assertEqual(rec["issue"], 5)
+        self.assertEqual(rec["route_auto"], "build")
+        self.assertEqual(rec["route_final"], "build")
+        self.assertEqual(rec["rounds"], 2)
+        self.assertEqual(rec["approved_round"], 2)
+        self.assertEqual(rec["escalations"], [{"round": 2, "kind": "capability"}])
+        self.assertTrue(rec["merged"])
+        self.assertRegex(rec["recorded_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        self.assertNotIn("post_merge_bugs", rec)
+        self.assertEqual(lines[0], json.dumps(rec, sort_keys=True))
+        # A second record appends and keeps the first line intact
+        self.record(route_final="deep", upgrade_reason="locator found a gate",
+                    fixer_models=[{"model": "opus", "effort": "high"}], escalations=[], approved_round=1)
+        iw.cmd_record_route(5, self.src, cwd=self.repo)
+        lines2 = self.lines()
+        self.assertEqual(len(lines2), 2)
+        self.assertEqual(lines2[0], lines[0])
+        self.assertEqual(json.loads(lines2[1])["route_final"], "deep")
+
+    def test_route_auto_missing_is_null(self):
+        self.record(route_final="quick", fixer_models=[{"model": "haiku", "effort": "medium"}], escalations=[],
+                    approved_round=0, merged=False)
+        code, out = self.main()
+        self.assertEqual(code, 0)
+        self.assertTrue(out["ok"])
+        self.assertIsNone(out["record"]["route_auto"])
+        self.assertEqual(len(self.lines()), 1)
+
+    def test_invalid_records_exit_2_and_write_nothing(self):
+        self.set_route_auto("deep")
+        deep_fixers = [{"model": "opus", "effort": "high"}]
+        cases = {
+            "downgrade": {"route_final": "build"},
+            "bad model": {"route_final": "deep", "fixer_models": [{"model": "gpt", "effort": "high"}],
+                          "escalations": [], "approved_round": 1},
+            "bad effort": {"route_final": "deep", "fixer_models": [{"model": "opus", "effort": "turbo"}],
+                           "escalations": [], "approved_round": 1},
+            "bad auditor": {"route_final": "deep", "fixer_models": deep_fixers, "escalations": [],
+                            "approved_round": 1, "auditor_model": {"model": "opus"}},
+            "4 rounds": {"route_final": "deep", "fixer_models": deep_fixers * 4,
+                         "escalations": [{"round": k, "kind": "effort"} for k in (2, 3, 4)], "approved_round": 4},
+            "no rounds": {"route_final": "deep", "fixer_models": [], "escalations": [], "approved_round": 0},
+            "approved out of range": {"route_final": "deep", "fixer_models": deep_fixers, "escalations": [],
+                                      "approved_round": 2},
+            "approved bool": {"route_final": "deep", "fixer_models": deep_fixers, "escalations": [],
+                              "approved_round": True},
+            "escalations length": {"route_final": "deep", "fixer_models": deep_fixers},
+            "escalation kind": {"route_final": "deep", "escalations": [{"round": 2, "kind": "luck"}]},
+            "escalation round": {"route_final": "deep", "escalations": [{"round": 3, "kind": "effort"}]},
+            "unknown key": {"route_final": "deep", "post_merge_bugs": 0},
+            "merged not bool": {"route_final": "deep", "merged": "yes"},
+            "bad route": {"route_final": "huge"},
+        }
+        for name, overrides in cases.items():
+            self.record(**overrides)
+            code, out = self.main()
+            self.assertEqual(code, 2, name)
+            self.assertFalse(out["ok"], name)
+            self.assertEqual(self.lines(), [], name)
+        # Missing required key
+        rec = self.record(route_final="deep")
+        del rec["merged"]
+        Path(self.src).write_text(json.dumps(rec))
+        self.assertEqual(self.main()[0], 2)
+        # Invalid JSON, a non-object and a missing file
+        for text in ("{not json", "[1, 2]"):
+            Path(self.src).write_text(text)
+            self.assertEqual(self.main()[0], 2, text)
+        os.remove(self.src)
+        self.assertEqual(self.main()[0], 2)
+        self.assertEqual(self.lines(), [])
+
+    def test_upgrade_requires_reason(self):
+        self.set_route_auto("quick")
+        self.record(upgrade_reason=None)
+        self.assertEqual(self.main()[0], 2)
+        self.record(upgrade_reason="   ")
+        self.assertEqual(self.main()[0], 2)
+        self.assertEqual(self.lines(), [])
+        self.record(upgrade_reason="touches a gate")
+        code, out = self.main()
+        self.assertEqual(code, 0)
+        self.assertEqual(out["record"]["route_auto"], "quick")
+        self.assertEqual(out["record"]["upgrade_reason"], "touches a gate")
+        self.assertEqual(len(self.lines()), 1)
 
 
 class TestGeneratorWriteAgents(unittest.TestCase):
