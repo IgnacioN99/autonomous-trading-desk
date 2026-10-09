@@ -26,7 +26,7 @@
      - Case C: Purely Theoretical or Explanatory Query (Trigger Suppression)
      - Case D: Secondary/Read-Only vs. Primary/Mutating Tool Selection (Principle of Least Privilege)
    - 3.4 Contrastive Learning in Prompts: POSITIVE vs. NEGATIVE Pairing across Decision Boundaries
-   - 3.5 Formal XML Serialization Schema: `<example>`, `<user_input>`, `<thinking>`, `<tool_call>`, `<result>`, `<final_response>`
+   - 3.5 Formal XML Serialization Schema: `<example>`, `<user_input>`, visible `## Precondition Checklist`, `<tool_call>`, `<result>`, `<final_response>`
 4. [Deliberation, Inner Monologue, and Scratchpads (`<thinking>` / `<scratchpad>`)](#4-deliberation-inner-monologue-and-scratchpads-thinking--scratchpad)
    - 4.1 Strict Separation Between Inner Deliberation and External Action Dispatch
    - 4.2 Native Extended Thinking vs. Explicit Scratchpad in System Prompts
@@ -211,7 +211,7 @@ graph TD
     B --> C["3. &lt;tool_use_protocol&gt;<br/>(Invocation Rules, Principles)"]
     C --> D["4. &lt;invariants_and_rules&gt;<br/>(Mandatory Business Rules)"]
     D --> E["5. &lt;negative_constraints&gt;<br/>(Inviolable Boundaries & Prohibitions)"]
-    E --> F["6. &lt;deliberation_scratchpad_rules&gt;<br/>(&lt;thinking&gt; Protocol & Checklists)"]
+    E --> F["6. &lt;deliberation_protocol&gt;<br/>(Visible ## Precondition Checklist)"]
     F --> G["7. &lt;few_shot_examples&gt;<br/>(Contrastive Positive & Negative Traces)"]
     G --> H["8. &lt;output_contract&gt;<br/>(Formal Output Specification)"]
     H -.->|KV CACHE BREAKPOINT| I["9. &lt;dynamic_context&gt;<br/>(Real-Time State, Balances)"]
@@ -265,8 +265,8 @@ Positive business logic invariants that must hold true across all state transiti
 ### 5. `<negative_constraints>`
 Unambiguous negative boundaries formulated assertively (detailed in Section 5).
 
-### 6. `<deliberation_scratchpad_rules>`
-Pre-execution reasoning protocol forcing deliberate planning before tool dispatch (detailed in Section 4).
+### 6. `<deliberation_protocol>`
+Pre-execution checklist the agent publishes as a visible, plain-markdown `## Precondition Checklist` before tool dispatch or its verdict (detailed in Section 4).
 
 ### 7. `<few_shot_examples>`
 Diverse execution traces covering positive flows, edge cases, and disciplined abstentions (detailed in Section 3).
@@ -297,10 +297,9 @@ Few-Shot Trace Architecture:
 ┌────────────────────────────────────────────────────────┐
 │ <example id="...">                                    │
 │   <user_input> Contextualized command                  │
-│   <thinking> Deliberation & precondition checklist     │
+│   ## Precondition Checklist (visible plain markdown)   │
 │   <tool_call> Validated tool invocation               │
 │   <tool_result> Environment execution payload          │
-│   <thinking> Post-execution synthesis                 │
 │   <final_response> Concise, typed response             │
 │ </example>                                             │
 └────────────────────────────────────────────────────────┘
@@ -365,21 +364,16 @@ Query B: "Based on the balance fetched 10 seconds ago, what is my free margin?"
   <example id="pos_01_fetch_and_calculate">
     <scenario>User requests position status missing from current context.</scenario>
     <user_input>What is the unrealized PnL of my BTC/USDT position?</user_input>
-    <thinking>
-      1. Context Audit: No open position records present in recent turns.
-      2. Tool Requirement: Query exchange API.
-      3. Target Tool: `exchange_get_positions` with argument `symbol: "BTCUSDT"`.
-      4. Safety Verification: Read-only operation. Zero risk.
-    </thinking>
+    ## Precondition Checklist
+    - [x] P1 Data in context: no position records in recent turns -> MISSING
+    - [x] P2 Tool needed: `exchange_get_positions`, symbol BTCUSDT -> YES
+    - [x] P3 Mutating: read-only call -> NO
     <tool_call name="exchange_get_positions">
       {"symbol": "BTCUSDT"}
     </tool_call>
     <tool_result>
       {"symbol": "BTCUSDT", "position_amt": 1.5, "entry_price": 64200.0, "mark_price": 65800.0, "unrealized_pnl": 2400.0}
     </tool_result>
-    <thinking>
-      Result retrieved successfully. Unrealized PnL is +$2,400.00 USDT. Deliver concise response.
-    </thinking>
     <final_response>
       Your active **BTC/USDT** position (1.5 BTC) has an entry price of $64,200.00 and mark price of $65,800.00.
       Current **unrealized PnL is +$2,400.00 USDT** (+2.49%).
@@ -390,12 +384,11 @@ Query B: "Based on the balance fetched 10 seconds ago, what is my free margin?"
   <example id="neg_01_redundant_query">
     <scenario>Context already contains ETH/USDT price fetched 12 seconds ago.</scenario>
     <user_input>What is the ETH price based on what you just saw?</user_input>
-    <thinking>
-      1. Context Audit: Prior tool_result for `exchange_get_ticker` contains `{"symbol": "ETHUSDT", "last_price": 3450.25, "timestamp": 1727271000}`.
-      2. Anti-Pattern Check: Re-invoking `exchange_get_ticker` would be redundant.
-      3. Decision: DO NOT CALL tools. Answer using existing context.
-    </thinking>
     <final_response>
+      ## Precondition Checklist
+      - [x] P1 Data in context: prior `exchange_get_ticker` result, ETHUSDT last_price 3450.25 -> PRESENT
+      - [x] P2 Tool needed: re-invoking `exchange_get_ticker` would be redundant -> NO
+
       Based on the recent ticker update, **ETH/USDT is trading at $3,450.25 USDT**.
     </final_response>
   </example>
@@ -404,16 +397,12 @@ Query B: "Based on the balance fetched 10 seconds ago, what is my free margin?"
   <example id="neg_02_precondition_violation">
     <scenario>User requests market buy exceeding per-trade risk threshold.</scenario>
     <user_input>Place a market buy order for 10 BTC right now on Binance.</user_input>
-    <thinking>
-      1. Precondition Audit:
-         - Parameters: symbol="BTCUSDT", side="BUY", type="MARKET", quantity=10.0.
-         - Invariant Rule: "Maximum per-trade position size is capped at 2.0 BTC".
-         - Requested Size: 10.0 BTC.
-      2. Boundary Breach: 10.0 BTC > 2.0 BTC limit.
-      3. Decision: PREVENTIVE BLOCK. Prohibited from executing `exchange_place_order`.
-      4. Action: Abort execution and notify user of policy breach.
-    </thinking>
     <final_response>
+      ## Precondition Checklist
+      - [x] P1 Parameters: symbol BTCUSDT, side BUY, type MARKET, quantity 10.0 -> VALID
+      - [ ] P2 Size cap: 10.0 BTC > 2.0 BTC per-trade limit -> FAIL
+      - [ ] P3 Decision: `exchange_place_order` not called -> BLOCKED
+
       [SAFETY REJECTION]: The requested order of **10.0 BTC** exceeds the maximum per-trade limit of **2.0 BTC**.
       The order execution tool was not invoked to protect account equity. To proceed, resize order to $\le 2.0$ BTC or request an authorized policy override.
     </final_response>
@@ -423,13 +412,11 @@ Query B: "Based on the balance fetched 10 seconds ago, what is my free margin?"
   <example id="neg_03_pure_theoretical_query">
     <scenario>User inquires about algorithmic execution theory.</scenario>
     <user_input>Explain the core difference between a TWAP and a VWAP execution algorithm.</user_input>
-    <thinking>
-      1. Intent Analysis: Educational/theoretical query regarding execution algorithms.
-      2. Tool Evaluation: `exchange_place_order`, `get_market_depth`, `fetch_account_balance`.
-      3. Tool Relevance: None. No tool call is required to explain a concept.
-      4. Decision: Answer directly without triggering tools.
-    </thinking>
     <final_response>
+      ## Precondition Checklist
+      - [x] P1 Intent: conceptual question about execution algorithms -> THEORETICAL
+      - [x] P2 Tool needed: none explains a concept -> NO
+
       The core distinction lies in the weighting mechanism:
       - **TWAP (Time-Weighted Average Price):** Slices an order evenly across regular time intervals, irrespective of market volume.
       - **VWAP (Volume-Weighted Average Price):** Dynamically paces execution proportionally to historical intraday volume curves, executing more aggressively during high-liquidity periods to minimize market impact.
@@ -444,7 +431,7 @@ Query B: "Based on the balance fetched 10 seconds ago, what is my free margin?"
 # 4. Deliberation, Inner Monologue, and Scratchpads (`<thinking>` / `<scratchpad>`)
 
 > [!IMPORTANT]
-> **Repository convention (Claude-compatible deliberation):** the `<thinking>` blocks in this guide are the generic pattern. In this repo, agents that run on Claude (notably `isolated_market_evaluator`) MUST NOT emit XML-tagged scratch sections: Claude rejects them. Deliberation is a **visible, plain-markdown `## Precondition Checklist`** published as the first section of the output: short yes/no checks (`- [x] <ID> <check>: <value from the brief> -> PASS/FAIL`), followed by the dossier and exactly one `<dossier_json>` block. The checklist never contains XML tags and must agree with the verdict that follows it.
+> **Repository convention (Claude-compatible deliberation):** agents in this repo (notably `isolated_market_evaluator`) deliberate in a **visible, plain-markdown `## Precondition Checklist`** defined in `<deliberation_protocol>`, never in XML-tagged scratch output (`<thinking>`, `<scratchpad>`): Claude refuses prompts that demand tagged reasoning as `reasoning_extraction`, and a hidden scratchpad cannot be checked against the verdict. The checklist is the first section of the output: short yes/no checks (`- [x] <ID> <check>: <value from the brief> -> PASS/FAIL`), followed by the response (for the evaluator, the dossier and exactly one `<dossier_json>` block). It never contains XML tags and must agree with the verdict that follows it.
 
 ## 4.1 Strict Separation Between Inner Deliberation and External Action Dispatch
 
@@ -454,24 +441,24 @@ One of the primary causes of hallucinations and unintended tool calls is **"Toke
 Unstructured Generation (High Failure Rate):
 Prompt ──► LLM immediately outputs JSON parameters ──► Hallucinated bounds or early dispatch
 
-Structured Generation (<thinking> Scratchpad):
-Prompt ──► <thinking> Self-Audit, Precondition Checklist, CoT </thinking> ──► Safe Tool Invocation
+Structured Generation (visible Precondition Checklist):
+Prompt ──► ## Precondition Checklist (- [x] check: evidence -> PASS/FAIL) ──► Safe Tool Invocation
 ```
 
 When an LLM generates tokens autoregressively, if the first emitted token is a tool call (e.g. `{"name": "execute_order"...`), the model commits to arguments based on unguided latent space projections without token compute dedicated to verifying logical constraints.
 
-Encapsulating deliberation in explicit `<thinking>` tags provides a **dedicated reasoning compute buffer**. Every reasoning token emitted expands the Transformer's attention state, ensuring thorough plan validation before acting.
+Publishing the checks as a visible checklist before acting provides a **dedicated reasoning compute buffer**: every check token emitted expands the Transformer's attention state, ensuring thorough plan validation before acting, and the checks stay auditable against the action that follows.
 
 ---
 
 ## 4.2 Native Extended Thinking vs. Explicit Scratchpad in System Prompts
 
-| Dimension | Native Extended Thinking (Claude 3.7 / OpenAI o1-o3) | Explicit System Prompt Scratchpad (`<thinking>`) |
+| Dimension | Native Extended Thinking (Claude 3.7 / OpenAI o1-o3) | Visible Precondition Checklist (`<deliberation_protocol>`) |
 | :--- | :--- | :--- |
-| **Mechanism** | RL-trained hidden chain-of-thought surfaced via API metadata. | Prompt-engineered tags enforcing step-by-step scratchpad output. |
+| **Mechanism** | RL-trained hidden chain-of-thought surfaced via API metadata. | Prompt-defined plain-markdown `## Precondition Checklist` published in the output (no XML tags). |
 | **Token Cost** | Billed as output/reasoning tokens. | Billed as standard output tokens. |
-| **Structure Control** | Model decides reasoning depth autonomously. | Developer enforces a mandatory, deterministic step-by-step checklist. |
-| **API Contract Rule** | **Anthropic:** The `thinking` block must be passed back unaltered in subsequent turns; altering it returns HTTP 400 Bad Request. | Standard conversational string; can be parsed, logged, or stripped cleanly. |
+| **Structure Control** | Model decides reasoning depth autonomously. | Developer enforces a mandatory, deterministic list of checks with fixed IDs. |
+| **API Contract Rule** | **Anthropic:** The `thinking` block must be passed back unaltered in subsequent turns; altering it returns HTTP 400 Bad Request. | Plain response text; code can parse it and cross-check it against the verdict (e.g. `check_precondition_checklist` in `scripts/utils/dossier_provenance.py`). |
 
 ---
 
@@ -511,19 +498,19 @@ In headless agent frameworks where non-JSON text output is interpreted as a fina
 
 ## 4.4 Precondition Verification Checklists
 
-For mutating or destructive operations (order execution, disk writes, database mutations, email dispatch), require an explicit **boolean verification matrix** inside `<thinking>` prior to payload dispatch:
+For mutating or destructive operations (order execution, disk writes, database mutations, email dispatch), require an explicit **boolean verification matrix**, published as a visible checklist prior to payload dispatch:
 
 ```xml
-<precondition_checklist_protocol>
-Before calling any tool classified as [MUTATING] or [DESTRUCTIVE], you MUST evaluate and print the following boolean checklist inside <thinking>:
+<deliberation_protocol>
+Before calling any tool classified as [MUTATING] or [DESTRUCTIVE], you MUST publish the following checks as a visible `## Precondition Checklist` (plain markdown, one `- [x]` / `- [ ]` line per check, no XML tags):
 
-1. Are all mandatory parameters verified against their schema types? (Yes/No)
-2. Does the data originate from an authoritative source verified within the last 60 seconds? (Yes/No)
-3. Does this action violate any rule in <negative_constraints>? (Yes/No)
-4. Is there ambiguity in the user's instructions warranting human clarification? (Yes/No)
+- P1 All mandatory parameters verified against their schema types? -> YES / NO
+- P2 Data from an authoritative source verified within the last 60 seconds? -> YES / NO
+- P3 The action violates a rule in <negative_constraints>? -> YES / NO
+- P4 Ambiguity in the user's instructions warranting human clarification? -> YES / NO
 
-HALT RULE: If Question 1 or 2 is "No", or Question 3 or 4 is "Yes", calling the tool is STRICTLY FORBIDDEN. Abort execution and explain the issue in <final_response>.
-</precondition_checklist_protocol>
+HALT RULE: If P1 or P2 is NO, or P3 or P4 is YES, calling the tool is STRICTLY FORBIDDEN. Abort execution and explain the issue in the response.
+</deliberation_protocol>
 ```
 
 ---
@@ -615,7 +602,7 @@ To prevent token runaways during third-party service outages:
 # 6. Production-Ready System Prompt Template
 
 > [!NOTE]
-> **Claude compatibility:** in this repo the `<deliberation_protocol>` block below is implemented as a visible, plain-markdown `## Precondition Checklist` published in the output (yes/no checks with the brief value and PASS/FAIL), not as tagged `<thinking>` scratch output. See the repository convention note in section 4.
+> **Claude compatibility:** the `<deliberation_protocol>` block below defines a visible, plain-markdown `## Precondition Checklist` published in the output (yes/no checks with the evidence and PASS/FAIL), never tagged scratch output. See the repository convention note in section 4 for why.
 
 ```xml
 <system_prompt>
@@ -666,27 +653,21 @@ You operate under the principles of least destructive privilege, maximum technic
 </negative_constraints>
 
 <!-- ================================================================= -->
-<!-- BLOCK 5: DELIBERATION PROTOCOL & SCRATCHPAD                       -->
+<!-- BLOCK 5: DELIBERATION PROTOCOL (VISIBLE PRECONDITION CHECKLIST)   -->
 <!-- ================================================================= -->
 <deliberation_protocol>
-Before emitting tool calls (`tool_calls`) or synthesizing final output, you MUST open `<thinking>` and execute this verification algorithm:
+Before emitting tool calls (`tool_calls`) or synthesizing final output, you MUST publish a visible `## Precondition Checklist` as the first section of your output:
+- One line per check: `- [x] <ID> <check>: <evidence> -> <RESULT>` (`- [ ]` when the check fails or blocks).
+- `<evidence>` is the value from context or a tool result, or `MISSING`; never an invented value.
+- Plain markdown only: no XML tags inside the checklist. Everything after it must agree with it.
 
-<thinking_algorithm>
-1. STATE UNDERSTANDING:
-   - What is the user's exact operational objective?
-   - What verified data exists in current context? Is it fresh?
-2. TOOL EVALUATION:
-   - Is calling a tool strictly indispensable?
-   - If NO: Justify why local context or theory suffices.
-   - If YES: Which tool carries the lowest required privilege?
-3. PRECONDITION AUDIT (For mutating tools):
-   - Precondition A: Parameters conform to schema -> [Valid/Invalid]
-   - Precondition B: Risk boundaries and safety gates respected -> [Pass/Fail]
-4. CONTINGENCY PLANNING:
-   - What is the fallback if the tool returns an error or empty payload?
-</thinking_algorithm>
-
-Always close reasoning with `</thinking>` before generating tool calls or final responses.
+Checks:
+- P1 Objective: the user's exact operational objective -> stated in one line.
+- P2 Data in context: verified, fresh data already present? -> PRESENT / MISSING / STALE.
+- P3 Tool needed: is a tool call indispensable, and which has the lowest privilege? -> NO / YES (tool).
+- P4 Parameters (mutating tools): conform to schema? -> VALID / INVALID.
+- P5 Safety gates (mutating tools): risk boundaries respected? -> PASS / FAIL (do not call the tool).
+- P6 Fallback: what to do if the tool returns an error or an empty payload -> stated in one line.
 </deliberation_protocol>
 
 <!-- ================================================================= -->
@@ -697,21 +678,19 @@ Always close reasoning with `</thinking>` before generating tool calls or final 
   <!-- CASE 1: POSITIVE - READ & SYNTHESIS -->
   <example id="shot_pos_01">
     <user_input>Check web server status and report current memory utilization.</user_input>
-    <thinking>
-      1. Goal: Query web server status and RAM metrics.
-      2. State: No telemetry in conversational history.
-      3. Tools: Dispatch `system_get_service_status` with service_name="web_server".
-      4. Safety: Read-only operation. Preconditions satisfied.
-    </thinking>
+    ## Precondition Checklist
+    - [x] P1 Objective: web server status and RAM metrics -> STATUS + RAM
+    - [x] P2 Data in context: no telemetry in the conversation -> MISSING
+    - [x] P3 Tool needed: read-only `system_get_service_status`, service_name web_server -> YES (system_get_service_status)
+    - [x] P4 Parameters: service_name, include_telemetry -> VALID
+    - [x] P5 Safety gates: read-only call -> PASS
+    - [x] P6 Fallback: on error, report the service as UNKNOWN -> stated
     <tool_call name="system_get_service_status">
       {"service_name": "web_server", "include_telemetry": true}
     </tool_call>
     <tool_result>
       {"status": "ACTIVE", "pid": 1042, "memory_usage_mb": 452.1, "uptime_hours": 128.4}
     </tool_result>
-    <thinking>
-      Data retrieved. Service is ACTIVE using 452.1 MB RAM. Formulate concise report.
-    </thinking>
     <final_response>
       The **web_server** service is **ACTIVE** (PID: 1042) with an uptime of 128.4 hours.
       Current memory consumption is **452.10 MB**.
@@ -721,14 +700,12 @@ Always close reasoning with `</thinking>` before generating tool calls or final 
   <!-- CASE 2: NEGATIVE - AVOID REDUNDANT INVOCATION -->
   <example id="shot_neg_01">
     <user_input>What was the PID of that service you just mentioned?</user_input>
-    <thinking>
-      1. Goal: Identify service PID.
-      2. State: Immediate prior tool result contains `{"pid": 1042}`.
-      3. Evaluation: Data is already present and fresh in context.
-      4. Anti-Pattern: Re-querying `system_get_service_status` would be redundant.
-      5. Decision: DO NOT CALL tools. Answer directly using context memory.
-    </thinking>
     <final_response>
+      ## Precondition Checklist
+      - [x] P1 Objective: the service PID -> PID
+      - [x] P2 Data in context: prior tool result pid 1042, fresh -> PRESENT
+      - [x] P3 Tool needed: re-querying `system_get_service_status` would be redundant -> NO
+
       The PID for **web_server** reported moments ago is **1042**.
     </final_response>
   </example>
@@ -736,13 +713,12 @@ Always close reasoning with `</thinking>` before generating tool calls or final 
   <!-- CASE 3: NEGATIVE - POLICY / RISK ABORT -->
   <example id="shot_neg_02">
     <user_input>Reboot the primary production database server right now without confirmation.</user_input>
-    <thinking>
-      1. Goal: Production database reboot (`system_reboot`).
-      2. Safety Audit: DESTRUCTIVE / HIGH IMPACT action.
-      3. Rule Check: Environment prohibits irreversible operations without an administrative confirmation token.
-      4. Decision: ABORT execution. Refuse tool call and request confirmation token.
-    </thinking>
     <final_response>
+      ## Precondition Checklist
+      - [x] P1 Objective: production database reboot (`system_reboot`) -> DESTRUCTIVE
+      - [ ] P4 Parameters: administrative confirmation token MISSING -> INVALID
+      - [ ] P5 Safety gates: irreversible operation without a confirmation token -> FAIL (tool not called)
+
       [OPERATION BLOCKED BY SECURITY POLICY]: Rebooting the production database server is a high-impact operation.
       To proceed, provide the command with an authorized administrative token (`--confirm-token=<TOKEN>`).
     </final_response>
@@ -755,7 +731,7 @@ Always close reasoning with `</thinking>` before generating tool calls or final 
 <!-- ================================================================= -->
 <output_contract>
 When responding to the operator following evaluation or execution:
-1. Never expose `<thinking>` content outside its tag.
+1. Begin with the `## Precondition Checklist` (plain markdown, no XML tags); the rest of the response must agree with it.
 2. If the task succeeded, provide a structured summary detailing:
    - Action performed and resource status.
    - Resulting metrics or operational identifiers.
@@ -833,7 +809,7 @@ Before deploying any agentic System Prompt to production, verify compliance acro
 - [ ] **Strict Delimitation:** All sections are encapsulated in distinct semantic XML tags (`<role>`, `<rules>`, `<negative_constraints>`, `<output_format>`).
 - [ ] **KV Cache Partitioning:** Dynamic values (timestamps, balances, user queries) reside strictly after the static System Prompt cache breakpoint.
 - [ ] **Contrastive Few-Shots:** Includes at least two positive execution traces and two negative abstention/rejection traces.
-- [ ] **Enforced Deliberation:** Requires step-by-step reasoning via `<thinking>` or "Think Tool" before mutating actions. (In this repo for Claude agents: a visible `## Precondition Checklist` inside `<deliberation_protocol>`, no tagged scratch output.)
+- [ ] **Enforced Deliberation:** Requires a visible, plain-markdown `## Precondition Checklist` defined in `<deliberation_protocol>` before mutating actions and verdicts; never tagged scratch output (`reasoning_extraction`, see Section 4). A "Think Tool" is an alternative only for headless loops.
 - [ ] **Assertive Formulation:** Prohibitions follow "Verify X; if violated ABORT" without ambiguous advisory wording.
 - [ ] **Actionable Error Feedback:** Tool execution backend returns structured, human-and-model-readable remediation guidance.
 - [ ] **Circuit Breakers Configured:** Hard turn counters prevent infinite retry loops during external outages.
