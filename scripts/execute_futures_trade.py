@@ -112,6 +112,11 @@ JSON schemas (stable; extra keys may be added, existing keys are never renamed):
       placement response: by a closePosition stop at the SL within one tick that was not listed before the entry;
       issue #179: that read precedes the entry order, one short retry); a -4130 on that placement with no such stop
       (a leftover closePosition stop) auto-destructs and files a HIGH issue.
+      Issue #263: a -2021 on an uncrossed STOP_MARKET entry re-reads the price once; past the trigger, the whole
+      order runs once more through every gate and enters at MARKET with "converted_from": "STOP_MARKET",
+      "trigger_crossed_retry": true and "retry_price" (also in the audit record); otherwise (or a second -2021) it
+      returns "trigger_crossed": true, "trigger_price", "cur_price" (re-read price or null) and places nothing. A
+      rejection on the retry keeps its gate's keys, adds "trigger_crossed_retry" / "retry_price" and prefixes "error".
       In PROD every new entry is rejected while an opening order rests on the exchange without a registry record
       (find_unregistered_resting_entries; the position guardian reports them as unknown_resting_entry).
       PROD gates are anchored to the exchange (issue #101): logs/session_state.json and logs/pending_entries.json
@@ -4015,6 +4020,56 @@ def execute_complete_trade(
     bypass_eval_gate=False,
     confirmed=False
 ):
+    """Opens a trade (entry, verified SL, TPs) behind every gate. Issue #263: when Binance answers -2021 to an
+    uncrossed STOP_MARKET entry and one ticker re-read shows the trigger crossed, the whole pass runs ONCE more with
+    the original arguments (dossier, every PROD gate, the crossed R:R gate and the risk clamp, fresh snapshots), so a
+    crossed trigger enters at MARKET as it does when the crossing is seen before the POST; never a third attempt."""
+    args = dict(symbol=symbol, direction=direction, leverage=leverage, margin_usdt=margin_usdt, sl_price=sl_price,
+                tp1_price=tp1_price, tp2_price=tp2_price, target_env=target_env, trigger_price=trigger_price,
+                order_type=order_type, limit_price=limit_price, bypass_delta_gate=bypass_delta_gate,
+                is_yolo=is_yolo, bypass_eval_gate=bypass_eval_gate, confirmed=confirmed)
+    res = _execute_complete_trade_pass(**args)
+    retry_px = res.pop("_crossed_retry_price", None) if isinstance(res, dict) else None
+    if retry_px is None:
+        return res
+    trigger_p = res.get("trigger_price")
+    print(f"⚠️ -2021 on the STOP_MARKET entry of {symbol}: re-read price {retry_px} is past the trigger {trigger_p}; "
+          "re-running every gate once to enter at MARKET (crossed-trigger path).", file=sys.stderr)
+    res = _execute_complete_trade_pass(**args, _crossed_retry=retry_px)
+    if not isinstance(res, dict):
+        return res
+    res.pop("_crossed_retry_price", None)   # unreachable on the retry pass; never leaked
+    res.setdefault("trigger_crossed_retry", True)
+    res.setdefault("retry_price", retry_px)
+    if not res.get("success"):
+        res.setdefault("trigger_crossed", True)
+        note = f"a -2021 STOP_MARKET -> MARKET conversion (trigger {trigger_p} crossed, re-read price {retry_px})"
+        # A CRITICAL fail-safe (filled MARKET, SL unverified) keeps its text first
+        res["error"] = (f"{res.get('error')} (after {note})" if res.get("emergency_abort")
+                        else f"After {note}: {res.get('error')}")
+    return res
+
+
+def _execute_complete_trade_pass(
+    symbol,
+    direction,
+    leverage=3,
+    margin_usdt=100.0,
+    sl_price=None,
+    tp1_price=None,
+    tp2_price=None,
+    target_env=None,
+    trigger_price=None,
+    order_type='MARKET',
+    limit_price=None,
+    bypass_delta_gate=False,
+    is_yolo=False,
+    bypass_eval_gate=False,
+    confirmed=False,
+    _crossed_retry=None
+):
+    """One pass of execute_complete_trade. _crossed_retry: the re-read price on the one retry after a -2021
+    (issue #263), None otherwise."""
     target_env = resolve_env(target_env)
     is_yolo = (is_yolo is True) or (str(is_yolo).lower() in ['true', '1', 'yes'])
     confirmed = (confirmed is True) or (str(confirmed).lower() in ['true', '1', 'yes'])
@@ -4472,6 +4527,30 @@ def execute_complete_trade(
                         result["prearm_anomaly"] = anomaly
                         _report_prearm_anomaly(symbol, target_env, 'STOP_MARKET', order_id, anomaly)
                     return result
+                elif _is_immediate_trigger(cond_order):
+                    # Issue #263: -2021 = the trigger was reached after the price read above; no entry order exists.
+                    # First pass: ONE ticker re-read; crossed -> the wrapper re-runs the whole pass once (every gate,
+                    # the crossed R:R gate and the clamp, then MARKET). Not crossed, unreadable, or a second -2021:
+                    # typed failure, nothing placed.
+                    retry_px = cur_price
+                    if _crossed_retry is None:
+                        try:
+                            reread = send_signed_request('GET', '/fapi/v1/ticker/price', {'symbol': symbol},
+                                                         target_env=target_env)
+                            retry_px = float(reread.get('price', 0)) if isinstance(reread, dict) else 0.0
+                        except Exception:
+                            retry_px = 0.0
+                        retry_px = retry_px if retry_px > 0 else None
+                        if retry_px is not None and ((retry_px >= trigger_p) if is_long else (retry_px <= trigger_p)):
+                            return {"success": False, "_crossed_retry_price": retry_px, "trigger_price": trigger_p}
+                    return {"success": False, "trigger_crossed": True, "trigger_price": trigger_p,
+                            "cur_price": retry_px,
+                            "error": (f"Entry trigger crossed (-2021): Binance rejected the STOP_MARKET entry at "
+                                      f"{trigger_p} as already triggered ({cond_order}); "
+                                      + ("a second -2021 on the one allowed retry" if _crossed_retry is not None
+                                         else "the price re-read failed" if retry_px is None
+                                         else f"the re-read price {retry_px} is not past the trigger")
+                                      + ". No order was placed (fail-closed).")}
                 else:
                     return {"success": False, "error": f"Failed to place conditional order: {cond_order}"}
             else:
@@ -4622,6 +4701,9 @@ def execute_complete_trade(
     actual_entry_price = float(entry_order.get('avgPrice', cur_price))
     if actual_entry_price == 0:
         actual_entry_price = cur_price
+    # Issue #263: a MARKET fill on the one retry after a -2021 on the STOP_MARKET entry (result and audit record)
+    conversion_fields = ({"converted_from": "STOP_MARKET", "trigger_crossed_retry": True,
+                          "retry_price": _crossed_retry} if _crossed_retry is not None and crossed_market_entry else {})
 
     # ATOMIC POST-ENTRY HARDENING: Position is now live on the books.
     # Enclose in try/except to guarantee emergency auto-destruct on ANY failure.
@@ -4720,6 +4802,7 @@ def execute_complete_trade(
                           entry_slippage_pct=round(slip / gate_ref * 100.0, 6))
             if book_side_price is not None:
                 record['book_side_price'] = book_side_price
+        record.update(conversion_fields)
         if profile_unreadable:
             record['profile_unreadable'] = True  # round 4: sized and gated on the default profile
         append_trade_audit_record(record, margin_usdt)
@@ -4741,7 +4824,8 @@ def execute_complete_trade(
             "tp2_qty": tp2_qty,
             "tp2_order_id": tp2_order.get('orderId') if isinstance(tp2_order, dict) else None,
             "notional": total_qty * actual_entry_price,
-            "real_margin": (total_qty * actual_entry_price) / effective_leverage
+            "real_margin": (total_qty * actual_entry_price) / effective_leverage,
+            **conversion_fields
         }
     except Exception as exc:
         abort_exit = emergency_abort_market_close(symbol, exit_side, total_qty, target_env=target_env)
