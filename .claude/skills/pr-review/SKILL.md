@@ -58,6 +58,8 @@ with a clean context; you orchestrate, they audit.
    `python3 scripts/ci/assemble_review.py --pr <n> --from-claude-subagent <id>=<agentId> ...`
    It copies each `### Verdict: <id>` section from the subagent transcript into
    `logs/pr_review/report.md` and computes the `### Final Consolidated Verdict` mechanically.
+   Rows agy truncated in `transcript.jsonl` are read from the sibling `transcript_full.jsonl` (paired by
+   `step_index`, cross-checked); if that fails, the reviewer is reported as an error, never guessed.
 6. **Verify:** `python3 scripts/ci/verify_review.py logs/pr_manifest.json logs/pr_review/report.md`
    - exit 0: all approved. exit 1: complete, changes required (still post it).
    - exit 2: missing/inconclusive reviewers. Re-launch ONLY those reviewers once (their Agent calls in

@@ -381,6 +381,29 @@ class TestReviewAssembler(unittest.TestCase):
                 self.assertEqual(sections, {})
                 self.assertIn("mismatch", errors[0])
 
+    def test_malformed_agy_rows_reported_not_raised(self):
+        """Issue #43: malformed rows (non-list tool_calls, deep nesting) become reviewer errors, never a traceback."""
+        conv = "11111111-aaaa-bbbb-cccc-000000000004"
+        system = {"step_index": 0, "source": "SYSTEM", "type": "USER_INPUT", "status": "DONE",
+                  "created_at": "2026-10-05T00:00:00Z", "content": "sender=aaaaaaaa-0000-0000-0000-000000000000"}
+        model = {"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE",
+                 "created_at": "2026-10-05T00:00:05Z", "content": "", "tool_calls": "send_message"}
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = Path(tmp) / "brain"
+            logs = brain / conv / ".system_generated" / "logs"
+            logs.mkdir(parents=True)
+            with mock.patch.dict(os.environ, {"AGY_BRAIN_DIRS": str(brain)}):
+                for label, last_line in (("non-list tool_calls", json.dumps(model)),
+                                         ("deep nesting", "[" * 100000 + "]" * 100000)):
+                    with self.subTest(label):
+                        (logs / "transcript.jsonl").write_text(json.dumps(system) + "\n" + last_line + "\n",
+                                                               encoding="utf-8")
+                        sections, _, errors = assemble_review.collect_sections(
+                            ["agentic_harness"], {"agentic_harness": conv}, {})
+                        self.assertEqual(sections, {})
+                        self.assertEqual(len(errors), 1)
+                        self.assertTrue(errors[0].startswith("agentic_harness: "), errors[0])
+
     def test_assemble_marks_missing_reviewers_incomplete(self):
         manifest = {"required_reviewers": ["prompt_engineering"], "changed_files": ["docs/a.md"]}
         report, result = assemble_review.build_report(manifest, {}, {}, pr="")

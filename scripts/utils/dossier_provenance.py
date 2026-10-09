@@ -11,8 +11,9 @@ block) into its own transcript. Two runtimes are supported:
     agy truncates long fields in transcript.jsonl (row key "truncated_fields"; content/thinking keep
     head + "\\n<truncated N bytes>\\n" + tail, tool_call args keep a JSON-encoded prefix +
     "\\n<truncated N bytes>"). read_agy_steps() takes those scanned rows from the sibling
-    transcript_full.jsonl (same line) only after cross-checking every untruncated field, the
-    head/tail/prefix and N (UTF-8 bytes removed) against transcript.jsonl, and fails closed otherwise.
+    transcript_full.jsonl (paired by step_index, unique in both files) only after cross-checking every
+    untruncated field, the head/tail/prefix and N (UTF-8 bytes removed) against transcript.jsonl, and fails
+    closed otherwise (also on a marker without truncated_fields and on malformed rows: always ProvenanceError).
     Untruncated rows are read from transcript.jsonl exactly as before.
   * Claude Code: the subagent transcript lives next to its parent session,
         ~/.claude/projects/<project-slug>/<parentSessionId>/subagents/agent-<agentId>.jsonl
@@ -26,6 +27,8 @@ Every consumer (pre_trade_guard.py hook, execute_futures_trade.py) re-verifies t
 the transcript before allowing an order, so a dossier typed by the main agent is rejected.
 
 Single source of truth for dossier validation: validate_dossier_for_trade().
+check_precondition_checklist() compares the evaluator's visible checklist with its block; only the recorder
+calls it (record time), using the extraction's final_text, which is never stored nor hashed.
 """
 
 import datetime
@@ -117,6 +120,14 @@ def find_subagent_transcript(conversation_id: str) -> str:
     return matches[0]
 
 
+def _parse_line(line: str, path: str) -> Any:
+    """json.loads of one transcript line; a line nested too deeply to parse is hostile, not skippable."""
+    try:
+        return json.loads(line)
+    except RecursionError:
+        raise ProvenanceError(f"Transcript line nested too deeply to parse ({path}).")
+
+
 def _read_steps(path: str) -> list:
     steps = []
     with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -125,7 +136,7 @@ def _read_steps(path: str) -> list:
             if not line:
                 continue
             try:
-                steps.append(json.loads(line))
+                steps.append(_parse_line(line, path))
             except json.JSONDecodeError:
                 continue
     return steps
@@ -140,23 +151,37 @@ def _decode_arg(value: Any) -> str:
                 decoded = json.loads(stripped)
                 if isinstance(decoded, str):
                     return decoded
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, RecursionError):
                 pass
         return value
-    return json.dumps(value)
+    try:
+        return json.dumps(value)
+    except (TypeError, ValueError, RecursionError) as e:
+        raise ProvenanceError(f"Tool call argument cannot be decoded: {type(e).__name__}")
 
 
-def _model_texts(step: dict) -> list:
+def _model_texts(step: Any) -> list:
     """Text the model itself produced in a step: its response and the args of send_message calls.
-    Tool results (e.g. view_file of the prompt with its few-shot dossiers) are never PLANNER_RESPONSE."""
+    Tool results (e.g. view_file of the prompt with its few-shot dossiers) are never PLANNER_RESPONSE.
+    Raises ProvenanceError on a malformed row (non-dict step, non-list tool_calls, non-dict call or args)."""
+    if not isinstance(step, dict):
+        raise ProvenanceError(f"Transcript row is not a JSON object ({type(step).__name__}).")
     if step.get("source") != "MODEL" or step.get("type") != "PLANNER_RESPONSE":
         return []
     texts = []
     if isinstance(step.get("content"), str):
         texts.append(step["content"])
-    for call in step.get("tool_calls") or []:
+    calls = step.get("tool_calls") or []
+    if not isinstance(calls, list):
+        raise ProvenanceError(f"Malformed tool_calls at step {step.get('step_index')} (not a list).")
+    for call in calls:
+        if not isinstance(call, dict):
+            raise ProvenanceError(f"Malformed tool call at step {step.get('step_index')} (not an object).")
         if call.get("name") == "send_message":
-            for value in (call.get("args") or {}).values():
+            args = call.get("args") or {}
+            if not isinstance(args, dict):
+                raise ProvenanceError(f"Malformed send_message args at step {step.get('step_index')} (not an object).")
+            for value in args.values():
                 texts.append(_decode_arg(value))
     return texts
 
@@ -165,22 +190,43 @@ def _model_texts(step: dict) -> list:
 # agy transcript truncation: resolve scanned rows from transcript_full.jsonl
 # =============================================================================
 def full_transcript_path(path: str) -> str:
-    """Sibling transcript_full.jsonl of an agy transcript.jsonl (same logs/ dir, rows paired by line)."""
+    """Sibling transcript_full.jsonl of an agy transcript.jsonl (same logs/ dir, rows paired by step_index)."""
     return os.path.join(os.path.dirname(path), TRANSCRIPT_FULL_NAME)
 
 
 def _read_rows_by_line(path: str) -> list:
-    """Parsed JSON value per physical line (None for blank or unparsable lines), so the rows of
-    transcript.jsonl and transcript_full.jsonl can be paired by line number."""
+    """Parsed JSON value per physical line (None for blank or unparsable lines).
+    Raises ProvenanceError for a line nested too deeply to parse."""
     rows = []
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
             line = line.strip()
             try:
-                rows.append(json.loads(line) if line else None)
+                rows.append(_parse_line(line, path) if line else None)
             except json.JSONDecodeError:
                 rows.append(None)
     return rows
+
+
+def _step_key(row: dict) -> Optional[int]:
+    """step_index usable as a pairing key (an int, never a bool), else None."""
+    idx = row.get("step_index")
+    return idx if isinstance(idx, int) and not isinstance(idx, bool) else None
+
+
+def _rows_by_step_index(rows: list, label: str) -> dict:
+    """step_index -> row for the JSON-object rows of one file; a duplicate step_index fails closed."""
+    by_index = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        idx = _step_key(row)
+        if idx is None:
+            continue
+        if idx in by_index:
+            raise ProvenanceError(f"{TRANSCRIPT_FULL_NAME} mismatch at step {idx}: duplicate step_index in {label}")
+        by_index[idx] = row
+    return by_index
 
 
 def _needs_full_row(row: Any) -> bool:
@@ -194,8 +240,26 @@ def _needs_full_row(row: Any) -> bool:
         return True  # malformed: resolve, so the cross-check fails closed
     if "content" in fields:
         return True
-    return "tool_calls" in fields and any(
-        isinstance(c, dict) and c.get("name") == "send_message" for c in row.get("tool_calls") or [])
+    if "tool_calls" not in fields:
+        return False
+    calls = row.get("tool_calls") or []
+    if not isinstance(calls, list):
+        return True  # malformed: resolve, so the cross-check fails closed
+    return any(isinstance(c, dict) and c.get("name") == "send_message" for c in calls)
+
+
+def _same_json_value(short_val: Any, full_val: Any) -> bool:
+    """True when an untruncated transcript.jsonl arg (JSON-encoded by agy's own encoder, whose separators and
+    escaping may differ from Python's, e.g. '{"a":1}' or '\\u003c') decodes to the transcript_full.jsonl value.
+    Compared through a canonical encoding so 1, 1.0 and true stay distinct."""
+    if not isinstance(short_val, str):
+        return False
+    try:
+        decoded = json.loads(short_val)
+        canon = lambda v: json.dumps(v, sort_keys=True, ensure_ascii=False)  # noqa: E731
+        return canon(decoded) == canon(full_val)
+    except (ValueError, TypeError, RecursionError):
+        return False
 
 
 def _middle_cut_matches(short: Any, full: Any) -> bool:
@@ -217,7 +281,9 @@ def _middle_cut_matches(short: Any, full: Any) -> bool:
 def _resolve_tool_calls(short_calls: Any, full_calls: Any, truncated: bool, bad) -> list:
     """Cross-checks tool_calls and returns them in transcript.jsonl form (JSON-encoded arg values).
     Truncated args keep a prefix of json.dumps(full_value, ensure_ascii=False) + '\\n<truncated N bytes>',
-    N = UTF-8 bytes removed from that encoded value; every other arg must decode to the full value."""
+    N = UTF-8 bytes removed from that encoded value. A prefix cannot be parsed, so that comparison stays
+    sensitive to agy's encoder (separators, escaping). Every other arg must decode to the full value: compared
+    with json.loads on the short side (so encoder differences do not matter), else as before."""
     if not isinstance(short_calls, list) or not isinstance(full_calls, list) or len(short_calls) != len(full_calls):
         raise bad("tool_calls count differs")
     out = []
@@ -242,7 +308,7 @@ def _resolve_tool_calls(short_calls: Any, full_calls: Any, truncated: bool, bad)
                 if removed != int(m.group(2)) or not encoded.startswith(prefix):
                     raise bad(f"truncated tool_calls[{i}].args.{name} does not match the full value")
                 args[name] = encoded
-            elif _decode_arg(s_val) != _decode_arg(encoded):
+            elif not _same_json_value(s_val, f_args[name]) and _decode_arg(s_val) != _decode_arg(encoded):
                 raise bad(f"tool_calls[{i}].args.{name} differs")
             else:
                 args[name] = s_val
@@ -295,27 +361,52 @@ def _resolve_truncated_row(short: dict, full: Any) -> dict:
 
 def read_agy_steps(path: str) -> Tuple[list, list]:
     """Rows of an agy transcript.jsonl, with every truncated row whose model text is scanned replaced by its
-    verified counterpart from transcript_full.jsonl. Other rows are returned exactly as in transcript.jsonl.
-    Returns (steps, resolved_rows). Raises ProvenanceError if a needed row cannot be resolved."""
-    rows = _read_rows_by_line(path)
-    needed = {i for i, row in enumerate(rows) if _needs_full_row(row)}
-    full_rows = []
+    verified counterpart from transcript_full.jsonl, paired by step_index (unique in both files; rows of the full
+    file that no truncated row needs are ignored, so line layouts may differ). Other rows are returned exactly as
+    in transcript.jsonl. Returns (steps, resolved_rows). Raises ProvenanceError (never another exception type) if
+    a row is not a JSON object or is malformed, if a needed row cannot be resolved, or if a scanned row that is
+    not resolved carries the '<truncated N bytes>' marker (agy truncated it without listing truncated_fields)."""
+    try:
+        return _read_agy_steps(path)
+    except (TypeError, AttributeError, ValueError, RecursionError) as e:
+        raise ProvenanceError(f"Malformed agy transcript ({path}): {type(e).__name__}: {e}")
+
+
+def _read_agy_steps(path: str) -> Tuple[list, list]:
+    rows = [row for row in _read_rows_by_line(path) if row is not None]
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ProvenanceError(f"Transcript row is not a JSON object ({type(row).__name__}) in {path}")
+    needed = [row for row in rows if _needs_full_row(row)]
+    needed_ids = {id(row) for row in needed}
+    for row in rows:
+        if id(row) in needed_ids:
+            continue
+        if any(TRUNCATED_MARKER_RE.search(text) for text in _model_texts(row)):
+            raise ProvenanceError(
+                f"transcript.jsonl step {row.get('step_index')} carries a '<truncated N bytes>' marker in the "
+                f"subagent output but no truncated_fields: cannot read it safely ({path})."
+            )
+    full_by_index = {}
     if needed:
         full_path = full_transcript_path(path)
         try:
             full_rows = _read_rows_by_line(full_path)
         except OSError as e:
-            first = rows[min(needed)].get("step_index")
             raise ProvenanceError(
-                f"transcript.jsonl truncates the subagent output at step {first} and {TRANSCRIPT_FULL_NAME} "
-                f"is missing or unreadable ({full_path}): {e}"
+                f"transcript.jsonl truncates the subagent output at step {needed[0].get('step_index')} and "
+                f"{TRANSCRIPT_FULL_NAME} is missing or unreadable ({full_path}): {e}"
             )
+        _rows_by_step_index(rows, "transcript.jsonl")
+        full_by_index = _rows_by_step_index(full_rows, TRANSCRIPT_FULL_NAME)
     steps, resolved = [], []
-    for i, row in enumerate(rows):
-        if row is None:
-            continue
-        if i in needed:
-            row = _resolve_truncated_row(row, full_rows[i] if i < len(full_rows) else None)
+    for row in rows:
+        if id(row) in needed_ids:
+            idx = _step_key(row)
+            if idx is None:
+                raise ProvenanceError(
+                    f"{TRANSCRIPT_FULL_NAME} mismatch at step {row.get('step_index')}: missing or invalid step_index")
+            row = _resolve_truncated_row(row, full_by_index.get(idx))
             resolved.append(row)
         steps.append(row)
     return steps, resolved
@@ -334,20 +425,34 @@ def _parse_created_at(value: Any) -> int:
     return 0
 
 
-def _parse_block(raw: str) -> Optional[dict]:
-    """Parses a <dossier_json> body. Tool-call args may still carry one level of string escaping."""
+def _parse_block_ex(raw: str) -> Tuple[Optional[dict], bool]:
+    """Parses a <dossier_json> body. Tool-call args may still carry one level of string escaping.
+    Returns (dossier or None, True when that single-escaped decode was needed)."""
     for candidate in (raw, None):
-        if candidate is None:
+        escaped = candidate is None
+        if escaped:
             try:
                 candidate = json.loads('"' + raw + '"')
-            except json.JSONDecodeError:
-                return None
+            except (json.JSONDecodeError, RecursionError):
+                return None, escaped
         try:
             parsed = json.loads(candidate)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):
             continue
-        return parsed if isinstance(parsed, dict) else None
-    return None
+        return (parsed if isinstance(parsed, dict) else None), escaped
+    return None, False
+
+
+def _block_text(text: str, escaped: bool) -> str:
+    """Message text as the block was parsed: single-escaped text is decoded the same way (raw text if that fails),
+    so check_precondition_checklist reads real lines."""
+    if not escaped:
+        return text
+    try:
+        decoded = json.loads('"' + text + '"')
+    except (json.JSONDecodeError, RecursionError):
+        return text
+    return decoded if isinstance(decoded, str) else text
 
 
 def sha256_text(text: str) -> str:
@@ -376,9 +481,9 @@ def extract_dossier_from_transcript(path: str) -> Dict[str, Any]:
             for m in DOSSIER_RE.finditer(text):
                 saw_block = True
                 raw = m.group(1).strip()
-                parsed = _parse_block(raw)
+                parsed, escaped = _parse_block_ex(raw)
                 if parsed is not None:
-                    found = (step, raw, parsed)
+                    found = (step, raw, parsed, _block_text(text, escaped))
                     break
 
     if not found:
@@ -386,13 +491,16 @@ def extract_dossier_from_transcript(path: str) -> Dict[str, Any]:
             raise ProvenanceError(f"<dossier_json> block emitted by the subagent is not a valid JSON object ({path}).")
         raise ProvenanceError(f"No <dossier_json> block emitted by the subagent in {path}")
 
-    step, raw, dossier = found
+    step, raw, dossier, final_text = found
 
     return {
         "source": AGY_SOURCE,
         "raw": raw,
         "sha256": sha256_text(raw),
         "dossier": dossier,
+        # Message carrying the block (resolved text for truncated rows), for check_precondition_checklist at
+        # record time. Never stored in the record nor hashed.
+        "final_text": final_text,
         "step_index": step.get("step_index"),
         "created_at_ts": _parse_created_at(step.get("created_at")),
         "conversation_id": os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(path)))),
@@ -490,8 +598,8 @@ def read_claude_subagent(path: str, expected_agent_type: str) -> Tuple[dict, lis
     try:
         with open(meta_path, "r", encoding="utf-8") as f:
             meta = json.load(f)
-    except (OSError, ValueError) as e:
-        raise ProvenanceError(f"Claude Code subagent metadata unreadable ({meta_path}): {e}")
+    except (OSError, ValueError, RecursionError) as e:
+        raise ProvenanceError(f"Claude Code subagent metadata unreadable ({meta_path}): {type(e).__name__}: {e}")
     agent_type = meta.get("agentType") if isinstance(meta, dict) else None
     if agent_type != expected_agent_type:
         raise ProvenanceError(
@@ -516,13 +624,16 @@ def read_claude_subagent(path: str, expected_agent_type: str) -> Tuple[dict, lis
 
 
 def claude_assistant_texts(row: dict) -> list:
-    """Text blocks the subagent model itself wrote in one assistant row (never tool results)."""
+    """Text blocks the subagent model itself wrote in one assistant row (never tool results).
+    Raises ProvenanceError when the message content is neither a string nor a list."""
     message = row.get("message") if isinstance(row.get("message"), dict) else {}
     if message.get("role", "assistant") != "assistant":
         return []
     content = message.get("content")
     if isinstance(content, str):
         return [content]
+    if content is not None and not isinstance(content, list):
+        raise ProvenanceError(f"Malformed assistant message content ({type(content).__name__}).")
     texts = []
     for block in content or []:
         if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str):
@@ -541,9 +652,9 @@ def extract_dossier_from_claude_transcript(path: str, expected_agent_type: str =
             for m in DOSSIER_RE.finditer(text):
                 saw_block = True
                 raw = m.group(1).strip()
-                parsed = _parse_block(raw)
+                parsed, escaped = _parse_block_ex(raw)
                 if parsed is not None:
-                    found = (idx, row, raw, parsed)
+                    found = (idx, row, raw, parsed, _block_text(text, escaped))
                     break
 
     if not found:
@@ -551,12 +662,13 @@ def extract_dossier_from_claude_transcript(path: str, expected_agent_type: str =
             raise ProvenanceError(f"<dossier_json> block emitted by the subagent is not a valid JSON object ({path}).")
         raise ProvenanceError(f"No <dossier_json> block emitted by the subagent in {path}")
 
-    idx, row, raw, dossier = found
+    idx, row, raw, dossier, final_text = found
     return {
         "source": CLAUDE_SOURCE,
         "raw": raw,
         "sha256": sha256_text(raw),
         "dossier": dossier,
+        "final_text": final_text,  # see extract_dossier_from_transcript; never stored nor hashed
         "step_index": idx,
         "step_uuid": row.get("uuid"),
         "created_at_ts": _parse_created_at(row.get("timestamp")),
@@ -588,6 +700,69 @@ def normalize_status(status: Any) -> Tuple[str, bool]:
     if s.startswith("APPROVED"):  # e.g. APPROVED_PENDING_CONFIRMATION
         return "APPROVED", "PENDING" in s or "CONFIRM" in s
     return "REJECTED", False
+
+
+# =============================================================================
+# Precondition Checklist vs dossier (issue #27, checked by record_evaluation.py at record time only)
+# =============================================================================
+CHECKLIST_HEADING_RE = re.compile(r"^\s*##\s+Precondition Checklist\s*$")
+CHECKLIST_END_RE = re.compile(r"^\s*#{1,2}\s|<dossier_json>")
+C42_LINE_RE = re.compile(r"C4\.2 Overall status:.*->\s*(\S+)")
+CANDIDATE_CHECK_RE = re.compile(
+    r"^\s*-\s*\[([ xX])\]\s+(\S+)\s+(\S+)(?:\s+\(YOLO\))?\s+(K1|K2|K3|K4|C3\.1)(?=\s|$)")
+APPROVED_CANDIDATE_CHECKS = ("K1", "K2", "K3", "K4", "C3.1")
+
+
+def check_precondition_checklist(text: str, dossier: dict) -> list:
+    """Consistency of the evaluator's visible '## Precondition Checklist' with its <dossier_json> (the format
+    of .agents/agents/isolated_market_evaluator/agent.md). Returns human-readable problems; [] = consistent.
+    Region: from the heading to the next '# '/'## ' heading, the <dossier_json> block or the end of the text.
+    Rules: exactly one 'C4.2 Overall status: ... -> <STATUS>' line whose status equals the dossier status (both
+    normalized with normalize_status); every approved candidate has '[x]' K1, K2, K3, K4 and C3.1 lines prefixed
+    exactly '<SYMBOL> <DIRECTION>' (optionally '(YOLO)'). Lines of other candidates and other ids are ignored."""
+    lines = str(text or "").splitlines()
+    start = next((i for i, line in enumerate(lines) if CHECKLIST_HEADING_RE.match(line)), None)
+    if start is None:
+        return ["missing ## Precondition Checklist"]
+    region = []
+    for line in lines[start + 1:]:
+        if CHECKLIST_END_RE.search(line):
+            break
+        region.append(line)
+
+    problems = []
+    dossier = dossier if isinstance(dossier, dict) else {}
+    status = normalize_status(dossier.get("status"))[0]
+    c42 = [m for m in (C42_LINE_RE.search(line) for line in region) if m]
+    if len(c42) != 1:
+        problems.append(f"expected exactly one 'C4.2 Overall status' line in the checklist, found {len(c42)}")
+    else:
+        token = c42[0].group(1).strip(".,;:!?()[]*`'\"")
+        c42_status = normalize_status(token)[0]
+        if c42_status != status:
+            problems.append(f"C4.2 Overall status '{token}' does not match the dossier status '{status}'")
+
+    marks = {}
+    for line in region:
+        m = CANDIDATE_CHECK_RE.match(line)
+        if m:
+            key = (m.group(2).upper(), m.group(3).upper(), m.group(4))
+            marks.setdefault(key, []).append(m.group(1).lower() == "x")
+    candidates = dossier.get("approved_candidates")
+    for cand in candidates if isinstance(candidates, list) else []:
+        if not isinstance(cand, dict):
+            continue
+        symbol = str(cand.get("symbol") or "").strip().upper()
+        direction = str(cand.get("direction") or "").strip().upper()
+        if not symbol:
+            continue
+        for check in APPROVED_CANDIDATE_CHECKS:
+            seen = marks.get((symbol, direction, check))
+            if not seen:
+                problems.append(f"approved {symbol} {direction}: no {check} line in the checklist")
+            elif not all(seen):
+                problems.append(f"approved {symbol} {direction}: {check} is not checked [x]")
+    return problems
 
 
 def normalize_candidates(dossier: dict, pending_confirmation: bool = False) -> list:

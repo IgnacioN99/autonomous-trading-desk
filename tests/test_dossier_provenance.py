@@ -39,8 +39,25 @@ def iso(ts: int) -> str:
     return datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def dossier_text(payload: dict, header: str = "# QUANTITATIVE EVALUATION MASTER DOSSIER\n") -> str:
-    return f"{header}\n<dossier_json>\n{json.dumps(payload, indent=2)}\n</dossier_json>\n"
+def checklist_for(payload: dict) -> str:
+    """Precondition Checklist consistent with the payload (issue #27): K1-K4/C3.1 [x] per approved candidate
+    and a C4.2 line carrying the raw status."""
+    lines = ["## Precondition Checklist", "- [x] C0.2 Brief age: 1 min -> PASS"]
+    for c in payload.get("approved_candidates") or []:
+        prefix = f"{str(c['symbol']).upper()} {str(c['direction']).upper()}" + (" (YOLO)" if c.get("is_yolo") else "")
+        lines += [f"- [x] {prefix} {check} gate: brief value -> PASS" for check in ("K1", "K2", "K3", "C3.1")]
+        lines.append(f"- [x] {prefix} K4 Verdict: K1-K3 PASS -> APPROVED (Tier S)")
+    lines.append(f"- [{'x' if payload.get('status') != 'REJECTED' else ' '}] C4.2 Overall status: verdict -> "
+                 f"{payload.get('status')}")
+    return "\n".join(lines) + "\n\n## 1. Basket\n"
+
+
+def dossier_text(payload: dict, header: str = "# QUANTITATIVE EVALUATION MASTER DOSSIER\n", checklist=True) -> str:
+    """Evaluator message: header, Precondition Checklist (True: consistent with the payload; False: none;
+    a string: that text) and the <dossier_json> block."""
+    if checklist is True:
+        checklist = checklist_for(payload)
+    return f"{header}{checklist or ''}\n<dossier_json>\n{json.dumps(payload, indent=2)}\n</dossier_json>\n"
 
 
 APPROVED_SHORT = {
@@ -212,6 +229,38 @@ class TestTranscriptExtraction(TranscriptFixture):
         path = self.write_transcript(conv, [self.system_step(self.now), step])
         ex = dp.extract_dossier_from_transcript(path)
         self.assertEqual(ex["dossier"]["status"], "APPROVED")
+        # final_text is decoded like the block, so the checklist check reads real lines (issue #27)
+        self.assertEqual(ex["final_text"], dossier_text(APPROVED_SHORT))
+        with patch.object(rec, "_register_shadow"), redirect_stdout(io.StringIO()):
+            record = rec.record_from_subagent(conv, target_env="prod", base_dir=self.workspace)
+        self.assertEqual(record["status"], "APPROVED")
+        # An inconsistent single-escaped checklist is still refused in PROD, and nothing is written
+        os.remove(dp.default_dossier_path(self.workspace))
+        bad = checklist_for(APPROVED_SHORT).replace("- [x] FILUSDT SHORT K1", "- [ ] FILUSDT SHORT K1")
+        step["tool_calls"][0]["args"]["Message"] = json.dumps(dossier_text(APPROVED_SHORT, checklist=bad))[1:-1]
+        self.write_transcript("aaaaaaaa-0000-0000-0000-00000000000b", [self.system_step(self.now), step])
+        with self.assertRaises(rec.RecordRefused) as cm:
+            rec.record_from_subagent("aaaaaaaa-0000-0000-0000-00000000000b", target_env="prod",
+                                     base_dir=self.workspace, shadow=False, verbose=False)
+        self.assertIn("K1 is not checked", str(cm.exception))
+        self.assertFalse(os.path.exists(dp.default_dossier_path(self.workspace)))
+
+    def test_claude_text_with_one_level_of_escaping_decodes_final_text(self):
+        with tempfile.TemporaryDirectory() as projects, patch.dict(os.environ, {dp.CLAUDE_PROJECTS_ENV: projects}):
+            d = os.path.join(projects, "-repo", "5e55105e-0000-4000-8000-000000000009", "subagents")
+            os.makedirs(d)
+            path = os.path.join(d, "agent-a2800000000000001.jsonl")
+            row = {"type": "assistant", "timestamp": iso(self.now - 30), "uuid": "u1", "isSidechain": True,
+                   "agentId": "a2800000000000001", "sessionId": "5e55105e-0000-4000-8000-000000000009",
+                   "message": {"role": "assistant", "content": [
+                       {"type": "text", "text": json.dumps(dossier_text(APPROVED_SHORT))[1:-1]}]}}
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(json.dumps(row) + "\n")
+            with open(dp.claude_meta_path(path), "w", encoding="utf-8") as f:
+                json.dump({"agentType": dp.EVALUATOR_NAME}, f)
+            ex = dp.extract_dossier_from_claude_transcript(path)
+        self.assertEqual(ex["final_text"], dossier_text(APPROVED_SHORT))
+        self.assertEqual(dp.check_precondition_checklist(ex["final_text"], ex["dossier"]), [])
 
     def test_content_block(self):
         conv = "aaaaaaaa-0000-0000-0000-000000000003"
@@ -999,6 +1048,439 @@ class TestClaudeProjectRoots(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             roots = dp.claude_project_roots()
         self.assertEqual(roots[0], os.path.join(os.path.expanduser("~"), ".claude", "projects"))
+
+
+# =============================================================================
+# Issue #27: Precondition Checklist vs dossier at record time
+# =============================================================================
+PEPE_APPROVED = {
+    "status": "APPROVED", "target_env": "PROD", "summary": "pepe",
+    "approved_candidates": [{"symbol": "1000PEPEUSDT", "direction": "LONG", "is_yolo": True, "tier": "A",
+                             "requires_user_confirmation": True}],
+}
+
+
+def c0_stop_text(payload: dict) -> str:
+    return ("# QUANTITATIVE EVALUATION MASTER DOSSIER\n## Precondition Checklist\n"
+            "- [x] C0.1 Brief source: view_file logs/primed_brief.json -> file\n"
+            "- [ ] C0.2 Brief age: generated_at_ts 14 min ago -> FAIL\n"
+            "- [ ] C4.2 Overall status: STALE_BRIEF -> REJECTED\n\n"
+            f"<dossier_json>\n{json.dumps(payload)}\n</dossier_json>\n")
+
+
+class TestPreconditionChecklistChecker(unittest.TestCase):
+    """dp.check_precondition_checklist on synthetic evaluator messages."""
+
+    def check(self, payload, checklist=True):
+        return dp.check_precondition_checklist(dossier_text(payload, checklist=checklist), payload)
+
+    def test_consistent_checklist_passes(self):
+        self.assertEqual(self.check(APPROVED_SHORT), [])
+        self.assertEqual(self.check(PEPE_APPROVED), [])
+        self.assertEqual(self.check({"status": "NEUTRAL", "approved_candidates": []}), [])
+
+    def test_missing_checklist(self):
+        self.assertEqual(self.check(APPROVED_SHORT, checklist=False), ["missing ## Precondition Checklist"])
+        text = dossier_text(APPROVED_SHORT, checklist=checklist_for(APPROVED_SHORT).replace("## Precondition", "### Precondition"))
+        self.assertIn("missing ## Precondition Checklist", dp.check_precondition_checklist(text, APPROVED_SHORT))
+
+    def test_c42_mismatch_missing_and_duplicate(self):
+        base = checklist_for(APPROVED_SHORT)
+        mismatch = base.replace("verdict -> APPROVED", "verdict -> REJECTED")
+        problems = dp.check_precondition_checklist(dossier_text(APPROVED_SHORT, checklist=mismatch), APPROVED_SHORT)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("does not match the dossier status 'APPROVED'", problems[0])
+        missing = "\n".join(l for l in base.splitlines() if "C4.2" not in l)
+        problems = dp.check_precondition_checklist(dossier_text(APPROVED_SHORT, checklist=missing), APPROVED_SHORT)
+        self.assertEqual(problems, ["expected exactly one 'C4.2 Overall status' line in the checklist, found 0"])
+        c42 = next(l for l in base.splitlines() if "C4.2" in l)
+        dup = base.replace(c42, c42 + "\n" + c42)
+        problems = dp.check_precondition_checklist(dossier_text(APPROVED_SHORT, checklist=dup), APPROVED_SHORT)
+        self.assertIn("found 2", problems[0])
+        # A C4.2 line after the next heading is outside the checklist region
+        moved = missing.replace("## 1. Basket", "## 1. Basket\n" + c42)
+        self.assertIn("found 0", dp.check_precondition_checklist(
+            dossier_text(APPROVED_SHORT, checklist=moved), APPROVED_SHORT)[0])
+
+    def test_unchecked_or_missing_gate_of_an_approved_candidate(self):
+        base = checklist_for(APPROVED_SHORT)
+        for check in ("K1", "K2", "K3", "K4", "C3.1"):
+            with self.subTest(check):
+                line = next(l for l in base.splitlines() if f"FILUSDT SHORT {check} " in l)
+                unchecked = base.replace(line, line.replace("- [x]", "- [ ]"))
+                problems = dp.check_precondition_checklist(dossier_text(APPROVED_SHORT, checklist=unchecked),
+                                                           APPROVED_SHORT)
+                self.assertEqual(problems, [f"approved FILUSDT SHORT: {check} is not checked [x]"])
+                dropped = base.replace(line + "\n", "")
+                problems = dp.check_precondition_checklist(dossier_text(APPROVED_SHORT, checklist=dropped),
+                                                           APPROVED_SHORT)
+                self.assertEqual(problems, [f"approved FILUSDT SHORT: no {check} line in the checklist"])
+
+    def test_same_symbol_other_direction_does_not_count(self):
+        other = checklist_for(APPROVED_SHORT).replace("FILUSDT SHORT", "FILUSDT LONG")
+        problems = dp.check_precondition_checklist(dossier_text(APPROVED_SHORT, checklist=other), APPROVED_SHORT)
+        self.assertEqual(len(problems), 5)
+        self.assertTrue(all("approved FILUSDT SHORT: no" in p for p in problems), problems)
+
+    def test_symbol_match_is_token_exact(self):
+        pepe = dict(PEPE_APPROVED, approved_candidates=[{"symbol": "PEPEUSDT", "direction": "LONG"}])
+        text = dossier_text(pepe, checklist=checklist_for(PEPE_APPROVED))  # lines name 1000PEPEUSDT
+        problems = dp.check_precondition_checklist(text, pepe)
+        self.assertEqual(len(problems), 5)
+        self.assertTrue(all("approved PEPEUSDT LONG: no" in p for p in problems), problems)
+
+    def test_rejected_candidate_lines_may_be_unchecked(self):
+        rejected_lines = "".join(f"- [ ] WLFIUSDT LONG {c} gate -> BLOCKED\n" for c in ("K1", "K2", "K3", "C3.1", "K4"))
+        text = checklist_for(APPROVED_SHORT).replace("## Precondition Checklist\n",
+                                                     "## Precondition Checklist\n" + rejected_lines)
+        self.assertEqual(dp.check_precondition_checklist(dossier_text(APPROVED_SHORT, checklist=text), APPROVED_SHORT), [])
+
+    def test_c0_stop_rejected_dossier_is_consistent(self):
+        payload = {"status": "REJECTED", "approved_candidates": [], "summary": "STALE_BRIEF: 14 min"}
+        self.assertEqual(dp.check_precondition_checklist(c0_stop_text(payload), payload), [])
+
+    def test_formatting_tolerance(self):
+        text = dossier_text(APPROVED_SHORT).replace("\n", "\r\n").replace("- [x]", "    - [X]").replace(
+            "-> PASS", "-> PASS   ")
+        self.assertEqual(dp.check_precondition_checklist(text, APPROVED_SHORT), [])
+        # Lowercase dossier symbol/direction and the legacy APPROVED_PENDING_CONFIRMATION status are normalized
+        legacy = dict(APPROVED_SHORT, status="APPROVED_PENDING_CONFIRMATION")
+        self.assertEqual(dp.check_precondition_checklist(dossier_text(legacy), legacy), [])
+        # Unrelated check ids (another session may add C1.3 / RULE 10 lines) are ignored
+        extra = checklist_for(APPROVED_SHORT).replace("- [x] C0.2", "- [ ] C1.3 New gate -> FAIL\n- [x] C0.2")
+        self.assertEqual(dp.check_precondition_checklist(dossier_text(APPROVED_SHORT, checklist=extra), APPROVED_SHORT), [])
+
+
+class TestPreconditionChecklistRecording(ClaudeTranscriptFixture):
+    """record_evaluation.py refuses (PROD) / warns (TESTNET) on an inconsistent checklist (issue #27)."""
+
+    def run_main(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(rec, "BASE_DIR", self.workspace), patch.object(rec, "_register_shadow"), \
+                redirect_stdout(out), redirect_stderr(err):
+            code = rec.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def agy_transcript(self, conv: str, text: str) -> str:
+        ts = self.now - 30
+        steps = [self.system_step(ts - 5)] + self.view_file_steps(ts - 3) + [self.send_message_step(ts, text)]
+        return self.write_transcript(conv, steps)
+
+    def claude_transcript(self, agent: str, text: str) -> str:
+        ts = self.now - 30
+        rows = [self.user_row(ts - 5, "Evaluate logs/primed_brief.json.")] + self.read_rows(ts - 3) + [self.text_row(ts, text)]
+        return self.write_claude(agent, rows)
+
+    def dossier_path(self):
+        return dp.default_dossier_path(self.workspace)
+
+    def history(self):
+        path = os.path.join(self.workspace, "logs", "evaluations", "evaluations_history.jsonl")
+        with open(path, encoding="utf-8") as f:
+            return [json.loads(l) for l in f if l.strip()]
+
+    def assertRefused(self, flag, ident, fragment):
+        code, _, err = self.run_main([flag, ident, "--env", "prod"])
+        self.assertEqual(code, 2, err)
+        self.assertIn("Precondition Checklist", err)
+        self.assertIn(fragment, err)
+        self.assertFalse(os.path.exists(self.dossier_path()))
+
+    def test_prod_approved_without_checklist_refused(self):
+        self.agy_transcript("abababab-0000-0000-0000-000000000001", dossier_text(APPROVED_SHORT, checklist=False))
+        self.assertRefused("--from-subagent", "abababab-0000-0000-0000-000000000001", "missing ## Precondition Checklist")
+        self.claude_transcript("a2700000000000001", dossier_text(APPROVED_SHORT, checklist=False))
+        self.assertRefused("--from-claude-subagent", "a2700000000000001", "missing ## Precondition Checklist")
+
+    def test_prod_approved_with_inconsistent_checklist_refused(self):
+        base = checklist_for(APPROVED_SHORT)
+        cases = {
+            "C4.2 mismatch": (base.replace("verdict -> APPROVED", "verdict -> NEUTRAL"), "does not match"),
+            "C4.2 missing": ("\n".join(l for l in base.splitlines() if "C4.2" not in l), "found 0"),
+            "K2 unchecked": (base.replace("- [x] FILUSDT SHORT K2", "- [ ] FILUSDT SHORT K2"), "K2 is not checked"),
+            "other direction": (base.replace("FILUSDT SHORT", "FILUSDT LONG"), "approved FILUSDT SHORT: no K1"),
+        }
+        for i, (label, (checklist, fragment)) in enumerate(cases.items()):
+            with self.subTest(label):
+                conv = f"abababab-1000-0000-0000-00000000000{i}"
+                self.agy_transcript(conv, dossier_text(APPROVED_SHORT, checklist=checklist))
+                self.assertRefused("--from-subagent", conv, fragment)
+                agent = f"a27100000000000{i:02d}"
+                self.claude_transcript(agent, dossier_text(APPROVED_SHORT, checklist=checklist))
+                self.assertRefused("--from-claude-subagent", agent, fragment)
+
+    def test_testnet_approved_without_checklist_warns_and_records(self):
+        payload = dict(APPROVED_SHORT, target_env="TESTNET")
+        self.agy_transcript("abababab-0000-0000-0000-000000000002", dossier_text(payload, checklist=False))
+        code, _, err = self.run_main(["--from-subagent", "abababab-0000-0000-0000-000000000002", "--env", "testnet"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("CHECKLIST WARNING (TESTNET", err)
+        self.assertIn("missing ## Precondition Checklist", err)
+        record = dp.load_dossier(self.dossier_path())
+        self.assertEqual((record["status"], record["target_env"]), ("APPROVED", "testnet"))
+        os.remove(self.dossier_path())
+        self.claude_transcript("a2700000000000002", dossier_text(payload, checklist=False))
+        code, _, err = self.run_main(["--from-claude-subagent", "a2700000000000002", "--env", "testnet"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("CHECKLIST WARNING (TESTNET", err)
+        self.assertEqual(dp.load_dossier(self.dossier_path())["provenance"]["source"], dp.CLAUDE_SOURCE)
+
+    def test_prod_rejected_with_inconsistent_checklist_recorded_with_warning(self):
+        """A refused REJECTED record would leave an older APPROVED latest_dossier.json live."""
+        self.record_prod("abababab-0000-0000-0000-000000000003", APPROVED_SHORT)
+        rejected = {"status": "REJECTED", "target_env": "PROD", "approved_candidates": [], "summary": "no"}
+        bad = checklist_for(rejected).replace("verdict -> REJECTED", "verdict -> APPROVED")
+        self.agy_transcript("abababab-0000-0000-0000-000000000004", dossier_text(rejected, checklist=bad))
+        code, _, err = self.run_main(["--from-subagent", "abababab-0000-0000-0000-000000000004", "--env", "prod"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("CHECKLIST WARNING (PROD, status REJECTED)", err)
+        self.assertEqual(dp.load_dossier(self.dossier_path())["status"], "REJECTED")
+        ok, _, _ = self.validate("FILUSDT", "SHORT")
+        self.assertFalse(ok, "the older APPROVED dossier must no longer authorize anything")
+        # Missing checklist on a NEUTRAL dossier: same treatment
+        neutral = {"status": "NEUTRAL", "target_env": "PROD", "approved_candidates": []}
+        self.claude_transcript("a2700000000000003", dossier_text(neutral, checklist=False))
+        code, _, err = self.run_main(["--from-claude-subagent", "a2700000000000003", "--env", "prod"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("CHECKLIST WARNING (PROD, status NEUTRAL)", err)
+
+    def test_prod_c0_stop_rejected_dossier_recorded_without_warning(self):
+        payload = {"status": "REJECTED", "target_env": "PROD", "approved_candidates": [], "summary": "STALE_BRIEF: x"}
+        self.agy_transcript("abababab-0000-0000-0000-000000000005", c0_stop_text(payload))
+        code, _, err = self.run_main(["--from-subagent", "abababab-0000-0000-0000-000000000005", "--env", "prod"])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("CHECKLIST WARNING", err)
+        self.assertEqual(dp.load_dossier(self.dossier_path())["status"], "REJECTED")
+
+    def test_prod_yolo_candidate_and_rejected_lines_recorded(self):
+        text = checklist_for(PEPE_APPROVED).replace("## Precondition Checklist\n", "## Precondition Checklist\n" + "".join(
+            f"- [ ] PEPEUSDT LONG {c} gate -> FAIL\n" for c in ("K1", "K2", "K3", "C3.1", "K4")))
+        self.agy_transcript("abababab-0000-0000-0000-000000000006", dossier_text(PEPE_APPROVED, checklist=text))
+        code, _, err = self.run_main(["--from-subagent", "abababab-0000-0000-0000-000000000006", "--env", "prod"])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("CHECKLIST WARNING", err)
+
+    def test_stored_record_keeps_snapshots_and_hash_without_final_text(self):
+        path = self.agy_transcript("abababab-0000-0000-0000-000000000007", dossier_text(APPROVED_SHORT))
+        extracted = dp.extract_dossier_from_transcript(path)
+        self.assertIn("## Precondition Checklist", extracted["final_text"])
+        self.assertNotIn("final_text", dp.build_record_from_extraction(extracted))
+        code, _, err = self.run_main(["--from-subagent", "abababab-0000-0000-0000-000000000007", "--env", "prod"])
+        self.assertEqual(code, 0, err)
+        with open(self.dossier_path(), encoding="utf-8") as f:
+            stored_text = f.read()
+        record = json.loads(stored_text)
+        self.assertIn("FILUSDT|SHORT", record["radar_snapshots"])
+        self.assertEqual(record["provenance"]["sha256"], dp.sha256_text(extracted["raw"]))
+        self.assertNotIn("final_text", stored_text)
+        self.assertNotIn("Precondition Checklist", stored_text)
+        self.assertEqual(self.history()[-1]["sha256"], record["provenance"]["sha256"])
+        ok, reason, cand = self.validate("FILUSDT", "SHORT")
+        self.assertTrue(ok, reason)
+        self.assertEqual(cand["dossier_sha256"], record["provenance"]["sha256"])
+        claude = self.claude_transcript("a2700000000000004", dossier_text(APPROVED_SHORT))
+        self.assertIn("## Precondition Checklist", dp.extract_dossier_from_claude_transcript(claude)["final_text"])
+
+    def test_truncated_agy_checklist_is_read_from_the_full_transcript(self):
+        conv = "abababab-0000-0000-0000-000000000008"
+        ts = self.now - 30
+        steps = [self.system_step(ts - 5), self.send_message_step(ts, dossier_text(APPROVED_SHORT, header=LONG_HEADER))]
+        path = self.write_transcript(conv, steps, truncate={1: ["tool_calls"]})
+        self.assertNotIn("Precondition Checklist", self.load_rows(path)[1]["tool_calls"][0]["args"]["Message"])
+        code, _, err = self.run_main(["--from-subagent", conv, "--env", "prod"])
+        self.assertEqual(code, 0, err)
+        self.assertTrue(dp.load_dossier(self.dossier_path())["provenance"]["full_transcript_used"])
+        # The same cut over an inconsistent checklist is refused: the check reads the resolved text
+        os.remove(self.dossier_path())
+        conv2 = "abababab-0000-0000-0000-000000000009"
+        bad = checklist_for(APPROVED_SHORT).replace("- [x] FILUSDT SHORT K3", "- [ ] FILUSDT SHORT K3")
+        steps = [self.system_step(ts - 5),
+                 self.send_message_step(ts, dossier_text(APPROVED_SHORT, header=LONG_HEADER, checklist=bad))]
+        self.write_transcript(conv2, steps, truncate={1: ["tool_calls"]})
+        self.assertRefused("--from-subagent", conv2, "K3 is not checked")
+
+
+# =============================================================================
+# Issue #43: read_agy_steps hardening
+# =============================================================================
+class TestAgyReaderHardening(TranscriptFixture):
+
+    def truncated(self, conv: str) -> str:
+        ts = self.now - 30
+        steps = [self.system_step(ts - 5)] + self.view_file_steps(ts - 3) + \
+            [self.send_message_step(ts, dossier_text(APPROVED_SHORT, header=LONG_HEADER))]
+        return self.write_transcript(conv, steps, truncate={3: ["tool_calls"]})
+
+    def write_lines(self, path: str, lines: list, newline: str = "\n") -> None:
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write("".join(line + newline for line in lines))
+
+    def raw_lines(self, path: str) -> list:
+        with open(path, encoding="utf-8") as f:
+            return [l.rstrip("\r\n") for l in f if l.strip()]
+
+    def assertProvenanceError(self, path: str, fragment: str):
+        with self.assertRaises(dp.ProvenanceError) as cm:
+            dp.extract_dossier_from_transcript(path)
+        self.assertIn(fragment, str(cm.exception))
+
+    def test_marker_without_truncated_fields_fails_closed(self):
+        # send_message arg cut like agy, but the row does not list truncated_fields
+        path = self.truncated("cdcdcdcd-0000-0000-0000-000000000001")
+        self.edit_row(path, 3, lambda row: row.pop("truncated_fields"))
+        self.assertProvenanceError(path, "no truncated_fields")
+        # Planner content middle-cut without truncated_fields (an earlier complete dossier must not win)
+        conv = "cdcdcdcd-0000-0000-0000-000000000002"
+        steps = [self.system_step(self.now), self.content_step(self.now - 5, dossier_text(APPROVED_SHORT)),
+                 self.content_step(self.now, agy_middle_cut(dossier_text({"status": "REJECTED"}, header=LONG_HEADER)))]
+        self.assertProvenanceError(self.write_transcript(conv, steps), "no truncated_fields")
+
+    def test_model_row_with_truncated_tool_calls_and_no_send_message(self):
+        conv = "cdcdcdcd-0000-0000-0000-000000000003"
+        ts = self.now - 30
+        view_call, view_result = self.view_file_steps(ts - 3)
+        view_call["tool_calls"][0]["args"]["AbsolutePath"] = json.dumps("logs/" + "deep/" * 40 + "primed_brief.json")
+        steps = [self.system_step(ts - 5), view_call, view_result, self.send_message_step(ts, dossier_text(APPROVED_SHORT))]
+        path = self.write_transcript(conv, steps, truncate={1: ["tool_calls"]}, full=False)
+        self.assertIn("\n<truncated ", self.load_rows(path)[1]["tool_calls"][0]["args"]["AbsolutePath"])
+        ex = dp.extract_dossier_from_transcript(path)
+        self.assertEqual(ex["dossier"]["status"], "APPROVED")
+        self.assertFalse(ex["full_transcript_used"])
+
+    def test_extra_or_unparsable_line_in_one_file_still_resolves(self):
+        layouts = {
+            "extra row in full": lambda short, full: (short, [json.dumps({"step_index": 99, "source": "SYSTEM"})] + full),
+            "unparsable line in full": lambda short, full: (short, ["{not json"] + full),
+            "unparsable line in short": lambda short, full: (short[:2] + ["{not json"] + short[2:], full),
+            "full rows reordered": lambda short, full: (short, list(reversed(full))),
+        }
+        for i, (label, change) in enumerate(layouts.items()):
+            with self.subTest(label):
+                path = self.truncated(f"cdcdcdcd-1000-0000-0000-00000000000{i}")
+                full_path = dp.full_transcript_path(path)
+                short, full = change(self.raw_lines(path), self.raw_lines(full_path))
+                self.write_lines(path, short)
+                self.write_lines(full_path, full)
+                ex = dp.extract_dossier_from_transcript(path)
+                self.assertEqual((ex["step_index"], ex["full_transcript_used"]), (3, True))
+
+    def test_crlf_in_only_one_file(self):
+        for i, which in enumerate(("short", "full")):
+            with self.subTest(which):
+                path = self.truncated(f"cdcdcdcd-2000-0000-0000-00000000000{i}")
+                target = path if which == "short" else dp.full_transcript_path(path)
+                self.write_lines(target, self.raw_lines(target), newline="\r\n")
+                ex = dp.extract_dossier_from_transcript(path)
+                self.assertTrue(ex["full_transcript_used"])
+
+    def test_duplicate_or_missing_step_index(self):
+        path = self.truncated("cdcdcdcd-3000-0000-0000-000000000001")
+        full_path = dp.full_transcript_path(path)
+        full = self.raw_lines(full_path)
+        self.write_lines(full_path, full + [full[3]])
+        self.assertProvenanceError(path, "duplicate step_index in transcript_full.jsonl")
+
+        path = self.truncated("cdcdcdcd-3000-0000-0000-000000000002")
+        self.edit_row(path, 1, lambda row: row.update(step_index=3))
+        self.assertProvenanceError(path, "duplicate step_index in transcript.jsonl")
+
+        path = self.truncated("cdcdcdcd-3000-0000-0000-000000000003")
+        self.edit_row(path, 3, lambda row: row.pop("step_index"))
+        self.assertProvenanceError(path, "transcript_full.jsonl mismatch at step None: missing or invalid step_index")
+
+        path = self.truncated("cdcdcdcd-3000-0000-0000-000000000004")
+        full_path = dp.full_transcript_path(path)
+        self.write_lines(full_path, self.raw_lines(full_path)[:3])
+        self.assertProvenanceError(path, "transcript_full.jsonl mismatch at step 3: row missing or unreadable")
+
+    def test_encoder_differences_in_untruncated_args(self):
+        """agy's compact encoder ('{"a":1}', '\\u003c') vs Python's json.dumps in the full row."""
+        conv = "cdcdcdcd-4000-0000-0000-000000000001"
+        ts = self.now - 30
+        step = self.send_message_step(ts, dossier_text(APPROVED_SHORT, header=LONG_HEADER))
+        compact = json.dumps({"a": 1, "t": "<b>"}, separators=(",", ":")).replace("<", "\\u003c").replace(">", "\\u003e")
+        step["tool_calls"].append({"name": "notify", "args": {"Options": compact}})
+        path = self.write_transcript(conv, [self.system_step(ts - 5), step], truncate={1: ["tool_calls"]})
+        self.assertEqual(self.load_rows(path)[1]["tool_calls"][1]["args"]["Options"], '{"a":1,"t":"\\u003cb\\u003e"}')
+        self.assertEqual(self.load_rows(dp.full_transcript_path(path))[1]["tool_calls"][1]["args"]["Options"],
+                         {"a": 1, "t": "<b>"})
+        ex = dp.extract_dossier_from_transcript(path)
+        self.assertTrue(ex["full_transcript_used"])
+        # A different value (or the same digits with another JSON type) is still a mismatch
+        for other in ({"a": 2, "t": "<b>"}, {"a": True, "t": "<b>"}, {"a": 1.0, "t": "<b>"}):
+            with self.subTest(other=other):
+                self.edit_row(dp.full_transcript_path(path), 1,
+                              lambda row: row["tool_calls"][1]["args"].update(Options=other))
+                self.assertProvenanceError(path, "tool_calls[1].args.Options differs")
+
+    def test_malformed_rows_raise_provenance_error(self):
+        model = {"source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": iso(self.now), "content": ""}
+        rows = {
+            "non-list tool_calls": dict(model, tool_calls="send_message"),
+            "non-dict call": dict(model, tool_calls=["send_message"]),
+            "non-dict args": dict(model, tool_calls=[{"name": "send_message", "args": ["x"]}]),
+        }
+        for i, (label, row) in enumerate(rows.items()):
+            with self.subTest(label):
+                with self.assertRaises(dp.ProvenanceError):
+                    dp._model_texts(row)  # assemble_review.py calls it directly
+                path = self.write_transcript(f"cdcdcdcd-5000-0000-0000-00000000000{i}", [self.system_step(self.now), row])
+                self.assertProvenanceError(path, "Malformed")
+        with self.assertRaises(dp.ProvenanceError):
+            dp._model_texts(["not", "a", "row"])
+        # Truncated row whose tool_calls is not a list: resolution fails closed
+        bad = dict(model, tool_calls={"name": "send_message"}, truncated_fields=["tool_calls"])
+        path = self.write_transcript("cdcdcdcd-5000-0000-0000-00000000000a", [self.system_step(self.now), bad], full=True)
+        self.edit_row(dp.full_transcript_path(path), 1, lambda row: row.pop("truncated_fields"))
+        with self.assertRaises(dp.ProvenanceError) as cm:
+            dp.read_agy_steps(path)
+        self.assertIn("tool_calls count differs", str(cm.exception))
+
+    def test_non_object_and_deeply_nested_lines(self):
+        path = self.standard_transcript("cdcdcdcd-6000-0000-0000-000000000001", APPROVED_SHORT)
+        lines = self.raw_lines(path)
+        self.write_lines(path, lines[:1] + ["[1, 2]"] + lines[1:])
+        self.assertProvenanceError(path, "not a JSON object")
+        deep = "[" * 100000 + "]" * 100000
+        path = self.standard_transcript("cdcdcdcd-6000-0000-0000-000000000002", APPROVED_SHORT)
+        self.write_lines(path, self.raw_lines(path) + [deep])
+        self.assertProvenanceError(path, "nested too deeply")
+        # Same line in transcript_full.jsonl, needed for a truncated row
+        path = self.truncated("cdcdcdcd-6000-0000-0000-000000000003")
+        full_path = dp.full_transcript_path(path)
+        self.write_lines(full_path, self.raw_lines(full_path) + [deep])
+        self.assertProvenanceError(path, "nested too deeply")
+
+    def test_legacy_record_without_full_transcript_used_still_verifies(self):
+        self.record_prod("cdcdcdcd-7000-0000-0000-000000000001", APPROVED_SHORT)
+        path = dp.default_dossier_path(self.workspace)
+        record = dp.load_dossier(path)
+        record["provenance"].pop("full_transcript_used")
+        record["provenance"].pop("resolved_steps")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(record, f)
+        ok, reason, rebuilt = dp.rebuild_verified_record(record)
+        self.assertTrue(ok, reason)
+        self.assertFalse(rebuilt["provenance"]["full_transcript_used"])
+        ok, reason, _ = self.validate("FILUSDT", "SHORT")
+        self.assertTrue(ok, reason)
+
+
+class TestClaudeReaderHardening(ClaudeTranscriptFixture):
+
+    def test_malformed_claude_rows_raise_provenance_error(self):
+        agent = "a4300000000000001"
+        row = self.text_row(self.now, "x")
+        row["message"]["content"] = 42
+        with self.assertRaises(dp.ProvenanceError):
+            dp.extract_dossier_from_claude_transcript(self.write_claude(agent, [row]))
+        agent = "a4300000000000002"
+        path = self.standard_claude(agent, APPROVED_SHORT)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("[" * 100000 + "]" * 100000 + "\n")
+        with self.assertRaises(dp.ProvenanceError) as cm:
+            dp.extract_dossier_from_claude_transcript(path)
+        self.assertIn("nested too deeply", str(cm.exception))
 
 
 class TestPrimeEvaluatorBriefRiskProfile(unittest.TestCase):

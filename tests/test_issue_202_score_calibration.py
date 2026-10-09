@@ -79,11 +79,15 @@ def write_agy_dossier(brain, dossier_path, candidates, created=None, target_env=
     payload = {"status": "APPROVED", "approved_candidates": candidates, "summary": "test"}
     if target_env:
         payload["target_env"] = target_env
+    # Precondition Checklist consistent with the block (the recorder checks it at record time, issue #27)
+    checklist = "## Precondition Checklist\n" + "".join(
+        f"- [x] {c['symbol']} {c['direction']} {check} gate -> PASS\n"
+        for c in candidates for check in ("K1", "K2", "K3", "C3.1", "K4")) + "- [x] C4.2 Overall status: -> APPROVED\n"
     steps = [{"step_index": 0, "source": "SYSTEM", "type": "USER_INPUT",
               "content": "sender=11111111-2222-3333-4444-555555555555"},
              {"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE",
               "created_at": created.strftime("%Y-%m-%dT%H:%M:%SZ"),
-              "content": f"Master Dossier\n<dossier_json>{json.dumps(payload)}</dossier_json>"}]
+              "content": f"Master Dossier\n{checklist}<dossier_json>{json.dumps(payload)}</dossier_json>"}]
     tpath = os.path.join(tdir, "transcript.jsonl")
     with open(tpath, "w", encoding="utf-8") as f:
         for s in steps:
