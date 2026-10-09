@@ -23,3 +23,7 @@ PENDING_DRIFT_CAP_TOLERANCE = 1.2
 # GATE 3 (PROD): financial friction floor. TP1 must be at least this fraction (0.35%) from the effective entry,
 # on the profit side, or taker fees eat the edge.
 MIN_TP1_DISTANCE = 0.0035
+
+# Crossed-trigger R:R gate (PROD, issue #165): when the trigger is already crossed at execution time, the order
+# enters at the current price; R:R to TP2 from that price (|TP2 - price| / |price - SL|) must be at least this.
+MIN_RR_TP2_CROSSED = 3.0
