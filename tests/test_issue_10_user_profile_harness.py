@@ -42,7 +42,7 @@ SCRIPTS_DIR = os.path.join(BASE_DIR, "scripts")
 HOOKS_DIR = os.path.join(SCRIPTS_DIR, "hooks")
 LOOPS_DIR = os.path.join(SCRIPTS_DIR, "loops")
 
-for p in [BASE_DIR, SCRIPTS_DIR, HOOKS_DIR, LOOPS_DIR]:
+for p in [BASE_DIR, SCRIPTS_DIR, HOOKS_DIR, LOOPS_DIR, os.path.join(BASE_DIR, "tests")]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
@@ -318,14 +318,16 @@ class TestPreTradeGuardProfileEnforcement(unittest.TestCase):
         conv_id = "abcdef12-3456-7890-abcd-ef1234567890"
         tdir = os.path.join(self.brain_dir, conv_id, ".system_generated", "logs")
         os.makedirs(tdir, exist_ok=True)
-        block = json.dumps({"status": "APPROVED", "approved_candidates": candidates, "summary": "test"})
+        from dossier_checklist_fixture import checklist_for  # the PROD gate re-checks it (issue #223)
+        payload = {"status": "APPROVED", "approved_candidates": candidates, "summary": "test"}
+        block = json.dumps(payload)
         created = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         tpath = os.path.join(tdir, "transcript.jsonl")
         with open(tpath, "w", encoding="utf-8") as f:
             f.write(json.dumps({"step_index": 0, "source": "SYSTEM", "type": "USER_INPUT",
                                 "content": "sender=11111111-2222-3333-4444-555555555555"}) + "\n")
             f.write(json.dumps({"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": created,
-                                "content": f"<dossier_json>{block}</dossier_json>"}) + "\n")
+                                "content": f"{checklist_for(payload)}<dossier_json>{block}</dossier_json>"}) + "\n")
         record = dp.build_record_from_extraction(dp.extract_dossier_from_transcript(tpath))
         # Issue #202: radar snapshots as record_evaluation.py joins them (confidence == dossier score)
         record["radar_snapshots"] = {f"{c['symbol']}|{c['direction']}": {"radar_snapshot": {"confidence": c["score"]}}

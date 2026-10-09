@@ -185,7 +185,9 @@ EVALUATOR_DELIVERY = (
     "deliver the complete Master Dossier, including its single `<dossier_json>` block,\n"
     "  as your final response (the last message you write), exactly once. The parent records it with\n"
     "  `python3 scripts/record_evaluation.py --from-claude-subagent <agentId>`, which reads the block from your\n"
-    "  transcript and verifies that you ran as `isolated_market_evaluator`."
+    "  transcript and verifies that you ran as `isolated_market_evaluator`. The `## Precondition Checklist` and the\n"
+    "  `<dossier_json>` block must be in the same final text block of your final response; a checklist written in\n"
+    "  an earlier message is not read and an APPROVED dossier is then refused in PROD."
 )
 REVIEWER_DELIVERY = (
     "reply once, as your final response (the last message you write), with only your\n"

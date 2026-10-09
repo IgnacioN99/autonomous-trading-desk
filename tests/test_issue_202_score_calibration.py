@@ -79,10 +79,9 @@ def write_agy_dossier(brain, dossier_path, candidates, created=None, target_env=
     payload = {"status": "APPROVED", "approved_candidates": candidates, "summary": "test"}
     if target_env:
         payload["target_env"] = target_env
-    # Precondition Checklist consistent with the block (the recorder checks it at record time, issue #27)
-    checklist = "## Precondition Checklist\n" + "".join(
-        f"- [x] {c['symbol']} {c['direction']} {check} gate -> PASS\n"
-        for c in candidates for check in ("K1", "K2", "K3", "C3.1", "K4")) + "- [x] C4.2 Overall status: -> APPROVED\n"
+    # Precondition Checklist consistent with the block (checked at record time, issue #27, and at trade time with
+    # the K4 result token, issue #223)
+    checklist = tgb.checklist_for(payload)
     steps = [{"step_index": 0, "source": "SYSTEM", "type": "USER_INPUT",
               "content": "sender=11111111-2222-3333-4444-555555555555"},
              {"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE",
@@ -1190,9 +1189,11 @@ class TestPromptAndDocs(unittest.TestCase):
         for shot in ("FILUSDT Tier S, confidence 95 = score 95", "SOLUSDT Tier A+, confidence 70 = score 70",
                      "Tier A), confidence 60 = score 60"):
             self.assertIn(shot, text)
-        # the four shot dossiers (#206 added the squeezed RLCUSDT SHORT) + the contract's sample YOLO item
-        self.assertEqual(text.count('"score": '), 5)
+        # the five shot dossiers (#206 added the squeezed RLCUSDT SHORT, #223 the downgraded NEARUSDT LONG) + the
+        # contract's sample YOLO item
+        self.assertEqual(text.count('"score": '), 6)
         self.assertIn("RLCUSDT Tier A, confidence 64 = score 64", text)
+        self.assertIn("NEARUSDT Tier A, confidence 72 = score 72", text)
         self.assertIn('"leverage": 5, "score": null, "is_yolo": true', text)
         self.assertIn("stays the raw radar `confidence` even when RULE 3 downgrades the tier; never adjust it", text)
         self.assertNotIn("Maximum Conviction", text)

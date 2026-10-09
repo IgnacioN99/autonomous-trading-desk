@@ -25,9 +25,12 @@ from unittest.mock import patch, MagicMock
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS_DIR = os.path.join(BASE_DIR, "scripts")
-if SCRIPTS_DIR not in sys.path:
-    sys.path.insert(0, SCRIPTS_DIR)
+TESTS_DIR = os.path.join(BASE_DIR, "tests")
+for _p in (SCRIPTS_DIR, TESTS_DIR):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
+from dossier_checklist_fixture import checklist_for  # the PROD gate re-checks the checklist (issue #223)
 import execute_futures_trade as eft
 import user_profile as up
 import trading_doctor
@@ -122,12 +125,13 @@ class _TempWorkspace(unittest.TestCase):
         candidates = [dict({"score": 85}, **c) for c in candidates]
         tdir = os.path.join(self.brain, conv_id, ".system_generated", "logs")
         os.makedirs(tdir, exist_ok=True)
-        block = json.dumps({"status": "APPROVED", "approved_candidates": candidates, "summary": "test"})
+        payload = {"status": "APPROVED", "approved_candidates": candidates, "summary": "test"}
+        block = json.dumps(payload)
         steps = [
             {"step_index": 0, "source": "SYSTEM", "type": "USER_INPUT", "content": "sender=11111111-2222-3333-4444-555555555555"},
             {"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE",
              "created_at": created.strftime("%Y-%m-%dT%H:%M:%SZ"),
-             "content": f"Master Dossier\n<dossier_json>{block}</dossier_json>"},
+             "content": f"Master Dossier\n{checklist_for(payload)}<dossier_json>{block}</dossier_json>"},
         ]
         tpath = os.path.join(tdir, "transcript.jsonl")
         with open(tpath, "w", encoding="utf-8") as f:
