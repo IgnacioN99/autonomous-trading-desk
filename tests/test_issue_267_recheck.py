@@ -353,8 +353,10 @@ class _RecheckWorkspace(tdp.TranscriptFixture):
         path = self.standard_transcript(OLD_CONV, payload, ts)
         record = dp.build_record_from_extraction(dp.extract_dossier_from_transcript(path), recorded_at_ts=ts + 5)
         record["target_env"] = env.lower()
-        with open(self.dossier_path, "w", encoding="utf-8") as f:
-            json.dump(record, f)
+        # Issue #270: like record_evaluation._persist, the session's own file gets the same record
+        for path in (self.dossier_path, dp.session_dossier_path(self.workspace, record["parent_conversation_id"])):
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(record, f)
         return record
 
     def run_brief(self, spec=f"{SYMBOL}:{DIRECTION}", payload_fn=live_payload, risk=None, insights_file=None):
@@ -550,7 +552,9 @@ class TestRecheckBrief(_RecheckWorkspace):
         code, brief, err = self.run_brief()
         self.assertEqual(code, 0, err)
         self.assertEqual(brief["recheck_of"]["entry"], 1.0)
-        # Hand-written legacy dossier, missing dossier, NEUTRAL dossier, another environment
+        # Hand-written legacy dossier, missing dossier, NEUTRAL dossier, another environment. Issue #270: the
+        # session's own file is removed too, else its verified plan (still on disk) would be re-checked
+        os.remove(dp.session_dossier_path(self.workspace, record["parent_conversation_id"]))
         now = int(time.time())
         with open(self.dossier_path, "w", encoding="utf-8") as f:
             json.dump({"timestamp_ts": now, "valid_until_ts": now + 1200, "status": "APPROVED",

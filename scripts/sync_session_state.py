@@ -204,6 +204,19 @@ def load_audit_metadata(target_env: str = None, records: List[dict] = None) -> D
             continue
     return meta
 
+ORIGIN_ID_CHARS = 8
+
+
+def origin_tag(meta) -> str:
+    """Issue #270: short origin of a position or resting entry from its audit record / pending score_meta: the
+    evaluator's session (dossier_session) and dossier sha256, 8 characters each ("session:1a2b3c4d dossier:9f8e7d6c",
+    only the known parts). "" when neither is known (unknown origin: the caller adds no tag)."""
+    meta = meta if isinstance(meta, dict) else {}
+    parts = [f"{label}:{str(meta[key])[:ORIGIN_ID_CHARS]}" for label, key in
+             (("session", "dossier_session"), ("dossier", "dossier_sha256")) if meta.get(key)]
+    return " ".join(parts)
+
+
 def write_error_state(err_msg: str, now_ts: int, now_utc: str, target_env: str, btc_price: float,
                       listing_read_error=None) -> dict:
     """Writes and returns the fail-closed state (is_valid False, delta_bias UNKNOWN, zeroed figures, error text) used
@@ -326,6 +339,9 @@ def resting_entry_exposure(target_env: str, algos_res, open_orders_res, exposure
         else:
             short_n += notional
         out["resting_entries"].append({"symbol": sym, "dir": "LONG" if is_long else "SHORT", "kind": kind})
+        origin = origin_tag(rec.get("score_meta"))
+        if origin:  # issue #270: only when known
+            out["resting_entries"][-1]["origin"] = origin
     out["resting_margin_usdt"] = round(margin, 2)
     out["delta_bias_incl_resting"] = book_exposure(long_n, short_n)["delta_bias"]
     return out
@@ -428,6 +444,11 @@ def sync_session_state(target_env: str = None) -> dict:
             "tp1_price": meta_trade.get("tp1_price"),
             "tp2_price": meta_trade.get("tp2_price")
         })
+        # Issue #270: origin from the symbol's latest audit record of the same direction, only when known
+        if str(meta_trade.get("direction") or direction).upper() == str(direction).upper():
+            origin = origin_tag(meta_trade)
+            if origin:
+                active_positions[-1]["origin"] = origin
         if entry_diag["user_trades_error"]:
             active_positions[-1]["entry_time_error"] = entry_diag["user_trades_error"]
             if entry_diag["rate_limited"]:

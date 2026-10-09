@@ -15,7 +15,12 @@ Resilience Features:
    key, Binance signature= / listenKey values, exact balances, and full state payloads. Attachments
    (--context-file / --output-file) naming a credential file (.env, *.env, MCP configs, *.pem, *.key) are refused.
 5. Intelligent Deduplication / Anti-Spam: Computes a SHA-256 fingerprint; if the same failure
-   occurred within the past 24 hours, updates telemetry rather than spamming new issues.
+   occurred within the past 24 hours, updates telemetry rather than spamming new issues. The fingerprint file's
+   read-modify-write is serialised with utils/file_lock.py (best effort, never blocks). Issue #270 (sessions in
+   parallel): before creating an issue, find_open_issue looks the fingerprint up in the OPEN GitHub issues (one
+   `gh issue list`, bounded by DEDUPE_LOOKUP_TIMEOUT_S = 5 s, the only extra latency for in-process callers); a hit
+   is counted locally instead of creating a duplicate, and any lookup failure creates or queues as before.
+   `--find-open-issue` exposes the same fingerprint and lookup to report_issue.sh.
 
 6. Structured Report: six-section body (scripts/utils/issue_telemetry.py, same headings as report_issue.sh)
    with runtime/ledger telemetry and mandatory severity:* + priority:* labels that are never silently dropped.
@@ -40,6 +45,7 @@ import shlex
 import hashlib
 import datetime
 import subprocess
+import tempfile
 import http.client
 import urllib.request
 import urllib.error
@@ -52,6 +58,7 @@ if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
 
 from utils import issue_telemetry  # noqa: E402
+from utils import file_lock  # noqa: E402
 LOGS_DIR = os.path.join(BASE_DIR, "logs")
 BACKLOG_FILE = os.path.join(LOGS_DIR, "issues_backlog.jsonl")
 FINGERPRINTS_FILE = os.path.join(LOGS_DIR, "issues_fingerprints.json")
@@ -195,11 +202,54 @@ def load_fingerprints() -> Dict[str, Any]:
     return {}
 
 def save_fingerprints(data: Dict[str, Any]):
-    os.makedirs(LOGS_DIR, exist_ok=True)
-    temp_file = FINGERPRINTS_FILE + f".tmp.{os.getpid()}"
-    with open(temp_file, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    os.replace(temp_file, FINGERPRINTS_FILE)
+    """Atomic write through a unique temp file (concurrent writers never share it)."""
+    target_dir = os.path.dirname(os.path.abspath(FINGERPRINTS_FILE))
+    os.makedirs(target_dir, exist_ok=True)
+    fd, temp_file = tempfile.mkstemp(prefix=".issues_fingerprints.", suffix=".tmp", dir=target_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(temp_file, FINGERPRINTS_FILE)
+    except BaseException:
+        try:
+            os.remove(temp_file)
+        except OSError:
+            pass
+        raise
+
+def set_fingerprint(fingerprint: str, entry: Dict[str, Any]):
+    """Locked read-modify-write of one fingerprint record (issue #270: reporters of parallel sessions)."""
+    with file_lock.locked(FINGERPRINTS_FILE):
+        cache = load_fingerprints()
+        cache[fingerprint] = entry
+        save_fingerprints(cache)
+
+DEDUPE_LOOKUP_TIMEOUT_S = 5.0
+FINGERPRINT_RE = re.compile(r"^[0-9a-f]{16}$")
+
+def find_open_issue(fingerprint: str, repo: Optional[str],
+                    timeout: float = DEDUPE_LOOKUP_TIMEOUT_S) -> Optional[Dict[str, Any]]:
+    """Issue #270: {"number", "url"} of an OPEN issue of `repo` whose body carries `fingerprint` (the "Fingerprint ID"
+    row of both reporters), from one `gh issue list` call bounded by `timeout` seconds. None when there is none and
+    on ANY failure (no gh, unauthenticated, offline, timeout, unexpected output): the caller creates or queues."""
+    if not repo or not FINGERPRINT_RE.match(str(fingerprint or "")):
+        return None
+    try:
+        if not shutil.which("gh"):
+            return None
+        res = subprocess.run(
+            ["gh", "issue", "list", "--repo", repo, "--state", "open", "--search", f"{fingerprint} in:body",
+             "--json", "number,url,body", "--limit", "10"],
+            capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL
+        )
+        if res.returncode != 0:
+            return None
+        for item in json.loads(res.stdout or "[]"):
+            if isinstance(item, dict) and fingerprint in str(item.get("body") or "") and item.get("url"):
+                return {"number": item.get("number"), "url": item.get("url")}
+    except Exception:
+        return None
+    return None
 
 def append_to_backlog(issue_payload: Dict[str, Any]):
     os.makedirs(LOGS_DIR, exist_ok=True)
@@ -409,26 +459,47 @@ def report_issue(
     target_repo = repo or derive_github_repo()
 
     fingerprint = compute_fingerprint(clean_title, error_detail)
-    fp_cache = load_fingerprints()
     now_ts = int(time.time())
 
-    # 24-hour deduplication control
-    if not force_sync and fingerprint in fp_cache:
-        last_seen = fp_cache[fingerprint].get("last_seen_ts", 0)
-        count = fp_cache[fingerprint].get("count", 1)
-        if now_ts - last_seen < 86400:  # Less than 24h
-            fp_cache[fingerprint]["count"] = count + 1
-            fp_cache[fingerprint]["last_seen_ts"] = now_ts
-            save_fingerprints(fp_cache)
-            msg = f"Deduplication active: Error '{clean_title}' was already reported previously (Occurrences: {count + 1}). Omitting duplicate issue."
-            print(f"ℹ️ {msg}")
-            return {
-                "success": True,
-                "deduplicated": True,
-                "fingerprint": fingerprint,
-                "occurrences": count + 1,
-                "message": msg
-            }
+    # 24-hour deduplication control (locked read-modify-write, issue #270)
+    occurrences = None
+    if not force_sync:
+        with file_lock.locked(FINGERPRINTS_FILE):
+            fp_cache = load_fingerprints()
+            entry = fp_cache.get(fingerprint)
+            if isinstance(entry, dict) and now_ts - entry.get("last_seen_ts", 0) < 86400:  # Less than 24h
+                occurrences = entry.get("count", 1) + 1
+                entry["count"] = occurrences
+                entry["last_seen_ts"] = now_ts
+                save_fingerprints(fp_cache)
+    if occurrences is None and not force_sync and target_repo and os.getenv("GITHUB_TOKEN"):
+        # Issue #270: another session (or reporter) may already have an OPEN issue for this fingerprint
+        found = find_open_issue(fingerprint, target_repo)
+        if found:
+            with file_lock.locked(FINGERPRINTS_FILE):
+                fp_cache = load_fingerprints()
+                prev = fp_cache.get(fingerprint) if isinstance(fp_cache.get(fingerprint), dict) else {}
+                occurrences = prev.get("count", 1) + 1
+                fp_cache[fingerprint] = {
+                    "title": clean_title,
+                    "issue_number": found.get("number"),
+                    "html_url": found.get("url"),
+                    "last_seen_ts": now_ts,
+                    "count": occurrences,
+                    "status": PUBLISHED_GITHUB
+                }
+                save_fingerprints(fp_cache)
+            print(f"ℹ️ Open issue #{found.get('number')} ({found.get('url')}) already reports fingerprint {fingerprint}.")
+    if occurrences is not None:
+        msg = f"Deduplication active: Error '{clean_title}' was already reported previously (Occurrences: {occurrences}). Omitting duplicate issue."
+        print(f"ℹ️ {msg}")
+        return {
+            "success": True,
+            "deduplicated": True,
+            "fingerprint": fingerprint,
+            "occurrences": occurrences,
+            "message": msg
+        }
 
     # Format GitHub labels (severity + priority are mandatory)
     labels = issue_telemetry.build_labels(severity, priority, category)
@@ -471,13 +542,12 @@ def report_issue(
     if not target_repo:
         print("ℹ️ GITHUB_REPO not configured or detectable from git remote. Enqueueing issue in local backlog (logs/issues_backlog.jsonl)...")
         append_to_backlog(issue_record)
-        fp_cache[fingerprint] = {
+        set_fingerprint(fingerprint, {
             "title": clean_title,
             "last_seen_ts": now_ts,
             "count": 1,
             "status": "QUEUED_OFFLINE"
-        }
-        save_fingerprints(fp_cache)
+        })
         return issue_record
 
     token = os.getenv("GITHUB_TOKEN")
@@ -491,15 +561,14 @@ def report_issue(
             issue_record["labels_applied"] = gh_res.get("labels_applied")
 
             # Record fingerprint (the status lets --sync-backlog skip already-published reports)
-            fp_cache[fingerprint] = {
+            set_fingerprint(fingerprint, {
                 "title": clean_title,
                 "issue_number": gh_res.get("issue_number"),
                 "html_url": gh_res.get("html_url"),
                 "last_seen_ts": now_ts,
                 "count": 1,
                 "status": status
-            }
-            save_fingerprints(fp_cache)
+            })
 
             if gh_res.get("url_unknown"):
                 print("✅ GITHUB ISSUE CREATED (URL unknown: see the warning above)")
@@ -515,13 +584,12 @@ def report_issue(
 
     # If no token or dispatch failed, enqueue in backlog
     append_to_backlog(issue_record)
-    fp_cache[fingerprint] = {
+    set_fingerprint(fingerprint, {
         "title": clean_title,
         "last_seen_ts": now_ts,
         "count": 1,
         "status": "QUEUED_OFFLINE"
-    }
-    save_fingerprints(fp_cache)
+    })
     return issue_record
 
 def _fingerprint_published(entry: Any) -> bool:
@@ -558,7 +626,7 @@ def sync_backlog(repo: Optional[str] = None):
 
     print(f"🔄 Syncing {len(lines)} pending issue(s) to https://github.com/{target_repo}/issues...")
     fp_cache = load_fingerprints()
-    fp_dirty = False
+    fp_dirty = set()
     remaining = []
     success_count = 0
     skipped_count = 0
@@ -598,14 +666,18 @@ def sync_backlog(repo: Optional[str] = None):
                     "count": entry.get("count", 1),
                 })
                 fp_cache[fp] = entry
-                fp_dirty = True
+                fp_dirty.add(fp)
             time.sleep(1)  # Rate limit cushion
         except Exception as e:
             print(f"   ❌ Failed to dispatch '{item.get('title')}': {e}")
             remaining.append(line)
 
     if fp_dirty:
-        save_fingerprints(fp_cache)
+        # Merge into the current file under the lock: other reporters may have written meanwhile (issue #270)
+        with file_lock.locked(FINGERPRINTS_FILE):
+            current = load_fingerprints()
+            current.update({fp: fp_cache[fp] for fp in fp_dirty})
+            save_fingerprints(current)
 
     # Rewrite backlog only with remaining failures
     with open(BACKLOG_FILE, "w", encoding="utf-8") as f:
@@ -667,11 +739,26 @@ def main():
     parser.add_argument("--repo", type=str, default=None, help="Target repository (e.g. owner/repo). If omitted, derived from GITHUB_REPO or git remote origin.")
     parser.add_argument("--sync-backlog", action="store_true", help="Sync queued issues in logs/issues_backlog.jsonl to GitHub")
     parser.add_argument("--force", action="store_true", help="Bypass 24h deduplication and force issue creation")
+    parser.add_argument("--find-open-issue", action="store_true",
+                        help="Issue #270 (used by report_issue.sh): print 'fingerprint<TAB><fp>' for --title/--error "
+                             "and, only with --repo, 'open_issue<TAB><url>' when an OPEN issue carries it "
+                             "(bounded gh lookup; any failure prints nothing more). Never creates or queues.")
 
     args = parser.parse_args()
 
     if args.sync_backlog:
         sync_backlog(repo=args.repo)
+        return
+
+    if args.find_open_issue:
+        if not args.title or not args.error:
+            parser.print_help()
+            sys.exit(1)
+        fingerprint = compute_fingerprint(sanitize_telemetry(args.title), args.error)
+        print(f"fingerprint\t{fingerprint}")
+        found = find_open_issue(fingerprint, args.repo) if args.repo else None
+        if found:
+            print(f"open_issue\t{found['url']}")
         return
 
     if not args.title or not args.error:

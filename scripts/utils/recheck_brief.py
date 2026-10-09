@@ -5,11 +5,12 @@ recheck_brief.py - Inputs of `prime_evaluator_brief.py --recheck SYMBOL:DIRECTIO
 When the user confirms a candidate after its dossier expired, the re-check builds a normal brief (fresh ground
 truth, macro BTC, risk profile, lessons) with only that candidate's LIVE setup, recomputed by the screening code
 (`screening_pipeline.py --recheck`, the same 60 s subprocess as a full scan) and never copied from the old brief.
-- The old plan comes only from logs/evaluations/latest_dossier.json re-verified against the evaluator transcript
+- The old plan comes only from a dossier record re-verified against the evaluator transcript
   (dossier_provenance.rebuild_verified_record; its expiry is not checked): an APPROVED record approving that
-  symbol and direction for the same environment. Anything else, a YOLO candidate (needs a full scan) or a latest
-  dossier that is itself a re-check (carries `recheck_of`: no chained re-checks) refuses the re-check
-  (RecheckError: no brief is written).
+  symbol and direction for the same environment. Issue #270: the brief CLI has no session, so exactly one such
+  record (by sha256) among latest_dossier.json and the per-session files must exist. Anything else (none, two
+  sessions' plans), a YOLO candidate (needs a full scan) or a dossier that is itself a re-check (carries
+  `recheck_of`: no chained re-checks) refuses the re-check (RecheckError: no brief is written).
 - The brief carries `recheck` {symbol, direction, setup_status found|no_setup|unavailable, cause} and
   `recheck_of` (sha256 and the verified old plan). The YOLO slot is not scanned (empty, never counted as a YOLO
   scan failure). record_evaluation.py links the new dossier to `recheck_of` and prints the bounds verdict
@@ -55,11 +56,48 @@ def _norm_env(value: Any) -> str:
     return "prod" if env in ("production", "mainnet") else env
 
 
-def load_confirmed_plan(symbol: str, direction: str, target_env: str, base_dir: str) -> Dict[str, Any]:
+def load_confirmed_plan(symbol: str, direction: str, target_env: str, base_dir: str,
+                        session: Optional[str] = None) -> Dict[str, Any]:
+    """`recheck_of` snapshot of the confirmed candidate (issue #270). With a known `session`: that session's own
+    dossier file (else latest_dossier.json). Without one (the brief CLI): every dossier file (latest_dossier.json and
+    the per-session files) is checked and exactly one distinct verified plan (by sha256) must qualify; two or more
+    refuse (ambiguous), none raises latest_dossier.json's own error."""
+    if session:
+        return _plan_from_file(dp.resolve_dossier_path(base_dir, session=session), symbol, direction, target_env)
+    latest = dp.default_dossier_path(base_dir)
+    plans, latest_error = {}, None
+    for path in dp.dossier_paths(base_dir):
+        if _is_recheck_of(path, symbol, direction):  # that plan was already re-checked: no chained re-checks
+            raise RecheckError("the latest dossier is already a re-check: ask the user again or run a full scan")
+        try:
+            plan = _plan_from_file(path, symbol, direction, target_env)
+        except RecheckError as e:
+            if path == latest:
+                latest_error = e
+            continue
+        plans.setdefault(plan.get("sha256"), plan)
+    if len(plans) == 1:
+        return next(iter(plans.values()))
+    if len(plans) > 1:
+        raise RecheckError(f"{len(plans)} verified dossiers of different sessions approve {symbol} {direction}: "
+                           "ambiguous, run a full scan")
+    raise latest_error or RecheckError("no readable evaluation dossier to re-check: run a full scan")
+
+
+def _is_recheck_of(path: str, symbol: str, direction: str) -> bool:
+    """True when the file holds a re-check dossier of symbol + direction (its stored `recheck_of`)."""
+    try:
+        old = dp.load_dossier(path).get("recheck_of")
+    except Exception:
+        return False
+    return isinstance(old, dict) and str(old.get("symbol") or "").upper() == symbol \
+        and str(old.get("direction") or "").upper() == direction
+
+
+def _plan_from_file(path: str, symbol: str, direction: str, target_env: str) -> Dict[str, Any]:
     """`recheck_of` snapshot of the confirmed candidate, taken only from the provenance-verified rebuilt record of
-    latest_dossier.json (expiry not checked). Raises RecheckError when the record is missing, already a re-check
+    one dossier file (expiry not checked). Raises RecheckError when the record is missing, already a re-check
     (it carries `recheck_of` / `recheck_bounds`), unverifiable, not APPROVED, for another environment, does not approve symbol + direction, or the candidate is YOLO."""
-    path = dp.default_dossier_path(base_dir)
     try:
         record = dp.load_dossier(path)
     except Exception as e:

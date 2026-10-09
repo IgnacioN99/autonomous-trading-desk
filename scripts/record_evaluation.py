@@ -3,8 +3,9 @@
 record_evaluation.py - Atomic registration of the evaluator subagent dossier.
 
 Persists the verdict emitted by the 'isolated_market_evaluator' subagent into
-logs/evaluations/latest_dossier.json. That file is the authorization token required by
-the pre_trade_guard.py hook and execute_futures_trade.py before any order is dispatched.
+logs/evaluations/dossier_<session>.json (its parent session, issue #270) and, as the newest scan overall,
+logs/evaluations/latest_dossier.json. Those files are the authorization token required by the pre_trade_guard.py
+hook (PROD: the calling session's own file) and execute_futures_trade.py before any order is dispatched.
 
 Canonical flow (PROD and TESTNET):
   1. python3 scripts/prime_evaluator_brief.py
@@ -188,7 +189,24 @@ def attach_recheck(record: dict, base_dir: Optional[str] = None, now_ts: Optiona
     return None
 
 
+SESSION_DOSSIER_PRUNE_AFTER_S = 6 * 3600  # per-session files untouched for longer are deleted (best effort)
+
+
+def _prune_session_dossiers(base: str, keep: str, now_ts: Optional[float] = None) -> None:
+    """Deletes per-session dossier files (dp.SESSION_DOSSIER_PREFIX) older than SESSION_DOSSIER_PRUNE_AFTER_S by
+    mtime, except `keep`. Never touches latest_dossier.json or the history; never raises."""
+    cutoff = (now_ts if now_ts is not None else time.time()) - SESSION_DOSSIER_PRUNE_AFTER_S
+    for path in dp.dossier_paths(base)[1:]:
+        try:
+            if os.path.abspath(path) != os.path.abspath(keep) and os.path.getmtime(path) < cutoff:
+                os.remove(path)
+        except OSError:
+            continue
+
+
 def _persist(record: dict, base_dir: Optional[str] = None, shadow: bool = True) -> str:
+    """Issue #270: writes the record to its session's file (dossier_<parent_conversation_id>.json, when the
+    session is known) and, as a full copy, to latest_dossier.json (the newest scan overall). Returns the latter."""
     base, dossier_file, history_file = _paths(base_dir)
     try:
         snapshots = build_radar_snapshots(record, base)
@@ -196,7 +214,12 @@ def _persist(record: dict, base_dir: Optional[str] = None, shadow: bool = True) 
         snapshots = None
     if snapshots is not None:
         record["radar_snapshots"] = snapshots
+    session_file = dp.session_dossier_path(base, record.get("parent_conversation_id"))
+    if session_file:
+        atomic_write_json(session_file, record)
     atomic_write_json(dossier_file, record)
+    if session_file:
+        _prune_session_dossiers(base, keep=session_file)
     prov = record.get("provenance") or {}
     atomic_append_jsonl(history_file, {
         "timestamp_utc": record.get("timestamp_utc"),
@@ -205,6 +228,7 @@ def _persist(record: dict, base_dir: Optional[str] = None, shadow: bool = True) 
         "schema_version": record.get("schema_version"),
         "evaluator_agent": record.get("evaluator_agent"),
         "conversation_id": record.get("conversation_id"),
+        "parent_conversation_id": record.get("parent_conversation_id"),
         "status": record.get("status"),
         "approved_symbols": record.get("approved_symbols", []),
         "provenance_source": prov.get("source"),

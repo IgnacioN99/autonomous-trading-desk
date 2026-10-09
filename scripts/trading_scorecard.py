@@ -118,7 +118,8 @@ def _norm_tier(raw):
 
 
 def load_dossier_candidates():
-    """(candidates, warning): approved candidates of latest_dossier.json with the dossier's validity window."""
+    """(candidates, warning): approved candidates of latest_dossier.json with the dossier's validity window. The
+    newest scan overall on purpose (issue #270: per-session dossier files are not read here)."""
     path = os.path.join(_logs_dir(), "evaluations", "latest_dossier.json")
     if not os.path.exists(path):
         return [], None
