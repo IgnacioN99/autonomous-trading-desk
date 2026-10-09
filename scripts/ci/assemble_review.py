@@ -46,9 +46,11 @@ OVERALL_INCOMPLETE = "[INCOMPLETE REVIEW]"
 
 def extract_section_from_transcript(path: str, reviewer: str) -> str | None:
     """Last '### Verdict: <reviewer>' section the subagent model emitted (send_message or response).
-    Raises ProvenanceError when a truncated row cannot be resolved from transcript_full.jsonl."""
+    Raises ProvenanceError when a truncated row cannot be resolved from transcript_full.jsonl, or when the verdict
+    row or a later one carries a '<truncated N bytes>' marker without truncated_fields."""
     found = None
-    steps, _ = transcripts.read_agy_steps(path)
+    steps, _ = transcripts.read_agy_steps(
+        path, is_winner=lambda texts: any(gate.extract_section(text, reviewer) for text in texts))
     for step in steps:
         for text in transcripts._model_texts(step):
             section = gate.extract_section(text, reviewer)

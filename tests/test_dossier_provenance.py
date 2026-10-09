@@ -1383,6 +1383,79 @@ class TestAgyReaderHardening(TranscriptFixture):
         self.write_lines(full_path, self.raw_lines(full_path)[:3])
         self.assertProvenanceError(path, "transcript_full.jsonl mismatch at step 3: row missing or unreadable")
 
+    # -- Issue #224: marker and duplicate step_index scope ----------------------
+    QUOTE = "Review note quoting agy:\n<truncated 5 bytes>\nend of quote."
+
+    def test_marker_in_row_before_the_winner_passes(self):
+        ts = self.now - 30
+        earlier = {
+            "content": self.content_step(ts - 10, self.QUOTE),
+            "send_message": self.send_message_step(ts - 10, self.QUOTE),
+        }
+        for i, (label, row) in enumerate(earlier.items()):
+            with self.subTest(label):
+                steps = [self.system_step(ts - 20), row, self.send_message_step(ts, dossier_text(APPROVED_SHORT))]
+                path = self.write_transcript(f"cdcdcdcd-8000-0000-0000-00000000000{i}", steps)
+                ex = dp.extract_dossier_from_transcript(path)
+                self.assertEqual((ex["dossier"]["status"], ex["step_index"]), ("APPROVED", 2))
+                # Without a winner predicate every row is still checked
+                with self.assertRaises(dp.ProvenanceError) as cm:
+                    dp.read_agy_steps(path)
+                self.assertIn("no truncated_fields", str(cm.exception))
+        # The winner is chosen after resolution: a truncated winning row still exempts earlier rows
+        path = self.truncated("cdcdcdcd-8000-0000-0000-00000000000a")
+        self.edit_row(path, 1, lambda row: row.update(content=self.QUOTE))
+        ex = dp.extract_dossier_from_transcript(path)
+        self.assertEqual((ex["step_index"], ex["full_transcript_used"]), (3, True))
+
+    def test_marker_in_or_after_the_winner_fails(self):
+        ts = self.now - 30
+        cases = {
+            "in the winning row": [self.system_step(ts - 20),
+                                   self.send_message_step(ts, dossier_text(APPROVED_SHORT, header=self.QUOTE + "\n"))],
+            "after the winner": [self.system_step(ts - 20), self.send_message_step(ts - 10, dossier_text(APPROVED_SHORT)),
+                                 self.content_step(ts, self.QUOTE)],
+            "no winner": [self.system_step(ts - 20), self.content_step(ts - 10, self.QUOTE),
+                          self.content_step(ts, "No dossier this time.")],
+        }
+        for i, (label, steps) in enumerate(cases.items()):
+            with self.subTest(label):
+                path = self.write_transcript(f"cdcdcdcd-8100-0000-0000-00000000000{i}", steps)
+                self.assertProvenanceError(path, "no truncated_fields")
+
+    def test_duplicate_step_index_outside_needed_rows_passes(self):
+        # Two non-needed short rows share an index that no truncated row needs
+        path = self.truncated("cdcdcdcd-8200-0000-0000-000000000001")
+        for line in (1, 2):
+            self.edit_row(path, line, lambda row: row.update(step_index=7))
+        ex = dp.extract_dossier_from_transcript(path)
+        self.assertEqual((ex["step_index"], ex["full_transcript_used"]), (3, True))
+        # The full file repeats an index that no truncated row needs
+        path = self.truncated("cdcdcdcd-8200-0000-0000-000000000002")
+        full_path = dp.full_transcript_path(path)
+        full = self.raw_lines(full_path)
+        self.write_lines(full_path, full + [full[1]])
+        ex = dp.extract_dossier_from_transcript(path)
+        self.assertEqual((ex["step_index"], ex["full_transcript_used"]), (3, True))
+
+    def test_duplicate_needed_step_index_fails(self):
+        # Two truncated rows that both need resolution share one step_index in transcript.jsonl
+        ts = self.now - 30
+        steps = [self.system_step(ts - 20),
+                 self.send_message_step(ts - 10, dossier_text(APPROVED_SHORT, header=LONG_HEADER)),
+                 self.send_message_step(ts, dossier_text(APPROVED_SHORT, header=LONG_HEADER))]
+        path = self.write_transcript("cdcdcdcd-8300-0000-0000-000000000001", steps,
+                                     truncate={1: ["tool_calls"], 2: ["tool_calls"]})
+        self.edit_row(path, 1, lambda row: row.update(step_index=2))
+        self.assertProvenanceError(path, "mismatch at step 2: duplicate step_index in transcript.jsonl")
+        # The full file repeats the needed index
+        path = self.write_transcript("cdcdcdcd-8300-0000-0000-000000000002", steps,
+                                     truncate={1: ["tool_calls"], 2: ["tool_calls"]})
+        full_path = dp.full_transcript_path(path)
+        full = self.raw_lines(full_path)
+        self.write_lines(full_path, full + [full[1]])
+        self.assertProvenanceError(path, "mismatch at step 1: duplicate step_index in transcript_full.jsonl")
+
     def test_encoder_differences_in_untruncated_args(self):
         """agy's compact encoder ('{"a":1}', '\\u003c') vs Python's json.dumps in the full row."""
         conv = "cdcdcdcd-4000-0000-0000-000000000001"

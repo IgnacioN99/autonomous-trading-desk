@@ -52,8 +52,6 @@ agy mechanics to Claude Code.
 the `pr-review` skill: triage, launch every required `<id>_reviewer` with the Agent tool in ONE message,
 `python3 scripts/ci/assemble_review.py --pr <n> --from-claude-subagent <id>=<agentId> ...` (it verifies each
 transcript's agentType), `verify_review.py`, then `gh pr comment <n> --body-file logs/pr_review/report.md`.
-agy transcripts: rows truncated in `transcript.jsonl` are read from `transcript_full.jsonl` (paired by
-`step_index`, cross-checked); the assembler and `record_evaluation.py` fail closed when that is not possible.
 
 ## Issue workflow
 
