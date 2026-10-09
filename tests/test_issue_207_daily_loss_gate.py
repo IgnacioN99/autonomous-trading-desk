@@ -697,7 +697,9 @@ class TestRiskReducingPathsNeverCallTheGate(unittest.TestCase):
     def test_only_execute_complete_trade_calls_it(self):
         import inspect
         source = inspect.getsource(eft)
-        body = inspect.getsource(eft.execute_complete_trade)
+        # Issue #263: execute_complete_trade runs its body through _execute_complete_trade_pass (at most twice)
+        body = inspect.getsource(eft._execute_complete_trade_pass)
+        self.assertIn("_execute_complete_trade_pass(", inspect.getsource(eft.execute_complete_trade))
         self.assertEqual(source.count("check_daily_loss_gate("), 2)  # the definition and one call
         self.assertIn("check_daily_loss_gate(", body)
         for name in ("close_position_market", "move_sl_to_breakeven", "audit_orphan_positions",
