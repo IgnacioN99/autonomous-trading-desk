@@ -1917,12 +1917,6 @@ def check_daily_loss_gate(target_env, is_yolo_order, prof, equity_now, *, open_p
         import user_profile as up
         from utils import daily_loss_gate as dlg
         start_ms = sss.get_start_of_day_utc(now)
-        fills, truncated = sss.fetch_day_fills(start_ms, env)
-        if not isinstance(fills, list):
-            return unreadable(fills)
-        if truncated:
-            return unreadable(f"truncated after {sss.DAY_FILLS_MAX_PAGES} pages of {sss.DAY_FILLS_LIMIT}, or a later "
-                              "page failed")
         audit_path = os.path.join(_workspace_dir(), 'logs', 'trades_audit.jsonl')
         try:
             records = read_audit_tail(audit_path) if os.path.exists(audit_path) else []
@@ -1933,6 +1927,16 @@ def check_daily_loss_gate(target_env, is_yolo_order, prof, equity_now, *, open_p
             if not isinstance(pos_res, list):
                 return unreadable(f"/fapi/v2/positionRisk query failed: {pos_res}")
             open_positions = [(p["symbol"], p["side"]) for p in compute_exposure(pos_res)["active_positions"]]
+        # Round 5: a rejected symbol-less read (-1102) falls back to the audited + open symbols (informational scope)
+        fills_info = {}
+        fills, truncated = sss.fetch_day_fills(
+            start_ms, env, info=fills_info,
+            fallback_symbols=sss.day_fallback_symbols(records, start_ms, env, [s for s, _d in open_positions]))
+        if not isinstance(fills, list):
+            return unreadable(fills)
+        if truncated:
+            return unreadable(f"truncated after {sss.DAY_FILLS_MAX_PAGES} pages of {sss.DAY_FILLS_LIMIT} (per-symbol "
+                              f"fallback: {sss.DAY_FILLS_MAX_SYMBOL_REQUESTS} requests), or a later page failed")
         view = sss.day_trade_view(records, fills, start_ms, env, open_positions)
         if view.get("counted_by") != "trades":
             return refuse(f"DAILY LOSS GATE: today's trades cannot be counted per trade ({view.get('day_error')}): "
@@ -1942,6 +1946,7 @@ def check_daily_loss_gate(target_env, is_yolo_order, prof, equity_now, *, open_p
                              equity_now=equity_now, is_yolo_order=is_yolo_order, **up.get_daily_loss_limits(prof))
         state["is_yolo_order"] = is_yolo_order
         dlg.note_unaudited_closing_symbols(state, view.get("unaudited_closing_symbols") or [])  # informational
+        dlg.note_fills_scope(state, fills_info)  # informational
         if other_asset:
             state["non_usdt_commission"] = True  # left out of the USDT sum; those trades have gross R only
         if state.get("blocked"):

@@ -425,6 +425,113 @@ class TestCheckDailyLossGate(GateWorkspace):
         self.assertIn("audit unreadable", reason)
 
 
+class SymbolOnlyFills(DayFills):
+    """Round 5: the symbol-less userTrades read is rejected with -1102; per-symbol reads serve that symbol's fills."""
+
+    def __init__(self, fills, error=None, **kw):
+        super().__init__(fills, **kw)
+        self.first_error = error or {"code": -1102, "msg": "Mandatory parameter 'symbol' was not sent."}
+        self.symbol_params = []
+
+    def __call__(self, method, endpoint, params=None, target_env=None, retry_count=0):
+        params = dict(params or {})
+        if endpoint == "/fapi/v1/userTrades":
+            if "symbol" not in params:
+                self.params.append(params)
+                return dict(self.first_error)
+            self.symbol_params.append(params)
+            return [dict(f) for f in sorted(self.fills, key=lambda f: (f["time"], f["id"]))
+                    if f["symbol"] == params["symbol"] and f["time"] >= params["startTime"]][:params["limit"]]
+        return super().__call__(method, endpoint, params, target_env, retry_count)
+
+
+class TestPerSymbolFallback(GateWorkspace):
+
+    def test_minus_1102_falls_back_to_audited_and_open_symbols(self):
+        (r0, f0), (r1, f1) = closed_trade(0, -1.0), closed_trade(1, -1.0)
+        self.audit(r0, r1)
+        fake = SymbolOnlyFills(f0 + f1 + [fill(77, 77, "SELL", 5, 1, DAY + H, pnl=-1.0, symbol="OPENUSDT")])
+        with patch.object(sss.time, "sleep") as sleep:
+            ok, reason, state = self.gate(fake, positions=[("OPENUSDT", "LONG")])
+        self.assertFalse(ok)  # the two full stops are still seen through the fallback
+        self.assertIn("consecutive_full_sl=2", reason)
+        self.assertEqual((state["per_symbol_fallback"], state["fills_scope"]), (True, "audited+open symbols"))
+        self.assertEqual(sorted(p["symbol"] for p in fake.symbol_params), ["OPENUSDT", "T0USDT", "T1USDT"])
+        self.assertTrue(all(p["startTime"] == DAY for p in fake.symbol_params))
+        self.assertEqual(sleep.call_count, 3)  # paced like the paged read
+        info = {}
+        with patch("execute_futures_trade.send_signed_request", side_effect=fake), patch.object(sss.time, "sleep"):
+            fills, truncated = sss.fetch_day_fills(DAY, "prod", fallback_symbols=["T0USDT"], info=info)
+        self.assertEqual((len(fills), truncated, info["per_symbol_fallback"]), (2, False, True))
+        # a clean day through the fallback is allowed (informational scope only)
+        (r2, f2), = [closed_trade(2, 1.0)]
+        self.audit(r2)
+        with patch.object(sss.time, "sleep"):
+            ok, reason, state = self.gate(SymbolOnlyFills(f2))
+        self.assertTrue(ok, reason)
+        self.assertEqual(state["fills_scope"], "audited+open symbols")
+
+    def test_other_errors_and_mcp_are_unchanged(self):
+        rec, fs = closed_trade(0, -1.0)
+        self.audit(rec)
+        fake = SymbolOnlyFills(fs, error={"code": -1021, "msg": "Timestamp for this request is outside recvWindow."})
+        ok, reason, _ = self.gate(fake)
+        self.assertFalse(ok)
+        self.assertIn("-1021", reason)
+        self.assertEqual(fake.symbol_params, [])
+        fake = SymbolOnlyFills(fs)
+        ok, reason, _ = self.gate(fake, mcp=True)
+        self.assertFalse(ok)
+        self.assertIn("MCP", reason)
+        self.assertEqual((fake.params, fake.symbol_params), ([], []))
+        # no fallback symbols: the -1102 reply stays an unreadable read
+        with patch("execute_futures_trade.send_signed_request", side_effect=SymbolOnlyFills([])):
+            res, truncated = sss.fetch_day_fills(DAY, "prod")
+        self.assertEqual((res["code"], truncated), (-1102, False))
+
+    def test_request_cap_reads_as_truncated_and_fails_closed(self):
+        recs, fills = [], []
+        for i in range(sss.DAY_FILLS_MAX_SYMBOL_REQUESTS + 5):
+            rec, fs = closed_trade(i % 20, 1.0, symbol=f"C{i:02d}USDT")
+            recs.append(rec)
+            fills += fs
+        self.audit(*recs)
+        fake = SymbolOnlyFills(fills)
+        with patch.object(sss.time, "sleep"):
+            ok, reason, _ = self.gate(fake)
+        self.assertFalse(ok)
+        self.assertIn("truncated", reason)
+        self.assertEqual(len(fake.symbol_params), sss.DAY_FILLS_MAX_SYMBOL_REQUESTS)
+
+    def test_sync_notes_the_scope(self):
+        rec, fs = closed_trade(0, 1.0)
+        tmp = tempfile.mkdtemp()
+        path = os.path.join(tmp, "session_state.json")
+        with open(os.path.join(tmp, "trades_audit.jsonl"), "w", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+
+        class SyncSymbolOnly(SymbolOnlyFills):
+            def __call__(self, method, endpoint, params=None, target_env=None, retry_count=0):
+                if endpoint == "/fapi/v1/ticker/price":
+                    return {"price": "100.0"}
+                if endpoint in ("/fapi/v1/openAlgoOrders", "/fapi/v1/openOrders"):
+                    return []
+                if endpoint == "/fapi/v2/balance":
+                    return [{"asset": "USDT", "balance": "1000"}]
+                return super().__call__(method, endpoint, params, target_env, retry_count)
+
+        with patch.object(sss, "LOGS_DIR", tmp), patch.object(sss, "STATE_FILE", path), \
+             patch.object(sss, "AUDIT_LOG", os.path.join(tmp, "trades_audit.jsonl")), \
+             patch.object(sss, "get_start_of_day_utc", return_value=DAY), patch.object(sss.time, "sleep"), \
+             patch.dict(sys.modules, {"shadow_tracker": None}), \
+             patch("user_profile.load_user_profile", return_value={"risk_pct_equity": 0.02}), \
+             patch("execute_futures_trade.send_signed_request", side_effect=SyncSymbolOnly(fs)):
+            state = sss.sync_session_state(target_env="prod")
+        gate = state["daily_loss_gate"]
+        self.assertEqual((gate["blocked"], gate["fills_scope"]), (False, "audited+open symbols"))
+        self.assertEqual(state["closed_today_summary"]["counted_by"], "trades")
+
+
 class DayHarness(tpe.ExecutorHarness):
     """ExecutorHarness with the real Daily Loss Gate: the fake also serves today's userTrades."""
 
@@ -743,6 +850,19 @@ class TestBrief(unittest.TestCase):
         self.assertEqual(quiet["daily_loss_gate"], {"blocked": False, "scope": None, "reason": None})
         self.assertNotIn("MANUSDT", json.dumps(quiet))
 
+    def test_reason_capped_at_200_characters(self):
+        """Round 5: the brief's daily_loss_gate.reason is at most 200 characters, ending in "…" when cut."""
+        long_reason = "DAILY LOSS GATE: " + "x" * 400
+        brief = self.assemble({"target_env": "prod",
+                               "daily_loss_gate": {"blocked": True, "scope": "all", "reason": long_reason}})
+        reason = brief["daily_loss_gate"]["reason"]
+        self.assertEqual(len(reason), 200)
+        self.assertTrue(reason.endswith("…"))
+        self.assertTrue(long_reason.startswith(reason[:-1]))
+        short = self.assemble({"target_env": "prod",
+                               "daily_loss_gate": {"blocked": True, "scope": "all", "reason": "x" * 200}})
+        self.assertEqual(short["daily_loss_gate"]["reason"], "x" * 200)
+
     def test_missing_or_foreign_state_reads_blocked(self):
         for state in ({"target_env": "prod"}, {"target_env": "testnet", "daily_loss_gate": {"blocked": False}}, {}):
             with self.subTest(state=state):
@@ -822,6 +942,21 @@ class TestPrompt(unittest.TestCase):
         agreement = next(l for l in self.text.splitlines() if l.startswith("- Every later section"))
         self.assertIn(coherence, constraint9)
         self.assertIn(coherence, agreement)
+
+    def test_round_5_contract_and_yolo_semantics(self):
+        semantics = next(l for l in self.text.splitlines() if l.startswith("- Checkbox semantics"))
+        self.assertIn("`- [x] C1.3 Daily loss gate: blocked true, scope yolo -> YOLO`", semantics)
+        self.assertIn("YOLO candidates REJECTED, standard ones stay approvable", semantics)
+        contract = self.text.split("<output_contract>")[1].split("</output_contract>")[0]
+        self.assertIn("`ENV_MISMATCH:`, `DAILY_LOSS_GATE:` or `BRIEF_FILE_UNAVAILABLE:`", contract)
+        self.assertIn("or the daily loss gate is active (scope all)", contract)
+        shot = self.text.split('<example id="eval_neg_08_daily_loss_gate_active">')[1].split("</example>")[0]
+        self.assertIn("C0.1 Brief source: view_file logs/primed_brief.json -> file", shot)
+        self.assertIn("C0.4 Risk profile: risk_pct_equity 0.005, leverage_standard 3 -> PASS", shot)
+        with open(os.path.join(BASE_DIR, "AGENTS.md"), encoding="utf-8") as f:
+            agents = f.read()
+        mcp = next(l for l in agents.splitlines() if l.strip().startswith("* `MCP`:"))
+        self.assertIn("No `userTrades`: the Daily Loss Gate refuses PROD openings.", mcp)
 
     def test_daily_loss_gate_few_shot(self):
         """Round 4: one compact negative few-shot; it passes the recorder's checklist check (PR #222)."""

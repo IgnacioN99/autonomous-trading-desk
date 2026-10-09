@@ -379,7 +379,13 @@ def brief_daily_loss_gate(state: Any, target_env: str) -> dict:
     scope = gate.get("scope") if gate.get("scope") in ("all", "yolo") else ("all" if blocked else None)
     # The reason only when blocked: an inactive gate's informational notes (unscored / unaudited trades) stay in the
     # ledger cache and the doctor, never in the evaluator's brief
-    return {"blocked": blocked, "scope": scope, "reason": gate.get("reason") if blocked else None}
+    reason = gate.get("reason") if blocked else None
+    if isinstance(reason, str) and len(reason) > BRIEF_GATE_REASON_MAX:  # token budget
+        reason = reason[:BRIEF_GATE_REASON_MAX - 1] + "…"
+    return {"blocked": blocked, "scope": scope, "reason": reason}
+
+
+BRIEF_GATE_REASON_MAX = 200  # characters of daily_loss_gate.reason in the brief (cut ones end in "…")
 
 
 # Issue #187 / #212: closed-today data-quality keys reach the brief only when they differ from these defaults.

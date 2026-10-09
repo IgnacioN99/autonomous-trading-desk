@@ -829,11 +829,12 @@ def run_doctor(target_env: str = None, auto_heal: bool = False) -> int:
             warnings.append(mismatch_warning)
             print(f"⚠️  [STATE LEDGER] {mismatch_warning}")
         # Issue #207: per-trade counting quality and the Daily Loss Gate state (WARN only, never critical)
-        counted_warning = ledger_counted_by_warning(_read_session_state(), target_env)
+        ledger_state = _read_session_state()  # read once for both checks
+        counted_warning = ledger_counted_by_warning(ledger_state, target_env)
         if counted_warning:
             warnings.append(counted_warning)
             print(f"⚠️  [STATE LEDGER] {counted_warning}")
-        gate_level, gate_msg = daily_loss_gate_line(_read_session_state(), target_env)
+        gate_level, gate_msg = daily_loss_gate_line(ledger_state, target_env)
         if gate_level == "warn":
             warnings.append(gate_msg)
             print(f"⚠️  [DAILY LOSS GATE] {gate_msg}")

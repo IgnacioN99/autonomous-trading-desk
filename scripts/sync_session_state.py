@@ -55,21 +55,34 @@ DAY_FILLS_MAX_PAGES = 10
 DAY_FILLS_PAGE_SLEEP_SECONDS = 0.2  # between day-fill pages (only when a day needs more than one page)
 
 
-def fetch_day_fills(start_ms: int, target_env: str):
-    """(fills, truncated) of GET /fapi/v1/userTrades since start_ms (issue #208): pages of DAY_FILLS_LIMIT, each next
-    page from the last fill's time (inclusive, deduplicated by (symbol, id): ids are per symbol), until a page holds fewer than DAY_FILLS_LIMIT
-    rows; at most DAY_FILLS_MAX_PAGES pages. truncated: the cap was hit, a later page failed or brought no new fill
-    (the day's figures may then be incomplete). A failed first read returns its non-list reply (fills unreadable)."""
-    seen, params = {}, {"startTime": int(start_ms), "limit": DAY_FILLS_LIMIT}
+DAY_FILLS_MAX_SYMBOL_REQUESTS = 30  # per-symbol fallback (issue #207): beyond this the read is truncated
+FILLS_SCOPE_FALLBACK = "audited+open symbols"
+
+
+def _symbol_required_error(res) -> bool:
+    """True for a Binance reply rejecting the symbol-less userTrades read (-1102 / a 'symbol' parameter error)."""
+    if not isinstance(res, dict):
+        return False
+    msg = str(res.get("msg") or res.get("error") or "").lower()
+    return res.get("code") == -1102 or ("symbol" in msg and any(w in msg for w in ("mandatory", "required", "param")))
+
+
+def _read_day_pages(params: dict, target_env: str, seen: dict, budget: dict):
+    """Pages of userTrades from params (pagination and dedupe of fetch_day_fills) into seen. Returns None when
+    complete, "truncated", or the non-list reply of a failed first page. budget["requests"] counts every request and
+    budget["max"] (when set) caps it."""
     for page in range(DAY_FILLS_MAX_PAGES):
-        if page:
-            time.sleep(DAY_FILLS_PAGE_SLEEP_SECONDS)  # PR #212 review: pace pages on the shared PROD IP
+        if budget.get("max") is not None and budget["requests"] >= budget["max"]:
+            return "truncated"
+        if budget["requests"]:
+            time.sleep(DAY_FILLS_PAGE_SLEEP_SECONDS)  # PR #212 review: pace requests on the shared PROD IP
+        budget["requests"] += 1
         try:
             res = eft.send_signed_request("GET", "/fapi/v1/userTrades", dict(params), target_env=target_env)
         except Exception as e:  # PR #212 review: an exception reads as unreadable fills, never a crash of the sync
             res = {"error": f"{type(e).__name__}: {e}"[:200]}
         if not isinstance(res, list):
-            return (res, False) if page == 0 else (_sorted_fills(seen), True)
+            return res if page == 0 else "truncated"
         new = 0
         for f in res:
             key = (str(f.get("symbol") or "").upper(), str(f.get("id"))) if isinstance(f, dict) else None
@@ -77,12 +90,57 @@ def fetch_day_fills(start_ms: int, target_env: str):
                 seen[key] = f
                 new += 1
         if len(res) < DAY_FILLS_LIMIT:
-            return _sorted_fills(seen), False
+            return None
         if not new:
-            return _sorted_fills(seen), True  # a full page of one millisecond: cannot advance
+            return "truncated"  # a full page of one millisecond: cannot advance
         params["startTime"] = max(params["startTime"],
                                   max(int(_as_float(f.get("time"))) for f in res if isinstance(f, dict)))
-    return _sorted_fills(seen), True
+    return "truncated"
+
+
+def fetch_day_fills(start_ms: int, target_env: str, fallback_symbols=None, info: dict = None):
+    """(fills, truncated) of GET /fapi/v1/userTrades since start_ms (issue #208): pages of DAY_FILLS_LIMIT, each next
+    page from the last fill's time (inclusive, deduplicated by (symbol, id): ids are per symbol), until a page holds fewer than DAY_FILLS_LIMIT
+    rows; at most DAY_FILLS_MAX_PAGES pages. truncated: the cap was hit, a later page failed or brought no new fill
+    (the day's figures may then be incomplete). A failed first read returns its non-list reply (fills unreadable).
+    Issue #207: when the symbol-less first page is rejected with -1102 / a 'symbol' parameter error and
+    fallback_symbols is given, the same read runs per symbol (same startTime, pagination and dedupe, the same pause
+    between requests, at most DAY_FILLS_MAX_SYMBOL_REQUESTS requests in all, else truncated); a failed per-symbol
+    first page returns its reply (unreadable). info (optional dict) then gets per_symbol_fallback True, fills_scope
+    FILLS_SCOPE_FALLBACK and the symbols: fills of other symbols cannot be seen."""
+    seen, budget = {}, {"requests": 0}
+    err = _read_day_pages({"startTime": int(start_ms), "limit": DAY_FILLS_LIMIT}, target_env, seen, budget)
+    if isinstance(err, dict) and _symbol_required_error(err) and fallback_symbols:
+        symbols = sorted({str(s).upper() for s in fallback_symbols if str(s or "").strip()})
+        if isinstance(info, dict):
+            info.update(per_symbol_fallback=True, fills_scope=FILLS_SCOPE_FALLBACK, symbols=symbols)
+        budget["max"] = budget["requests"] + DAY_FILLS_MAX_SYMBOL_REQUESTS
+        for sym in symbols:
+            err = _read_day_pages({"symbol": sym, "startTime": int(start_ms), "limit": DAY_FILLS_LIMIT},
+                                  target_env, seen, budget)
+            if err is not None:
+                break
+    if err is None:
+        return _sorted_fills(seen), False
+    if err == "truncated":
+        return _sorted_fills(seen), True
+    return err, False
+
+
+def day_fallback_symbols(records, start_ms: int, target_env: str, open_symbols=()) -> list:
+    """Symbols the per-symbol userTrades fallback reads (issue #207): those of the env's audit entries recorded since
+    24 h before start_ms (a trade entered yesterday may close today) plus the symbols open now."""
+    since = start_ms / 1000.0 - 86400
+    norm = pt.norm_env(target_env)
+    out = {str(s).upper() for s in open_symbols or [] if s}
+    for r in records or []:
+        if not isinstance(r, dict) or r.get("event") or not r.get("symbol"):
+            continue
+        if pt.norm_env(r.get("target_env")) not in (None, norm):
+            continue
+        if _as_float(r.get("timestamp")) >= since:
+            out.add(str(r["symbol"]).upper())
+    return sorted(out)
 
 
 def _as_float(v) -> float:
@@ -409,7 +467,11 @@ def sync_session_state(target_env: str = None) -> dict:
     #    matched to the audit entries by trade_outcomes.summarize_closed_today (no extra request), so a TP1 partial
     #    plus its runner is one trade, not two wins; fills_closed keeps the per-fill count.
     start_ms = get_start_of_day_utc()
-    trades_res, day_truncated = fetch_day_fills(start_ms, target_env)
+    fills_info = {}  # issue #207: per-symbol fallback when the symbol-less read is rejected
+    trades_res, day_truncated = fetch_day_fills(
+        start_ms, target_env, info=fills_info,
+        fallback_symbols=day_fallback_symbols(records, start_ms, target_env,
+                                              [p["symbol"] for p in active_positions]))
     today_realized_pnl = 0.0
     today_commissions = 0.0
     fills_closed = 0
@@ -527,7 +589,8 @@ def sync_session_state(target_env: str = None) -> dict:
         state["closed_today_summary"]["fills_error"] = str(trades_res)[:200]
     if day_error:
         state["closed_today_summary"]["trade_summary_error"] = day_error
-    state["daily_loss_gate"] = ledger_daily_loss_gate(target_env, trades_res, day_truncated, view)
+    state["daily_loss_gate"] = ledger_daily_loss_gate(target_env, trades_res, day_truncated, view,
+                                                      fills_info=fills_info)
 
     # Save to atomic file with kernel-level replace (no non-atomic fallback, issue #127)
     return _write_state(state)
@@ -588,7 +651,7 @@ def _gate_unavailable(reason: str) -> dict:
 
 
 def ledger_daily_loss_gate(target_env: str, trades_res, truncated: bool, view: dict, prof: dict = None,
-                           equity=None) -> dict:
+                           equity=None, fills_info: dict = None) -> dict:
     """The Daily Loss Gate state (utils.daily_loss_gate.evaluate, as a YOLO order so `scope` shows every active
     limit) for the ledger cache (issue #207), from the fills and per-trade view this sync already read, the profile
     and the live USDT wallet balance (/fapi/v2/balance). TESTNET: not blocked (the executor skips the gate there).
@@ -613,6 +676,7 @@ def ledger_daily_loss_gate(target_env: str, trades_res, truncated: bool, view: d
         net, _other = dlg.day_net_realized(trades_res)
         state = dlg.evaluate(net, view.get("trades") or [], risk_pct=eft.profile_risk_fraction(prof),
                              equity_now=equity, is_yolo_order=True, **limits)
+        dlg.note_fills_scope(state, fills_info)
         return dlg.note_unaudited_closing_symbols(state, view.get("unaudited_closing_symbols") or [])
     except Exception as e:
         return _gate_unavailable(f"{type(e).__name__}: {e}")

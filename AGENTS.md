@@ -13,7 +13,7 @@ Whenever the user explicitly requests crypto trading operations, Binance Futures
      * The desk operates primarily in **PROD (Mainnet Real)**. All scans, evaluations, diagnostics (`trading_doctor.py`) and ledger syncs (`sync_session_state.py`) target the environment resolved by `scripts/utils/env_resolver.py` (`BINANCE_API_ENV`).
      * TESTNET is strictly an isolated sandbox mode used only when `--env testnet` is explicitly passed by the user.
    - **Authentication Modes (`BINANCE_AUTH_MODE`):**
-     * `MCP`: Binance Agentic MCP Gateway (`agent.binance.com`) on an isolated agentic sub-account. Binance caps sub-accounts at 5x leverage (error `-4421`); the executor auto-clamps.
+     * `MCP`: Binance Agentic MCP Gateway (`agent.binance.com`) on an isolated agentic sub-account. Binance caps sub-accounts at 5x leverage (error `-4421`); the executor auto-clamps. No `userTrades`: the Daily Loss Gate refuses PROD openings.
      * `KEYS`: standard HMAC API keys. Use a futures-only key with withdrawals disabled and IP restriction.
    - **Layer 0: Pre-Flight Diagnostic, Onboarding Profiler & Health Sensor (`scripts/trading_doctor.py` & `scripts/user_profile.py`):**
      * Prior to any scanning or trading action, execute the Doctor and verify that the User Profile (`config/user_profile.json`) is calibrated. If uninitialized, prompt the user through an interactive onboarding interview to define risk tolerance (`risk_pct_equity`, default 0.5% of equity per trade), max margin ceiling (30%), leverage, overnight handling mode, and YOLO moonshot preference.

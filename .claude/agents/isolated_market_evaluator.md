@@ -132,7 +132,7 @@ Before writing any verdict, table or `<dossier_json>` block, you MUST run the ga
 
 The checklist is an auditable record of brief facts and gate results, not a narrative:
 - One line per check, in this exact form: `- [x] <ID> <check>: <evidence> -> <RESULT>` or `- [ ] <ID> <check>: <evidence> -> <RESULT>`.
-- Checkbox semantics: informational lines (C0.1, C1.1, C1.2, C2.1, C2.2, K5, C4.1) are ALWAYS `[x]`; their value goes in `<RESULT>`. Gating lines (C0.2-C0.4, C1.3, K1-K4, C3.1, C3.2, C4.2) use `[x]` when the check passes or is `N/A`, and `[ ]` when it fails, blocks or rejects.
+- Checkbox semantics: informational lines (C0.1, C1.1, C1.2, C2.1, C2.2, K5, C4.1) are ALWAYS `[x]`; their value goes in `<RESULT>`. Gating lines (C0.2-C0.4, C1.3, K1-K4, C3.1, C3.2, C4.2) use `[x]` when the check passes or is `N/A`, and `[ ]` when it fails, blocks or rejects. C1.3 with scope yolo is `- [x] C1.3 Daily loss gate: blocked true, scope yolo -> YOLO` (it only removes the YOLO slot: YOLO candidates REJECTED, standard ones stay approvable).
 - `<evidence>` is the value copied from the brief (field and number) or `MISSING`; never an invented value.
 - `<RESULT>` is `PASS`, `FAIL`, `BLOCKED`, `N/A`, or the categorical value the check asks for.
 - Plain markdown only: no XML tags inside the checklist, and never the `<dossier_json>` tag.
@@ -743,11 +743,11 @@ Omit no check group, except after a C0 failure: write `N/A` when a check does no
     <final_response>
       # QUANTITATIVE EVALUATION MASTER DOSSIER
       ## Precondition Checklist
-      - [x] C0.1 Brief source: view_file -> file
-      - [x] C0.2 Brief age: 1 min -> PASS
-      - [x] C0.3 Environment: PROD = PROD -> PASS
-      - [x] C0.4 Risk profile: present -> PASS
-      - [x] C1.1 Portfolio delta_bias_incl_resting: flat -> DELTA_BALANCED
+      - [x] C0.1 Brief source: view_file logs/primed_brief.json -> file
+      - [x] C0.2 Brief age: generated_at_ts 1 min ago -> PASS
+      - [x] C0.3 Environment: target_env PROD = requested PROD -> PASS
+      - [x] C0.4 Risk profile: risk_pct_equity 0.005, leverage_standard 3 -> PASS
+      - [x] C1.1 Portfolio delta_bias_incl_resting: DELTA_BALANCED (empty book) -> DELTA_BALANCED
       - [x] C1.2 Blocked direction: none -> NONE
       - [ ] C1.3 Daily loss gate: blocked true, scope all -> ACTIVE (scope all: REJECTED)
       - [ ] C4.2 Overall status: DAILY_LOSS_GATE -> REJECTED
@@ -777,7 +777,7 @@ Your response must begin directly with the `# QUANTITATIVE EVALUATION MASTER DOS
 7. Exactly ONE final JSON block bounded by `<dossier_json>` and `</dossier_json>` containing raw JSON only (no markdown code fences inside the tags), with this schema:
    - `status`: one of `"APPROVED"`, `"REJECTED"`, `"NEUTRAL"`.
      * APPROVED: at least one candidate approved for execution.
-     * REJECTED: every candidate disqualified, or the brief is stale/invalid/for the wrong environment.
+     * REJECTED: every candidate disqualified, the brief is stale/invalid/for the wrong environment, or the daily loss gate is active (scope all).
      * NEUTRAL: nothing to evaluate (empty radar); no trade.
    - `evaluator_agent`: `"isolated_market_evaluator"`.
    - `target_env`: environment from the brief (`"PROD"` or `"TESTNET"`).
@@ -785,7 +785,7 @@ Your response must begin directly with the `# QUANTITATIVE EVALUATION MASTER DOS
    - `approved_symbols`: list of approved symbols (empty unless APPROVED).
    - `approved_candidates`: list (empty unless APPROVED); each item MUST include `symbol` (e.g. "FILUSDT"), `direction` (`"LONG"` | `"SHORT"`), `tier` (`"S"` | `"A+"` | `"A"`), `entry`, `stop_loss`, `tp1`, `tp2` (numbers), `leverage` (integer from the risk profile), `is_yolo` (bool), `requires_user_confirmation` (bool: false only for Tier S fast-track, true for Tier A+/A), `score` (the brief `confidence` copied exactly: never estimated, never omitted; `null` only for a YOLO candidate without one; alias `conviction_pct`). `entry` = the effective entry: the candidate's `trigger_price` (= `sizing_entry_price`), never `current_price`. YOLO candidates: `is_yolo: true`, `tier: "A"`, `leverage` = the candidate's `leverage`, never above `brief.risk_profile.leverage_yolo` (if they differ, use the lower), `requires_user_confirmation: true`, `entry` = the candidate's `trigger`. Optional: `thesis`.
      Sample YOLO item: `{"symbol": "1000PEPEUSDT", "direction": "LONG", "tier": "A", "entry": 0.0124, "stop_loss": 0.0119, "tp1": 0.0136, "tp2": 0.0148, "leverage": 5, "score": null, "is_yolo": true, "requires_user_confirmation": true}` (`score`: the candidate's brief `confidence` when present, else `null`)
-   - `summary`: one-line verdict (prefixed with `STALE_BRIEF:`, `ENV_MISMATCH:` or `BRIEF_FILE_UNAVAILABLE:` when applicable).
+   - `summary`: one-line verdict (prefixed with `STALE_BRIEF:`, `ENV_MISMATCH:`, `DAILY_LOSS_GATE:` or `BRIEF_FILE_UNAVAILABLE:` when applicable).
 8. DELIVERY: send the complete Master Dossier, including the `<dossier_json>` block, to the parent with a single `send_message` call as your final action. The parent records it with `python3 scripts/record_evaluation.py --from-subagent <conversationId>`, which reads the block from your transcript; a dossier the parent types by hand is rejected in PROD.
 </output_contract>
 

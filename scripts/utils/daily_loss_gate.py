@@ -129,6 +129,16 @@ def note_unaudited_closing_symbols(state: dict, symbols: Iterable[str]) -> dict:
     return state
 
 
+def note_fills_scope(state: dict, info: Any) -> dict:
+    """Informational only (issue #207 round 5; never blocks): the day's fills came from the per-symbol userTrades
+    fallback, so fills of symbols outside the audited + open ones are not seen. Sets per_symbol_fallback and
+    fills_scope on the state."""
+    if isinstance(info, dict) and info.get("per_symbol_fallback"):
+        state["per_symbol_fallback"] = True
+        state["fills_scope"] = info.get("fills_scope")
+    return state
+
+
 def _evaluate(fills_net_pnl_usdt, trades, *, risk_pct, equity_now, daily_stop_r, max_consecutive_sl,
               yolo_max_daily_losses, is_yolo_order) -> dict:
     net, risk, equity, stop_r = (_num(fills_net_pnl_usdt), _num(risk_pct), _num(equity_now), _num(daily_stop_r))
