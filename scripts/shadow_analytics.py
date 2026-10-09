@@ -9,7 +9,7 @@ Performs 3 quantitative evaluations on counterfactual setups in the Shadow Desk:
 
 Delta-gate opportunity cost (issue #251; report-only, read-only: it never writes a file or touches an order):
   4. Regret: regret_R = shadow_R(blocked) - realized_R(blocker), one pair per (resolved DELTA_GATE /
-     DUPLICATE_RESTING row, blocker of its registration snapshot). shadow_R = simulated_pnl_usdt / target_dollar_risk
+     DUPLICATE_RESTING / DELTA_GATE_POST_APPROVAL row, blocker of its registration snapshot). shadow_R = simulated_pnl_usdt / target_dollar_risk
      (GROSS; EXPIRED rows = 0 R, counted apart; rows without it skipped and counted). realized_R(blocker): 0 for a
      resting entry cancelled unfilled at the timeout (logs/guardian_actions.jsonl pending_timeout_cancel, by
      symbol + entry_id), else realized_r_net (NET) of its logs/trade_outcomes.jsonl row (KEYS mode only), joined by
@@ -20,6 +20,10 @@ Delta-gate opportunity cost (issue #251; report-only, read-only: it never writes
   5. Policy replay of the DELTA_GATE rows' book snapshots: current rule, resting entries counted only after N
      minutes or at a fraction weight, and swap (a candidate outscoring the weakest same-direction resting blocker by
      >= X points cancels it and is placed). Total R, max drawdown in R and a net-delta exposure summary per policy.
+  DELTA_GATE_POST_APPROVAL (issue #261): the hook's denials of dossier-approved candidates, registered by
+  shadow_tracker from logs/gate_denials.jsonl; in both 4 and 5 (each denial its own replay event) with a caveat:
+  their book is the cached session state at denial time (source session_state_cache), and denials by the
+  executor's own live Gate 1 are not recorded.
 
 Usage:
   python3 scripts/shadow_analytics.py [--json] [--resting-age-min 30] [--resting-weight 0.5] [--swap-margin 10]
@@ -41,7 +45,8 @@ RESOLVED_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "l
 TRADES_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "logs", "shadow_trades.jsonl"))
 LOGS_DIR = os.path.dirname(RESOLVED_FILE)
 
-REGRET_GATES = ("DELTA_GATE", "DUPLICATE_RESTING")
+REGRET_GATES = ("DELTA_GATE", "DUPLICATE_RESTING", "DELTA_GATE_POST_APPROVAL")
+REPLAY_GATES = ("DELTA_GATE", "DELTA_GATE_POST_APPROVAL")
 EXPIRED_CLASSIFICATIONS = ("EXPIRED", "EXPIRED_UNTRIGGERED")
 MIN_SAMPLE = 30  # same minimum as exit_policy_sim.MIN_SAMPLE
 DEFAULT_RESAMPLES = 2000
@@ -69,6 +74,10 @@ REPLAY_MODEL_NOTE = ("Replay model: the book is each dossier's registration snap
                      "weight (Gate 1 new-order rule) even where resting entries are discounted, so the resting "
                      "policies place conservatively; a swap does not re-check the delta gate; blockers with an "
                      "unknown realized R count 0 R in every policy (blocker_r_unknown).")
+HOOK_DENIAL_NOTE = ("DELTA_GATE_POST_APPROVAL rows (issue #261) are the hook's denials of dossier-approved candidates: "
+                    "their book is the cached logs/session_state.json at denial time (source session_state_cache, "
+                    "possibly up to 300 s old), not the exchange; denials by the executor's own live Gate 1 are not "
+                    "recorded.")
 
 def load_jsonl(path: str) -> List[Dict[str, Any]]:
     if not os.path.exists(path):
@@ -380,7 +389,7 @@ def regret_report(resolved: List[Dict[str, Any]], guardian_actions: List[Dict[st
         "by_score_delta": split("score_delta_bucket", SCORE_DELTA_BUCKETS),
         "by_blocker_kind": split("blocker_kind", ("position", "resting_filled", "resting_expired_unfilled")),
         "counts": counts, "min_sample": MIN_SAMPLE, "pairs": pairs,
-        "warnings": [CONSERVATIVE_NOTE, GROSS_NET_NOTE, SELECTION_BIAS_NOTE],
+        "warnings": [CONSERVATIVE_NOTE, GROSS_NET_NOTE, SELECTION_BIAS_NOTE, HOOK_DENIAL_NOTE],
     }
 
 
@@ -428,19 +437,21 @@ def _max_drawdown(contributions: List[tuple]) -> float:
 def replay_policies(resolved: List[Dict[str, Any]], index: Dict[str, Any],
                     resting_age_min: float = DEFAULT_RESTING_AGE_MIN, resting_weight: float = DEFAULT_RESTING_WEIGHT,
                     swap_margin: float = DEFAULT_SWAP_MARGIN) -> Dict[str, Any]:
-    """Report-only replay of the resolved DELTA_GATE rows (grouped per dossier into events, oldest first) under:
+    """Report-only replay of the resolved DELTA_GATE and DELTA_GATE_POST_APPROVAL rows (REPLAY_GATES, grouped per
+    dossier into events, oldest first) under:
     current (nothing placed), resting_after_n_min (a resting entry counts toward delta only once it is
     resting_age_min old; unknown age counts), resting_fraction (resting entries count at resting_weight) and swap (a
     candidate whose score beats the weakest scored same-direction resting blocker by >= swap_margin cancels it and is
     placed). Candidates of one event are taken by score, highest first; a placement joins the book (as a resting
     entry) until its shadow row resolved. Total R = placed candidates' shadow R + realized R of the events'
     blockers not cancelled (unknown: 0 R, counted); exposure = the full-weight book after each event's decisions."""
-    rows = [r for r in resolved if row_gate(r)[0] == "DELTA_GATE"]
+    rows = [r for r in resolved if row_gate(r)[0] in REPLAY_GATES]
     skipped = {"no_book": 0, "no_shadow_r": 0, "notional_missing": 0}
     events: Dict[Any, Dict[str, Any]] = {}
     notional_derived = 0
     for r in rows:
-        if not isinstance(r.get("book"), list):
+        if not isinstance(r.get("book"), list) or r.get("book_truncated"):
+            # issue #261: a hook event whose book did not fit its 4 KB line has no usable (complete) book
             skipped["no_book"] += 1
             continue
         if shadow_r(r) is None:
@@ -451,7 +462,8 @@ def replay_policies(resolved: List[Dict[str, Any]], index: Dict[str, Any],
             skipped["notional_missing"] += 1
             continue
         notional_derived += int(derived)
-        key = r.get("dossier_sha256") or r.get("id")
+        # A hook denial (later, cache book) is its own event, apart from its dossier's DELTA_GATE rows
+        key = (r.get("dossier_sha256") or r.get("id"), row_gate(r)[0])
         ev = events.setdefault(key, {"ts": _num(r.get("registered_at_ts")) or 0.0, "book": r["book"], "rows": []})
         ev["ts"] = min(ev["ts"], _num(r.get("registered_at_ts")) or 0.0)
         ev["rows"].append(dict(r, _notional=notional, _derived=derived))
@@ -551,7 +563,8 @@ def replay_policies(resolved: List[Dict[str, Any]], index: Dict[str, Any],
             "skipped": skipped, "notional_derived": notional_derived, "book_notional_missing": book_notional_missing,
             "blockers": len(blocker_r), "blocker_r_unknown": sum(1 for r in blocker_r.values() if r is None),
             "policies": policies,
-            "warnings": [IN_SAMPLE_NOTE, RANKING_NOTE, SELECTION_BIAS_NOTE, REPLAY_MODEL_NOTE, GROSS_NET_NOTE]}
+            "warnings": [IN_SAMPLE_NOTE, RANKING_NOTE, SELECTION_BIAS_NOTE, REPLAY_MODEL_NOTE, GROSS_NET_NOTE,
+                         HOOK_DENIAL_NOTE]}
 
 
 def _fmt_r(value) -> str:

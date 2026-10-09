@@ -394,43 +394,63 @@ class TestPrearmRejectMessage(tpe.ExecutorHarness):
             return self.fake(method, endpoint, params, target_env)
         return send
 
-    def test_minus_4509_with_message_stop_market(self):
+    def test_stop_market_never_sends_the_prearm(self):
+        # Owner decision (issue #232): a STOP_MARKET entry is not pre-armed, so it can no longer hit -4509.
         res = self.execute(order_type="STOP_MARKET", trigger_price=102.347,
                            send=self.send_with_prearm({"code": -4509, "msg": self.MSG}))
         self.assertTrue(res["success"], res.get("error"))
-        self.assertEqual(res["prearm_status"], "rejected:-4509")
-        self.assertEqual(res["prearm_reject_msg"], self.MSG)
-        self.assertEqual(res["prearm_anomaly"]["status"], "rejected:-4509")
-        self.assertIn(self.MSG, res["prearm_anomaly"]["message"])
-        self.assertIn("Stop Loss not pre-armed (rejected:-4509). ", res["message"])
-        rec = tpe.read_registry(self.ws)["testnet:SOLUSDT:8"]
-        self.assertEqual((rec["prearm_status"], rec["prearm_reject_msg"]), ("rejected:-4509", self.MSG))
-        self.report.assert_called_once()
-        kw = self.report.call_args.kwargs
-        self.assertIn(self.MSG, kw["context"])
-        self.assertEqual(kw["error_detail"], "SOLUSDT pre-arm rejected:-4509", "dedup fingerprint unchanged")
-        self.assertEqual(kw["title"], "prearm_resting_entry_stop: pre-armed stop of SOLUSDT rejected:-4509")
+        self.assertEqual(res["prearm_status"], "skipped:no_position")
+        self.assertEqual([c for c in self.calls if c[0] == "POST" and c[1] == ALGO_ENDPOINT
+                          and c[2].get("closePosition") == "true"], [])
+        self.assertNotIn("prearm_reject_msg", res)
+        self.assertNotIn("prearm_anomaly", res)
+        self.report.assert_not_called()
 
-    def test_minus_4509_with_message_resting_limit(self):
-        res = self.execute(order_type="LIMIT", limit_price=98.767,
-                           send=self.send_with_prearm({"code": -4509, "msg": self.MSG}))
+    def test_minus_4509_with_message_resting_limit_logged_not_reported(self):
+        with self.assertLogs("execute_futures_trade", level="WARNING") as logs:
+            res = self.execute(order_type="LIMIT", limit_price=98.767,
+                               send=self.send_with_prearm({"code": -4509, "msg": self.MSG}))
         self.assertTrue(res["pending_limit_entry"], res)
         self.assertEqual(res["prearm_status"], "rejected:-4509")
         self.assertEqual(res["prearm_reject_msg"], self.MSG)
-        self.assertEqual(tpe.read_registry(self.ws)["testnet:SOLUSDT:7"]["prearm_reject_msg"], self.MSG)
-        self.assertIn(self.MSG, self.report.call_args.kwargs["context"])
+        self.assertIn("Stop Loss not pre-armed (rejected:-4509). ", res["message"])
+        self.assertIn(self.MSG, res["message"])
+        self.assertNotIn("prearm_anomaly", res)
+        self.report.assert_not_called()
+        rec = tpe.read_registry(self.ws)["testnet:SOLUSDT:7"]
+        self.assertEqual((rec["prearm_status"], rec["prearm_reject_msg"]), ("rejected:-4509", self.MSG))
+        line = next(m for m in logs.output if "rejected:-4509" in m)
+        self.assertIn("SOLUSDT", line)
+        self.assertIn(self.MSG, line)
+
+    def test_other_rejection_code_still_reported(self):
+        msg = "Reach max stop order limit."
+        res = self.execute(order_type="LIMIT", limit_price=98.767,
+                           send=self.send_with_prearm({"code": -4045, "msg": msg}))
+        self.assertEqual(res["prearm_status"], "rejected:-4045")
+        self.assertEqual(res["prearm_reject_msg"], msg)
+        self.assertEqual(res["prearm_anomaly"]["status"], "rejected:-4045")
+        self.assertIn(msg, res["prearm_anomaly"]["message"])
+        self.report.assert_called_once()
+        kw = self.report.call_args.kwargs
+        self.assertIn(msg, kw["context"])
+        self.assertIn("the position guardian protects it at fill", kw["context"])
+        self.assertEqual(kw["error_detail"], "SOLUSDT pre-arm rejected:-4045", "dedup fingerprint unchanged")
+        self.assertEqual(kw["title"], "prearm_resting_entry_stop: pre-armed stop of SOLUSDT rejected:-4045")
 
     def test_no_message_no_field(self):
-        res = self.execute(order_type="STOP_MARKET", trigger_price=102.347,
-                           send=self.send_with_prearm({"code": -4509}))
+        with self.assertLogs("execute_futures_trade", level="WARNING") as logs:
+            res = self.execute(order_type="LIMIT", limit_price=98.767, send=self.send_with_prearm({"code": -4509}))
         self.assertEqual(res["prearm_status"], "rejected:-4509")
         self.assertNotIn("prearm_reject_msg", res)
-        self.assertNotIn("prearm_reject_msg", tpe.read_registry(self.ws)["testnet:SOLUSDT:8"])
-        self.assertNotIn("Binance message", self.report.call_args.kwargs["context"])
-        self.assertEqual(res["prearm_anomaly"]["message"], "Stop Loss not pre-armed (rejected:-4509).")
+        self.assertNotIn("prearm_reject_msg", tpe.read_registry(self.ws)["testnet:SOLUSDT:7"])
+        self.assertIn("Stop Loss not pre-armed (rejected:-4509). ", res["message"])
+        self.assertNotIn("Binance message", res["message"])
+        self.assertTrue(any("rejected:-4509" in m and "no Binance message" in m for m in logs.output), logs.output)
+        self.report.assert_not_called()
 
     def test_minus_2021_still_not_an_anomaly(self):
-        res = self.execute(order_type="STOP_MARKET", trigger_price=102.347,
+        res = self.execute(order_type="LIMIT", limit_price=98.767,
                            send=self.send_with_prearm({"code": -2021, "msg": "Order would immediately trigger."}))
         self.assertEqual(res["prearm_status"], "rejected:-2021")
         self.assertEqual(res["prearm_reject_msg"], "Order would immediately trigger.")

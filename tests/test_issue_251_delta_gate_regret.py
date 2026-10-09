@@ -58,7 +58,7 @@ class TrackerBase(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
         for name in ("SHADOW_TRADES_FILE", "SHADOW_RESOLVED_FILE", "BRIEF_FILE", "DOSSIER_FILE",
-                     "PENDING_ENTRIES_FILE", "SESSION_STATE_FILE", "TRADES_AUDIT_FILE"):
+                     "PENDING_ENTRIES_FILE", "SESSION_STATE_FILE", "TRADES_AUDIT_FILE", "GATE_DENIALS_FILE"):
             p = patch.object(st, name, os.path.join(self.dir, name.lower()))
             p.start()
             self.addCleanup(p.stop)
