@@ -529,6 +529,11 @@ def daily_loss_gate_line(state, target_env: str):
     text = sss.format_daily_loss_gate(gate)
     if not isinstance(gate, dict) or gate.get("blocked") is not False or gate.get("scope"):
         return "warn", f"Daily Loss Gate: {text}"
+    unaudited = gate.get("unaudited_closing_symbols") or []
+    if unaudited:  # round 4: informational (never blocks), but the streak cannot see those trades
+        return "warn", (f"Daily Loss Gate: {text}; closing fills today without an audit record on "
+                        f"{', '.join(str(s) for s in unaudited)}: counted in the USDT figure, NOT in the "
+                        "consecutive-SL streak.")
     return "ok", f"Daily Loss Gate: {text}"
 
 

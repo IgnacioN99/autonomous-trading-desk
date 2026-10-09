@@ -577,7 +577,9 @@ def day_trade_view(records, trades_res, start_ms, target_env, open_positions, au
         day = {"trades_closed": wins_f + losses_f, "wins": wins_f, "losses": losses_f, "scratches": 0,
                "realized_r_net_sum": None, "partial_history": 0}
     view.update(day=day, day_error=day_error, counts_kept=day_error_counts_kept,
-                counted_by="fills" if day_error and not day_error_counts_kept else "trades")
+                counted_by="fills" if day_error and not day_error_counts_kept else "trades",
+                # issue #207 round 4: symbols whose closing fills are out of the per-trade view (informational)
+                unaudited_closing_symbols=unmatched_symbols if day_error_counts_kept else [])
     return view
 
 
@@ -609,8 +611,9 @@ def ledger_daily_loss_gate(target_env: str, trades_res, truncated: bool, view: d
             equity = _wallet_balance_usdt(target_env)
         limits = up.get_daily_loss_limits(prof)
         net, _other = dlg.day_net_realized(trades_res)
-        return dlg.evaluate(net, view.get("trades") or [], risk_pct=eft.profile_risk_fraction(prof), equity_now=equity,
-                            is_yolo_order=True, **limits)
+        state = dlg.evaluate(net, view.get("trades") or [], risk_pct=eft.profile_risk_fraction(prof),
+                             equity_now=equity, is_yolo_order=True, **limits)
+        return dlg.note_unaudited_closing_symbols(state, view.get("unaudited_closing_symbols") or [])
     except Exception as e:
         return _gate_unavailable(f"{type(e).__name__}: {e}")
 

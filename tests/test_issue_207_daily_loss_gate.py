@@ -389,6 +389,26 @@ class TestCheckDailyLossGate(GateWorkspace):
         ok, reason, _ = self.gate(DayFills(fs), positions=[("OPENUSDT", "LONG")])
         self.assertTrue(ok, reason)
 
+    def test_unaudited_closing_symbols_are_noted_not_blocking(self):
+        """Round 4: closing fills of a symbol with no audit record (counts kept per trade) are named, never block."""
+        rec, fs = closed_trade(0, 1.0)
+        self.audit(rec)
+        manual = [fill(900 + i, 900 + i, "SELL", 10, 1, DAY + 5 * H, pnl=-1.0, symbol=f"M{i:02d}USDT")
+                  for i in range(12)]
+        ok, reason, state = self.gate(DayFills(fs + manual))
+        self.assertTrue(ok, reason)
+        self.assertEqual(state["unaudited_closing_symbols"], [f"M{i:02d}USDT" for i in range(10)])  # capped at 10
+        self.assertIn("unaudited_closing_symbols=M00USDT", state["reason"])
+        self.assertEqual(state["day_net_realized_usdt"], 10.0 - 12.0)  # still in the USDT figure
+        ok, _, clean = self.gate(DayFills(fs))
+        self.assertEqual((ok, clean["unaudited_closing_symbols"], clean["reason"]), (True, [], None))
+        level, msg = trading_doctor.daily_loss_gate_line({"target_env": "prod", "daily_loss_gate": state}, "prod")
+        self.assertEqual(level, "warn")
+        self.assertIn("M00USDT", msg)
+        self.assertIn("NOT in the consecutive-SL streak", msg)
+        self.assertEqual(trading_doctor.daily_loss_gate_line({"target_env": "prod", "daily_loss_gate": clean},
+                                                             "prod")[0], "ok")
+
     def test_testnet_skipped_without_requests(self):
         fake = MagicMock(side_effect=AssertionError("no request in TESTNET"))
         with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
@@ -463,6 +483,41 @@ class TestExecutorIntegration(DayHarness):
         self.assertEqual(audit["daily_loss_gate"]["blocked"], False)
         self.assertIs(audit["daily_loss_gate"]["is_yolo_order"], False)
         self.assertIn("consecutive_full_sl", audit["daily_loss_gate"])
+
+    def test_unreadable_profile_is_visible_not_blocking(self):
+        """Round 4: a failed profile load keeps the defaults (no block) but flags state, audit record and stderr."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), \
+             patch("user_profile.load_user_profile", side_effect=ValueError("bad json")):
+            res = self._execute_without_profile_patch()
+        self.assertTrue(res["success"], res.get("error"))
+        audit = tpe.read_jsonl(self.ws, "trades_audit.jsonl")[-1]
+        self.assertIs(audit["profile_unreadable"], True)
+        self.assertIs(audit["daily_loss_gate"]["profile_unreadable"], True)
+        self.assertIs(audit["daily_loss_gate"]["blocked"], False)
+        self.assertIn("user profile unreadable (ValueError: bad json)", err.getvalue())
+        ok = self.execute_real_gate()
+        audit = tpe.read_jsonl(self.ws, "trades_audit.jsonl")[-1]
+        self.assertTrue(ok["success"])
+        self.assertNotIn("profile_unreadable", audit)
+        self.assertNotIn("profile_unreadable", audit["daily_loss_gate"])
+
+    def _execute_without_profile_patch(self):
+        """execute_real_gate, but the caller controls user_profile.load_user_profile."""
+        with patch("execute_futures_trade.send_signed_request", side_effect=self.fake), \
+             patch("execute_futures_trade._workspace_dir", return_value=self.ws), \
+             patch("execute_futures_trade.load_env", return_value={"LIVE_TRADING_ARMED": "true"}), \
+             patch("execute_futures_trade.enforce_evaluation_dossier", return_value=(True, "ok", None)), \
+             patch("execute_futures_trade.check_mechanical_gates", return_value=(True, None)), \
+             patch("execute_futures_trade.get_symbol_filters", return_value=dict(tpe.EX_FILTERS)), \
+             patch("execute_futures_trade.uses_mcp_gateway", return_value=False), \
+             patch("execute_futures_trade.verify_algo_stop_loss", return_value=(True, {"algoId": 9})), \
+             patch("quant_risk_engine.get_account_equity", return_value=1000.0), \
+             patch.object(sss, "get_start_of_day_utc", return_value=DAY), \
+             patch("report_agent_issue.report_issue"):
+            tpe.write_session_state(self.ws, self.positions)
+            return eft.execute_complete_trade(symbol="SOLUSDT", direction="LONG", leverage=3, margin_usdt=10.0,
+                                              sl_price=97.0, tp1_price=110.0, tp2_price=120.0, target_env="prod")
 
     def test_testnet_never_reads_the_day(self):
         res = self.execute_real_gate(env="testnet")
@@ -638,6 +693,13 @@ class TestSyncState(unittest.TestCase):
                 self.assertEqual((gate["blocked"], gate["scope"]), (True, "all"))
                 self.assertIn(fragment, gate["reason"])
 
+    def test_sync_notes_unaudited_closing_symbols(self):
+        rec, fs = closed_trade(0, 1.0)
+        manual = [fill(901, 901, "SELL", 10, 1, DAY + 5 * H, pnl=-1.0, symbol="MANUSDT")]
+        gate = self.run_sync(SyncExchange(fs + manual), audit=[rec])["daily_loss_gate"]
+        self.assertEqual((gate["blocked"], gate["unaudited_closing_symbols"]), (False, ["MANUSDT"]))
+        self.assertIn("unaudited_closing_symbols=MANUSDT", gate["reason"])
+
     def test_testnet_not_blocked(self):
         gate = self.run_sync(SyncExchange([], error={"code": -1}), env="testnet")["daily_loss_gate"]
         self.assertEqual((gate["blocked"], gate["scope"]), (False, None))
@@ -673,7 +735,13 @@ class TestBrief(unittest.TestCase):
                                                       "trade_summary_error": "boom"}})
         self.assertEqual(bad["ground_truth_portfolio"]["closed_today_data"],
                          {"counted_by": "fills", "fills_closed": 3, "truncated": True, "trade_summary_error": "boom"})
-        self.assertEqual(bad["daily_loss_gate"], {"blocked": False, "scope": None, "reason": "DAILY LOSS GATE: x"})
+        self.assertEqual(bad["daily_loss_gate"], {"blocked": False, "scope": None, "reason": None})
+        # an inactive gate's informational reason (unscored / unaudited notes) never reaches the evaluator
+        note = dict(gate, blocked=False, scope=None, unaudited_closing_symbols=["MANUSDT"], unscored_closed=1,
+                    reason="DAILY LOSS GATE: inactive; unaudited_closing_symbols=MANUSDT")
+        quiet = self.assemble({"target_env": "prod", "daily_loss_gate": note})
+        self.assertEqual(quiet["daily_loss_gate"], {"blocked": False, "scope": None, "reason": None})
+        self.assertNotIn("MANUSDT", json.dumps(quiet))
 
     def test_missing_or_foreign_state_reads_blocked(self):
         for state in ({"target_env": "prod"}, {"target_env": "testnet", "daily_loss_gate": {"blocked": False}}, {}):
@@ -734,14 +802,41 @@ class TestPrompt(unittest.TestCase):
         rules = self.text.split("<operational_rules>")[1].split("</operational_rules>")[0]
         rule10 = rules.split("- RULE 10")[1]
         self.assertLess(rules.index("- RULE 9"), rules.index("- RULE 10"))
-        for fragment in ("daily_loss_gate.blocked", "scope: all", "REJECTED", "daily loss gate active",
+        for fragment in ("daily_loss_gate.blocked", "scope: all", "REJECTED", "no approved candidates",
+                         "summary starting `DAILY_LOSS_GATE:`",
                          "scope: yolo", "YOLO slot rejected", "standard candidates evaluated normally"):
             self.assertIn(fragment, rule10)
         items = self.text.split("<checklist_items>")[1].split("</checklist_items>")[0]
         c1 = items.split("C1 PORTFOLIO DELTA GATE:")[1].split("C2 MACRO")[0]
         self.assertIn("- C1.3 Daily loss gate (`daily_loss_gate`, RULE 10)", c1)
-        self.assertEqual(self.text.count("- [x] C1.3 Daily loss gate: none -> NOT ACTIVE"),
-                         self.text.count("<example id="))
+        self.assertIn("or C1.3 ACTIVE) / NEUTRAL", items)
+        stop = next(l for l in self.text.splitlines() if l.startswith("Omit no check group"))
+        self.assertIn("likewise after C1 when C1.3 is ACTIVE (`DAILY_LOSS_GATE:`)", stop)
+        self.assertIn("<STALE_BRIEF|ENV_MISMATCH|DAILY_LOSS_GATE>", stop)
+        # Round 4: evidence copied from the brief; every example but the daily-loss-gate one shows it NOT ACTIVE
+        self.assertEqual(self.text.count("- [x] C1.3 Daily loss gate: blocked false -> NOT ACTIVE"),
+                         self.text.count("<example id=") - 1)
+        self.assertNotIn("C1.3 Daily loss gate: none", self.text)
+        coherence = "C1.3 is NOT ACTIVE (scope `yolo`: non-YOLO only)"
+        constraint9 = next(l for l in self.text.splitlines() if l.startswith("9. CHECKLIST CONSTRAINT"))
+        agreement = next(l for l in self.text.splitlines() if l.startswith("- Every later section"))
+        self.assertIn(coherence, constraint9)
+        self.assertIn(coherence, agreement)
+
+    def test_daily_loss_gate_few_shot(self):
+        """Round 4: one compact negative few-shot; it passes the recorder's checklist check (PR #222)."""
+        import re
+        from utils import dossier_provenance as dp
+        shot = re.search(r'<example id="eval_neg_08_daily_loss_gate_active">([\s\S]*?)</example>', self.text)
+        self.assertIsNotNone(shot)
+        body = shot.group(1)
+        self.assertIn("<!-- EXAMPLE 13: NEGATIVE - DAILY LOSS GATE ACTIVE", self.text)
+        self.assertIn("- [ ] C1.3 Daily loss gate: blocked true, scope all -> ACTIVE (scope all: REJECTED)", body)
+        final = re.search(r"<final_response>([\s\S]*?)</final_response>", body).group(1)
+        dossier = json.loads(re.search(r"<dossier_json>([\s\S]*?)</dossier_json>", final).group(1))
+        self.assertEqual((dossier["status"], dossier["approved_candidates"]), ("REJECTED", []))
+        self.assertTrue(dossier["summary"].startswith("DAILY_LOSS_GATE:"))
+        self.assertEqual(dp.check_precondition_checklist(final, dossier), [])
 
     def test_rule_9_and_rule_1_notes(self):
         rule9 = self.text.split("- RULE 9")[1].split("- RULE 10")[0]

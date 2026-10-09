@@ -377,7 +377,9 @@ def brief_daily_loss_gate(state: Any, target_env: str) -> dict:
         return {"blocked": True, "scope": "all", "reason": "unavailable: ledger has no daily_loss_gate state"}
     blocked = gate.get("blocked") is not False
     scope = gate.get("scope") if gate.get("scope") in ("all", "yolo") else ("all" if blocked else None)
-    return {"blocked": blocked, "scope": scope, "reason": gate.get("reason")}
+    # The reason only when blocked: an inactive gate's informational notes (unscored / unaudited trades) stay in the
+    # ledger cache and the doctor, never in the evaluator's brief
+    return {"blocked": blocked, "scope": scope, "reason": gate.get("reason") if blocked else None}
 
 
 # Issue #187 / #212: closed-today data-quality keys reach the brief only when they differ from these defaults.

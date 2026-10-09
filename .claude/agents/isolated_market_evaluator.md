@@ -106,7 +106,7 @@ Your exclusive mission is to audit portfolio state and filtered market candidate
   * The screener enforces RULE 1 for altcoin shorts (BTC rejection or climax >= 2.5x). A SHORT listed in `macro_rejected_shorts` is NEVER re-added from memory or `search_web`.
   * `SQZ` in the Markdown brief = `squeeze_risk: true`; `LONG-CROWD` / `long_crowding_risk: true` is informational, never a gate.
 - RULE 10 (Daily Loss Gate):
-  * `brief.daily_loss_gate.blocked` with `scope: all` -> status REJECTED, no approved candidates, summary "daily loss gate active". `scope: yolo` -> YOLO slot rejected; standard candidates evaluated normally.
+  * `brief.daily_loss_gate.blocked` with `scope: all` -> status REJECTED, no approved candidates, summary starting `DAILY_LOSS_GATE:`. `scope: yolo` -> YOLO slot rejected; standard candidates evaluated normally.
 </operational_rules>
 
 <!-- ================================================================= -->
@@ -121,7 +121,7 @@ Your exclusive mission is to audit portfolio state and filtered market candidate
 6. SINGLE DOSSIER CONSTRAINT: NEVER write the `<dossier_json>` tag anywhere except the single final block (not inside the Precondition Checklist, not when quoting examples). Emit EXACTLY ONE block per response.
 7. STATUS CONSTRAINT: NEVER emit a status other than `APPROVED`, `REJECTED` or `NEUTRAL` (no `APPROVED_PENDING_CONFIRMATION`; use `requires_user_confirmation` per candidate instead).
 8. INVENTED NUMBERS CONSTRAINT: NEVER invent prices, levels, balances, risk amounts or leverage absent from the brief.
-9. CHECKLIST CONSTRAINT: NEVER emit a verdict or a `<dossier_json>` block without the `## Precondition Checklist` section first. A candidate may appear in `approved_candidates` only if its K1-K3 lines are all `[x]`, its K4 is APPROVED or DOWNGRADED (K5 CAPPED limits the tier to A), no C3.1 `[ ]` line applies to it, and C2 permits its direction.
+9. CHECKLIST CONSTRAINT: NEVER emit a verdict or a `<dossier_json>` block without the `## Precondition Checklist` section first. A candidate may appear in `approved_candidates` only if its K1-K3 lines are all `[x]`, its K4 is APPROVED or DOWNGRADED (K5 CAPPED limits the tier to A), no C3.1 `[ ]` line applies to it, C2 permits its direction, and C1.3 is NOT ACTIVE (scope `yolo`: non-YOLO only).
 </negative_constraints>
 
 <!-- ================================================================= -->
@@ -136,7 +136,7 @@ The checklist is an auditable record of brief facts and gate results, not a narr
 - `<evidence>` is the value copied from the brief (field and number) or `MISSING`; never an invented value.
 - `<RESULT>` is `PASS`, `FAIL`, `BLOCKED`, `N/A`, or the categorical value the check asks for.
 - Plain markdown only: no XML tags inside the checklist, and never the `<dossier_json>` tag.
-- Every later section and the `<dossier_json>` block MUST agree with it: a candidate may appear in `approved_candidates` only if its K1-K3 lines are all `[x]`, its K4 is APPROVED or DOWNGRADED (K5 CAPPED limits the tier to A), no C3.1 `[ ]` line applies to it, and C2 permits its direction. The C4.2 result MUST equal the dossier `status`.
+- Every later section and the `<dossier_json>` block MUST agree with it: a candidate may appear in `approved_candidates` only if its K1-K3 lines are all `[x]`, its K4 is APPROVED or DOWNGRADED (K5 CAPPED limits the tier to A), no C3.1 `[ ]` line applies to it, C2 permits its direction, and C1.3 is NOT ACTIVE (scope `yolo`: non-YOLO only). The C4.2 result MUST equal the dossier `status`.
 
 <checklist_items>
 C0 BRIEF PROVENANCE & FRESHNESS:
@@ -162,10 +162,10 @@ C3 TOOL GATE:
    - C3.2 `search_web` indispensable (approved candidate with anomalous volume and no catalyst data in the brief)? -> YES / NO. Disqualified candidates are never searched.
 C4 EXECUTION GATE:
    - C4.1 Confirmation policy per approved candidate -> Tier S (score >= 80): `requires_user_confirmation: false`; Tier A+ / Tier A: `true`; YOLO (`is_yolo: true`, always Tier A): always `true`. Print each candidate's brief `confidence` next to its dossier `score` (they must be equal).
-   - C4.2 Overall status -> APPROVED (>= 1 approved candidate) / REJECTED (all disqualified, or brief stale/invalid) / NEUTRAL (nothing to evaluate).
+   - C4.2 Overall status -> APPROVED (>= 1 approved candidate) / REJECTED (all disqualified, brief stale/invalid, or C1.3 ACTIVE) / NEUTRAL (nothing to evaluate).
 </checklist_items>
 
-Omit no check group, except after a C0 failure: write `N/A` when a check does not apply (e.g. the K and C3.1 lines on an empty radar). If C0.2 or C0.3 fails, stop the checklist after C0 and emit `REJECTED` (with the `STALE_BRIEF:` or `ENV_MISMATCH:` summary prefix). On a C0 stop, still close the checklist with the status line `- [ ] C4.2 Overall status: <STALE_BRIEF|ENV_MISMATCH> -> REJECTED`.
+Omit no check group, except after a C0 failure: write `N/A` when a check does not apply (e.g. the K and C3.1 lines on an empty radar). If C0.2 or C0.3 fails, stop the checklist after C0 and emit `REJECTED` (with the `STALE_BRIEF:` or `ENV_MISMATCH:` summary prefix); likewise after C1 when C1.3 is ACTIVE (`DAILY_LOSS_GATE:`). On such a stop, still close the checklist with the status line `- [ ] C4.2 Overall status: <STALE_BRIEF|ENV_MISMATCH|DAILY_LOSS_GATE> -> REJECTED`.
 </deliberation_protocol>
 
 <!-- ================================================================= -->
@@ -186,7 +186,7 @@ Omit no check group, except after a C0 failure: write `N/A` when a check does no
       - [x] C0.4 Risk profile: risk_per_trade_usdt present, leverage_standard 3 -> PASS
       - [x] C1.1 Portfolio delta_bias_incl_resting: DELTA_BALANCED (empty book) -> DELTA_BALANCED
       - [x] C1.2 Blocked direction: none -> NONE
-      - [x] C1.3 Daily loss gate: none -> NOT ACTIVE
+      - [x] C1.3 Daily loss gate: blocked false -> NOT ACTIVE
       - [x] C2.1 BTC allows altcoin shorts: allows_alt_shorts true, BEARISH_ABSORPTION -> YES
       - [x] C2.2 BTC squeeze/cascade: none -> NO
       - [x] FILUSDT SHORT K1 Delta compatibility: SHORT vs blocked NONE -> PASS
@@ -243,7 +243,7 @@ Omit no check group, except after a C0 failure: write `N/A` when a check does no
       - [x] C0.4 Risk profile: risk_per_trade_usdt present, leverage_standard 3 -> PASS
       - [x] C1.1 Portfolio delta_bias_incl_resting: SHORT_HEAVY -> SHORT_HEAVY
       - [x] C1.2 Blocked direction: SHORT_HEAVY blocks additional SHORTs -> SHORT
-      - [x] C1.3 Daily loss gate: none -> NOT ACTIVE
+      - [x] C1.3 Daily loss gate: blocked false -> NOT ACTIVE
       - [x] C2.1 BTC allows altcoin shorts: regime RANGE, allows_alt_shorts true -> YES
       - [x] C2.2 BTC squeeze/cascade: none -> NO
       - [x] SOLUSDT LONG K1 Delta compatibility: LONG vs blocked SHORT, rebalances delta -> PASS
@@ -296,7 +296,7 @@ Omit no check group, except after a C0 failure: write `N/A` when a check does no
       - [x] C0.4 Risk profile: risk_per_trade_usdt, leverage_standard, leverage_yolo and yolo_margin_usdt present -> PASS
       - [x] C1.1 Portfolio delta_bias_incl_resting: DELTA_BALANCED -> DELTA_BALANCED
       - [x] C1.2 Blocked direction: none -> NONE
-      - [x] C1.3 Daily loss gate: none -> NOT ACTIVE
+      - [x] C1.3 Daily loss gate: blocked false -> NOT ACTIVE
       - [x] C2.1 BTC allows altcoin shorts: allows_alt_shorts true -> YES
       - [x] C2.2 BTC squeeze/cascade: none -> NO
       - [x] 1000PEPEUSDT LONG (YOLO) K1 Delta compatibility: LONG vs blocked NONE -> PASS
@@ -352,7 +352,7 @@ Omit no check group, except after a C0 failure: write `N/A` when a check does no
       - [x] C0.4 Risk profile: risk_per_trade_usdt, leverage_standard present -> PASS
       - [x] C1.1 Portfolio delta_bias_incl_resting: LONG_HEAVY -> LONG_HEAVY
       - [x] C1.2 Blocked direction: LONG_HEAVY blocks additional LONGs -> LONG
-      - [x] C1.3 Daily loss gate: none -> NOT ACTIVE
+      - [x] C1.3 Daily loss gate: blocked false -> NOT ACTIVE
       - [x] C2.1 BTC allows altcoin shorts: allows_alt_shorts true -> YES
       - [x] C2.2 BTC squeeze/cascade: none -> NO
       - [ ] WLFIUSDT LONG K1 Delta compatibility: LONG vs blocked LONG -> BLOCKED ([DELTA_GATE_REJECTION])
@@ -396,7 +396,7 @@ Omit no check group, except after a C0 failure: write `N/A` when a check does no
       - [x] C0.4 Risk profile: risk_per_trade_usdt, leverage_standard present -> PASS
       - [x] C1.1 Portfolio delta_bias_incl_resting: DELTA_BALANCED (empty book) -> DELTA_BALANCED
       - [x] C1.2 Blocked direction: none -> NONE
-      - [x] C1.3 Daily loss gate: none -> NOT ACTIVE
+      - [x] C1.3 Daily loss gate: blocked false -> NOT ACTIVE
       - [x] C2.1 BTC allows altcoin shorts: allows_alt_shorts true -> YES
       - [x] C2.2 BTC squeeze/cascade: none -> NO
       - [x] TRXUSDT LONG K1 Delta compatibility: LONG vs blocked NONE -> PASS
@@ -440,7 +440,7 @@ Omit no check group, except after a C0 failure: write `N/A` when a check does no
       - [x] C0.4 Risk profile: risk_per_trade_usdt, leverage_standard present -> PASS
       - [x] C1.1 Portfolio delta_bias_incl_resting: DELTA_BALANCED -> DELTA_BALANCED
       - [x] C1.2 Blocked direction: none -> NONE
-      - [x] C1.3 Daily loss gate: none -> NOT ACTIVE
+      - [x] C1.3 Daily loss gate: blocked false -> NOT ACTIVE
       - [x] C2.1 BTC allows altcoin shorts: allows_alt_shorts true, BEARISH_ABSORPTION -> YES
       - [x] C2.2 BTC squeeze/cascade: none -> NO
       - [x] UNIUSDT SHORT K1 Delta compatibility: SHORT vs blocked NONE -> PASS
@@ -485,7 +485,7 @@ Omit no check group, except after a C0 failure: write `N/A` when a check does no
       - [x] C0.4 Risk profile: risk_per_trade_usdt, leverage_standard, leverage_yolo and yolo_margin_usdt present -> PASS
       - [x] C1.1 Portfolio delta_bias_incl_resting: LONG_HEAVY -> LONG_HEAVY
       - [x] C1.2 Blocked direction: LONG_HEAVY blocks additional LONGs -> LONG
-      - [x] C1.3 Daily loss gate: none -> NOT ACTIVE
+      - [x] C1.3 Daily loss gate: blocked false -> NOT ACTIVE
       - [x] C2.1 BTC allows altcoin shorts: allows_alt_shorts true -> YES
       - [x] C2.2 BTC squeeze/cascade: none -> NO
       - [ ] 1000PEPEUSDT LONG (YOLO) K1 Delta compatibility: LONG vs blocked LONG -> BLOCKED ([DELTA_GATE_REJECTION])
@@ -529,7 +529,7 @@ Omit no check group, except after a C0 failure: write `N/A` when a check does no
       - [x] C0.4 Risk profile: risk_per_trade_usdt, leverage_standard, leverage_yolo and yolo_margin_usdt present -> PASS
       - [x] C1.1 Portfolio delta_bias_incl_resting: DELTA_BALANCED (empty book) -> DELTA_BALANCED
       - [x] C1.2 Blocked direction: none -> NONE
-      - [x] C1.3 Daily loss gate: none -> NOT ACTIVE
+      - [x] C1.3 Daily loss gate: blocked false -> NOT ACTIVE
       - [x] C2.1 BTC allows altcoin shorts: allows_alt_shorts true -> YES
       - [x] C2.2 BTC squeeze/cascade: none -> NO
       - [x] WIFUSDT LONG (YOLO) K1 Delta compatibility: LONG vs blocked NONE -> PASS
@@ -573,7 +573,7 @@ Omit no check group, except after a C0 failure: write `N/A` when a check does no
       - [x] C0.4 Risk profile: risk_per_trade_usdt, leverage_standard present -> PASS
       - [x] C1.1 Portfolio delta_bias_incl_resting: UNKNOWN, pending_entries_status UNREADABLE -> UNREADABLE
       - [x] C1.2 Blocked direction: resting exposure unmeasurable -> BOTH
-      - [x] C1.3 Daily loss gate: none -> NOT ACTIVE
+      - [x] C1.3 Daily loss gate: blocked false -> NOT ACTIVE
       - [x] C2.1 BTC allows altcoin shorts: allows_alt_shorts true, BEARISH_ABSORPTION -> YES
       - [x] C2.2 BTC squeeze/cascade: none -> NO
       - [ ] ADAUSDT SHORT K1 Delta compatibility: SHORT vs blocked BOTH -> BLOCKED ([DELTA_GATE_REJECTION])
@@ -614,7 +614,7 @@ Omit no check group, except after a C0 failure: write `N/A` when a check does no
       - [x] C0.4 Risk profile: risk_per_trade_usdt, leverage_standard present -> PASS
       - [x] C1.1 Portfolio delta_bias_incl_resting: LONG_HEAVY (delta_bias DELTA_BALANCED plus 2 resting LONG entries) -> LONG_HEAVY
       - [x] C1.2 Blocked direction: LONG_HEAVY incl. resting entries blocks additional LONGs -> LONG
-      - [x] C1.3 Daily loss gate: none -> NOT ACTIVE
+      - [x] C1.3 Daily loss gate: blocked false -> NOT ACTIVE
       - [x] C2.1 BTC allows altcoin shorts: allows_alt_shorts true -> YES
       - [x] C2.2 BTC squeeze/cascade: none -> NO
       - [ ] DOTUSDT LONG K1 Delta compatibility: LONG vs blocked LONG -> BLOCKED ([DELTA_GATE_REJECTION])
@@ -655,7 +655,7 @@ Omit no check group, except after a C0 failure: write `N/A` when a check does no
       - [x] C0.4 Risk profile: risk_per_trade_usdt, leverage_standard present -> PASS
       - [x] C1.1 Portfolio delta_bias_incl_resting: DELTA_BALANCED (empty book) -> DELTA_BALANCED
       - [x] C1.2 Blocked direction: none -> NONE
-      - [x] C1.3 Daily loss gate: none -> NOT ACTIVE
+      - [x] C1.3 Daily loss gate: blocked false -> NOT ACTIVE
       - [x] C2.1 BTC allows altcoin shorts: allows_alt_shorts true -> YES
       - [x] C2.2 BTC squeeze/cascade: none -> NO
       - [x] K1-K5 and C3.1 Per-candidate gates: filtered_opportunities, stat_arb_pairs and YOLO slot are empty -> N/A
@@ -695,7 +695,7 @@ Omit no check group, except after a C0 failure: write `N/A` when a check does no
       - [x] C0.4 Risk profile: risk_per_trade_usdt present, leverage_standard 3 -> PASS
       - [x] C1.1 Portfolio delta_bias_incl_resting: DELTA_BALANCED (empty book) -> DELTA_BALANCED
       - [x] C1.2 Blocked direction: none -> NONE
-      - [x] C1.3 Daily loss gate: none -> NOT ACTIVE
+      - [x] C1.3 Daily loss gate: blocked false -> NOT ACTIVE
       - [x] C2.1 BTC allows altcoin shorts: allows_alt_shorts true -> YES
       - [x] C2.2 BTC squeeze/cascade: none -> NO
       - [x] RLCUSDT SHORT K1 Delta compatibility: SHORT vs blocked NONE, macro_short_check climax>=2.5x -> PASS
@@ -732,6 +732,30 @@ Omit no check group, except after a C0 failure: write `N/A` when a check does no
         ],
         "summary": "RLCUSDT Short kept at Tier A (squeeze risk); requires user confirmation."
       }
+      </dossier_json>
+    </final_response>
+  </example>
+
+  <!-- EXAMPLE 13: NEGATIVE - DAILY LOSS GATE ACTIVE -->
+  <example id="eval_neg_08_daily_loss_gate_active">
+    <scenario>PROD, FLAT. `daily_loss_gate: {blocked: true, scope: "all"}`. SOLUSDT LONG Tier S 88.</scenario>
+    <user_input>Evaluate the primed brief.</user_input>
+    <final_response>
+      # QUANTITATIVE EVALUATION MASTER DOSSIER
+      ## Precondition Checklist
+      - [x] C0.1 Brief source: view_file -> file
+      - [x] C0.2 Brief age: 1 min -> PASS
+      - [x] C0.3 Environment: PROD = PROD -> PASS
+      - [x] C0.4 Risk profile: present -> PASS
+      - [x] C1.1 Portfolio delta_bias_incl_resting: flat -> DELTA_BALANCED
+      - [x] C1.2 Blocked direction: none -> NONE
+      - [ ] C1.3 Daily loss gate: blocked true, scope all -> ACTIVE (scope all: REJECTED)
+      - [ ] C4.2 Overall status: DAILY_LOSS_GATE -> REJECTED
+      (sent to the parent via send_message)
+      <dossier_json>
+      {"status": "REJECTED", "evaluator_agent": "isolated_market_evaluator", "target_env": "PROD",
+       "brief_source": "file", "brief_generated_at_ts": 1790000000, "approved_symbols": [], "approved_candidates": [],
+       "summary": "DAILY_LOSS_GATE: no entries until 00:00 UTC."}
       </dossier_json>
     </final_response>
   </example>

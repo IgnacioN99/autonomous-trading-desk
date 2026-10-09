@@ -1941,6 +1941,7 @@ def check_daily_loss_gate(target_env, is_yolo_order, prof, equity_now, *, open_p
         state = dlg.evaluate(net, view.get("trades") or [], risk_pct=profile_risk_fraction(prof),
                              equity_now=equity_now, is_yolo_order=is_yolo_order, **up.get_daily_loss_limits(prof))
         state["is_yolo_order"] = is_yolo_order
+        dlg.note_unaudited_closing_symbols(state, view.get("unaudited_closing_symbols") or [])  # informational
         if other_asset:
             state["non_usdt_commission"] = True  # left out of the USDT sum; those trades have gross R only
         if state.get("blocked"):
@@ -3899,13 +3900,18 @@ def execute_complete_trade(
                     "error": f"FAIL-CLOSED: Cannot verify account equity for PROD ({e}). Order blocked."}
         account_equity = 10000.0  # Safe testnet sandbox fallback
 
+    profile_unreadable = False
     try:
         import user_profile as up
         prof = up.load_user_profile()
         max_margin_ratio = float(prof.get("max_margin_ratio", 0.30))
-    except Exception:
+    except Exception as e:
         prof = {}
         max_margin_ratio = 0.30
+        # Issue #207 round 4: the defaults apply (never a block), but the fallback is visible
+        profile_unreadable = True
+        print(f"⚠️ user profile unreadable ({type(e).__name__}: {e}); default limits applied (Daily Loss Gate, "
+              "sizing).", file=sys.stderr)
 
     # Dynamic margin scaling: if margin_usdt is None or default 100.0, scale dynamically
     margin_defaulted = margin_usdt is None or margin_usdt == 100.0
@@ -4023,6 +4029,8 @@ def execute_complete_trade(
         target_env, is_yolo or _dossier_candidate_is_yolo(_eval_cand), prof, account_equity,
         open_positions=([(p["symbol"], p["side"]) for p in live_snapshot["exposure"]["active_positions"]]
                         if live_snapshot else None))
+    if profile_unreadable and isinstance(daily_state, dict):
+        daily_state = dict(daily_state, profile_unreadable=True)  # round 4: carried into the audit record
     if not daily_ok:
         return {"success": False, "hard_gate_rejection": True, "daily_loss_gate_rejection": True,
                 "error": daily_reason, "daily_loss_gate": daily_state}
@@ -4445,6 +4453,8 @@ def execute_complete_trade(
         }
         record.update(score_audit_fields(score_meta))
         record['daily_loss_gate'] = daily_state  # issue #207: the gate state this entry passed
+        if profile_unreadable:
+            record['profile_unreadable'] = True  # round 4: sized and gated on the default profile
         append_trade_audit_record(record, margin_usdt)
 
         return {

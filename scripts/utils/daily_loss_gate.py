@@ -113,6 +113,22 @@ def evaluate(fills_net_pnl_usdt: Any, trades: Iterable[dict], *, risk_pct: Any, 
     return state
 
 
+UNAUDITED_SYMBOLS_CAP = 10
+
+
+def note_unaudited_closing_symbols(state: dict, symbols: Iterable[str]) -> dict:
+    """Informational only (issue #207 round 4; never blocks): closing fills today of symbols with no audit record
+    (e.g. manual trades) count in the USDT figure but not in the streak. state["unaudited_closing_symbols"] = the
+    sorted symbols (at most UNAUDITED_SYMBOLS_CAP); when non-empty the reason names them."""
+    syms = sorted({str(s).upper() for s in symbols or [] if str(s or "").strip()})[:UNAUDITED_SYMBOLS_CAP]
+    state["unaudited_closing_symbols"] = syms
+    if syms:
+        note = (f"unaudited_closing_symbols={','.join(syms)} (closing fills without an audit record: in the USDT "
+                "figure, not in the consecutive-SL streak)")
+        state["reason"] = f"{state['reason']}; {note}" if state.get("reason") else f"DAILY LOSS GATE: inactive; {note}"
+    return state
+
+
 def _evaluate(fills_net_pnl_usdt, trades, *, risk_pct, equity_now, daily_stop_r, max_consecutive_sl,
               yolo_max_daily_losses, is_yolo_order) -> dict:
     net, risk, equity, stop_r = (_num(fills_net_pnl_usdt), _num(risk_pct), _num(equity_now), _num(daily_stop_r))
