@@ -13,11 +13,14 @@ this guard included, live).
   * Edit / Write / MultiEdit / NotebookEdit: the absolute target must be inside a linked worktree of this
     repository (never the main checkout), and never under .git/, .claude/, .agents/hooks.json or logs/ (except
     logs/issue_work/). Never the running guard file (os.path.realpath(__file__), which matters when a session
-    runs from a worktree) nor a worktree's logs/issue_work/guard_heartbeat.json or fixer_binding.json.
-  * Read / Grep / Glob: allowed, except a path under <main checkout>/logs/issue_work_keys/ (the heartbeat keys),
-    a Grep `glob` or Glob `pattern` naming that directory, and a Grep with a `glob` over a directory that holds
-    it (ripgrep's glob filters override .gitignore). Any other Grep or Glob over the main checkout relies on the
-    .gitignore entry for that directory, which ripgrep honours. Reads neither claim nor write the heartbeat.
+    runs from a worktree) nor a worktree's logs/issue_work/guard_heartbeat.json or fixer_binding.json. These
+    names are compared case-folded (`LOGS/`, `.GIT/` and `.CLAUDE/` are the same directories on DrvFs).
+  * Read / Grep / Glob: allowed, except the heartbeat keys in <main checkout>/logs/issue_work_keys/ (compared
+    case-folded, plus st_dev / st_ino for other names of that directory): a path with an `issue_work_keys`
+    component, a Grep `glob` or Glob `pattern` naming it, a Grep `glob` that can match `<N>.key` (unparseable
+    globs such as braces count as a match), and any Grep or Glob rooted at that directory, under it or at an
+    ancestor of it (the main checkout included), with or without a glob. Git runs only for the rules that need
+    the main checkout (check_read_tool). Reads neither claim nor write the heartbeat.
   * Bash:
       - a command containing a carriage return is denied (send LF line endings): bash reads `\\r` as a word
         character, so `cd x<CR>` would name another directory than the one the guard sees;
@@ -67,7 +70,7 @@ or unsigned heartbeat and casual forgery, not a determined one: if the frontmatt
 fixer is unguarded and could read the key and sign a heartbeat itself.
 
 Contract (Claude Code hooks): hook JSON on stdin; exit 0 allows, exit 2 denies (reason on stderr). Malformed input
-or an unresolvable repository is denied (fail closed).
+or an unresolvable repository is denied (fail closed); a read that needs no main-checkout rule never resolves it.
 """
 
 import glob
@@ -214,6 +217,8 @@ HEARTBEAT_FILE = "guard_heartbeat.json"
 PROTECTED_WORK_FILES = {f"{WORK_DIR}/{BINDING_FILE}", f"{WORK_DIR}/{HEARTBEAT_FILE}"}
 # In the MAIN checkout: <N>.key per issue, written by issue_workspace.py init (gitignored)
 KEYS_DIR = "logs/issue_work_keys"
+KEYS_DIR_NAME = "issue_work_keys"
+KEY_FILE_CHARS = set("0123456789.key")  # every character of a key file name, <N>.key
 # Fields covered by the heartbeat HMAC; issue_workspace.py check-guard recomputes it over the same fields
 SIGNED_FIELDS = ("ts", "worktree", "issue", "decision", "session_id", "binding_claim")
 CR_MESSAGE = "carriage return in command; send LF line endings"
@@ -228,29 +233,61 @@ class Denied(Exception):
 
 
 class Confinement:
-    """The main checkout (off limits) and the linked worktrees (where the fixer may work)."""
+    """The main checkout (off limits) and the linked worktrees (where the fixer may work). Built from a project
+    directory, both are resolved with git on first use (main_root / worktrees), so a read that needs neither
+    spawns no git; a failed lookup raises Denied."""
 
-    def __init__(self, main_root: str, worktrees: list):
-        self.main_root = os.path.realpath(main_root)
-        self.worktrees = [os.path.realpath(w) for w in worktrees if os.path.realpath(w) != self.main_root]
+    def __init__(self, main_root: str = "", worktrees: list = (), project_dir: str = ""):
+        self._project_dir = project_dir
+        self._main_root = self._worktrees = None
+        if main_root:
+            self._set(main_root, worktrees)
+
+    def _set(self, main_root: str, worktrees) -> None:
+        self._main_root = os.path.realpath(main_root)
+        self._worktrees = [os.path.realpath(w) for w in worktrees if os.path.realpath(w) != self._main_root]
 
     @classmethod
     def from_project_dir(cls, project_dir: str) -> "Confinement":
-        common = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
-                                cwd=project_dir, capture_output=True, text=True, timeout=10)
-        if common.returncode != 0:
-            raise Denied(f"cannot resolve the repository from {project_dir}")
-        main_root = os.path.dirname(common.stdout.strip().rstrip("/"))
-        listing = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=main_root,
-                                 capture_output=True, text=True, timeout=10)
+        return cls(project_dir=project_dir)
+
+    def _resolve(self) -> None:
+        try:
+            common = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                                    cwd=self._project_dir, capture_output=True, text=True, timeout=10)
+            if common.returncode != 0:
+                raise Denied(f"cannot resolve the repository from {self._project_dir}")
+            main_root = os.path.dirname(common.stdout.strip().rstrip("/"))
+            listing = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=main_root,
+                                     capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError) as e:
+            raise Denied(f"cannot resolve the repository from {self._project_dir} ({e})")
         if listing.returncode != 0:
             raise Denied("cannot list the repository worktrees")
-        trees = [ln[len("worktree "):] for ln in listing.stdout.splitlines() if ln.startswith("worktree ")]
-        return cls(main_root, trees)
+        self._set(main_root, [ln[len("worktree "):] for ln in listing.stdout.splitlines()
+                              if ln.startswith("worktree ")])
+
+    @property
+    def main_root(self) -> str:
+        if self._main_root is None:
+            self._resolve()
+        return self._main_root
+
+    @property
+    def worktrees(self) -> list:
+        if self._worktrees is None:
+            self._resolve()
+        return self._worktrees
 
     @staticmethod
     def _under(path: str, root: str) -> bool:
         return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+
+    @staticmethod
+    def _under_folded(path: str, root: str) -> bool:
+        """_under on the case-folded real paths of both sides: on case-insensitive mounts (DrvFs, /mnt/c) `LOGS`
+        and `logs` are the same directory. Over-denies a case variant on a case-sensitive filesystem."""
+        return Confinement._under(_folded(path), _folded(root))
 
     def in_main(self, path: str) -> bool:
         return self._under(os.path.realpath(path), self.main_root)
@@ -260,27 +297,43 @@ class Confinement:
         return next((w for w in self.worktrees if self._under(real, w)), "")
 
 
+def _folded(path: str) -> str:
+    """The real path, case-folded: the comparison key of the case-insensitive checks."""
+    return os.path.normcase(os.path.realpath(path)).casefold()
+
+
+def _same_file(a: str, b: str) -> bool:
+    """Same file or directory by st_dev / st_ino (catches aliases such as another case or a short name). Only an
+    extra reason to deny: a failed stat answers False and never allows anything by itself."""
+    try:
+        return os.path.samestat(os.stat(a), os.stat(b))
+    except (OSError, ValueError):
+        return False
+
+
 # --------------------------------------------------------------------------------------------------
 # Edit tools (and Bash write targets inside the issue worktree)
 # --------------------------------------------------------------------------------------------------
 def _check_tree_write(shown: str, real: str, tree: str) -> None:
-    """Rules for any write inside a worktree, whichever tool makes it."""
-    if real == RUNNING_GUARD:
+    """Rules for any write inside a worktree, whichever tool makes it. The names are compared case-folded, so on a
+    case-insensitive mount `LOGS/`, `.GIT/` or `.CLAUDE/` are denied like their lower-case forms."""
+    if _folded(real) == _folded(RUNNING_GUARD) or _same_file(real, RUNNING_GUARD):
         raise Denied(f"{shown} is the running guard (off limits)")
     rel = os.path.relpath(real, tree).replace(os.sep, "/")
     if rel == ".":
         raise Denied(f"{shown}: the worktree root itself cannot be a write target")
-    parts = rel.split("/")
+    folded = rel.casefold()
+    parts = folded.split("/")
     if ".git" in parts:
         raise Denied(f"{shown}: git internals are off limits")
     if parts[0] == ".claude":
         raise Denied(f"{shown}: .claude/ is generated or local configuration (edit .agents/ and run the generator)")
-    if rel == ".agents/hooks.json":
+    if folded == ".agents/hooks.json":
         raise Denied(f"{shown}: hook configuration is off limits")
     if parts[0] == "logs" and (len(parts) < 3 or parts[1] != "issue_work"):
         raise Denied(f"{shown}: only logs/issue_work/ may be written under logs/")
-    if rel in PROTECTED_WORK_FILES:
-        raise Denied(f"{shown}: {parts[-1]} is written only by the guard and issue_workspace.py")
+    if folded in PROTECTED_WORK_FILES:
+        raise Denied(f"{shown}: {rel.split('/')[-1]} is written only by the guard and issue_workspace.py")
 
 
 def check_edit_path(path, conf: Confinement) -> None:
@@ -1189,24 +1242,137 @@ def write_heartbeat(tree: str, tool, reason: str, session_id, binding_claim: str
         pass
 
 
+def _glob_literals(component: str):
+    """The literal characters of one glob component (outside `[...]` classes, `\\x` escapes resolved), or None
+    when it does not parse (an unclosed class or a trailing backslash)."""
+    literals, i, n = [], 0, len(component)
+    while i < n:
+        c = component[i]
+        if c == "\\":
+            if i + 1 == n:
+                return None
+            literals.append(component[i + 1])
+            i += 2
+        elif c == "[":
+            j = i + 1
+            if j < n and component[j] in "!^":
+                j += 1
+            if j < n and component[j] == "]":  # a `]` first in the class is a member
+                j += 1
+            end = component.find("]", j)
+            if end < 0:
+                return None
+            i = end + 1
+        else:
+            if c not in "*?":
+                literals.append(c)
+            i += 1
+    return literals
+
+
+def _glob_can_match_key(glob: str) -> bool:
+    """True when a Grep `glob` can match a heartbeat key file (`<N>.key`) or the keys directory's name. A glob
+    that does not parse (braces, a `!` negation, an unclosed class, a directory-only `x/`) counts as a match.
+    Over-approximates (fail closed): a wildcard glob matches when all its literal characters fit those names,
+    so `*`, `**/*`, `*.key` or `?.k*` match and `*.py` does not."""
+    folded = glob.casefold()
+    if not folded or "{" in folded or "}" in folded or folded.startswith("!") or folded.endswith("/"):
+        return True
+    component = folded.rsplit("/", 1)[-1]
+    literals = _glob_literals(component)
+    if literals is None:
+        return True
+    if not any(ch in component for ch in "*?["):
+        name = "".join(literals)
+        return bool(re.fullmatch(r"\d+\.key", name)) or name == KEYS_DIR_NAME
+    return set(literals) <= KEY_FILE_CHARS or set(literals) <= set(KEYS_DIR_NAME)
+
+
+def _has_keys_component(path: str) -> bool:
+    """A real path with an `issue_work_keys` component, in any case (whatever the repository)."""
+    return KEYS_DIR_NAME in _folded(path).split(os.sep)
+
+
+def _keys_alias(path: str) -> bool:
+    """True when the path or one of its ancestors is the same directory (st_dev / st_ino) as a sibling named
+    issue_work_keys: another name for the keys directory (a case variant or a short name)."""
+    current = os.path.realpath(path)
+    while True:
+        parent = os.path.dirname(current)
+        sibling = os.path.join(parent, KEYS_DIR_NAME)
+        if os.path.isdir(sibling) and _same_file(current, sibling):
+            return True
+        if parent == current:
+            return False
+        current = parent
+
+
+def _holds_keys(root: str) -> bool:
+    """A directory with logs/issue_work_keys/ or issue_work_keys/ right inside it (a main checkout or its logs/)."""
+    return os.path.isdir(os.path.join(root, KEYS_DIR)) or os.path.isdir(os.path.join(root, KEYS_DIR_NAME))
+
+
+def _in_linked_worktree(root: str) -> bool:
+    """True when the nearest `.git` at or above root is a `gitdir:` file: root is inside a linked worktree (or a
+    submodule). git never creates a worktree around an existing directory, so it cannot hold the main checkout."""
+    current = root
+    while True:
+        dot_git = os.path.join(current, ".git")
+        if os.path.lexists(dot_git):
+            if not os.path.isfile(dot_git):
+                return False
+            try:
+                with open(dot_git, encoding="utf-8") as f:
+                    return f.read(8) == "gitdir: "
+            except (OSError, ValueError):
+                return False
+        parent = os.path.dirname(current)
+        if parent == current:
+            return False
+        current = parent
+
+
 def check_read_tool(tool: str, tool_input: dict, conf: Confinement, cwd) -> None:
-    """Read / Grep / Glob may read anything except the heartbeat keys under <main checkout>/logs/issue_work_keys/:
-    a path under that directory, a Grep `glob` or Glob `pattern` naming it, or a Grep with a `glob` over a
-    directory that holds it (ripgrep's glob filters override .gitignore). Without a `glob`, Grep and Glob over
-    the main checkout rely on the .gitignore entry of that directory."""
-    keys = os.path.join(conf.main_root, KEYS_DIR)
-    base = cwd if isinstance(cwd, str) and os.path.isabs(cwd) else conf.main_root
+    """Read / Grep / Glob may read anything except the heartbeat keys under <main checkout>/logs/issue_work_keys/
+    (compared case-folded, plus st_dev / st_ino for other names of that directory):
+      * any tool: a target with an `issue_work_keys` component, or a Grep `glob` / Glob `pattern` naming it;
+      * Grep: a `glob` that can match `<N>.key` or the directory's name (_glob_can_match_key), whatever the path;
+      * Grep / Glob: a root that is the keys directory, under it or an ancestor of it (the main checkout, its
+        logs/, every directory above), with or without a glob: never rely on .gitignore.
+    Git runs only when the rule needs the main checkout: a Read never (unless its relative path has no absolute
+    cwd), a Grep / Glob only when its root is not inside a linked worktree, is an ancestor of the session's cwd or
+    the call has no absolute cwd; a failed lookup denies."""
     target = tool_input.get("file_path") if tool == "Read" else tool_input.get("path")
-    root = os.path.realpath(target if isinstance(target, str) and os.path.isabs(target)
-                            else os.path.join(base, target if isinstance(target, str) else ""))
-    if Confinement._under(root, keys):
-        raise Denied(f"{target}: the heartbeat keys ({KEYS_DIR}/ of the main checkout) are off limits")
     pattern = tool_input.get("glob") if tool == "Grep" else tool_input.get("pattern") if tool == "Glob" else None
-    if isinstance(pattern, str) and "issue_work_keys" in pattern:
-        raise Denied(f"{pattern}: the heartbeat keys ({KEYS_DIR}/ of the main checkout) are off limits")
-    if tool == "Grep" and isinstance(pattern, str) and pattern and Confinement._under(keys, root):
-        raise Denied(f"Grep with a glob over {root}, which holds the heartbeat keys ({KEYS_DIR}/; a glob filter "
-                     "overrides .gitignore): pass a path inside the issue worktree")
+    off_limits = f"the heartbeat keys ({KEYS_DIR}/ of the main checkout) are off limits"
+    if isinstance(pattern, str) and KEYS_DIR_NAME in pattern.casefold():
+        raise Denied(f"{pattern}: {off_limits}")
+    if tool == "Grep" and isinstance(pattern, str) and pattern and _glob_can_match_key(pattern):
+        raise Denied(f"Grep glob {pattern!r} can match the heartbeat keys ({KEYS_DIR}/<N>.key; a glob filter "
+                     "overrides .gitignore): use a narrower glob such as '*.py'")
+    has_cwd = isinstance(cwd, str) and os.path.isabs(cwd)
+    rel = target if isinstance(target, str) else ""
+    if os.path.isabs(rel):
+        root = os.path.realpath(rel)
+    else:
+        root = os.path.realpath(os.path.join(cwd if has_cwd else conf.main_root, rel))
+    if _has_keys_component(root) or _keys_alias(root):
+        raise Denied(f"{target}: {off_limits}")
+    if tool == "Read":
+        return
+    holds = f"{tool} over {root}, which holds the heartbeat keys ({KEYS_DIR}/): pass a path inside the issue worktree"
+    if _holds_keys(root):
+        raise Denied(holds)
+    if has_cwd and _in_linked_worktree(root) and not Confinement._under_folded(cwd, root):
+        return
+    keys = os.path.join(conf.main_root, KEYS_DIR)
+    if Confinement._under_folded(root, keys):
+        raise Denied(f"{target}: {off_limits}")
+    above = [keys]
+    while os.path.dirname(above[-1]) != above[-1]:
+        above.append(os.path.dirname(above[-1]))
+    if Confinement._under_folded(keys, root) or any(_same_file(root, a) for a in above):
+        raise Denied(holds)
 
 
 def evaluate_payload(payload: dict, conf: Confinement) -> str:
@@ -1247,11 +1413,14 @@ def main() -> int:
     tool = payload.get("tool_name")
     if tool not in EDIT_TOOLS | READ_TOOLS | {"Bash"}:
         return 0
-    try:
-        conf = Confinement.from_project_dir(os.environ.get("CLAUDE_PROJECT_DIR") or payload.get("cwd") or ".")
-    except (Denied, OSError, subprocess.SubprocessError) as e:
-        print(f"issue_fixer_guard: {e}; denied (fail closed).", file=sys.stderr)
-        return 2
+    # Reads resolve the repository only when a rule needs it (check_read_tool); every other tool needs it now
+    conf = Confinement.from_project_dir(os.environ.get("CLAUDE_PROJECT_DIR") or payload.get("cwd") or ".")
+    if tool not in READ_TOOLS:
+        try:
+            conf.main_root
+        except Denied as e:
+            print(f"issue_fixer_guard: {e}; denied (fail closed).", file=sys.stderr)
+            return 2
     try:
         reason = evaluate_payload(payload, conf)
     except Exception as e:  # noqa: BLE001 - an unexpected error must deny, never fall through
@@ -1263,7 +1432,11 @@ def main() -> int:
             tree = ""
         session_id = payload.get("session_id")
         claim = claim_binding(tree, session_id) if not reason else "n/a"
-        write_heartbeat(tree, tool, reason, session_id, claim, conf.main_root)
+        try:
+            main_root = conf.main_root
+        except Denied:
+            main_root = ""
+        write_heartbeat(tree, tool, reason, session_id, claim, main_root)
     if reason:
         print(f"BLOCKED by issue_fixer_guard: {reason}. This guard is a confinement policy, not a sandbox (a "
               "denylist plus path rules; Claude Code only). Work only inside the issue worktree; allowed shell: "

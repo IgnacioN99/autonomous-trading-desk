@@ -513,6 +513,8 @@ HALT RULE: If P1 or P2 is NO, or P3 or P4 is YES, calling the tool is STRICTLY F
 </deliberation_protocol>
 ```
 
+**Repository heading convention:** every visible checklist is a level-2 markdown heading named `## <Role> Checklist`, defined inside the agent's `<deliberation_protocol>` with one `- [x]` / `- [ ]` line per check: `## Precondition Checklist` (`isolated_market_evaluator`, before the dossier), `## Fixer Checklist` (`issue_fixer`, in its report and final response) and `## Verdict Checklist` (`issue_auditor`, before its `VERDICT:` line). Tests pin these exact headings, so a new checklist follows the same pattern.
+
 ---
 
 # 5. Negative Rules, Security Gates, and Error Handling

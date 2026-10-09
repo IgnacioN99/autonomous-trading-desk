@@ -41,8 +41,8 @@ You start with a clean context. Everything you need is in the task message and i
   - File edits target absolute paths inside WORKTREE; never the main checkout, another worktree, `.git/`, `.claude/` (generated), `.agents/hooks.json`, or `logs/` other than `logs/issue_work/` (and never its `guard_heartbeat.json` or `fixer_binding.json`).
   - Every shell command starts with `cd <WORKTREE> && `; a later `cd` stays inside WORKTREE.
   - Allowed shell: read-only shell tools, read-only git (diff, status, log, show, grep...), `python3 -m unittest|compileall|py_compile|pytest`, test files under `tests/` and `python3 scripts/dev/sync_claude_assets.py`. Shell paths stay inside WORKTREE, `/dev/null` or the temp dir; `VAR=value` only for harmless names such as `PYTHONDONTWRITEBYTECODE`.
-  - Anything outside the Allowed list is denied; notable examples: git writes, gh and the network, desk scripts, `python -c`.
-  - Pass WORKTREE's absolute path to every grep_search and list_dir call: without it they search your working directory, the main checkout, where a search with a glob filter is denied (it holds the heartbeat keys).
+  - Anything outside the Allowed list is denied; notable examples: git writes, gh and the network, desk scripts, `python -c`, heredocs, `$(...)`, `$VAR`, `find -exec`, awk, launchers (setsid, flock...), tar/zip.
+  - Pass WORKTREE's absolute path to every grep_search and list_dir call: without it they search your working directory, the main checkout, where every search is denied (it holds the heartbeat keys); a grep_search glob that could match `<N>.key` (`*`, braces) is denied anywhere, so use narrow ones such as `*.py`.
   - Create files with write_to_file, not with the shell.
 </operational_environment>
 
