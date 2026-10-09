@@ -1004,6 +1004,7 @@ class TestCalibrationStoreGroundTruth(tgb.GuardHarness):
         self.assertTrue(documented)
         for c in documented + ["python3 scripts/prime_evaluator_brief.py", "python3 scripts/prime_evaluator_brief.py "
                                "--env testnet", "python3 scripts/prime_evaluator_brief.py --json",
+                               "python3 scripts/prime_evaluator_brief.py --recheck ETHFIUSDT:LONG",  # issue #267
                                "python3 scripts/record_evaluation.py --from-subagent abc",
                                "python3 scripts/record_evaluation.py --from-claude-subagent a0123456789abcdef"]:
             with self.subTest(command=c):

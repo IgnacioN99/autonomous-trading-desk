@@ -68,7 +68,7 @@ graph TD
 ### 1. Deterministic Mechanical Hard Gates (PreToolUse Interception)
 Natural language instructions are not a reliable safety barrier in live financial trading. ATD rejects the antipattern of relying on the LLM's stochastic memory to enforce risk boundaries. Instead, runtime **PreToolUse hooks physically intercept every order execution attempt at the OS level**:
 - **Single Choke Point Enforcement:** Direct calls to exchange order tools are mechanically blocked. All orders must pass through `scripts/execute_futures_trade.py`; there is no MCP wrapper (calls to the retired `crypto_radar` MCP server are denied).
-- **Mandatory Clean-Room Evaluation:** Orders require a non-expired (<20m) dossier in `logs/evaluations/latest_dossier.json`, recorded from the evaluator subagent transcript with `record_evaluation.py --from-subagent` and re-verified (sha256 provenance), approving the symbol and direction. Hand-written dossiers are rejected in PROD.
+- **Mandatory Clean-Room Evaluation:** Orders require a non-expired (<20m) dossier in `logs/evaluations/latest_dossier.json`, recorded from the evaluator subagent transcript with `record_evaluation.py --from-subagent` and re-verified (sha256 provenance), approving the symbol and direction. Hand-written dossiers are rejected in PROD. A confirmation that arrives after expiry goes through a targeted re-check (`prime_evaluator_brief.py --recheck`, a new dossier through the same flow), never around the expiry check.
 - **Delta-Neutral Gate:** The hook pre-checks the cached `logs/session_state.json`; the executor's authoritative gate re-reads the exchange (filled positions plus resting opening orders). If the portfolio marks `LONG_HEAVY`, a `LONG` order is rejected with `hard_gate_rejection: True` before any order is sent; if `SHORT_HEAVY`, additional `SHORT` orders are blocked. On a non-empty book, an order whose own notional would tip it heavy in its direction is rejected too. Its opportunity cost is measured report-only by the shadow desk (`scripts/shadow_analytics.py`: regret in R of delta-blocked candidates against their blockers, plus a policy replay); nothing there changes the gate. When the hook denies a dossier-approved candidate on this gate it appends the event (cached book, dossier prices) to its own log `logs/gate_denials.jsonl` (written only by the hook), which the shadow tracker turns into a `DELTA_GATE_POST_APPROVAL` row; denials by the executor's live gate are not recorded.
 - **Dynamic Equity Risk Gate:** Maximum monetary loss is capped to the user's calibrated equity risk profile (default 0.5% of equity + 1.25x buffer, e.g. ~$62.50 on $10k), where equity is min(live wallet balance, balance + unrealized PnL of the open positions): open losses lower the cap, open gains never raise it. Position sizing still uses the wallet balance, so with large open losses a full-size standard order is rejected rather than sized down. Exception: when a trigger is already crossed and the order enters at the current price, an explicit standard margin (sized for the trigger) is clamped so the loss at SL, from the same reference as the crossed-trigger R:R gate, fits `RISK_CLAMP_HAIRCUT` (98%, `scripts/utils/gate_limits.py`) of the cap; a clamped size below the exchange minimum is rejected.
 - **Financial Friction Floor:** Orders where distance to TP1 is less than 0.35% are physically blocked, ensuring taker fees and bid-ask spread never consume the statistical edge.
@@ -168,6 +168,7 @@ This configures:
   is asked and the order needs `--confirmed`. The radar score is a heuristic, not a probability; until a bucket
   qualifies every Tier S asks the user.
 - Daily Loss Gate limits (`daily_stop_r` 3.0, `max_consecutive_sl` 2, `yolo_max_daily_losses` 1; see the gate above).
+- Re-check bounds (`recheck_max_drift_r` 0.25, range (0, 2]; `recheck_max_age_seconds` 1800, range 300-7200; invalid = default): when a confirmed candidate is re-checked after its dossier expired, the user's earlier "yes" covers the new plan only within them (see the re-check in step 3 below).
 - Maximum concurrent open positions (default: 3).
 - Overnight handling mode (`ZERO_OVERNIGHT_RISK`).
 - Taleb Barbell YOLO moonshot preference.
@@ -234,6 +235,7 @@ python3 scripts/broad_yolo_scanner.py --json             # memecoin / YOLO moons
 python3 scripts/quant_risk_engine.py parity --json       # also: pairs, kelly
 python3 scripts/fetch_newsletters.py --format json       # research newsletters & catalysts
 python3 scripts/prime_evaluator_brief.py --json          # writes the evaluator brief under logs/ (add --out <path> for a copy)
+python3 scripts/prime_evaluator_brief.py --recheck ETHFIUSDT:LONG   # brief with only that approved candidate's live setup
 ```
 
 Third-party Binance skills (under `.agents/skills/`) may be installed locally but are not part of the flow; agents must never use them to place orders, move funds or sign API requests.
@@ -246,7 +248,8 @@ Every new trade goes through the evaluator subagent; the dossier is never writte
    ```bash
    python3 scripts/record_evaluation.py --from-subagent <conversationId>
    ```
-   The recorder prints approved symbols, directions, `requires_user_confirmation` flags and the validity window (20 min from evaluation). Tier A/A+ candidates, and Tier S candidates whose score bucket is not calibrated, require explicit user confirmation.
+   The recorder prints approved symbols, directions, `requires_user_confirmation` flags and the validity window (20 min from evaluation; the hook and the executor refuse an expired dossier). Tier A/A+ candidates, and Tier S candidates whose score bucket is not calibrated, require explicit user confirmation; state the deadline when asking.
+   If the user confirms after the deadline, `python3 scripts/prime_evaluator_brief.py --recheck SYMBOL:DIRECTION` re-checks that one approved, non-YOLO candidate of the latest provenance-verified dossier (never a dossier that is itself a re-check: bounds are always measured against the original plan, so a second re-check is refused): a normal brief whose only setup is recomputed live by the screener (`recheck.setup_status` `found`, `no_setup` or `unavailable`) plus `recheck_of` (the old dossier sha256 and plan). Evaluate and record it as above; the recorder stores `recheck_of` outside the provenance hash and prints a deterministic bounds verdict (`scripts/utils/recheck_bounds.py`: same symbol and direction, same or higher tier, trigger/SL/TP2 drift within `recheck_max_drift_r` R of the original plan, R:R to TP2 >= 3:1, original evaluation at most `recheck_max_age_seconds` old). Only `WITHIN BOUNDS` lets the agent execute with `--confirmed` without asking again; the verdict is advisory and the gates are unchanged.
 4. Execute through `python3 scripts/execute_futures_trade.py` only (the single choke point).
 
 In TESTNET, the legacy manual recorder (`--env testnet --symbols ... --directions ...`) remains available for experiments; it is refused in PROD.
@@ -460,7 +463,7 @@ autonomous-trading-desk/
 ## 🛡️ Security & Fail-Closed Guarantee
 
 1. **Zero Credential Commits:** Strictly enforced via exhaustive `.gitignore`.
-2. **Atomic Dossier Verification:** The execution hook requires a fresh (<20 min) dossier in `logs/evaluations/latest_dossier.json` whose provenance (sha256 of the `<dossier_json>` block in the evaluator subagent transcript) is re-verified before allowing order dispatch.
+2. **Atomic Dossier Verification:** The execution hook requires a fresh (<20 min) dossier in `logs/evaluations/latest_dossier.json` whose provenance (sha256 of the `<dossier_json>` block in the evaluator subagent transcript) is re-verified before allowing order dispatch. A re-check dossier (`--recheck`) is verified exactly the same way.
 3. **Environment Separation:**
    * **PROD:** All gates (Delta-Neutral, Dynamic Equity Risk, Transaction Fee Floor, Leverage Limit) are 100% rigid and inviolable. Zero exceptions.
    * **TESTNET:** Gates can be bypassed via explicit command flags (`--bypass-delta-gate`, `--bypass-eval-gate`) for stress testing and exploratory development.

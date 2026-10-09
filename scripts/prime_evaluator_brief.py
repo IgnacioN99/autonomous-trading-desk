@@ -15,9 +15,11 @@ Target size: < 1,800 tokens (vs 35,000 tokens of accumulated chat history).
 Zero information loss, zero hallucination in clean-room instances.
 
 Usage:
-  python3 scripts/prime_evaluator_brief.py [--env prod|testnet] [--json] [--out [PATH]]
+  python3 scripts/prime_evaluator_brief.py [--env prod|testnet] [--json] [--out [PATH]] [--recheck SYMBOL:DIRECTION]
     --json        print the brief as JSON instead of Markdown
     --out [PATH]  also write the JSON brief to PATH (default: logs/primed_brief.json)
+    --recheck     brief with only the live setup of one approved candidate of the latest dossier (issue #267,
+                  utils/recheck_brief.py); exit 2 when there is no verified approval of it to re-check
 """
 
 import argparse
@@ -435,13 +437,16 @@ def _brief_max_line(data: Any) -> int:
     return max(len(line) for line in json.dumps(data, ensure_ascii=False, **BRIEF_JSON_FORMAT).split("\n"))
 
 
-def assemble_primed_brief(target_env: str = "prod", out_path: Optional[str] = None) -> dict:
+def assemble_primed_brief(target_env: str = "prod", out_path: Optional[str] = None,
+                          recheck: Optional[dict] = None) -> dict:
+    """`recheck` (issue #267, utils/recheck_brief.prepare_recheck): the single-candidate screening payload, the
+    empty YOLO slot and the recheck / recheck_of blocks of a `--recheck` brief, which replace the full scan."""
     run_id = uuid.uuid4().hex
     state = ensure_fresh_state(target_env=target_env)
     if not isinstance(state, dict):
         state = {}
     sync_failed = bool(state.pop(SYNC_FAILED_KEY, False))
-    screening = get_latest_screening_payload(target_env=target_env, run_id=run_id)
+    screening = recheck["screening"] if recheck else get_latest_screening_payload(target_env=target_env, run_id=run_id)
     risk_profile = build_risk_profile(target_env)
 
     portfolio = state.get("portfolio_exposure", {})
@@ -451,7 +456,9 @@ def assemble_primed_brief(target_env: str = "prod", out_path: Optional[str] = No
 
     yolo_slot = build_yolo_slot_brief(screening)
     unusable = screening_payload_unusable(screening)
-    if risk_profile.get("yolo_slot_enabled"):
+    if recheck:  # issue #267: the YOLO slot is not scanned by a re-check (never counted as a YOLO scan failure)
+        yolo_slot = recheck["yolo_slot"]
+    elif risk_profile.get("yolo_slot_enabled"):
         if unusable:
             yolo_slot = {"status": "UNAVAILABLE", "summary": YOLO_PIPELINE_FAILED_SUMMARY, "candidates": []}
             _record_pipeline_failure(run_id)
@@ -515,6 +522,8 @@ def assemble_primed_brief(target_env: str = "prod", out_path: Optional[str] = No
     # Issue #189: both keys always present (OK or the bad value), so an absent key never reads as OK
     brief["pending_entries_status"] = "UNREADABLE" if resting_bias == "UNKNOWN" else "OK"
     brief["state_sync"] = "FAILED" if sync_failed else "OK"
+    if recheck:  # issue #267: before the lesson budget, so the brief stays under BRIEF_BUDGET_BYTES
+        brief.update(recheck["blocks"])
     # Issue #206: altcoin SHORTs the screener's macro gate dropped (symbols only), so a thin radar is not read as quiet
     rejected_shorts = [r.get("symbol") for r in (screening.get("macro_rejected_shorts") or [])
                        if isinstance(r, dict) and r.get("symbol")]
@@ -815,6 +824,9 @@ def main(argv: Optional[list] = None) -> int:
     parser.add_argument("--json", action="store_true", help="Print the brief as JSON instead of Markdown")
     parser.add_argument("--out", nargs="?", const=BRIEF_FILE, default=None, metavar="PATH",
                         help="Also write the JSON brief to PATH (logs/primed_brief.json is always written)")
+    parser.add_argument("--recheck", default=None, metavar="SYMBOL:DIRECTION",
+                        help="Re-check one approved candidate of the latest dossier (e.g. after it expired) with its "
+                             "live setup only (issue #267)")
     args = parser.parse_args(argv)
 
     try:
@@ -824,11 +836,21 @@ def main(argv: Optional[list] = None) -> int:
         print(f"Invalid environment: {e}", file=sys.stderr)
         return 2
 
-    brief = assemble_primed_brief(target_env=env, out_path=args.out)
+    recheck = None
+    if args.recheck is not None:
+        from utils import recheck_brief
+        try:
+            recheck = recheck_brief.prepare_recheck(args.recheck, env, BASE_DIR)
+        except recheck_brief.RecheckError as e:
+            print(f"Re-check refused: {e}", file=sys.stderr)
+            return 2
+    brief = assemble_primed_brief(target_env=env, out_path=args.out, recheck=recheck)
     if args.json:
         print(json.dumps(brief, indent=2, ensure_ascii=False))
     else:
         print(format_markdown_brief(brief))
+        if recheck:
+            print(recheck_brief.recheck_summary(brief))
     if brief.get("dropped_lessons") or brief.get("lesson_budget_exceeded"):  # issue #271: the exit line
         print(f"Brief lessons: {len(brief.get('committed_memory_lessons') or [])} shown, "
               f"{len(brief.get('dropped_lessons') or [])} dropped for the budget"

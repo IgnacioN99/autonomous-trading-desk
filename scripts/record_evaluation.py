@@ -137,6 +137,57 @@ def build_radar_snapshots(record: dict, base_dir: Optional[str] = None) -> Optio
     return out
 
 
+BRIEF_LINK_WINDOW_S = 600  # the evaluator rejects briefs older than 10 min (prime_evaluator_brief.py)
+
+
+def attach_recheck(record: dict, base_dir: Optional[str] = None, now_ts: Optional[int] = None) -> Optional[str]:
+    """Issue #267: when the brief (logs/primed_brief.json) is a `--recheck` brief and this dossier was evaluated on
+    it, stores the brief's `recheck_of` (old dossier sha256 and its verified plan) and the deterministic bounds
+    verdict (utils/recheck_bounds.py, profile bounds from user_profile.get_recheck_bounds) as `recheck_of` /
+    `recheck_bounds`, outside the provenance sha256 (like radar_snapshots). Linked when the dossier's
+    `brief_generated_at_ts` equals the brief's `generated_at_ts` or, without that field, when the brief precedes the
+    dossier by at most BRIEF_LINK_WINDOW_S. Fails soft: no brief, no recheck_of or no link -> nothing stored.
+    Returns a warning when the brief carries recheck_of but this dossier is not linked to it, else None."""
+    path = os.path.join(base_dir or BASE_DIR, "logs", "primed_brief.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            brief = json.load(f)
+        recheck_of = brief.get("recheck_of")
+        generated_at = int(brief.get("generated_at_ts"))
+    except Exception:
+        return None
+    if not isinstance(recheck_of, dict):
+        return None
+    raw = (record.get("raw_payload") or {}).get("brief_generated_at_ts")
+    ts = int(record.get("timestamp_ts") or 0)
+    try:
+        linked = int(raw) == generated_at if raw is not None else (
+            ts - BRIEF_LINK_WINDOW_S <= generated_at <= ts)
+    except (TypeError, ValueError):
+        linked = False
+    if linked and str(brief.get("target_env") or "").lower() not in ("", str(record.get("target_env") or "").lower()):
+        linked = False
+    if not linked:
+        return ("the brief is a --recheck brief but this dossier was not evaluated on it (brief_generated_at_ts "
+                "differs): not linked to the confirmed plan, ask the user again before executing")
+    record["recheck_of"] = dict(recheck_of)
+    try:
+        from utils import recheck_bounds as rb
+        import user_profile as up
+        try:
+            profile = up.load_user_profile(base_dir or BASE_DIR)
+        except Exception:
+            profile = {}
+        bounds = up.get_recheck_bounds(profile)
+        verdict = rb.evaluate_recheck_bounds(recheck_of, record, int(now_ts if now_ts is not None else time.time()),
+                                             bounds["recheck_max_drift_r"], bounds["recheck_max_age_seconds"])
+        record["recheck_bounds"] = dict(verdict, bounds=bounds)
+    except Exception as e:  # never blocks recording; an unknown verdict asks the user again
+        record["recheck_bounds"] = {"within_bounds": False, "checks": [],
+                                    "reasons": [f"bounds check failed ({type(e).__name__})"]}
+    return None
+
+
 def _persist(record: dict, base_dir: Optional[str] = None, shadow: bool = True) -> str:
     base, dossier_file, history_file = _paths(base_dir)
     try:
@@ -159,6 +210,10 @@ def _persist(record: dict, base_dir: Optional[str] = None, shadow: bool = True) 
         "provenance_source": prov.get("source"),
         "sha256": prov.get("sha256"),
         "summary": record.get("summary", ""),
+        # Issue #267: only on a re-check dossier
+        **({"recheck_of": (record.get("recheck_of") or {}).get("sha256"),
+            "recheck_within_bounds": bool((record.get("recheck_bounds") or {}).get("within_bounds"))}
+           if isinstance(record.get("recheck_of"), dict) else {}),
     })
     if shadow:
         _register_shadow()
@@ -196,6 +251,17 @@ def _print_summary(record: dict, dossier_file: str, base: str, now_ts: int) -> N
         print("   No trade authorized by this dossier.")
     if record.get("summary"):
         print(f"   Summary: {record['summary']}")
+    old = record.get("recheck_of")
+    if isinstance(old, dict):  # issue #267
+        from utils import recheck_bounds as rb
+        lines = rb.format_recheck_verdict(record.get("recheck_bounds") or {})
+        print(f"   Re-check of dossier sha256 {str(old.get('sha256'))[:16]}… ({old.get('symbol')} {old.get('direction')}"
+              f" Tier {old.get('tier')}, entry {old.get('entry')}, SL {old.get('stop_loss')}, TP2 {old.get('tp2')}): "
+              f"{lines[0]}")
+        for line in lines[1:]:
+            print(f"     {line}")
+        print(f"   Deadline: valid until {_fmt_utc(valid_until, '%H:%M:%S UTC')} ({remaining // 60}m "
+              f"{remaining % 60:02d}s left)")
     prov = record.get("provenance") or {}
     if prov.get("source") in dp.SUBAGENT_SOURCES:
         runtime = "Claude Code" if prov.get("source") == dp.CLAUDE_SOURCE else "agy"
@@ -298,6 +364,9 @@ def _record_extracted(
         print(f"⚠️ CHECKLIST WARNING ({env.upper()}, status {record.get('status')}): {detail}", file=sys.stderr)
 
     record["target_env"] = env
+    recheck_warning = attach_recheck(record, base, now_ts)
+    if recheck_warning:
+        print(f"⚠️ RE-CHECK NOT LINKED: {recheck_warning}", file=sys.stderr)
     dossier_file = _persist(record, base, shadow=shadow)
     if verbose:
         _print_summary(record, dossier_file, base, now_ts)

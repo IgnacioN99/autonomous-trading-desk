@@ -195,6 +195,8 @@ class MarketScreeningPayload(BaseModel):
     macro_rejected_shorts: List[dict] = []
     # Issue #206: set when /fapi/v1/fundingInfo failed and every symbol's funding was read as 8h
     funding_info_warning: Optional[str] = None
+    # Issue #267: single-symbol re-check ({symbol, direction, setup_status, cause}); None on a full scan
+    recheck: Optional[dict] = None
 
 # ==========================================
 # 2. DETERMINISTIC EXECUTION PIPELINE
@@ -574,6 +576,82 @@ def execute_screening_pipeline(top_pairs_count: int = 80, target_env: Optional[s
     with rate_limit_guard.scan_session():
         return _run_screening_pipeline(top_pairs_count, target_env, include_yolo)
 
+RECHECK_YOLO_STATUS = "UNAVAILABLE: YOLO scan not run by a single-symbol re-check. YOLO slot kept empty."
+
+def execute_symbol_recheck(symbol: str, direction: str, target_env: Optional[str] = None) -> MarketScreeningPayload:
+    """Issue #267: the live setup of one symbol and direction through the standard scan's own steps (radar row ->
+    fundingInfo -> microstructure enrichment -> confidence / risk ceiling filter -> alt-short macro gate -> sizing),
+    with no YOLO, stat-arb, funding or news scan. Same rate-limit guard as execute_screening_pipeline. The payload's
+    `recheck` says why there is no candidate: setup_status "found", "no_setup" (the radar no longer produces it)
+    or "unavailable" (market data unavailable: rate-limit ban or a failed step)."""
+    with rate_limit_guard.scan_session():
+        return _run_symbol_recheck(str(symbol).strip().upper(), str(direction).strip().upper(), target_env)
+
+def _run_symbol_recheck(symbol: str, direction: str, target_env: Optional[str]) -> MarketScreeningPayload:
+    global _last_yolo_future
+    _last_yolo_future = None  # no YOLO scan in a re-check: the CLI exit never waits for one
+    t0 = time.time()
+    target_env = resolve_env(target_env)
+    macro_data, candidate, rejected, warning = None, None, [], None
+    status, cause = "no_setup", None
+    rate_limited = False
+    try:
+        rate_limit_guard.raise_if_banned()  # a ban persisted by an earlier run: no Binance call in this run
+        macro_data = fetch_macro_btc()
+        row = bmr.analyze_single_symbol(symbol, bmr.DEFAULT_INTERVAL)
+        if row is None:
+            cause = (f"radar: no setup for {symbol} (no LONG/SHORT score >= 45, or its {bmr.DEFAULT_INTERVAL} klines "
+                     "are unreadable or the wick candle has zero range)")
+        elif row.get("direction") != direction:
+            cause = f"radar: {symbol} now scores {row.get('direction')}, not {direction}"
+        else:
+            funding_intervals, warning = bmr.fetch_funding_intervals()
+            row = bmr.enrich_candidate_microstructure(row, funding_intervals, funding_interval_unknown=bool(warning))
+            if row.get("risk_pct_over_ceiling"):
+                cause = f"radar: {row.get('disqualify_reason') or 'risk_pct above the intraday ceiling'}"
+            elif row.get("confidence", 0) < 55:
+                cause = f"radar: confidence {row.get('confidence')} < 55 after the order-flow enrichment"
+            else:
+                kept, rejected = apply_alt_short_macro_gate([row], macro_data)
+                if not kept:
+                    cause = f"alt-short macro gate: {rejected[0]['reason'] if rejected else 'rejected'}"
+                else:
+                    candidate = enrich_and_size_candidate(kept[0], target_env)
+                    if candidate is None:
+                        cause = "sizing: no valid position size (see stderr)"
+                    else:
+                        status = "found"
+    except rate_limit_guard.RateLimitedError:
+        rate_limited = True
+    except Exception as e:  # any other failed step: the setup cannot be judged (fail closed)
+        status, cause, candidate = "unavailable", f"re-check failed ({type(e).__name__})", None
+        print(f"Symbol re-check of {symbol} failed: {type(e).__name__}: {e}", file=sys.stderr)
+    market_data_status = None
+    if rate_limited or rate_limit_guard.is_banned():  # same fail-closed rule as the full scan
+        market_data_status = rate_limit_guard.unavailable_text()
+        status, cause, candidate, rejected = "unavailable", market_data_status, None, []
+        if rate_limited or macro_data is None:
+            macro_data = _rate_limited_macro(market_data_status)
+    if macro_data is None:
+        macro_data = _rate_limited_macro("BTC macro not read (re-check failed)")
+    rate_limit_guard.persist()
+    return MarketScreeningPayload(
+        timestamp_utc=time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
+        pipeline_latency_ms=int((time.time() - t0) * 1000),
+        macro=macro_data,
+        top_candidates=[candidate] if candidate is not None else [],
+        actionable_stat_arb=[],
+        top_funding_arbitrage=[],
+        yolo_slot_status=RECHECK_YOLO_STATUS,
+        yolo_slot=YoloSlot(status="UNAVAILABLE", interval=YOLO_SCAN_INTERVAL),
+        news_catalysts_summary=[],
+        market_data_status=market_data_status,
+        run_id=os.environ.get(yolo_scan_health.RUN_ID_ENV) or None,
+        macro_rejected_shorts=rejected,
+        funding_info_warning=warning,
+        recheck={"symbol": symbol, "direction": direction, "setup_status": status, "cause": cause},
+    )
+
 def _run_screening_pipeline(top_pairs_count: int, target_env: Optional[str],
                             include_yolo: bool) -> MarketScreeningPayload:
     global _last_yolo_future
@@ -782,6 +860,8 @@ def main(argv: Optional[list] = None) -> int:
     parser = argparse.ArgumentParser(description="Deterministic Market Intelligence Pipeline")
     parser.add_argument("--json", action="store_true", help="Print payload in strict JSON format")
     parser.add_argument("--env", default=None, help="Target execution environment (prod/testnet)")
+    parser.add_argument("--recheck", default=None, metavar="SYMBOL:DIRECTION",
+                        help="Only re-check the live setup of one symbol and direction (issue #267)")
     args = parser.parse_args(argv)
 
     try:
@@ -789,12 +869,20 @@ def main(argv: Optional[list] = None) -> int:
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
+    recheck = None
+    if args.recheck is not None:
+        parts = str(args.recheck).strip().upper().split(":")
+        if len(parts) != 2 or not parts[0].isalnum() or parts[1] not in ("LONG", "SHORT"):
+            print("error: --recheck expects SYMBOL:DIRECTION (e.g. ETHFIUSDT:LONG)", file=sys.stderr)
+            return 2
+        recheck = parts
 
     real_stdout = sys.stdout
     try:
         # Keep stdout pure JSON with --json: library diagnostics go to stderr.
         with contextlib.redirect_stdout(sys.stderr if args.json else real_stdout):
-            payload = execute_screening_pipeline(target_env=env)
+            payload = (execute_symbol_recheck(recheck[0], recheck[1], target_env=env) if recheck
+                       else execute_screening_pipeline(target_env=env))
     except Exception as e:
         if args.json:
             real_stdout.write(json.dumps({"status": "error", "command": "screening", "env": env,
@@ -809,6 +897,10 @@ def main(argv: Optional[list] = None) -> int:
         print(f"⚡ PIPELINE COMPLETED IN {payload.pipeline_latency_ms} ms ({payload.timestamp_utc})")
         if payload.market_data_status:
             print(f"• Market data: {payload.market_data_status}")
+        if payload.recheck:
+            rc = payload.recheck
+            print(f"• Re-check {rc['symbol']} {rc['direction']}: {rc['setup_status']}"
+                  + (f" ({rc['cause']})" if rc.get("cause") else ""))
         print(f"• Macro BTC: {payload.macro.btc_regime} | Price: ${payload.macro.btc_price:,.1f} | Allows Shorts: {payload.macro.allows_alt_shorts}")
         print(f"• Top Qualified Setups: {len(payload.top_candidates)}")
         for c in payload.top_candidates:

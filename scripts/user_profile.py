@@ -57,7 +57,11 @@ DEFAULT_PROFILE = {
     "daily_stop_r": 3.0,
     "max_consecutive_sl": 2,
     "yolo_max_daily_losses": 1,
-    "yolo_slot_enabled": False,        # Barbell memecoin moonshot slot (10x-15x, $10 margin or 0.5% equity)
+    # Issue #267: bounds under which a re-checked candidate (prime_evaluator_brief.py --recheck after the dossier
+    # expired) is covered by the user's earlier "yes" (utils/recheck_bounds.py). Validated by get_recheck_bounds.
+    "recheck_max_drift_r": 0.25,
+    "recheck_max_age_seconds": 1800,
+    "yolo_slot_enabled": False,       # Barbell memecoin moonshot slot (10x-15x, $10 margin or 0.5% equity)
     "yolo_equity_pct": 0.005,          # 0.5% default margin for YOLO moonshots (e.g. $50 on $10k)
     "overnight_mode": "ZERO_OVERNIGHT_RISK", # ZERO_OVERNIGHT_RISK | CLOSE_ALL_AT_MARKET | SWING_STRUCTURAL_STOP
     "leverage_standard": 3,
@@ -257,6 +261,24 @@ def get_daily_loss_limits(profile: Optional[Dict[str, Any]] = None) -> Dict[str,
         raw = prof.get(key, DEFAULT_PROFILE[key])
         out[key] = raw if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 1 else DEFAULT_PROFILE[key]
     return out
+
+
+RECHECK_MAX_DRIFT_R_MAX = 2.0
+RECHECK_MAX_AGE_RANGE_S = (300, 7200)
+
+
+def get_recheck_bounds(profile: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Re-check bounds (issue #267) from the profile: recheck_max_drift_r (number, 0 < x <= RECHECK_MAX_DRIFT_R_MAX)
+    and recheck_max_age_seconds (number within RECHECK_MAX_AGE_RANGE_S, as int). A missing or invalid value falls
+    back to its DEFAULT_PROFILE value. Never raises."""
+    prof = profile if isinstance(profile, dict) else {}
+    raw = prof.get("recheck_max_drift_r", DEFAULT_PROFILE["recheck_max_drift_r"])
+    drift = (float(raw) if _is_number(raw) and 0 < raw <= RECHECK_MAX_DRIFT_R_MAX
+             else DEFAULT_PROFILE["recheck_max_drift_r"])
+    raw = prof.get("recheck_max_age_seconds", DEFAULT_PROFILE["recheck_max_age_seconds"])
+    low, high = RECHECK_MAX_AGE_RANGE_S
+    age = int(raw) if _is_number(raw) and low <= raw <= high else DEFAULT_PROFILE["recheck_max_age_seconds"]
+    return {"recheck_max_drift_r": drift, "recheck_max_age_seconds": age}
 
 
 def validate_leverage_setting(name: str, value: int, ceiling: int) -> Optional[str]:
