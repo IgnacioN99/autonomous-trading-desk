@@ -576,12 +576,12 @@ class TestIssueFixerGuard(unittest.TestCase):
         legacy = {"signed": False, "sig_ok": None, "issue": 7}
         self.assertEqual(self.check_guard(self.wt, 100),
                          (2, {"ok": False, "heartbeat_ts": None, "since": 100, "session_id": None,
-                              "binding_claim": None, **legacy}))
+                              "binding_claim": None, "marker_session_id_null": None, **legacy}))
         guard.write_heartbeat(self.wt, "Bash", "", "s1")
         ts = json.loads(hb.read_text())["ts"]
         self.assertEqual(self.check_guard(self.wt, ts),
                          (0, {"ok": True, "heartbeat_ts": ts, "since": ts, "session_id": "s1",
-                              "binding_claim": "n/a", **legacy}))
+                              "binding_claim": "n/a", "marker_session_id_null": None, **legacy}))
         self.assertEqual(self.check_guard(self.wt, ts + 1)[0], 2)  # stale: written before the fixer launch
         hb.write_text("{bad")
         self.assertEqual(self.check_guard(self.wt, 0)[0], 2)
@@ -682,6 +682,19 @@ class TestIssueFixerGuard(unittest.TestCase):
             ("Glob", {"pattern": "*.key", "path": keys}),
             ("Glob", {"pattern": f"{keys}/*"}),
             ("Glob", {"pattern": "logs/issue_work_keys/*.key"}),
+            # #250: a Grep or Glob rooted at an ancestor of the keys is denied with or without a glob (these two
+            # rows were allowed before, relying on .gitignore)
+            ("Grep", {"pattern": "x", "path": self.main}),
+            ("Glob", {"pattern": "**/*.md"}),
+            ("Grep", {"pattern": ".", "path": f"{self.main}/logs"}),
+            ("Glob", {"pattern": "*.py", "path": self.main}),
+            ("Grep", {"pattern": ".", "path": self.tmp}),
+            ("Glob", {"pattern": "*.md", "path": "/"}),
+            ("Grep", {"pattern": ".", "path": f"{self.main}/scripts/.."}),
+            # #250: a Grep glob that can match <N>.key is denied whatever the path; braces do not parse
+            ("Grep", {"pattern": ".", "path": self.wt, "glob": "*"}),
+            ("Grep", {"pattern": ".", "path": self.wt, "glob": "**/*.key"}),
+            ("Grep", {"pattern": ".", "path": self.wt, "glob": "*.{py,md}"}),
         ]
         for tool, tool_input in denied:
             with self.subTest(tool=tool, tool_input=tool_input):
@@ -697,16 +710,157 @@ class TestIssueFixerGuard(unittest.TestCase):
             ("Read", {"file_path": f"{self.main}/README.md"}),
             ("Read", {"file_path": f"{self.wt}/README.md"}),
             ("Grep", {"pattern": "x", "path": self.wt, "glob": "*.py"}),
-            ("Grep", {"pattern": "x", "path": self.main}),
             ("Grep", {"pattern": "issue_work_keys", "path": self.wt}),
             ("Glob", {"pattern": "**/*.py", "path": self.wt}),
-            ("Glob", {"pattern": "**/*.md"}),
+            ("Grep", {"pattern": "x", "path": f"{self.wt}/scripts", "glob": "**/test_*.py"}),
+            ("Grep", {"pattern": "x", "path": self.wt2, "glob": "*.md"}),
+            ("Glob", {"pattern": "*", "path": self.wt}),
+            ("Grep", {"pattern": "x", "path": self.wt}),
         ]
         for tool, tool_input in allowed:
             with self.subTest(tool=tool, tool_input=tool_input):
                 payload = {"tool_name": tool, "tool_input": tool_input, "cwd": self.main, "session_id": "s1"}
                 self.assertEqual(self.run_hook(payload), (0, ""))
         self.assertFalse(hb.exists())
+
+    # ----- #250: case variants (DrvFs is case-insensitive) and other names of a protected path -----
+    def test_case_variants_of_protected_paths_are_denied(self):
+        self._key(8)
+        for tool, tool_input in (
+                ("Read", {"file_path": f"{self.main}/LOGS/Issue_Work_Keys/8.key"}),
+                ("Read", {"file_path": f"{self.main}/logs/ISSUE_WORK_KEYS/8.key"}),
+                ("Grep", {"pattern": ".", "path": f"{self.main}/Logs/Issue_Work_Keys"}),
+                ("Glob", {"pattern": "LOGS/Issue_Work_Keys/*"}),
+                ("Grep", {"pattern": ".", "path": self.wt, "glob": "*.KEY"})):
+            with self.subTest(tool=tool, tool_input=tool_input):
+                payload = {"tool_name": tool, "tool_input": tool_input, "cwd": self.main}
+                self.assertIn("heartbeat keys", guard.evaluate_payload(payload, self.conf))
+
+        def edit(path):
+            return guard.evaluate_payload({"tool_name": "Write", "tool_input": {"file_path": path}}, self.conf)
+
+        for path, why in ((f"{self.wt}/LOGS/session_state.json", "logs/issue_work/"),
+                          (f"{self.wt}/Logs/x", "logs/issue_work/"),
+                          (f"{self.wt}/.GIT/config", "git internals"),
+                          (f"{self.wt}/scripts/.Git/hooks/x", "git internals"),
+                          (f"{self.wt}/.CLAUDE/agents/issue_fixer.md", ".claude/"),
+                          (f"{self.wt}/.Agents/Hooks.json", "hook configuration"),
+                          (f"{self.wt}/logs/ISSUE_WORK/guard_heartbeat.json", "written only by"),
+                          (f"{self.wt}/Logs/Issue_Work/Fixer_Binding.json", "written only by")):
+            with self.subTest(path=path):
+                self.assertIn(why, edit(path))
+        self.assertIn("logs/issue_work/", guard.evaluate(f"cd {self.wt} && echo x > LOGS/x", self.conf))
+        # Normal names stay writable
+        for path in (f"{self.wt}/logs/issue_work/notes.md", f"{self.wt}/.agents/agents/x/agent.md",
+                     f"{self.wt}/scripts/logs_helper.py", f"{self.wt}/tests/Logs/x.py"):
+            with self.subTest(path=path):
+                self.assertEqual(edit(path), "")
+        # The running guard under another case, or another name of the same file (st_dev / st_ino)
+        copy = os.path.join(self.wt, "scripts", "hooks", "issue_fixer_guard.py")  # committed by _make_repo
+        alias = os.path.join(self.wt, "scripts", "hooks", "guard_alias.py")
+        os.link(copy, alias)
+        self.addCleanup(os.remove, alias)
+        with mock.patch.object(guard, "RUNNING_GUARD", os.path.realpath(copy)):
+            self.assertIn("running guard", edit(os.path.join(self.wt, "scripts", "hooks", "Issue_Fixer_Guard.py")))
+            self.assertIn("running guard", edit(alias))
+        self.assertEqual(edit(alias), "")
+
+    def test_another_name_of_the_keys_directory_is_denied(self):
+        keys = os.path.realpath(os.path.dirname(self._key(8)))
+        alias = os.path.join(os.path.dirname(keys), "KEYS~1")
+        real_same = guard._same_file
+
+        def same_file(a, b):  # what a short name or a case variant looks like on DrvFs: same st_dev / st_ino
+            pair = {os.path.realpath(a), os.path.realpath(b)}
+            return pair == {alias, keys} or real_same(a, b)
+
+        with mock.patch.object(guard, "_same_file", side_effect=same_file):
+            for tool, tool_input in (("Read", {"file_path": f"{alias}/8.key"}),
+                                     ("Grep", {"pattern": ".", "path": alias})):
+                with self.subTest(tool=tool):
+                    payload = {"tool_name": tool, "tool_input": tool_input, "cwd": self.main}
+                    self.assertIn("heartbeat keys", guard.evaluate_payload(payload, self.conf))
+        payload = {"tool_name": "Read", "tool_input": {"file_path": f"{alias}/8.key"}, "cwd": self.main}
+        self.assertEqual(guard.evaluate_payload(payload, self.conf), "")
+
+    def test_grep_glob_that_can_match_a_key(self):
+        for glob in ("*", "**/*", "*.key", "**/*.key", "8.key", "250.key", "1?.key", "*.k*", "[0-9].key", "*.KEY",
+                     "issue_work_keys", "*_keys", "*e*", "*.{py,key}", "{a,b}.py", "!*.py", "logs/", "[abc",
+                     "x\\", "../trading/logs/*.key"):
+            with self.subTest(glob=glob):
+                self.assertTrue(guard._glob_can_match_key(glob))
+        for glob in ("*.py", "**/*.py", "test_*.py", "*.md", "*.json", "README.md", "9.keys", "key.py",
+                     "\\*.key", "[!k]*.py", "scripts/**/*.txt"):
+            with self.subTest(glob=glob):
+                self.assertFalse(guard._glob_can_match_key(glob))
+
+    # ----- #250: reads spawn git only for the rules that need the main checkout -----
+    def test_ordinary_reads_spawn_no_git(self):
+        self._key(8)
+        real_run = subprocess.run
+        calls = []
+
+        def spy(cmd, *args, **kwargs):
+            if cmd and cmd[0] == "git":
+                calls.append(cmd)
+            return real_run(cmd, *args, **kwargs)
+
+        ordinary = [
+            ("Read", {"file_path": f"{self.wt}/README.md"}),
+            ("Read", {"file_path": f"{self.main}/README.md"}),
+            ("Read", {"file_path": "/etc/hosts"}),
+            ("Read", {"file_path": f"{self.main}/logs/issue_work_keys/8.key"}),  # denied without git
+            ("Grep", {"pattern": "x", "path": self.wt, "glob": "*.py"}),
+            ("Grep", {"pattern": "x", "path": f"{self.wt}/scripts"}),
+            ("Glob", {"pattern": "**/*.py", "path": self.wt}),
+            ("Grep", {"pattern": "x", "path": self.main}),  # holds the keys: denied without git
+        ]
+        with mock.patch.object(guard.subprocess, "run", side_effect=spy):
+            for tool, tool_input in ordinary:
+                with self.subTest(tool=tool, tool_input=tool_input):
+                    self.run_hook({"tool_name": tool, "tool_input": tool_input, "cwd": self.main})
+                    self.assertEqual(calls, [])
+            # A root outside any linked worktree needs the main checkout; so do Bash and the edit tools
+            self.assertEqual(self.run_hook({"tool_name": "Grep", "tool_input": {"pattern": ".", "path": self.tmp},
+                                            "cwd": self.main})[0], 2)
+            self.assertTrue(calls)
+            calls.clear()
+            self.assertEqual(self.run_hook({"tool_name": "Bash",
+                                            "tool_input": {"command": f"cd {self.wt} && git status"}})[0], 0)
+            self.assertTrue(calls)
+        # Unresolvable repository: an ordinary read passes, a read that needs the main checkout is denied
+        plain = tempfile.mkdtemp()
+        self.addCleanup(os.rmdir, plain)
+        read = {"tool_name": "Read", "tool_input": {"file_path": f"{self.wt}/README.md"}, "cwd": self.main}
+        self.assertEqual(self.run_hook(read, project_dir=plain), (0, ""))
+        for payload in ({"tool_name": "Grep", "tool_input": {"pattern": "x"}},
+                        {"tool_name": "Read", "tool_input": {"file_path": "README.md"}},
+                        {"tool_name": "Glob", "tool_input": {"pattern": "*", "path": "/"}, "cwd": self.main}):
+            with self.subTest(payload=payload):
+                code, err = self.run_hook(payload, project_dir=plain)
+                self.assertEqual(code, 2)
+                self.assertIn("cannot resolve the repository", err)
+
+    # ----- #250: check-guard keeps the claim history in marker_session_id_null -----
+    def test_check_guard_reports_whether_the_marker_was_claimed(self):
+        self._heartbeat(self.wt2)
+        marker = self._bind(self.wt2)
+        ok = {"tool_name": "Bash", "tool_input": {"command": f"cd {self.wt2} && git status"}}
+        before = int(time.time())
+        self.assertEqual(self.run_hook(ok), (0, ""))  # no session id: nothing claimed
+        out = self.check_guard(self.wt2, before)[1]
+        self.assertEqual((out["binding_claim"], out["marker_session_id_null"]), ("n/a", True))
+        self.assertEqual(self.run_hook(dict(ok, session_id="sess-A")), (0, ""))
+        self.assertIs(self.check_guard(self.wt2, before)[1]["marker_session_id_null"], False)
+        # A later call that claims nothing (n/a) no longer hides that the marker was claimed
+        self.assertEqual(self.run_hook(ok), (0, ""))
+        out = self.check_guard(self.wt2, before)[1]
+        self.assertEqual((out["binding_claim"], out["marker_session_id_null"]), ("n/a", False))
+        # No marker, or an unreadable one: null
+        Path(marker).write_text("[1]")
+        self.assertIsNone(self.check_guard(self.wt2, before)[1]["marker_session_id_null"])
+        os.remove(marker)
+        self.assertIsNone(self.check_guard(self.wt2, before)[1]["marker_session_id_null"])
 
     def test_generated_fixer_hook_covers_read_tools(self):
         text = (REPO_ROOT / ".claude" / "agents" / "issue_fixer.md").read_text(encoding="utf-8")
@@ -841,7 +995,10 @@ class TestIssueWorkspaceReviewContext(unittest.TestCase):
     # ----- #230: the checks never see the orchestrator's credentials or home directory -----
     CREDENTIALS = {"BINANCE_API_KEY": "k", "BINANCE_API_SECRET": "s", "BINANCE_MCP_OAUTH_PATH": "/x/oauth.json",
                    "NOTION_TOKEN": "n", "GITHUB_TOKEN": "g", "GMAIL_APP_PASSWORD": "p", "ENV_FILE": "/x/.env",
-                   "GH_TOKEN": "t", "GH_ENTERPRISE_TOKEN": "e", "GEMINI_API_KEY": "m"}
+                   "GH_TOKEN": "t", "GH_ENTERPRISE_TOKEN": "e", "GEMINI_API_KEY": "m",
+                   # #250: never listed anywhere, dropped by the allowlist
+                   "ANTHROPIC_API_KEY": "a", "OPENAI_API_KEY": "o", "AWS_ACCESS_KEY_ID": "i",
+                   "AWS_SECRET_ACCESS_KEY": "w", "CLAUDE_CODE_MESSAGING_TOKEN": "c", "SOME_SERVICE_PASSWORD": "x"}
 
     def test_checks_run_without_credentials_or_home(self):
         home = os.path.join(self.tmp, "orchestrator-home")
@@ -849,8 +1006,7 @@ class TestIssueWorkspaceReviewContext(unittest.TestCase):
         Path(self.repo, "tests", "test_env.py").write_text(
             "import os\nimport unittest\n\n\nclass Env(unittest.TestCase):\n"
             "    def test_scrubbed(self):\n"
-            "        leaked = sorted(k for k in os.environ if k.startswith(('BINANCE_', 'NOTION_', 'GITHUB_', "
-            "'GMAIL_', 'GH_')) or k in ('ENV_FILE', 'GEMINI_API_KEY'))\n"
+            f"        leaked = sorted(k for k in os.environ if k in {sorted(self.CREDENTIALS)!r})\n"
             "        self.assertEqual(leaked, [])\n"
             f"        self.assertNotEqual(os.path.realpath(os.environ['HOME']), {os.path.realpath(home)!r})\n"
             "        self.assertTrue(os.path.isdir(os.environ['HOME']))\n"
@@ -862,14 +1018,23 @@ class TestIssueWorkspaceReviewContext(unittest.TestCase):
         self.assertIn("Ran 2 tests", out["checks"]["unittest"])
 
     def test_check_env_drops_credentials_and_replaces_home(self):
-        with mock.patch.dict(os.environ, dict(self.CREDENTIALS, HOME="/home/orchestrator", TZ="UTC", LANG="C.UTF-8",
-                                              PYTHONHASHSEED="0")):
+        kept = {"TZ": "UTC", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "LC_CTYPE": "C.UTF-8", "TERM": "dumb",
+                "TMPDIR": tempfile.gettempdir(), "PYTHONHASHSEED": "0", "PYTHONDONTWRITEBYTECODE": "1"}
+        # #250: an allowlist, so any variable outside it is dropped, not only the listed credentials
+        dropped = {"WSL_DISTRO_NAME": "Ubuntu", "XDG_RUNTIME_DIR": "/run/user/1", "USER": "nacho",
+                   "GIT_EDITOR": "vi", "MY_PATH": "/x", "HOME_DIR": "/x", "XLC_ALL": "x"}
+        with mock.patch.dict(os.environ, dict(self.CREDENTIALS, HOME="/home/orchestrator", **kept, **dropped)):
             env = iw.check_env("/tmp/fresh-home")
             path = os.environ["PATH"]
         self.assertFalse(set(self.CREDENTIALS) & set(env))
+        self.assertFalse(set(dropped) & set(env))
         self.assertEqual(env["HOME"], "/tmp/fresh-home")
-        self.assertEqual((env["PATH"], env["TZ"], env["LANG"], env["PYTHONHASHSEED"]), (path, "UTC", "C.UTF-8", "0"))
+        self.assertEqual(env["PATH"], path)
+        self.assertEqual({k: env[k] for k in kept}, kept)
         self.assertTrue(env["PYTHONUSERBASE"])
+        for name in env:
+            self.assertTrue(name in {"PATH", "LANG", "TZ", "TERM", "TMPDIR", "HOME"}
+                            or name.startswith(("LC_", "PYTHON")), name)
         # The temporary home of a run is removed afterwards
         homes = []
         real_run = subprocess.run
@@ -1408,6 +1573,42 @@ class TestGeneratorWriteAgents(unittest.TestCase):
         self.assertIn("`logs/issue_work_keys/<N>.key`", skill)
         self.assertIn("the routing log and the issue key above are the only exceptions", skill)
         self.assertIn("the fixer's own test runs are not scrubbed", skill)
+
+    def test_issue_250_prompt_and_doc_followups(self):
+        def text(*parts):
+            return REPO_ROOT.joinpath(*parts).read_text(encoding="utf-8")
+
+        # The agy denied list extends the notable examples (advisory: no guard runs under agy)
+        for fixer in (text(".agents", "agents", "issue_fixer", "agent.md"), text(".claude", "agents", "issue_fixer.md")):
+            operational = fixer.split("<operational_environment>", 1)[1].split("</operational_environment>", 1)[0]
+            examples = next(ln for ln in operational.splitlines()
+                            if "Anything outside the Allowed list is denied; notable examples:" in ln)
+            for item in ("git writes", "`python -c`", "heredocs", "`$(...)`", "`$VAR`", "`find -exec`", "awk",
+                         "launchers", "tar/zip"):
+                self.assertIn(item, examples)
+            self.assertNotIn("  - Denied:", operational)
+            self.assertIn("the main checkout, where every search is denied (it holds the heartbeat keys)", operational)
+        for skill in (text(".agents", "skills", "issue-orchestrator", "SKILL.md"),
+                      text(".claude", "skills", "issue-orchestrator", "SKILL.md")):
+            # Step 7a points to issue_workspace.py instead of repeating the variable list
+            step_7a = skill.split("   a. Run `python3 scripts/dev/issue_workspace.py review-context", 1)[1].split("\n")[0]
+            self.assertIn("the environment allowlist of `issue_workspace.py` `check_env`", step_7a)
+            self.assertIn("the fixer's own test runs are not scrubbed", step_7a)
+            for gone in ("only those are scrubbed", "GEMINI_API_KEY", "`BINANCE_*`"):
+                self.assertNotIn(gone, step_7a)
+            # A read-only fixer round leaves no heartbeat
+            guard_check = next(line for line in skill.splitlines() if "**Guard check.**" in line)
+            self.assertIn("A fixer round with no Edit/Write/Bash call leaves no heartbeat (reads write none), so "
+                          "`check-guard` exits 2.", guard_check)
+        # The checklist heading convention in the guide's section 4.4
+        guide = text("docs", "agent_prompt_engineering_guide.md")
+        section = guide.split("## 4.4 ", 1)[1].split("\n# ", 1)[0]
+        self.assertIn("**Repository heading convention:**", section)
+        for heading in ("`## Precondition Checklist`", "`## Fixer Checklist`", "`## Verdict Checklist`"):
+            self.assertIn(heading, section)
+        # The documented check_env allowlist matches the code
+        self.assertEqual(iw.CHECK_ENV_NAMES, {"PATH", "LANG", "TZ", "TERM", "TMPDIR"})
+        self.assertEqual(iw.CHECK_ENV_PREFIXES, ("LC_", "PYTHON"))
 
     def test_auditor_axioms_match_the_trading_risk_reviewer(self):
         """#231: every axiom token the auditor pins also appears in the trading_risk_reviewer source."""

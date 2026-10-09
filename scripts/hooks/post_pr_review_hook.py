@@ -10,11 +10,20 @@ logs/pr_review_state.json) up to date:
     (the Stop hook pr_review_stop_hook.py then makes the agent run the /pr-review skill, which
     launches the reviewer subagents natively in the same session: agy invoke_subagent, Claude Code
     Agent tool). Only the program of each executed sub-command counts: the same words inside quoted
-    strings, heredoc bodies or echo/grep arguments never arm. Pushes and PRs whose branch (refspec
-    destination, `--head`, or the checked-out branch of the `cd`/`git -C` directory) is main/master
-    never arm; a command that cannot be tokenized does not arm either (logged as "detect_error");
+    strings (quoted `;`, `&&`, `|` do not separate commands), heredoc bodies or echo/grep arguments
+    never arm. Pushes and PRs whose branch (destination of the first refspec, later refspecs are ignored;
+    `--head`; or the checked-out branch of the directory) is main/master never arm, nor do delete pushes
+    (`--delete`, `-d`, `:branch`); a command that cannot be tokenized does not arm either (logged as
+    "detect_error");
   * successful `gh pr comment ... --body-file .../pr_review/report.md` -> marker "done".
 Failed commands change nothing. Events are logged to logs/pr_hook_events.jsonl.
+
+Directory: a bare `gh pr create` / `git push` resolves its branch from the payload cwd (agy Cwd, Claude Code
+cwd), followed through `cd`/`chdir`/`pushd`/`Set-Location`/`sl`/`Push-Location` (`-Path`/`-LiteralPath`)
+and `git -C`; `popd`/`Pop-Location` return to the payload cwd. Whether that cwd follows the Bash tool's
+persistent directory cannot be confirmed here, so `gh pr create --head <branch>` is the checkout-independent
+form. Paths are POSIX (Linux, macOS, WSL): a backslash is a shell escape, Windows `C:\\dir` paths are
+not supported.
 
 Contract:
   Input (stdin): agy {toolCall:{name:"run_command", args:{CommandLine, Cwd?}}, conversationId, error?} or
@@ -27,7 +36,6 @@ import os
 import re
 import sys
 import json
-import shlex
 import subprocess
 from typing import NamedTuple
 
@@ -47,11 +55,15 @@ PROTECTED_BRANCHES = ("main", "master")
 
 # `<<WORD`, `<<-WORD`, `<<'WORD'`, `<< "WORD"`, `<<\WORD` (never the `<<<` here-string)
 _HEREDOC_RE = re.compile(r"(?<!<)<<(?!<)([-~]?)[ \t]*\\?(['\"]?)([A-Za-z0-9_][A-Za-z0-9_.-]*)\2")
+_OPERATOR_CHARS = "();<>|&"
 _ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 _RESERVED_WORDS = {"!", "{", "do", "then", "else", "elif", "if", "while", "until"}
 _SHELLS = {"bash", "sh", "zsh", "dash"}
 _GIT_VALUE_OPTIONS = {"-c", "--git-dir", "--work-tree", "--namespace", "--config-env"}
 _PUSH_VALUE_OPTIONS = {"--repo", "-o", "--push-option", "--receive-pack", "--exec"}
+_CHDIR_PROGRAMS = {"cd", "chdir", "pushd", "set-location", "sl", "push-location"}
+_POPDIR_PROGRAMS = {"popd", "pop-location"}
+_PATH_PARAMETERS = {"-path", "-literalpath"}  # PowerShell Set-Location / Push-Location
 _MAX_UNWRAP_DEPTH = 4
 
 
@@ -61,33 +73,179 @@ class ReviewTrigger(NamedTuple):
     directory: str   # directory the command ran in (payload cwd, then `cd` / `git -C`)
 
 
-def _strip_heredoc_bodies(text: str) -> str:
-    """Drops heredoc bodies and their terminator lines: their content is data, never a command."""
-    out, pending = [], []
-    for line in text.split("\n"):
-        if pending:
-            word, flag = pending[0]
-            candidate = line.rstrip("\r")
-            if flag == "-":
-                candidate = candidate.lstrip("\t")
-            elif flag == "~":
-                candidate = candidate.lstrip()
-            if candidate == word:
-                pending.pop(0)
-            continue
-        out.append(line)
-        pending = [(m.group(3), m.group(1)) for m in _HEREDOC_RE.finditer(line)]
-    return "\n".join(out)
+def _skip_heredoc_bodies(text: str, i: int, heredocs: list) -> int:
+    """Index after the bodies and terminator lines of the pending heredocs, whose lines start at `i`.
+
+    Their content is data, never a command; a missing terminator runs the body to the end of the text."""
+    while heredocs and i < len(text):
+        word, flag = heredocs[0]
+        end = text.find("\n", i)
+        end = len(text) if end < 0 else end
+        candidate = text[i:end].rstrip("\r")
+        if flag == "-":
+            candidate = candidate.lstrip("\t")
+        elif flag == "~":
+            candidate = candidate.lstrip()
+        if candidate == word:
+            heredocs.pop(0)
+        i = end + 1
+    heredocs.clear()
+    return min(i, len(text))
+
+
+def _arithmetic_end(text: str, i: int) -> int:
+    """Index after the `))` closing a `((` / `$((` whose expression starts at `i` (`<<` there is a shift)."""
+    depth = 2
+    while i < len(text):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    raise ValueError("No closing arithmetic expression")
+
+
+def _double_quoted(text: str, i: int) -> tuple[int, str]:
+    """(index after the closing quote, value) of a "..." string whose content starts at `i`.
+
+    `$(...)` inside is scanned as code, so its heredoc bodies and nested quotes do not end the string."""
+    value, n = [], len(text)
+    while i < n:
+        c = text[i]
+        if c == '"':
+            return i + 1, "".join(value)
+        if c == "\\" and i + 1 < n and text[i + 1] in '$`"\\\n':
+            if text[i + 1] != "\n":
+                value.append(text[i + 1])
+            i += 2
+        elif c == "$" and text.startswith("((", i + 1):
+            end = _arithmetic_end(text, i + 3)
+            value.append(text[i:end])
+            i = end
+        elif c == "$" and text.startswith("(", i + 1):
+            end = _substitution_end(text, i + 2)
+            value.append(text[i:end])
+            i = end
+        else:
+            value.append(c)
+            i += 1
+    raise ValueError("No closing quotation")
+
+
+def _substitution_end(text: str, i: int) -> int:
+    """Index after the `)` closing a `$(` whose body starts at `i`, skipping quotes and heredoc bodies."""
+    depth, heredocs, n = 1, [], len(text)
+    while i < n:
+        c = text[i]
+        if c == "\\":
+            i += 2
+        elif c == "'":
+            end = text.find("'", i + 1)
+            if end < 0:
+                raise ValueError("No closing quotation")
+            i = end + 1
+        elif c == '"':
+            i = _double_quoted(text, i + 1)[0]
+        elif c == "$" and text.startswith("((", i + 1):
+            i = _arithmetic_end(text, i + 3)
+        elif c in "()":
+            depth += 1 if c == "(" else -1
+            i += 1
+            if depth == 0:
+                return i
+        elif c == "<" and (match := _HEREDOC_RE.match(text, i)):
+            heredocs.append((match.group(3), match.group(1)))
+            i = match.end()
+        elif c == "\n":
+            i = _skip_heredoc_bodies(text, i + 1, heredocs)
+        else:
+            i += 1
+    raise ValueError("No closing command substitution")
+
+
+def _tokenize(text: str) -> list[tuple[str, str]]:
+    """Shell tokens: ("word", value without quotes) or ("op", run of ();<>|& characters; ";" for a newline).
+
+    Quoted or escaped characters never form an operator. A `<<WORD` outside quotes and arithmetic
+    (`$((...))`, `((...))`, kept inside one word) hides the heredoc body that follows the end of its line.
+    `#` starts a comment up to the end of the line, also inside a word (as posix shlex does).
+    Raises ValueError on an unclosed quote, substitution or arithmetic expression."""
+    tokens, heredocs, word, quoted = [], [], [], False
+    i, n = 0, len(text)
+
+    def end_word() -> None:
+        nonlocal word, quoted
+        if word or quoted:  # "" is still a word
+            tokens.append(("word", "".join(word)))
+        word, quoted = [], False
+
+    while i < n:
+        c = text[i]
+        if c == "\\":
+            if text.startswith("\n", i + 1) or text.startswith("\r\n", i + 1):  # line continuation
+                i += 2 if text[i + 1] == "\n" else 3
+                continue
+            if i + 1 >= n:
+                raise ValueError("No escaped character")
+            word.append(text[i + 1])
+            i += 2
+        elif c == "'":
+            end = text.find("'", i + 1)
+            if end < 0:
+                raise ValueError("No closing quotation")
+            word.append(text[i + 1:end])
+            quoted, i = True, end + 1
+        elif c == '"':
+            i, value = _double_quoted(text, i + 1)
+            word.append(value)
+            quoted = True
+        elif c == "$" and text.startswith("((", i + 1):
+            end = _arithmetic_end(text, i + 3)
+            word.append(text[i:end])
+            i = end
+        elif text.startswith("((", i) and not word and not quoted:  # arithmetic command
+            end = _arithmetic_end(text, i + 2)
+            word.append(text[i:end])
+            i = end
+        elif c == "#":
+            end = text.find("\n", i)
+            i = n if end < 0 else end
+        elif c in " \t\r":
+            end_word()
+            i += 1
+        elif c == "\n":
+            end_word()
+            tokens.append(("op", ";"))
+            i = _skip_heredoc_bodies(text, i + 1, heredocs)
+        elif c in _OPERATOR_CHARS:
+            end_word()
+            end = i
+            while end < n and text[end] in _OPERATOR_CHARS:
+                end += 1
+            if text[i:end].endswith("<<") and (match := _HEREDOC_RE.match(text, end - 2)):
+                heredocs.append((match.group(3), match.group(1)))
+            tokens.append(("op", text[i:end]))
+            i = end
+        else:
+            word.append(c)
+            i += 1
+    end_word()
+    return tokens
 
 
 def _split_subcommands(text: str) -> list[list[str]]:
-    """Words of every sub-command (split on && || ; | & ( ) and newlines). Raises ValueError (shlex)."""
-    text = text.replace("\\\r\n", "").replace("\\\n", "").replace("\n", "\n;")
-    lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
-    lexer.whitespace_split = True
+    """Words of every sub-command (split on unquoted && || ; | & ( ) and newlines). Raises ValueError."""
+    try:
+        tokens = _tokenize(text)
+    except ValueError:
+        raise
+    except Exception as exc:  # any scanner error (e.g. absurdly nested "$( ... )"): never arm
+        raise ValueError(f"Cannot scan the command: {exc!r}") from exc
     commands, current, skip_target = [], [], False
-    for token in lexer:
-        if token and all(c in lexer.punctuation_chars for c in token):
+    for kind, token in tokens:
+        if kind == "op":
             if any(c in token for c in "<>") and not any(c in token for c in ";()"):
                 if current and current[-1].isdigit():  # `2>&1`: the fd number is not an argument
                     current.pop()
@@ -147,9 +305,19 @@ def _change_dir(current: str, target: str, start: str) -> str:
     return os.path.normpath(os.path.join(current, target))
 
 
-def _push_branch(args: list[str]) -> str:
-    """Destination branch of the first refspec of `git push` args; "" without a refspec (or HEAD)."""
-    positionals, skip, options_done = [], False, False
+def _chdir_target(args: list[str]) -> str:
+    """Directory argument of cd/pushd/Set-Location: `-Path`/`-LiteralPath <dir>`, else the first positional."""
+    for i, arg in enumerate(args):
+        if arg.lower() in _PATH_PARAMETERS:
+            return args[i + 1] if i + 1 < len(args) else ""
+    targets = [a for a in args if not (a.startswith("-") and a != "-")]
+    return targets[0] if targets else ""
+
+
+def _push_branch(args: list[str]) -> str | None:
+    """Destination branch of the first refspec of `git push` args (later refspecs are ignored); "" without
+    a refspec (or HEAD); None for a delete push (`--delete`, `-d`, or an empty source such as `:x`)."""
+    positionals, skip, options_done, delete = [], False, False, False
     for arg in args:
         if skip:
             skip = False
@@ -159,10 +327,18 @@ def _push_branch(args: list[str]) -> str:
             options_done = True
         elif arg in _PUSH_VALUE_OPTIONS:
             skip = True
+        elif arg == "--delete":
+            delete = True
+        elif not arg.startswith("--"):
+            delete = delete or "d" in arg[1:].split("o", 1)[0]  # `-fd`; after `o` comes a push option value
+    if delete:
+        return None
     if len(positionals) < 2:
         return ""
     spec = positionals[1]
     spec = spec[1:] if spec.startswith("+") else spec
+    if spec.startswith(":") and spec != ":":  # `:x` deletes x (a bare `:` pushes the matching branches)
+        return None
     spec = spec.partition(":")[2] if ":" in spec else spec
     spec = spec[len("refs/heads/"):] if spec.startswith("refs/heads/") else spec
     return "" if spec in ("HEAD", "@") or _is_expansion(spec) else spec
@@ -190,9 +366,10 @@ def _scan_words(words: list[str], start: str, cwd: str, triggers: list, depth: i
     if not words:
         return cwd
     program, args = _program_name(words[0]), words[1:]
-    if program == "cd":
-        targets = [a for a in args if not (a.startswith("-") and a != "-")]
-        return _change_dir(cwd, targets[0] if targets else "", start)
+    if program in _CHDIR_PROGRAMS:
+        return _change_dir(cwd, _chdir_target(args), start)
+    if program in _POPDIR_PROGRAMS:
+        return start
     if program in _SHELLS and depth < _MAX_UNWRAP_DEPTH:
         for i, arg in enumerate(args):
             if arg.startswith("--"):
@@ -222,7 +399,9 @@ def _scan_words(words: list[str], start: str, cwd: str, triggers: list, depth: i
             else:
                 i += 2 if args[i] in _GIT_VALUE_OPTIONS else 1
         if i < len(args) and args[i] == "push":
-            triggers.append(ReviewTrigger("push", _push_branch(args[i + 1:]), directory))
+            branch = _push_branch(args[i + 1:])
+            if branch is not None:  # a delete push never arms
+                triggers.append(ReviewTrigger("push", branch, directory))
         return cwd
     if program == "gh" and args[:2] == ["pr", "create"]:
         triggers.append(ReviewTrigger("pr_create", _pr_head(args[2:]), cwd))
@@ -230,7 +409,7 @@ def _scan_words(words: list[str], start: str, cwd: str, triggers: list, depth: i
 
 
 def _scan_text(text: str, start: str, cwd: str, triggers: list, depth: int = 0) -> str:
-    for words in _split_subcommands(_strip_heredoc_bodies(text)):
+    for words in _split_subcommands(text):
         cwd = _scan_words(words, start, cwd, triggers, depth)
     return cwd
 
@@ -251,7 +430,10 @@ def find_review_trigger(command: str, cwd: str | None = None) -> ReviewTrigger |
 
 
 def is_pr_creation_or_push(command: str) -> bool:
-    """True when the command executes `gh pr create` or `git push` and the branch it names is not main/master."""
+    """True when the command executes `gh pr create` or `git push` and the branch it names is not main/master.
+
+    It makes no git call, so it can disagree with handle_post_tool_use: a bare `gh pr create` (no `--head`)
+    is True here, while the hook resolves the checked-out branch and does not arm on main."""
     try:
         trigger = find_review_trigger(command)
     except ValueError:

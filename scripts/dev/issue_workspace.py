@@ -15,14 +15,16 @@ it never touches the exchange, the ledger or any desk runtime file).
       log.
   check-guard <worktree> --since <epoch_s>
       Read <worktree>/logs/issue_work/guard_heartbeat.json (written by issue_fixer_guard.py on every decision) and
-      print {"ok", "heartbeat_ts", "since", "session_id", "signed", "sig_ok", "binding_claim", "issue"} plus a
-      "warning" when there is one: exit 0 when the heartbeat exists, ts >= since and, if the issue has a key, its
-      HMAC verifies; else exit 2 (the guard did not run, e.g. the Claude Code build ignored the fixer's
+      print {"ok", "heartbeat_ts", "since", "session_id", "signed", "sig_ok", "binding_claim",
+      "marker_session_id_null", "issue"} plus a "warning" when there is one: exit 0 when the heartbeat exists,
+      ts >= since and, if the issue has a key, its HMAC verifies; else exit 2 (the guard did not run, e.g. the Claude Code build ignored the fixer's
       frontmatter hook, or the heartbeat is unsigned, tampered with or from another worktree). The issue number
       comes from the binding marker, else from the -wt-issue-<N> directory name; a legacy worktree without a key
       reports `signed: false`, `sig_ok: null` and passes on the timestamp alone. A main checkout that cannot be
       resolved fails closed. session_id is the one the last hook payload carried (null if none);
-      binding_claim: failed still exits 0 with "warning": "binding claim failed".
+      binding_claim: failed still exits 0 with "warning": "binding claim failed". binding_claim reflects only the
+      last decision, so marker_session_id_null (true while the marker is unclaimed, null without a marker) shows
+      whether any claim ever succeeded.
   rebind <N> [--force]
       Reset the binding marker's session_id to null, so the guard binds the worktree to the next session that
       works in it (orchestrator only: the fixer cannot run this script). Without --force it refuses (exit 2)
@@ -39,10 +41,9 @@ it never touches the exchange, the ledger or any desk runtime file).
         files.txt    changed and new files
         checks.json  compileall, sync_claude_assets --check and unittest discover: exit code, duration, summary
         checks.log   the tail of each check's output
-      The checks run with a scrubbed environment (check_env): no BINANCE_*, NOTION_*, GITHUB_*, GMAIL_*, GH_*,
-      ENV_FILE, BINANCE_MCP_OAUTH_PATH or GEMINI_API_KEY, and HOME set to a fresh temporary directory. Only those
-      variables and HOME are scrubbed; any other variable is inherited. The fixer's own test runs are not
-      scrubbed (a hook cannot change a command's environment).
+      The checks run with an allowlisted environment (check_env): only PATH, LANG, LC_*, TZ, TERM, TMPDIR and
+      PYTHON* are inherited, so no credential reaches them, and HOME is a fresh temporary directory. The fixer's
+      own test runs are not scrubbed (a hook cannot change a command's environment).
   cleanup <N> [--force]
       Once the PR of fix/issue-<N>-* is merged (or with --force), remove the worktree, delete the local branch and
       the issue's heartbeat key. It never deletes remote branches (GitHub deletes merged head branches, and a
@@ -81,9 +82,10 @@ SIGNED_FIELDS = ("ts", "worktree", "issue", "decision", "session_id", "binding_c
 BINDING_CLAIMS = {"claimed", "already_bound", "failed", "n/a"}
 WORKTREE_ISSUE_RE = re.compile(r"-wt-issue-(\d+)$")
 REBIND_LIVE_SECONDS = 600
-# Environment the review-context checks never inherit: credentials reach desk code only through these
-SCRUBBED_ENV_PREFIXES = ("BINANCE_", "NOTION_", "GITHUB_", "GMAIL_", "GH_")  # GH_: gh reads GH_TOKEN itself
-SCRUBBED_ENV_NAMES = {"ENV_FILE", "BINANCE_MCP_OAUTH_PATH", "GEMINI_API_KEY"}  # GEMINI: run_pr_audit.py
+# The only variables the review-context checks inherit (an allowlist: any credential, listed or not, is dropped);
+# HOME is replaced by a fresh directory
+CHECK_ENV_NAMES = {"PATH", "LANG", "TZ", "TERM", "TMPDIR"}
+CHECK_ENV_PREFIXES = ("LC_", "PYTHON")
 
 ROUTES = ("quick", "build", "deep")  # ascending rank: a final route may upgrade, never downgrade
 DEEP_LABELS = {"cat:risk_gate", "severity:high", "severity:critical"}
@@ -256,8 +258,9 @@ def _worktree_issue(path: str):
 def cmd_check_guard(path: str, since: int) -> dict:
     """ok when the fixer guard wrote its heartbeat in this worktree at or after `since` (epoch seconds) and, when
     the issue has a key in the main checkout, the heartbeat's HMAC verifies for this worktree and issue. Also
-    reports the heartbeat's session_id (the id the hook payload carried, null when it carried none) and
-    binding_claim."""
+    reports the heartbeat's session_id (the id the hook payload carried, null when it carried none),
+    binding_claim (the last decision's only) and marker_session_id_null (whether the binding marker is still
+    unclaimed; null without a marker)."""
     beat = _read_json(os.path.join(path, WORK_DIR, HEARTBEAT_FILE))
     beat = beat if isinstance(beat, dict) else {}
     ts, session_id, claim = beat.get("ts"), beat.get("session_id"), beat.get("binding_claim")
@@ -292,8 +295,10 @@ def cmd_check_guard(path: str, since: int) -> dict:
             warnings.append("heartbeat signature missing or invalid")
     if claim == "failed":
         warnings.append("binding claim failed")
+    marker = _read_json(os.path.join(path, WORK_DIR, BINDING_FILE))
     out = {"ok": ts is not None and ts >= since and repo is not None and sig_ok is not False, "heartbeat_ts": ts,
            "since": since, "session_id": session_id, "signed": signed, "sig_ok": sig_ok, "binding_claim": claim,
+           "marker_session_id_null": marker.get("session_id") is None if isinstance(marker, dict) else None,
            "issue": issue}
     if warnings:
         out["warning"] = "; ".join(warnings)
@@ -439,13 +444,12 @@ def _summary(name: str, output: str) -> str:
 
 
 def check_env(home: str) -> dict:
-    """The environment of the review-context checks: the current one minus the listed credential variables
-    (SCRUBBED_ENV_PREFIXES, SCRUBBED_ENV_NAMES), with HOME set to `home` (a fresh empty directory). Only those
-    variables and HOME are scrubbed; every other variable (PATH, LANG, TZ, the Python variables, and any
-    credential not listed) is inherited. PYTHONUSERBASE keeps pointing at the real user site-packages, so
-    user-installed dependencies still import."""
-    env = {k: v for k, v in os.environ.items()
-           if not k.startswith(SCRUBBED_ENV_PREFIXES) and k not in SCRUBBED_ENV_NAMES}
+    """The environment of the review-context checks, built from an allowlist: only CHECK_ENV_NAMES (PATH, LANG,
+    TZ, TERM, TMPDIR) and the CHECK_ENV_PREFIXES variables (LC_*, PYTHON*) are inherited; every other variable,
+    credentials included (BINANCE_*, ANTHROPIC_API_KEY, AWS_*...), is dropped. HOME is set to `home` (a fresh
+    empty directory). PYTHONUSERBASE keeps pointing at the real user site-packages, so user-installed
+    dependencies still import."""
+    env = {k: v for k, v in os.environ.items() if k in CHECK_ENV_NAMES or k.startswith(CHECK_ENV_PREFIXES)}
     user_base = site.getuserbase()
     if user_base:
         env.setdefault("PYTHONUSERBASE", user_base)
