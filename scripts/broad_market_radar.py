@@ -274,30 +274,31 @@ def analyze_single_symbol(symbol, interval=DEFAULT_INTERVAL):
         confidence = min(score_long, 95)
         reasons = long_reasons
         score_components = dict(long_points)
-        trigger = candle_high * 1.0005
+        # Beyond the more extreme of the forming and the wick candle, as intraday_radar (issue #165)
+        trigger = max(candle_high, wick_high) * 1.0005
         entry = trigger
         sl = min(candle_low, wick_low) - (1.3 * atr)
         risk_pct = ((entry - sl) / entry) * 100
         if risk_pct < MIN_RISK_PCT:
             sl = entry * 0.985
             risk_pct = 1.5
-        tp1 = max(ema20, entry * (1 + risk_pct * 1.8 / 100))
         tp2 = entry * (1 + risk_pct * 4.0 / 100)
+        tp1 = min(max(ema20, entry * (1 + risk_pct * 1.8 / 100)), tp2)  # a far EMA 20 never puts TP1 past TP2 (#165)
         rr = (tp2 - entry) / (entry - sl) if (entry - sl) > 0 else 4.0
     elif score_short >= 45 and score_short > score_long:
         direction = "SHORT"
         confidence = min(score_short, 95)
         reasons = short_reasons
         score_components = dict(short_points)
-        trigger = candle_low * 0.9995
+        trigger = min(candle_low, wick_low) * 0.9995
         entry = trigger
         sl = max(candle_high, wick_high) + (1.3 * atr)
         risk_pct = ((sl - entry) / entry) * 100
         if risk_pct < MIN_RISK_PCT:
             sl = entry * 1.015
             risk_pct = 1.5
-        tp1 = min(ema20, entry * (1 - risk_pct * 1.8 / 100))
         tp2 = entry * (1 - risk_pct * 4.0 / 100)
+        tp1 = max(min(ema20, entry * (1 - risk_pct * 1.8 / 100)), tp2)
         rr = (entry - tp2) / (sl - entry) if (sl - entry) > 0 else 4.0
     else:
         return None
@@ -334,8 +335,8 @@ def analyze_single_symbol(symbol, interval=DEFAULT_INTERVAL):
         "price": current_price,
         "trigger": trigger,
         # Signed (issue #140): > 0 means the trigger is beyond the price in the trade direction. The trigger comes
-        # from the forming high/low and high >= close >= low, so it is never crossed at scan time; crossing happens
-        # at execution time, where the executor gates use the current price.
+        # from the forming and wick candles' high/low and high >= close >= low, so it is never crossed at scan time;
+        # crossing happens at execution time, where the executor gates use the current price.
         "trigger_distance_pct": round((trigger - current_price if direction == "LONG" else current_price - trigger)
                                       / current_price * 100, 2),
         "sl": sl,
@@ -380,6 +381,9 @@ def enrich_candidate_microstructure(cand, funding_intervals=None, funding_interv
     interval_h = sqf.funding_interval_h(sym, funding_intervals)
     cand['funding_interval_h'] = interval_h
     if not micro:
+        # Issue #165: no order-flow data, so absorption gave no score (fail closed)
+        cand['absorption_scored'] = False
+        cand.setdefault('reasons', []).append("🔬 ORDER FLOW: absorption not scored (no microstructure data)")
         # Issue #206: a SHORT without micro data cannot be checked for squeeze risk, so it is capped (fail closed)
         cand['funding_rate_pct'] = None
         cand['funding_rate_8h_pct'] = None

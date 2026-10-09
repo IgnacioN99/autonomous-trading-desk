@@ -173,8 +173,8 @@ except Exception:  # pragma: no cover - exercised only on broken installs
 
 # GATE 2 (YOLO loss cap) and GATE 3 (friction floor) limits, shared with the YOLO scanner and the screening
 # pipeline (scripts/utils/gate_limits.py, issue #64).
-from utils.gate_limits import (MIN_TP1_DISTANCE, PENDING_DRIFT_CAP_TOLERANCE, YOLO_MAX_LOSS_MARGIN_FRACTION,
-                               YOLO_MIN_LOSS_CAP_USDT)
+from utils.gate_limits import (MIN_RR_TP2_CROSSED, MIN_TP1_DISTANCE, PENDING_DRIFT_CAP_TOLERANCE,
+                               YOLO_MAX_LOSS_MARGIN_FRACTION, YOLO_MIN_LOSS_CAP_USDT)
 # Portfolio delta classification shared with sync_session_state.py; PROD gates apply it to the live exchange view.
 from utils.portfolio_exposure import (compute_exposure, book_exposure, project_order, resting_opening_legs,
                                       unrealized_pnl_total, LONG_HEAVY, SHORT_HEAVY)
@@ -1549,7 +1549,9 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
     min(wallet balance, balance + unrealized PnL of the snapshot's open positions) x risk_pct_equity x 1.25; a
     missing unRealizedProfit on an open position rejects. Issue #126: in PROD a defaulted standard margin
     (execute_complete_trade, no explicit --margin) is sized on the same min(wallet, wallet + uPnL), so open losses
-    size the order down instead of making Gate 2 reject it; an explicit margin is the user's and is not re-sized.
+    size the order down instead of making Gate 2 reject it; an explicit margin is the user's and is not re-sized,
+    except (issue #201) on a crossed trigger that enters at the current price: there the standard qty is clamped so
+    the loss at SL fits 98% of this cap (margin recomputed from the clamped qty) before Gate 2 runs.
     Gate 0A and Gate 1 read the registry captured in the snapshot (issue #127). TESTNET skips Gate 1 and keeps the
     10000 fallback. `exchange_ticks` ({symbol: tickSize}, issue #160) caps the registry tick_size used to match
     quantity-less resting orders to their records (record_price_tolerances).
@@ -2027,6 +2029,19 @@ def build_score_meta(cand, symbol, direction):
 # -----------------------------------------------------------------------------
 # Take-profit sizing / placement and audit ledger (shared by fresh entries and filled resting entries)
 # -----------------------------------------------------------------------------
+def _enters_at_limit(order_type, limit_price):
+    """Dispatch rule of a fresh entry (execute_complete_trade step 8): only a LIMIT order WITH a limit price is sent
+    as a LIMIT; anything else (MARKET, a breached STOP_MARKET, a LIMIT without a price) goes out as MARKET at the
+    current price. Shared by the effective entry, the crossed-trigger gates (issue #165) and the dispatch."""
+    return str(order_type).upper() == 'LIMIT' and bool(limit_price)
+
+
+def _notional_below(qty, price, min_notional):
+    """qty x price < min_notional, compared in Decimal (issue #165): a product that equals minNotional exactly is
+    not below it, whatever float rounding says."""
+    return Decimal(str(qty)) * Decimal(str(price)) < Decimal(str(min_notional))
+
+
 def split_take_profit_quantities(total_qty, filters, ref_price):
     """
     Asymmetric 30% TP1 / 70% TP2 split (positive right-tail skewness, no premature truncation). TP1 is bumped
@@ -2037,7 +2052,7 @@ def split_take_profit_quantities(total_qty, filters, ref_price):
     tp1_qty = round_step(total_qty * 0.30, filters['stepSize'], filters['precision_qty'])
     if tp1_qty < filters['minQty']:
         tp1_qty = filters['minQty']
-    if tp1_qty * ref_price < min_notional:
+    if _notional_below(tp1_qty, ref_price, min_notional):
         needed_qty = round_step(math.ceil(min_notional / ref_price / filters['stepSize']) * filters['stepSize'], filters['stepSize'], filters['precision_qty'])
         if needed_qty < total_qty:
             tp1_qty = needed_qty
@@ -3965,7 +3980,8 @@ def execute_complete_trade(
         trigger_p = round_price(trigger_price, filters['tickSize'], filters['precision_price'])
         trigger_breached = (cur_price >= trigger_p) if is_long else (cur_price <= trigger_p)
     effective_entry = cur_price
-    if str(order_type).upper() == 'LIMIT' and limit_price:
+    limit_entry = _enters_at_limit(order_type, limit_price)
+    if limit_entry:
         effective_entry = float(round_price(limit_price, filters['tickSize'], filters['precision_price']))
     elif str(order_type).upper() == 'STOP_MARKET' and trigger_p is not None and not trigger_breached:
         effective_entry = float(trigger_p)
@@ -3996,6 +4012,27 @@ def execute_complete_trade(
         return {"success": False, "error": (f"Rounded TP2 {tp2_p} (from {tp2_price}) is not on the profit side of the "
                                             f"effective entry {effective_entry} for a {'LONG' if is_long else 'SHORT'}. "
                                             "Execution aborted (fail-closed).")}
+    # Crossed-trigger R:R gate (issue #165, PROD): a trigger already crossed sends the order in at the current price
+    # (MARKET dispatch: anything but a LIMIT with a limit price, _enters_at_limit), so R:R to TP2 is re-measured from
+    # it (Decimal on the submitted prices). A LIMIT with a price enters at that price and is not concerned. TESTNET
+    # only warns.
+    crossed_market_entry = trigger_p is not None and trigger_breached and not limit_entry
+    if crossed_market_entry:
+        risk_dist = abs(Decimal(str(effective_entry)) - Decimal(str(sl_p)))
+        reward_dist = abs(Decimal(str(tp2_p)) - Decimal(str(effective_entry)))
+        crossed_rr = (reward_dist / risk_dist) if risk_dist > 0 and reward_dist > 0 else None
+        if crossed_rr is None or crossed_rr < Decimal(str(MIN_RR_TP2_CROSSED)):
+            # Truncated (never rounded up to a passing-looking 3.000)
+            rr_txt = (f"{crossed_rr.quantize(Decimal('0.001'), rounding=ROUND_DOWN)}:1" if crossed_rr is not None
+                      else "undefined (zero distance)")
+            rr_msg = (f"Trigger {trigger_p} already crossed (current price {cur_price}): the order would enter at the "
+                      f"current price, and R:R to TP2 from there is {rr_txt} (SL {sl_p}, TP2 {tp2_p}), below the "
+                      f"{MIN_RR_TP2_CROSSED}:1 minimum.")
+            if is_prod:
+                return {"success": False, "hard_gate_rejection": True,
+                        "error": (f"MECHANICAL HARD GATE REJECTION: {rr_msg} Re-plan the levels from the current "
+                                  "price or wait for a new setup. Execution aborted (fail-closed).")}
+            print(f"⚠️ TESTNET (crossed-trigger R:R gate relaxed): {rr_msg}", file=sys.stderr)
 
     # 1b. Pending resting entries (Issue #33, PROD): no new entry of any type on a symbol with a pending resting
     # entry (or an unreadable registry). An untriggered STOP_MARKET or a LIMIT entry rests on the book and gets its TPs
@@ -4058,12 +4095,73 @@ def execute_complete_trade(
     resting_kind = None
     if str(order_type).upper() == 'STOP_MARKET' and trigger_p is not None and not trigger_breached:
         resting_kind = 'STOP_MARKET'
-    elif str(order_type).upper() == 'LIMIT' and limit_price and (trigger_p is None or trigger_breached):
+    elif limit_entry and (trigger_p is None or trigger_breached):
         resting_kind = 'LIMIT'
     if resting_kind and is_prod:
         rest_ok, rest_err = check_resting_entry_gates(symbol, target_env)
         if not rest_ok:
             return {"success": False, "hard_gate_rejection": True, "error": rest_err}
+
+    # 1e. Risk-cap clamp (issue #201, PROD standard order with an explicit margin and a crossed trigger): the margin was
+    # sized for the trigger, but the order enters at the current price, further from the SL. The qty is capped so the
+    # loss at SL fits the Gate 2 cap (monetary_loss_cap on Gate 2's inputs) less a 2% haircut for Gate 2's own equity
+    # re-read. Gate 2 still runs unchanged.
+    clamp_max_qty = None
+    clamp_cap = None
+    if crossed_market_entry and is_prod and not is_yolo and not margin_defaulted:
+        try:
+            clamp_unrealized = unrealized_pnl_total(live_snapshot["exposure"])
+        except (ValueError, KeyError, TypeError) as e:
+            return {"success": False, "hard_gate_rejection": True,
+                    "error": (f"MECHANICAL HARD GATE REJECTION: FAIL-CLOSED — cannot read the unrealized PnL of the "
+                              f"open positions to fit the order to the monetary risk cap ({e}). Order blocked.")}
+        clamp_cap = monetary_loss_cap(float(account_equity), prof, is_testnet=False, is_yolo=False,
+                                      ref=effective_entry, total_qty=0.0, leverage=leverage,
+                                      unrealized=clamp_unrealized)[0]
+        clamp_max_qty = round_step(clamp_cap * 0.98 / abs(effective_entry - sl_p), filters['stepSize'],
+                                   filters['precision_qty'])
+
+    min_notional = filters.get('minNotional', 5.0)
+    # Binance does not document whether an untriggered conditional entry's notional is checked at the trigger or at
+    # the mark/last price (issue #42): use the lower of the two, which satisfies both readings.
+    notional_ref = min(effective_entry, cur_price) if resting_kind == 'STOP_MARKET' else effective_entry
+
+    def size_entry(lev):
+        """Entry qty from margin x lev at the effective entry, capped at clamp_max_qty (issue #201), with the one-step
+        minNotional bump (never above the clamp). Quantities vs minNotional compare in Decimal (issue #165).
+        Returns (total_qty, clamped, unclamped_qty, error_result or None)."""
+        raw_qty = margin_usdt * lev / effective_entry
+        unclamped_qty = round_step(raw_qty, filters['stepSize'], filters['precision_qty'])
+        clamped = clamp_max_qty is not None and raw_qty > clamp_max_qty
+        qty = clamp_max_qty if clamped else unclamped_qty
+        if _notional_below(qty, notional_ref, min_notional) and not clamped:
+            bumped_qty = round_step(qty + filters['stepSize'], filters['stepSize'], filters['precision_qty'])
+            if not _notional_below(bumped_qty, notional_ref, min_notional) and (
+                    clamp_max_qty is None or bumped_qty <= clamp_max_qty):
+                qty = bumped_qty
+        clamp_note = (f" after the Gate 2 risk clamp (qty {unclamped_qty} -> {qty}: the loss at SL from the current "
+                      f"price {effective_entry} must fit the cap)") if clamped else ""
+        if qty < filters['minQty']:
+            return qty, clamped, unclamped_qty, {
+                "success": False,
+                "error": (f"Quantity {qty} lower than minimum allowed {filters['minQty']}{clamp_note}. Execution "
+                          "aborted (fail-closed).")}
+        # Still below minNotional after the one-step bump (or the clamp): reject locally instead of a Binance -4164
+        # (issue #141).
+        if _notional_below(qty, notional_ref, min_notional):
+            how = clamp_note if clamped else " after a one-step size bump. Increase the margin"
+            return qty, clamped, unclamped_qty, {
+                "success": False,
+                "error": (f"Entry notional {qty * notional_ref:.4f} USDT ({qty} x {notional_ref}) is below the "
+                          f"exchange minNotional {min_notional} USDT{how}. Execution aborted (fail-closed).")}
+        return qty, clamped, unclamped_qty, None
+
+    # minNotional pre-check (issue #165) with the requested leverage, before any marginType / leverage write: the setup
+    # can only lower the leverage, so an order that fails here would fail after it too. Re-checked after the setup.
+    if isinstance(leverage, (int, float)) and not isinstance(leverage, bool) and leverage > 0:
+        _qty, _clamped, _unclamped, size_err = size_entry(leverage)
+        if size_err:
+            return size_err
 
     # 2. Configure Isolated margin and leverage first (Fail-Closed & Auto-Clamp for Subaccounts)
     setup_res = setup_margin_and_leverage(symbol, leverage, target_env=target_env)
@@ -4091,26 +4189,17 @@ def execute_complete_trade(
 
     effective_leverage = int(confirmed_leverage) if confirmed_leverage else leverage
 
-    # 3. Calculate exact token quantity using verified effective leverage, sized at the effective entry
-    notional_target = margin_usdt * effective_leverage
-    raw_qty = notional_target / effective_entry
-    total_qty = round_step(raw_qty, filters['stepSize'], filters['precision_qty'])
-    min_notional = filters.get('minNotional', 5.0)
-    # Binance does not document whether an untriggered conditional entry's notional is checked at the trigger or at
-    # the mark/last price (issue #42): use the lower of the two, which satisfies both readings.
-    notional_ref = min(effective_entry, cur_price) if resting_kind == 'STOP_MARKET' else effective_entry
-    if total_qty * notional_ref < min_notional:
-        bumped_qty = round_step(total_qty + filters['stepSize'], filters['stepSize'], filters['precision_qty'])
-        if bumped_qty * notional_ref >= min_notional:
-            total_qty = bumped_qty
-    if total_qty < filters['minQty']:
-        return {"success": False, "error": f"Quantity {total_qty} lower than minimum allowed {filters['minQty']}"}
-    # Still below minNotional after the one-step bump: reject locally instead of a Binance -4164 (issue #141).
-    if total_qty * notional_ref < min_notional:
-        return {"success": False, "error": (f"Entry notional {total_qty * notional_ref:.4f} USDT ({total_qty} x "
-                                            f"{notional_ref}) is below the exchange minNotional {min_notional} USDT "
-                                            "after a one-step size bump. Increase the margin. Execution aborted "
-                                            "(fail-closed).")}
+    # 3. Calculate exact token quantity using verified effective leverage, sized at the effective entry (clamped to
+    # the Gate 2 cap for a crossed trigger, issue #201; local minQty / minNotional rejects)
+    total_qty, clamped, unclamped_qty, size_err = size_entry(effective_leverage)
+    if size_err:
+        return size_err
+    if clamped:
+        # Issue #126 invariant: the margin recorded (pending / audit) stays qty x price / leverage
+        margin_usdt = round(total_qty * effective_entry / effective_leverage, 8)
+        print(f"[RISK CLAMP] qty {unclamped_qty} -> {total_qty} to fit the Gate 2 cap (crossed trigger {trigger_p}, "
+              f"entry at {effective_entry}, SL {sl_p}, loss cap {clamp_cap:.4f} USDT x 0.98; margin now "
+              f"{margin_usdt} USDT)", file=sys.stderr)
 
     # 4. MECHANICAL HARD GATES VERIFICATION (incl. liquidation gate with the confirmed effective leverage)
     liq_entry_price = effective_entry
@@ -4241,7 +4330,7 @@ def execute_complete_trade(
                 }
 
     # 8. Execute Entry Order (MARKET or LIMIT)
-    if order_type.upper() == 'LIMIT' and limit_price:
+    if limit_entry:
         lim_p = round_price(limit_price, filters['tickSize'], filters['precision_price'])
         entry_params = {
             'symbol': symbol,
@@ -4266,7 +4355,7 @@ def execute_complete_trade(
     # Protection against premature reduceOnly orders on resting LIMIT orders (Finding 9). A PARTIALLY_FILLED LIMIT
     # still rests too: it is registered and its partial position gets the planned SL right away (TPs once filled).
     entry_status = str(entry_order.get('status', '')).upper()
-    if order_type.upper() == 'LIMIT' and entry_status in ('NEW', 'PARTIALLY_FILLED'):
+    if limit_entry and entry_status in ('NEW', 'PARTIALLY_FILLED'):
         # Issue #36: a resting (NEW) LIMIT gets its SL pre-armed after the entry; a PARTIALLY_FILLED one is protected
         # below from executedQty (_ensure_entry_stop).
         prearm = (prearm_resting_entry_stop(symbol, exit_side, sl_p, cur_price, target_env=target_env,

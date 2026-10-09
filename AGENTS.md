@@ -23,7 +23,7 @@ Whenever the user explicitly requests crypto trading operations, Binance Futures
    - **Layer 2: Hard Code Gates (Mechanical Software Gates in `scripts/execute_futures_trade.py`):**
      * *Deterministic Execution Interception:* Risk control is never delegated to natural language LLM instructions; it is programmatically enforced at runtime. The execution engine physically intercepts every order:
        1. **Delta-Neutral Gate:** If live positions + resting entries mark `LONG_HEAVY`, rejects any `LONG`; `SHORT_HEAVY`, any `SHORT`. No order may tip a non-empty book heavy its way.
-       2. **Monetary Risk Gate:** Blocks orders whose loss at SL from the effective entry (limit/trigger if conditional) exceeds `risk_pct_equity` × min(wallet balance, balance + unrealized PnL) + buffer (default 0.5%, max 2.0%).
+       2. **Monetary Risk Gate:** Blocks orders whose loss at SL from the effective entry (limit/trigger if conditional) exceeds `risk_pct_equity` × min(wallet balance, balance + unrealized PnL) + buffer (default 0.5%, max 2.0%). Crossed trigger (enters at market): R:R to TP2 ≥ 3:1; explicit margin clamped to the cap.
        3. **Financial Friction Gate:** Blocks orders whose TP1 is under 0.35% from the effective entry (taker fees would eat the edge).
        4. **Leverage Gate:** Standard orders use the profile's `leverage_standard`, YOLO orders `leverage_yolo`; absolute desk ceiling = profile `leverage_ceiling` (default 15x).
        5. **Daily Loss Gate:** No entry once today's (UTC) net realized PnL ≤ -`daily_stop_r` x risk or after `max_consecutive_sl` full SLs (YOLO: `yolo_max_daily_losses`). PROD fails closed.
