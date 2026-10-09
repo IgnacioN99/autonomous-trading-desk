@@ -245,7 +245,8 @@ class TestSelection(InsightsFile):
         self.assertIn("ins-1700000003-fix000", err.getvalue())
         self.assertIn("ins-1700000002-pin000", err.getvalue())
         self.assertIn("100-byte cap", err.getvalue())
-        self.assertEqual(report, {"budget_exceeded": True})
+        # issue #271: the budget-bound lesson left out is reported
+        self.assertEqual(report, {"budget_exceeded": True, "dropped": ["ins-1700000004-global"]})
         within = {}
         with patch.object(peb, "INSIGHTS_FILE", self.path):
             peb.load_recent_insights(report=within)
