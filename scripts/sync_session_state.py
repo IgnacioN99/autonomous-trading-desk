@@ -590,7 +590,7 @@ def sync_session_state(target_env: str = None) -> dict:
     if day_error:
         state["closed_today_summary"]["trade_summary_error"] = day_error
     state["daily_loss_gate"] = ledger_daily_loss_gate(target_env, trades_res, day_truncated, view,
-                                                      fills_info=fills_info)
+                                                      fills_info=fills_info, audit_corrupt_lines=audit_corrupt_lines)
 
     # Save to atomic file with kernel-level replace (no non-atomic fallback, issue #127)
     return _write_state(state)
@@ -651,12 +651,13 @@ def _gate_unavailable(reason: str) -> dict:
 
 
 def ledger_daily_loss_gate(target_env: str, trades_res, truncated: bool, view: dict, prof: dict = None,
-                           equity=None, fills_info: dict = None) -> dict:
+                           equity=None, fills_info: dict = None, audit_corrupt_lines: int = 0) -> dict:
     """The Daily Loss Gate state (utils.daily_loss_gate.evaluate, as a YOLO order so `scope` shows every active
     limit) for the ledger cache (issue #207), from the fills and per-trade view this sync already read, the profile
     and the live USDT wallet balance (/fapi/v2/balance). TESTNET: not blocked (the executor skips the gate there).
     Any read problem, truncated fills or per-fill counts: {"blocked": true, "scope": "all", "reason": "unavailable:
-    ..."} (fail closed in the cache; the executor re-reads the exchange and is authoritative)."""
+    ..."} (fail closed in the cache; the executor re-reads the exchange and is authoritative). audit_corrupt_lines
+    and non-numeric fills are informational notes (utils.daily_loss_gate.note_malformed_inputs, issue #187)."""
     if pt.norm_env(target_env) == "testnet":
         return {"blocked": False, "scope": None, "reason": "TESTNET: gate skipped"}
     try:
@@ -673,10 +674,12 @@ def ledger_daily_loss_gate(target_env: str, trades_res, truncated: bool, view: d
         if equity is None:
             equity = _wallet_balance_usdt(target_env)
         limits = up.get_daily_loss_limits(prof)
-        net, _other = dlg.day_net_realized(trades_res)
+        fill_stats = {}
+        net, _other = dlg.day_net_realized(trades_res, stats=fill_stats)
         state = dlg.evaluate(net, view.get("trades") or [], risk_pct=eft.profile_risk_fraction(prof),
                              equity_now=equity, is_yolo_order=True, **limits)
         dlg.note_fills_scope(state, fills_info)
+        dlg.note_malformed_inputs(state, audit_corrupt_lines, fill_stats.get("malformed_fills"))  # informational
         return dlg.note_unaudited_closing_symbols(state, view.get("unaudited_closing_symbols") or [])
     except Exception as e:
         return _gate_unavailable(f"{type(e).__name__}: {e}")
@@ -701,12 +704,15 @@ def format_daily_loss_gate(gate) -> str:
         return "UNKNOWN (no state: sync required)"
     if gate.get("blocked") is not False:
         return f"🚨 ACTIVE ({gate.get('scope') or 'all'}): {gate.get('reason')}"
-    if gate.get("scope"):
-        return f"⚠️ ACTIVE ({gate['scope']}): {gate.get('reason')}"
+    # Not blocked: inactive whatever a leftover scope says (ACTIVE only when blocked, issue #187)
+    if "day_loss_limit_usdt" not in gate:
+        return f"inactive ({gate.get('reason')})"
+    # Skipped audit lines and non-numeric fills are named (informational, issue #187)
+    notes = "".join(f"; {k}={gate[k]}" for k in ("malformed_audit_lines", "malformed_fills")
+                    if type(gate.get(k)) is int and gate[k] > 0)
     return (f"inactive (day_net_realized_usdt={gate.get('day_net_realized_usdt')}, limit_usdt=-"
             f"{gate.get('day_loss_limit_usdt')}, consecutive_full_sl={gate.get('consecutive_full_sl')}, "
-            f"yolo_full_losses={gate.get('yolo_full_losses')})" if "day_loss_limit_usdt" in gate
-            else f"inactive ({gate.get('reason')})")
+            f"yolo_full_losses={gate.get('yolo_full_losses')}){notes}")
 
 
 def format_markdown_summary(state: dict) -> str:
