@@ -563,7 +563,7 @@ class TestPostHooksAcceptPowerShell(tgb.GuardHarness):
                 res = post_trade_sync.handle_post_trade_sync(self.payload(command))
                 self.assertTrue(res["order_placed"], command)
                 self.assertFalse(res["is_opening"], command)
-                self.assertTrue(res["synced"], command)
+                self.assertTrue(res["sync_attempted"], command)
             mock_audit.assert_not_called()
             res = post_trade_sync.handle_post_trade_sync(self.payload(
                 "python scripts\\execute_futures_trade.py --symbol BTCUSDT --direction LONG --env testnet"))

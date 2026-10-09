@@ -15,7 +15,9 @@ delta_bias itself is unchanged. Issue #173: audit_read_error (logs/trades_audit.
 the exception text, else None) and audit_corrupt_lines (skipped non-JSON-object lines, else 0); the doctor warns on
 either. Issue #160: portfolio_exposure.resting_mismatches lists same-env records with no live order match and no
 open position (not counted; the doctor warns), and the order listings are read before positionRisk so an entry
-filling between the reads is double counted rather than missed. The state is only ever written atomically
+filling between the reads is double counted rather than missed. Issue #189: listing_read_error (top level, also in
+the error state) names an order listing whose read raised or returned a non-list (resting exposure UNKNOWN, SL/TP
+listings empty), else None; the doctor warns, the exit code is unchanged. The state is only ever written atomically
 (issue #127): a failed write leaves the
 previous file. Issue #208: closed_today_summary counts trades, not fills (trade_outcomes.summarize_closed_today on
 the day's userTrades, pages of 1000 up to 10 pages, "truncated" when incomplete, and the audit records): closed_trades_count / wins / losses / scratches per trade,
@@ -202,7 +204,8 @@ def load_audit_metadata(target_env: str = None, records: List[dict] = None) -> D
             continue
     return meta
 
-def write_error_state(err_msg: str, now_ts: int, now_utc: str, target_env: str, btc_price: float) -> dict:
+def write_error_state(err_msg: str, now_ts: int, now_utc: str, target_env: str, btc_price: float,
+                      listing_read_error=None) -> dict:
     """Writes and returns the fail-closed state (is_valid False, delta_bias UNKNOWN, zeroed figures, error text) used
     when the ledger positions cannot be read or classified: never a 0-position DELTA_BALANCED state (Finding 6)."""
     error_state = {
@@ -211,6 +214,7 @@ def write_error_state(err_msg: str, now_ts: int, now_utc: str, target_env: str, 
         "last_updated_ts": now_ts,
         "last_updated_utc": now_utc,
         "target_env": target_env,
+        "listing_read_error": listing_read_error,
         "macro_btc": {
             "price_usdt": btc_price
         },
@@ -356,6 +360,10 @@ def sync_session_state(target_env: str = None) -> dict:
         except Exception as e:
             listings.append({"error": f"{type(e).__name__}: {e}"})
     algos_res, open_orders_res = listings
+    # Issue #189: a raised read or a non-list reply (e.g. {"error": ...}) is reported, not only seen as UNKNOWN.
+    listing_read_error = "; ".join(f"{endpoint} read failed: {str(res)[:200]}" for endpoint, res in
+                                   zip(("/fapi/v1/openAlgoOrders", "/fapi/v1/openOrders"), listings)
+                                   if not isinstance(res, list)) or None
 
     # 2. Active Ledger Positions
     try:
@@ -367,7 +375,7 @@ def sync_session_state(target_env: str = None) -> dict:
     # DO NOT write session_state.json with 0 positions and DELTA_BALANCED.
     if not isinstance(pos_res, list) or (isinstance(pos_res, dict) and ("code" in pos_res or "error" in pos_res or "msg" in pos_res)):
         return write_error_state(f"Failed to fetch positionRisk from ledger: {pos_res}", now_ts, now_utc,
-                                 target_env, btc_price)
+                                 target_env, btc_price, listing_read_error=listing_read_error)
 
     active_positions = []
     # Portfolio delta classification shared with the executor's PROD gates (utils/portfolio_exposure.py, issue #101).
@@ -376,7 +384,7 @@ def sync_session_state(target_env: str = None) -> dict:
         exposure = compute_exposure(pos_res)
     except ValueError as e:
         return write_error_state(f"Malformed positionRisk data from ledger: {e}", now_ts, now_utc, target_env,
-                                 btc_price)
+                                 btc_price, listing_read_error=listing_read_error)
     long_notional = exposure["long_notional"]
     short_notional = exposure["short_notional"]
 
@@ -549,6 +557,7 @@ def sync_session_state(target_env: str = None) -> dict:
         "target_env": target_env,
         "audit_read_error": audit_read_error,
         "audit_corrupt_lines": audit_corrupt_lines,
+        "listing_read_error": listing_read_error,
         "macro_btc": {
             "price_usdt": btc_price
         },
@@ -749,6 +758,8 @@ def format_markdown_summary(state: dict) -> str:
         f"* **Tactical Rule:** {exp['delta_advice']}",
         f"* **Incl. resting entries:** `{exp.get('delta_bias_incl_resting', 'UNKNOWN')}` "
         f"({len(exp.get('resting_entries') or [])} resting, margin ${exp.get('resting_margin_usdt', 0.0):.2f})",
+        *([f"* ⚠️ **Order listing read failed:** {state['listing_read_error']}"] if state.get("listing_read_error")
+          else []),
         "",
         f"### 🛡️ Active Positions ({exp['total_active_positions']})"
     ]

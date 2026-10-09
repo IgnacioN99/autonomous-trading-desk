@@ -501,10 +501,9 @@ def assemble_primed_brief(target_env: str = "prod", out_path: Optional[str] = No
         "committed_memory_lessons": []  # filled last (issue #187): its budget is what the rest of the brief leaves
     }
 
-    if resting_bias == "UNKNOWN":
-        brief["pending_entries_status"] = "UNREADABLE"
-    if sync_failed:
-        brief["state_sync"] = "FAILED"
+    # Issue #189: both keys always present (OK or the bad value), so an absent key never reads as OK
+    brief["pending_entries_status"] = "UNREADABLE" if resting_bias == "UNKNOWN" else "OK"
+    brief["state_sync"] = "FAILED" if sync_failed else "OK"
     # Issue #206: altcoin SHORTs the screener's macro gate dropped (symbols only), so a thin radar is not read as quiet
     rejected_shorts = [r.get("symbol") for r in (screening.get("macro_rejected_shorts") or [])
                        if isinstance(r, dict) and r.get("symbol")]
@@ -659,8 +658,9 @@ def format_markdown_brief(brief: dict) -> str:
     lines.append(f"- **Pending Entries ({len(pend)}):** "
                  + (", ".join(f"{x.get('symbol')} ({x.get('dir')} {x.get('kind')})" for x in pend) or "None")
                  + f" | **Delta incl. resting:** `{p.get('delta_bias_incl_resting', 'UNKNOWN')}`"
-                 + (" | **Pending entries status:** `UNREADABLE`" if brief.get("pending_entries_status") else "")
-                 + (" | **State sync:** `FAILED`" if brief.get("state_sync") else ""))
+                 + (" | **Pending entries status:** `UNREADABLE`"
+                    if brief.get("pending_entries_status") == "UNREADABLE" else "")
+                 + (" | **State sync:** `FAILED`" if brief.get("state_sync") == "FAILED" else ""))
     dlg = brief.get("daily_loss_gate") or {}
     if dlg.get("blocked"):  # issue #207; ACTIVE only when blocked (#187)
         lines.append(f"- **Daily Loss Gate:** `ACTIVE ({dlg.get('scope') or 'all'})` {dlg.get('reason') or ''}".rstrip())
