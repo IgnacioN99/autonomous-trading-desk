@@ -178,9 +178,9 @@ except ImportError:
 # Single dossier gate shared with the PreToolUse hook (scripts/utils/dossier_provenance.py).
 # If it cannot be imported, new positions fail closed in PROD (see enforce_evaluation_dossier).
 try:
-    from utils.dossier_provenance import validate_dossier_for_trade
+    from utils.dossier_provenance import validate_dossier_for_trade, find_approving_dossier
 except Exception:  # pragma: no cover - exercised only on broken installs
-    validate_dossier_for_trade = None
+    validate_dossier_for_trade = find_approving_dossier = None
 
 # GATE 2 (YOLO loss cap) and GATE 3 (friction floor) limits, shared with the YOLO scanner and the screening
 # pipeline (scripts/utils/gate_limits.py, issue #64).
@@ -1129,17 +1129,25 @@ def detect_yolo_position(symbol, leverage=None, explicit=None, base_dir=None, *,
     if _truthy(explicit):
         return True, 'explicit_flag'
     base = base_dir or _workspace_dir()
+    rec, need_audit = record, record is None and audit_fallback
     try:
-        from utils.dossier_provenance import default_dossier_path, load_dossier, find_candidate
-        cand = find_candidate(load_dossier(default_dossier_path(base)), symbol)
+        from utils.dossier_provenance import resolve_dossier_path, load_dossier, find_candidate
+        # Issue #270: the dossier the trade was opened from (the audit record's dossier_sha256), else the newest scan.
+        # A failed audit read here only falls back to the newest scan; the read below fails as before.
+        sha = None
+        try:
+            if need_audit:
+                rec, need_audit = latest_trade_audit_record(symbol, base), False
+            sha = rec.get('dossier_sha256') if isinstance(rec, dict) else None
+        except Exception:
+            pass
+        cand = find_candidate(load_dossier(resolve_dossier_path(base, sha256=sha)), symbol)
         if isinstance(cand, dict) and _truthy(cand.get('is_yolo')):
             return True, 'dossier_candidate'
     except Exception:
         pass
-    if record is not None:
-        rec = record
-    else:
-        rec = latest_trade_audit_record(symbol, base) if audit_fallback else None
+    if need_audit:
+        rec = latest_trade_audit_record(symbol, base)
     if rec and _truthy(rec.get('is_yolo')):
         return True, 'trade_audit'
     if leverage:
@@ -1783,7 +1791,10 @@ def enforce_evaluation_dossier(symbol, direction, target_env=None, bypass_eval_g
                                is_yolo=False):
     """
     Clean-room evaluation gate for NEW positions (never used by close/breakeven/trailing/audit/heal/cancel paths).
-    Delegates to utils.dossier_provenance.validate_dossier_for_trade (same gate as the PreToolUse hook).
+    Delegates to utils.dossier_provenance.validate_dossier_for_trade (same gate as the PreToolUse hook) through
+    find_approving_dossier (issue #270): the calling session is unknown here, so the newest verified record approving
+    the symbol and direction among latest_dossier.json and the per-session files is used (none: latest's verdict).
+    The session binding is the hook's (PROD).
     - PROD: fail closed. --bypass-eval-gate is refused. If the evaluator flagged the candidate as requiring
       user confirmation, `confirmed=True` is required. YOLO entries (dossier candidate flagged YOLO, or the order
       itself sent as YOLO) always require `confirmed=True`, even if `requires_user_confirmation` is false/missing.
@@ -1806,13 +1817,12 @@ def enforce_evaluation_dossier(symbol, direction, target_env=None, bypass_eval_g
             ), None
         return True, "Evaluation gate explicitly bypassed (TESTNET only).", None
 
-    if validate_dossier_for_trade is None:
+    if validate_dossier_for_trade is None or find_approving_dossier is None:
         return False, "MECHANICAL HARD GATE REJECTION (Evaluation Gate): FAIL-CLOSED — dossier validator (utils/dossier_provenance.py) unavailable.", None
 
     try:
-        ok, reason, cand = validate_dossier_for_trade(
-            symbol, direction, env, base_dir=base_dir or find_workspace_root()
-        )
+        ok, reason, cand, _path = find_approving_dossier(symbol, direction, env, base_dir or find_workspace_root(),
+                                                         validate=validate_dossier_for_trade)
     except Exception as e:
         return False, f"MECHANICAL HARD GATE REJECTION (Evaluation Gate, {label}): FAIL-CLOSED — dossier validation error ({e}).", None
 
@@ -1885,10 +1895,12 @@ SQUEEZE_FALLBACK_MESSAGE = SQUEEZE_FALLBACK_MESSAGE or _GENERIC_FALLBACK_ASK
 def squeeze_fallback_message(cand, base_dir):
     """Squeeze backstop when utils.score_calibration cannot be imported (issue #207): SQUEEZE_FALLBACK_MESSAGE when
     the stored dossier record's radar snapshot for the candidate has squeeze_risk true, or (a SHORT) is missing or not
-    bound to the dossier sha256, or the record cannot be read (fail closed: ask); else None."""
+    bound to the dossier sha256, or the record cannot be read (fail closed: ask); else None. The record is the file
+    holding the validated dossier sha256 (issue #270), else latest_dossier.json."""
     cand = cand if isinstance(cand, dict) else {}
     try:
-        with open(os.path.join(base_dir, 'logs', 'evaluations', 'latest_dossier.json'), 'r', encoding='utf-8') as f:
+        from utils.dossier_provenance import resolve_dossier_path
+        with open(resolve_dossier_path(base_dir, sha256=cand.get('dossier_sha256')), 'r', encoding='utf-8') as f:
             record = json.load(f)
         key = f"{str(cand.get('symbol') or '').upper()}|{str(cand.get('direction') or '').upper()}"
         entry = (record.get('radar_snapshots') or {}).get(key)
@@ -1988,9 +2000,10 @@ def check_daily_loss_gate(target_env, is_yolo_order, prof, equity_now, *, open_p
 
 
 # Issue #202: score metadata on the entry audit record (audit only; never a gate input). Never named `provenance`
-# (stamp_trade_record owns that key).
+# (stamp_trade_record owns that key). dossier_session (issue #270): the session whose evaluator approved the trade
+# (the dossier's parent_conversation_id), the origin sync_session_state shows for positions and resting entries.
 SCORE_AUDIT_KEYS = ('score', 'score_tier', 'score_components', 'score_source', 'score_missing_reason',
-                    'dossier_tier', 'dossier_score', 'dossier_sha256', 'score_schema_version')
+                    'dossier_tier', 'dossier_score', 'dossier_sha256', 'score_schema_version', 'dossier_session')
 
 
 def score_audit_fields(meta):
@@ -2000,10 +2013,12 @@ def score_audit_fields(meta):
 
 
 def read_radar_snapshot(symbol, direction, dossier_sha256=None):
-    """(row, None) or (None, reason): the radar row record_evaluation.py joined into latest_dossier.json
-    (`radar_snapshots["SYMBOL|DIRECTION"]`). Fails open: any problem is a reason, never an exception."""
+    """(row, None) or (None, reason): the radar row record_evaluation.py joined into the dossier record
+    (`radar_snapshots["SYMBOL|DIRECTION"]`) of the file holding dossier_sha256 (issue #270; else
+    latest_dossier.json). Fails open: any problem is a reason, never an exception."""
     try:
-        path = os.path.join(_workspace_dir(), 'logs', 'evaluations', 'latest_dossier.json')
+        from utils.dossier_provenance import resolve_dossier_path
+        path = resolve_dossier_path(_workspace_dir(), sha256=dossier_sha256)
         if not os.path.exists(path):
             return None, 'missing'
         with open(path, 'r', encoding='utf-8') as f:
@@ -2033,7 +2048,7 @@ def build_score_meta(cand, symbol, direction):
         return meta
     try:
         meta.update(dossier_tier=cand.get('tier'), dossier_score=cand.get('score'),
-                    dossier_sha256=cand.get('dossier_sha256'))
+                    dossier_sha256=cand.get('dossier_sha256'), dossier_session=cand.get('dossier_session'))
         row, reason = read_radar_snapshot(symbol, direction, meta['dossier_sha256'])
         if row is None:
             meta['score_missing_reason'] = reason

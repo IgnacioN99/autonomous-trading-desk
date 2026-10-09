@@ -10,6 +10,10 @@
 # Telemetry comes from scripts/utils/issue_telemetry.py when python3 + the helper are available,
 # otherwise from a bash-only fallback (git + BINANCE_API_ENV; ledger "unavailable").
 #
+# Issue #270: the body carries the same "Fingerprint ID" as report_agent_issue.py; before creating, an OPEN issue
+# with that fingerprint is looked up (report_agent_issue.py --find-open-issue, bounded) and, if found, reported
+# instead of a duplicate. Offline or on any lookup failure the report is created or queued as before.
+#
 # Every issue carries the mandatory labels severity:<level> and priority:<Px>
 # (priority defaults from severity: CRITICAL->P0, HIGH->P1, MEDIUM->P2, LOW->P3).
 #
@@ -726,6 +730,41 @@ ACCEPTANCE_MD=$(printf '%s\n' "$CLEAN_ACCEPTANCE" | tr ';' '\n' \
 [ -z "$ACCEPTANCE_MD" ] && ACCEPTANCE_MD="- [ ] Regression test added in tests/ covering this failure"
 
 # ------------------------------------------------------------------------------
+# Fingerprint and open-issue lookup (issue #270: reporters of parallel sessions)
+# ------------------------------------------------------------------------------
+# The Python reporter computes the fingerprint (same as its own reports) and, when a repo and gh are available,
+# looks it up in the OPEN issues (one gh call, 5 s bound; the whole helper is capped at 10 s with `timeout`).
+# Any failure (no python3 / helper / gh, offline, timeout) leaves both empty: the report is created or queued as
+# before.
+DEDUPE_HELPER="${BASE_DIR}/scripts/report_agent_issue.py"
+FINGERPRINT=""
+OPEN_ISSUE_URL=""
+if command -v python3 >/dev/null 2>&1 && [ -f "$DEDUPE_HELPER" ]; then
+    LOOKUP_REPO=""
+    if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
+        LOOKUP_REPO="$REPO"
+    fi
+    if type -P timeout >/dev/null 2>&1; then
+        LOOKUP_OUT=$(timeout 10 python3 "$DEDUPE_HELPER" --find-open-issue --title "$TITLE" --error "$ERROR_DETAIL" \
+            --repo "$LOOKUP_REPO" </dev/null 2>/dev/null || true)
+    else
+        LOOKUP_OUT=$(python3 "$DEDUPE_HELPER" --find-open-issue --title "$TITLE" --error "$ERROR_DETAIL" \
+            --repo "$LOOKUP_REPO" </dev/null 2>/dev/null || true)
+    fi
+    while IFS=$'\t' read -r l_key l_val; do
+        if [ "$l_key" = "fingerprint" ] && [[ "$l_val" =~ ^[0-9a-f]{16}$ ]]; then
+            FINGERPRINT="$l_val"
+        elif [ "$l_key" = "open_issue" ] && [[ "$l_val" =~ ^https://[^[:space:]]+/issues/[0-9]+$ ]]; then
+            OPEN_ISSUE_URL="$l_val"
+        fi
+    done <<< "$LOOKUP_OUT"
+fi
+FINGERPRINT_ROW=""
+if [ -n "$FINGERPRINT" ]; then
+    FINGERPRINT_ROW=$'\n'"| **Fingerprint ID** | \`${FINGERPRINT}\` |"
+fi
+
+# ------------------------------------------------------------------------------
 # Markdown Body Construction (same six headings as scripts/utils/issue_telemetry.py)
 # ------------------------------------------------------------------------------
 MD_BODY=$(cat <<EOF
@@ -741,7 +780,7 @@ MD_BODY=$(cat <<EOF
 | **Reporting Agent** | \`${CLEAN_AGENT}\` |
 | **Environment** | \`${T_ENV}\` |
 | **Git** | \`${T_COMMIT}\` on \`${T_BRANCH}\` (dirty: ${T_DIRTY}) |
-| **Timestamp UTC** | \`${TIMESTAMP_UTC}\` |
+| **Timestamp UTC** | \`${TIMESTAMP_UTC}\` |${FINGERPRINT_ROW}
 
 **Description:**
 ${CLEAN_ERROR}
@@ -809,6 +848,11 @@ EOF
 # ------------------------------------------------------------------------------
 # Dispatch to GitHub API or Enqueue in Local Backlog
 # ------------------------------------------------------------------------------
+if [ -n "$OPEN_ISSUE_URL" ]; then
+    echo "ℹ️ Deduplicated: open issue #${OPEN_ISSUE_URL##*/} already reports this failure (fingerprint ${FINGERPRINT}); no new issue created."
+    echo "   URL: ${OPEN_ISSUE_URL}"
+    exit 0
+fi
 if [ -n "$REPO" ] && gh_ready; then
     if gh_create_issue "$PAYLOAD"; then
         ISSUE_URL="$GH_ISSUE_URL"

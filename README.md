@@ -463,7 +463,7 @@ autonomous-trading-desk/
 ## 🛡️ Security & Fail-Closed Guarantee
 
 1. **Zero Credential Commits:** Strictly enforced via exhaustive `.gitignore`.
-2. **Atomic Dossier Verification:** The execution hook requires a fresh (<20 min) dossier in `logs/evaluations/latest_dossier.json` whose provenance (sha256 of the `<dossier_json>` block in the evaluator subagent transcript) is re-verified before allowing order dispatch. A re-check dossier (`--recheck`) is verified exactly the same way.
+2. **Atomic Dossier Verification:** The execution hook requires a fresh (<20 min) dossier (in PROD the calling session's own `logs/evaluations/dossier_<session>.json`; `latest_dossier.json` holds the newest scan overall, and the executor uses the newest verified record approving the order) whose provenance (sha256 of the `<dossier_json>` block in the evaluator subagent transcript) is re-verified before allowing order dispatch. A re-check dossier (`--recheck`) is verified exactly the same way.
 3. **Environment Separation:**
    * **PROD:** All gates (Delta-Neutral, Dynamic Equity Risk, Transaction Fee Floor, Leverage Limit) are 100% rigid and inviolable. Zero exceptions.
    * **TESTNET:** Gates can be bypassed via explicit command flags (`--bypass-delta-gate`, `--bypass-eval-gate`) for stress testing and exploratory development.

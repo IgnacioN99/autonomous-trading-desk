@@ -417,11 +417,17 @@ def snapshot_confirmation_required(cand: Any, env: str, base_dir: str) -> Option
 
 
 def _radar_snapshot_row(cand: dict, base_dir: str) -> Tuple[Optional[dict], str]:
-    """(row, "") for the stored latest dossier record's radar_snapshots["SYMBOL|DIRECTION"], bound to the validated
-    dossier by its provenance sha256; (None, reason) on any read problem or mismatch."""
+    """(row, "") for the stored dossier record's radar_snapshots["SYMBOL|DIRECTION"], bound to the validated
+    dossier by its provenance sha256; (None, reason) on any read problem or mismatch. The record is the file holding
+    the candidate's dossier_sha256 (per-session files, issue #270), else latest_dossier.json (DOSSIER_REL_PATH)."""
     key = f"{str(cand.get('symbol') or '').upper()}|{str(cand.get('direction') or '').upper()}"
     try:
-        with open(os.path.join(base_dir, DOSSIER_REL_PATH), "r", encoding="utf-8") as f:
+        from utils import dossier_provenance as dp  # stdlib only
+        path = dp.resolve_dossier_path(base_dir, sha256=cand.get("dossier_sha256"))
+    except Exception:
+        path = os.path.join(base_dir, DOSSIER_REL_PATH)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
             record = json.load(f)
         snaps = record.get("radar_snapshots") if isinstance(record, dict) else None
         prov = record.get("provenance") if isinstance(record, dict) else None

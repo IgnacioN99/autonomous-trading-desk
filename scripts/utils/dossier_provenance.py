@@ -80,7 +80,64 @@ class ProvenanceError(Exception):
 
 
 def default_dossier_path(base_dir: str) -> str:
+    """Newest recorded scan overall (a full copy of the newest per-session record, issue #270)."""
     return os.path.join(base_dir, "logs", "evaluations", "latest_dossier.json")
+
+
+# Issue #270: one dossier file per parent session (agy conversationId / Claude Code session id), so a scan in one
+# session never replaces another session's approval. latest_dossier.json stays the newest scan overall.
+SESSION_DOSSIER_PREFIX = "dossier_"
+SESSION_ID_UNSAFE_RE = re.compile(r"[^A-Za-z0-9._-]")
+SESSION_ID_MAX_CHARS = 128
+
+
+def session_dossier_path(base_dir: str, session: Any) -> Optional[str]:
+    """logs/evaluations/dossier_<session>.json (session sanitised to [A-Za-z0-9._-]); None when the session is
+    unknown, so the caller uses latest_dossier.json only."""
+    if not isinstance(session, str):
+        return None
+    safe = SESSION_ID_UNSAFE_RE.sub("_", session.strip())[:SESSION_ID_MAX_CHARS]
+    if not safe.strip("."):
+        return None
+    return os.path.join(base_dir, "logs", "evaluations", f"{SESSION_DOSSIER_PREFIX}{safe}.json")
+
+
+def dossier_paths(base_dir: str) -> list:
+    """latest_dossier.json first, then every per-session dossier file (sorted by name)."""
+    eval_dir = os.path.dirname(default_dossier_path(base_dir))
+    pattern = os.path.join(glob.escape(eval_dir), SESSION_DOSSIER_PREFIX + "*.json")
+    return [default_dossier_path(base_dir)] + sorted(p for p in glob.glob(pattern) if os.path.isfile(p))
+
+
+def _record_sha(record: Any) -> Optional[str]:
+    prov = record.get("provenance") if isinstance(record, dict) else None
+    return prov.get("sha256") if isinstance(prov, dict) else None
+
+
+def resolve_dossier_path(base_dir: str, symbol: Optional[str] = None, direction: Optional[str] = None,
+                         session: Optional[str] = None, sha256: Optional[str] = None, env: str = "prod",
+                         now_ts: Optional[int] = None) -> str:
+    """The dossier file a reader must use (issue #270). Always returns a path; latest_dossier.json is the fallback,
+    so every failure keeps today's message.
+    - sha256: the file whose stored provenance sha256 equals it (sha-bound readers: they must read the record the
+      gate validated); none -> latest (their own sha check then reports dossier_changed).
+    - session: that session's own file when it exists (even if unreadable: the gate then fails on it), else latest.
+    - symbol (+ direction): find_approving_dossier's file (newest verified, unexpired record approving them)."""
+    latest = default_dossier_path(base_dir)
+    if sha256:
+        for path in dossier_paths(base_dir):
+            try:
+                if _record_sha(load_dossier(path)) == sha256:
+                    return path
+            except Exception:
+                continue
+        return latest
+    if session:
+        own = session_dossier_path(base_dir, session)
+        return own if own and os.path.exists(own) else latest
+    if symbol:
+        return find_approving_dossier(symbol, direction, env, base_dir, now_ts=now_ts)[3]
+    return latest
 
 
 def is_claude_agent_id(value: str) -> bool:
@@ -1003,7 +1060,7 @@ def validate_dossier_for_trade(
 
     if not os.path.exists(dossier_path):
         return False, (
-            "No evaluation dossier at logs/evaluations/latest_dossier.json. Invoke the "
+            f"No evaluation dossier at logs/evaluations/{os.path.basename(dossier_path)}. Invoke the "
             f"'{EVALUATOR_NAME}' subagent and record its verdict with "
             "`record_evaluation.py --from-subagent <conversationId>` (agy) or "
             "`record_evaluation.py --from-claude-subagent <agentId>` (Claude Code)."
@@ -1075,7 +1132,49 @@ def validate_dossier_for_trade(
         return False, f"Dossier approved {symbol} {have}, but the order is {want}.", None
 
     if cand is not None:
-        # Audit metadata on a copy (issue #202): the stored/rebuilt record is never mutated
+        # Audit metadata on a copy (issue #202): the stored/rebuilt record is never mutated. dossier_session: the
+        # session that ran the evaluator (issue #270, origin of positions and resting entries)
         prov = record.get("provenance") if isinstance(record.get("provenance"), dict) else {}
-        cand = dict(cand, dossier_sha256=prov.get("sha256"))
+        cand = dict(cand, dossier_sha256=prov.get("sha256"), dossier_session=record.get("parent_conversation_id"))
     return True, "Dossier valid and approved.", cand
+
+
+def find_approving_dossier(symbol: str, direction: Optional[str], env: str, base_dir: str,
+                           now_ts: Optional[int] = None, require_provenance: Optional[bool] = None,
+                           validate: Optional[Callable] = None) -> Tuple[bool, str, Optional[dict], str]:
+    """Executor gate when the calling session is unknown (issue #270): among latest_dossier.json and the per-session
+    files, the newest record (timestamp_ts) that validate_dossier_for_trade accepts for symbol + direction wins.
+    Files are pre-filtered cheaply (APPROVED, symbol and direction listed, not expired) and each distinct provenance
+    sha256 is verified once. None accepted -> latest_dossier.json's own verdict (today's denial message).
+    `validate`: the validator to call (default validate_dossier_for_trade). Returns (ok, reason, candidate, path)."""
+    check = validate or validate_dossier_for_trade
+    now_ts = int(now_ts if now_ts is not None else time.time())
+    latest = default_dossier_path(base_dir)
+    sym, want = (symbol or "").upper(), (direction or "").upper()
+    ranked = []
+    for order, path in enumerate(dossier_paths(base_dir)):
+        try:
+            record = load_dossier(path)
+            ts = int(record.get("timestamp_ts"))
+        except Exception:
+            continue
+        if str(record.get("status", "")).upper() != "APPROVED" or now_ts > ts + TTL_SECONDS:
+            continue
+        cand = find_candidate(record, sym)
+        if sym not in [str(s).upper() for s in record.get("approved_symbols") or []]:
+            continue
+        if want and cand is not None and str(cand.get("direction") or "").upper() not in ("", want):
+            continue
+        ranked.append((-ts, order, path, _record_sha(record)))
+    tried = set()
+    for _neg_ts, _order, path, sha in sorted(ranked):
+        if sha and sha in tried:
+            continue
+        tried.add(sha)
+        ok, reason, cand = check(symbol, direction, env, dossier_path=path, now_ts=now_ts,
+                                 require_provenance=require_provenance)
+        if ok:
+            return ok, reason, cand, path
+    ok, reason, cand = check(symbol, direction, env, dossier_path=latest, now_ts=now_ts,
+                             require_provenance=require_provenance)
+    return ok, reason, cand, latest

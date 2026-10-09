@@ -390,7 +390,8 @@ SNAP = {"symbol": "SOLUSDT", "direction": "LONG", "confidence": 84, "tier": "Tie
         "score_components": {"rsi": 35, "wick": 35, "volume": 14}, "score_schema_version": 2}
 FULL_META = {"score": 84, "score_tier": "Tier S (x)", "score_components": SNAP["score_components"],
              "score_source": "radar_snapshot", "score_missing_reason": None, "dossier_tier": "S",
-             "dossier_score": 85, "dossier_sha256": "abc123", "score_schema_version": 2}  # issue #207
+             "dossier_score": 85, "dossier_sha256": "abc123", "score_schema_version": 2,  # issue #207
+             "dossier_session": None}  # issue #270: CAND carries no dossier_session
 
 
 def write_snapshot_dossier(ws, sha="abc123", snaps=None):

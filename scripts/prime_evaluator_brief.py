@@ -471,7 +471,9 @@ def assemble_primed_brief(target_env: str = "prod", out_path: Optional[str] = No
     # Issue #48 / #127: resting entries come from the session state only (sync_session_state.resting_entry_exposure),
     # the same view as delta_bias_incl_resting. A missing field (an older state) reads as UNKNOWN (fail closed).
     resting_bias = portfolio.get("delta_bias_incl_resting", "UNKNOWN")
-    pending_entries = [{"symbol": r.get("symbol"), "dir": r.get("dir"), "kind": r.get("kind")}
+    # Issue #270: "origin" (evaluator session + dossier, sync_session_state.origin_tag) only when known
+    pending_entries = [dict({"symbol": r.get("symbol"), "dir": r.get("dir"), "kind": r.get("kind")},
+                            **({"origin": r["origin"]} if r.get("origin") else {}))
                        for r in (portfolio.get("resting_entries") or []) if isinstance(r, dict)]
 
     # Condensed context pack (token-budget optimized)
@@ -504,7 +506,8 @@ def assemble_primed_brief(target_env: str = "prod", out_path: Optional[str] = No
                     "pnl": p["unrealized_pnl_usdt"],
                     "roe": p["roe_pct"],
                     "sl": p.get("sl_price"),
-                    "sl_verified": p.get("sl_algo_verified", False)
+                    "sl_verified": p.get("sl_algo_verified", False),
+                    **({"origin": p["origin"]} if p.get("origin") else {})
                 } for p in active_pos
             ]
         },
@@ -736,6 +739,11 @@ def _tier_label(o: dict) -> str:
     return next((c for c in _TIER_CODES if words == ["Tier", c]), "?")
 
 
+def _origin_md(row: dict) -> str:
+    """Issue #270: ' from <origin>' for a position / pending entry whose origin is known, else ''."""
+    return f" from {row['origin']}" if row.get("origin") else ""
+
+
 def format_markdown_brief(brief: dict) -> str:
     p = brief["ground_truth_portfolio"]
     m = brief["macro_btc"]
@@ -756,13 +764,14 @@ def format_markdown_brief(brief: dict) -> str:
         lines.append(f"**Market data:** {brief['market_data_status']}")
     lines.append("")
     lines.append("### ⚖️ Portfolio Ground Truth (Binance Ledger)")
-    lines.append(f"- **Active Positions ({p['active_positions_count']}):** " + (", ".join([f"{x['symbol']} ({x['dir']} PnL: ${x['pnl']})" for x in p['positions_summary']]) if p['positions_summary'] else "None"))
+    lines.append(f"- **Active Positions ({p['active_positions_count']}):** " + (", ".join([f"{x['symbol']} ({x['dir']} PnL: ${x['pnl']}{_origin_md(x)})" for x in p['positions_summary']]) if p['positions_summary'] else "None"))
     lines.append(f"- **Net Delta:** `${p['net_delta_usdt']:+.2f}` (L: ${p['long_notional_usdt']} | S: ${p['short_notional_usdt']})")
     lines.append(f"- **Realized PnL Today:** `${p['realized_pnl_today']:+.2f}` USDT | **Floating PnL:** `${p['floating_pnl_usdt']:+.2f}` USDT")
     lines.append(f"- **Tactical Rule:** {p['tactical_rule']}")
     pend = brief.get("pending_entries") or []
     lines.append(f"- **Pending Entries ({len(pend)}):** "
-                 + (", ".join(f"{x.get('symbol')} ({x.get('dir')} {x.get('kind')})" for x in pend) or "None")
+                 + (", ".join(f"{x.get('symbol')} ({x.get('dir')} {x.get('kind')}{_origin_md(x)})" for x in pend)
+                    or "None")
                  + f" | **Delta incl. resting:** `{p.get('delta_bias_incl_resting', 'UNKNOWN')}`"
                  + (" | **Pending entries status:** `UNREADABLE`"
                     if brief.get("pending_entries_status") == "UNREADABLE" else "")

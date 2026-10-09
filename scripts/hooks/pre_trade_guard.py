@@ -90,7 +90,11 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    PROD requires a schema v2 dossier whose provenance hash is re-verified against the
    isolated_market_evaluator subagent transcript (agy brain or Claude Code subagents/ with
    meta agentType), a matching direction and (when known) a parent conversation equal to the
-   current one (agy conversationId / Claude Code session_id). TESTNET is relaxed.
+   current one (agy conversationId / Claude Code session_id). Issue #270: in PROD with a known conversation the
+   hook reads that session's own logs/evaluations/dossier_<session>.json (a scan in another session never replaces
+   it); a session without one reads latest_dossier.json (the newest scan overall), denied as "not for the current
+   conversation" when that scan came from another one. Sha-bound readers (squeeze fallback, Tier S calibration)
+   read the file holding the validated sha256. TESTNET is relaxed and reads latest_dossier.json.
 7. EVALUATION TRAIL PROTECTION:
    Writes into logs/evaluations/, Antigravity brain transcripts or Claude Code subagent transcripts
    are denied, and so are agent-set transcript-root overrides (AGY_BRAIN_DIRS / CLAUDE_PROJECTS_DIRS);
@@ -602,7 +606,7 @@ SCRIPT_HEAD_BYTES = 4096
 # Desk shell scripts judged with relaxed rules (run-time values and unknown cwd only), pinned by the sha256 of their
 # bytes: an edited copy (or any other file under scripts/) is judged strictly. Update the pin with the script.
 DESK_SHELL_SCRIPTS = {
-    "scripts/report_issue.sh": "9336f05e6126ec779adc868ce3bf4aec798bcacdab3ae5c5e34a8120b831390f",
+    "scripts/report_issue.sh": "75af2e06899ddf54c570058dda7be8eae6fe1ffdfb208e921cc32ec68b5791e6",
 }
 # Fail-closed work budget of one hook evaluation (all nested lines, scripts and cwd candidates together)
 AUDIT_MAX_SUBCOMMANDS = 5000
@@ -1492,13 +1496,24 @@ def parse_trade_direction(cmd: str, args_dict: dict = None) -> Tuple[Optional[st
 # =============================================================================
 # Dossier gate (single source of truth: scripts/utils/dossier_provenance.py)
 # =============================================================================
+def _dossier_file_for(base_dir: str, env: str, conversation_id: Optional[str]) -> str:
+    """Issue #270: in PROD with a known conversation, that session's own dossier file when it exists (a session
+    without one reads latest_dossier.json, so the binding below still names the other conversation); otherwise
+    latest_dossier.json, as before. One existence check, no directory scan."""
+    if env == "prod" and conversation_id:
+        return dp.resolve_dossier_path(base_dir, session=conversation_id)
+    return dp.default_dossier_path(base_dir)
+
+
 def check_dossier(symbol: str, direction: Optional[str], env: str, base_dir: str,
                   conversation_id: Optional[str] = None, now_ts: Optional[int] = None) -> Tuple[bool, str, Optional[dict]]:
     """Validates the evaluator dossier for a trade and, in PROD, binds it to the current conversation."""
     if dp is None:
         return False, "Dossier provenance module (scripts/utils/dossier_provenance.py) is unavailable.", None
+    dossier_file = _dossier_file_for(base_dir, env, conversation_id)
     ok, reason, cand = dp.validate_dossier_for_trade(
-        symbol, direction, env, base_dir=base_dir, now_ts=now_ts if now_ts is not None else int(time.time())
+        symbol, direction, env, base_dir=base_dir, dossier_path=dossier_file,
+        now_ts=now_ts if now_ts is not None else int(time.time())
     )
     if not ok:
         return False, reason, None
@@ -1509,7 +1524,7 @@ def check_dossier(symbol: str, direction: Optional[str], env: str, base_dir: str
     # PROD: the provenance hash only binds the raw <dossier_json> block. Re-derive the verdict from the
     # evaluator transcript itself so a tampered approved list / parent id in the JSON file cannot widen it.
     try:
-        record = dp.load_dossier(dp.default_dossier_path(base_dir))
+        record = dp.load_dossier(dossier_file)
         rebuilt = dp.build_record_from_extraction(dp.extract_recorded_transcript(record))
     except Exception as e:
         return False, f"Failed to re-derive the dossier from the evaluator transcript ({e}).", None
@@ -1520,7 +1535,8 @@ def check_dossier(symbol: str, direction: Optional[str], env: str, base_dir: str
             + " (the recorded dossier differs from what the evaluator emitted)."
         ), None
     # The validated provenance sha (issue #202): binds the radar snapshot the calibration gate reads to this dossier
-    cand = dict(rebuilt_cand, dossier_sha256=(rebuilt.get("provenance") or {}).get("sha256"))
+    cand = dict(rebuilt_cand, dossier_sha256=(rebuilt.get("provenance") or {}).get("sha256"),
+                dossier_session=rebuilt.get("parent_conversation_id"))
 
     if conversation_id:
         parent = rebuilt.get("parent_conversation_id")
@@ -1601,7 +1617,9 @@ def check_leverage_gate(symbol: str, requested_leverage: int, base_dir: str, use
         return True, f"Standard leverage (<= {std_lev}x) authorized."
 
     env = resolve_env(target_env, base_dir=base_dir)
-    dossier_file = os.path.join(base_dir, "logs", "evaluations", "latest_dossier.json")
+    # Issue #270: the same file check_dossier validates (the calling session's own file in PROD)
+    dossier_file = (_dossier_file_for(base_dir, env, conversation_id) if dp is not None
+                    else os.path.join(base_dir, "logs", "evaluations", "latest_dossier.json"))
     if not os.path.exists(dossier_file):
         return False, prefix + f"Requested leverage ({requested_leverage}x > {std_lev}x) exceeds standard ceiling and no evaluation dossier exists."
 
@@ -5936,9 +5954,12 @@ def _tier_s_calibration_message(cand: dict, env: str, user_prof: dict, base_dir:
 
 def _squeeze_fallback_message(cand: dict, base_dir: str) -> Optional[str]:
     """Mirror of execute_futures_trade.squeeze_fallback_message (stdlib json): ask when the stored dossier record's
-    radar snapshot has squeeze_risk true, or (a SHORT) is missing or unbound, or the record cannot be read."""
+    radar snapshot has squeeze_risk true, or (a SHORT) is missing or unbound, or the record cannot be read. The record
+    is the file holding the validated dossier sha256 (issue #270), else latest_dossier.json."""
     try:
-        with open(os.path.join(base_dir, "logs", "evaluations", "latest_dossier.json"), "r", encoding="utf-8") as f:
+        path = (dp.resolve_dossier_path(base_dir, sha256=cand.get("dossier_sha256")) if dp is not None
+                else os.path.join(base_dir, "logs", "evaluations", "latest_dossier.json"))
+        with open(path, "r", encoding="utf-8") as f:
             record = json.load(f)
         key = f"{str(cand.get('symbol') or '').upper()}|{str(cand.get('direction') or '').upper()}"
         entry = (record.get("radar_snapshots") or {}).get(key)
