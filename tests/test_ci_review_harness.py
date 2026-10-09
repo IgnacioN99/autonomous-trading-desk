@@ -510,6 +510,18 @@ class TestPRReviewHooks(unittest.TestCase):
         "git push origin HEAD:main",
         'grep -n "git push" README.md',
         "git push origin 'fix/x",  # unbalanced quote: cannot tokenize -> never arms
+        # Issue #227: quoted or escaped punctuation is not a separator; delete pushes never arm
+        'echo ";" git push origin fix/x',
+        'echo "&&" git push origin fix/x',
+        'echo "|" git push origin fix/x',
+        "echo ';' git push origin fix/x",
+        "echo \\; git push origin fix/x",
+        "x=$((1<<3)); cat <<EOF\ngit push origin fix/x\nEOF",  # arithmetic shift, then a real heredoc
+        "git push origin --delete fix/x",
+        "git push -d origin fix/x",
+        "git push -fd origin fix/x",
+        "git push origin :fix/x",
+        "git push origin +:fix/x",
     )
     ARMING = (
         "git push -u origin fix/x",
@@ -522,6 +534,17 @@ class TestPRReviewHooks(unittest.TestCase):
         "bash -c 'git push origin fix/x'",
         "gh pr create --body \"$(cat <<'EOF'\nbody mentioning git push origin main\nEOF\n)\"",
         "git push origin fix/x; Write-Output ok",  # PowerShell-style separator
+        # Issue #227: `<<` inside quotes or arithmetic is no heredoc; an unquoted separator still splits
+        'echo ";" ; git push origin fix/x',
+        'echo "a <<EOF"\ngit push origin fix/x',
+        "echo 'a <<EOF'\ngit push origin fix/x",
+        "x=$((1<<3))\ngit push origin fix/x",
+        "((n = 1 << 2))\ngit push origin fix/x",
+        "cat <<<EOF\ngit push origin fix/x",  # here-string, not a heredoc
+        "git push origin --delete fix/old && git push origin fix/x",
+        # PR body with quotes and an unbalanced `)` inside a heredoc in "$(...)"
+        "gh pr create --title \"t\" --body \"$(cat <<'EOF'\n- fixes \"quoted\" text\n1) item; git push origin main\n"
+        "EOF\n)\"",
     )
 
     def test_issue_115_mentions_do_not_arm(self):
@@ -568,6 +591,42 @@ class TestPRReviewHooks(unittest.TestCase):
         self.assertEqual(find("git push origin fix/x && gh pr create --fill", "/start").kind, "pr_create")
         self.assertFalse(post_hook.is_pr_creation_or_push("git push origin fix/x && git push origin main"))
         self.assertIsNone(find("git status && echo pushed", "/start"))
+
+    def test_issue_227_directory_changes_delete_pushes_and_refspecs(self):
+        find = post_hook.find_review_trigger
+        for command in ("Set-Location /wt; git push", "sl /wt; git push", "pushd /wt; git push",
+                        "Push-Location -Path /wt; git push", "Set-Location -LiteralPath /wt; git push",
+                        "chdir /wt && git push", "cd /elsewhere && pushd /wt && git push"):
+            with self.subTest(command=command):
+                self.assertEqual(find(command, "/start"), post_hook.ReviewTrigger("push", "", "/wt"))
+        self.assertEqual(find("pushd /wt && popd && git push", "/start").directory, "/start")
+        self.assertEqual(find("Push-Location /wt; Pop-Location; git push", "/start").directory, "/start")
+        self.assertEqual(find("Set-Location /wt; Set-Location sub; git push", "/start").directory,
+                         os.path.normpath("/wt/sub"))
+        # Delete pushes record no trigger; the other push of the command decides
+        self.assertIsNone(find("git push origin --delete fix/x", "/start"))
+        self.assertIsNone(find("git push origin :fix/x", "/start"))
+        self.assertEqual(find("git push origin --delete fix/x && git push origin fix/y", "/start").branch, "fix/y")
+        self.assertEqual(find("git push origin fix/y && git push origin :fix/x", "/start").branch, "fix/y")
+        self.assertEqual(find("git push -o ci.skip origin fix/x", "/start").branch, "fix/x")  # -o value != -d
+        self.assertEqual(find("git push origin :", "/start").branch, "")  # matching branches: checkout branch
+        # Several refspecs: the first one decides (documented)
+        self.assertEqual(find("git push origin fix/x main", "/start").branch, "fix/x")
+        # Quotes inside a word are removed; a real heredoc still hides the commands in its body
+        self.assertEqual(find('gh pr create --head="fix/y"', "/start").branch, "fix/y")
+        self.assertEqual(find("cat <<EOF > n.md\ngh pr create\nEOF\ngit push origin fix/x", "/start"),
+                         post_hook.ReviewTrigger("push", "fix/x", "/start"))
+        self.assertEqual(find('echo "a <<EOF"\ngit push origin fix/x', "/start").branch, "fix/x")
+
+    def test_issue_227_unclosed_substitution_or_arithmetic_does_not_arm(self):
+        os.makedirs(os.path.dirname(self.state_file))  # the events log lives next to the state file
+        for command in ('gh pr create --body "$(cat <<EOF\nbody\n"', "x=$((1<<3)\ngit push origin fix/x"):
+            with self.subTest(command=command):
+                self.assertFalse(post_hook.is_pr_creation_or_push(command))
+                self.assertEqual(self._post(command), "ignored")
+                self.assertEqual(state_mod.load_state(), {})
+        events = [json.loads(e) for e in Path(state_mod.events_path()).read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([e["event"] for e in events], ["detect_error", "detect_error"])
 
     def test_issue_115_branch_resolution_uses_the_command_directory(self):
         self.checkout_branches["/wt"] = "fix/from-worktree"
