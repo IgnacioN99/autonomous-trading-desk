@@ -5,12 +5,20 @@ Validates Issue #174 Fast-Path invariants:
 2. AGENTS.md does not instruct agents to call view_file on research/ notebooks or SKILL.md during scans.
 3. Clean-room evaluator flow and pre-trade hook contracts remain intact.
 4. AGENTS.md byte cap (< 22,000 bytes) is respected.
+5. The generated Claude copy of the planner skill keeps the fast-path wording (#177), every generated
+   skill tells to load sibling skills with the Skill tool (#81), and the planner pins the resting-entry
+   and close guidance (#44, #112).
 """
 
 import os
+import sys
 import unittest
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
+from scripts.dev import sync_claude_assets as gen  # noqa: E402
 
 
 class TestHarnessFastPath(unittest.TestCase):
@@ -53,6 +61,33 @@ class TestHarnessFastPath(unittest.TestCase):
 
         self.assertIn("Deterministic Fast-Path", content)
         self.assertIn("Do NOT call `view_file` on `research/`", content)
+
+        claude_path = os.path.join(BASE_DIR, ".claude", "skills", "trade-execution-planner", "SKILL.md")
+        self.assertTrue(os.path.exists(claude_path))
+        with open(claude_path, "r", encoding="utf-8") as f:
+            claude_content = f.read()
+        self.assertIn("Deterministic Fast-Path", claude_content)
+        self.assertIn("Do NOT call `view_file` on `research/`", claude_content)
+
+    def test_generated_skills_say_to_load_siblings_with_skill_tool(self):
+        skills_dir = os.path.join(BASE_DIR, ".claude", "skills")
+        self.assertIn("trade-execution-planner", gen.SKILLS)
+        for name in gen.SKILLS:
+            with open(os.path.join(skills_dir, name, "SKILL.md"), "r", encoding="utf-8") as f:
+                text = f.read()
+            self.assertIn("Load sibling skills", text, name)
+            self.assertIn("Skill tool", text, name)
+
+    def test_planner_resting_entry_and_close_guidance(self):
+        skill_path = os.path.join(BASE_DIR, ".agents", "skills", "trade-execution-planner", "SKILL.md")
+        with open(skill_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        step7 = content.split("7. Field-by-field checklist", 1)[1].split("8. **Manage open positions**", 1)[0]
+        self.assertIn("Entry type: a resting entry (`STOP_MARKET` / `LIMIT`)", step7)
+        step8 = content.split("8. **Manage open positions**", 1)[1]
+        self.assertIn("--interval 60 --env <env>", step8)
+        self.assertIn("WRONG", step8)
+        self.assertIn("RIGHT", step8)
 
     def test_clean_room_evaluator_flow_intact(self):
         agents_path = os.path.join(BASE_DIR, "AGENTS.md")
