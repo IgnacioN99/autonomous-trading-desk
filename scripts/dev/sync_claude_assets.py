@@ -68,7 +68,7 @@ CLAUDE_AGENT_HOOKS = {
     "issue_fixer": (
         "hooks:\n"
         "  PreToolUse:\n"
-        "    - matcher: Bash|Edit|Write|MultiEdit|NotebookEdit\n"
+        "    - matcher: Bash|Edit|Write|MultiEdit|NotebookEdit|Read|Grep|Glob\n"
         "      hooks:\n"
         "        - type: command\n"
         "          command: 'python3 \"$CLAUDE_PROJECT_DIR\"/scripts/hooks/issue_fixer_guard.py || exit 2'"

@@ -345,7 +345,7 @@ Ask the agent to work an issue ("work issue 95") or run `/issue-orchestrator 95`
 | Subagent | Tools | Role |
 |---|---|---|
 | `issue_locator` | read, grep, list | Maps files, callers, persistence, tests and docs the fix must touch |
-| `issue_fixer` | read, grep, list, edit, write, guarded shell | Implements the orchestrator's `design.md` with tests; its edits and Bash run through `scripts/hooks/issue_fixer_guard.py` (confined to the issue worktree, never the main checkout where the hooks live; allowlist: read-only git, unittest/compileall, tests; no commits, gh, network, installs or desk scripts) |
+| `issue_fixer` | read, grep, list, edit, write, guarded shell | Implements the orchestrator's `design.md` with tests; its edits, Bash and Read/Grep/Glob run through `scripts/hooks/issue_fixer_guard.py` (reads only to keep the heartbeat keys out of reach; confined to the issue worktree, never the main checkout where the hooks live; a confinement policy (a denylist plus path rules), Claude Code only, not a sandbox: read-only git, unittest/compileall, tests; no commits, gh, network, installs or desk scripts) |
 | `issue_auditor` | read, grep, list | Audits the diff and the deterministic check results; `VERDICT: APPROVE` or `CHANGES_REQUESTED` (max 3 fixer rounds) |
 
 Flow: `python3 scripts/dev/issue_workspace.py init <N> --slug <slug>` (own worktree and `fix/issue-N-*` branch) → locator → design → fixer → `issue_workspace.py review-context <worktree>` + auditor → full suite by the orchestrator → commit, push, PR → `/pr-review` → merge on green CI → follow-up issues with severity/priority labels → `issue_workspace.py record-route <N> --from <file>` → `issue_workspace.py cleanup <N>`. Working files live in `<worktree>/logs/issue_work/` (gitignored).
@@ -403,10 +403,10 @@ autonomous-trading-desk/
 │   │   ├── pr_review_state.py         # Pending auto-review marker
 │   │   └── run_pr_audit.py            # Headless PR review fallback (agy -p / Gemini API)
 │   ├── dev/
-│   │   ├── issue_workspace.py         # Issue worktrees, auditor review context and cleanup
+│   │   ├── issue_workspace.py         # Issue worktrees, guard check, rebind, auditor review context and cleanup
 │   │   └── sync_claude_assets.py      # Generates .claude/agents + .claude/skills from .agents/ (--check)
 │   ├── hooks/
-│   │   ├── issue_fixer_guard.py       # issue_fixer confinement: worktree-only edits + Bash allowlist
+│   │   ├── issue_fixer_guard.py       # issue_fixer confinement policy (a denylist plus path rules), Claude Code only, not a sandbox
 │   │   ├── pre_trade_guard.py         # Mechanical hard gate hook (<15ms, fail-closed)
 │   │   ├── post_trade_sync.py         # Auto ground-truth sync on fills
 │   │   ├── post_pr_review_hook.py     # Arms the PR review after gh pr create / push

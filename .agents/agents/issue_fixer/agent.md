@@ -37,11 +37,12 @@ You start with a clean context. Everything you need is in the task message and i
 - Every `run_command` starts in another directory and does not keep `cd` between calls: prefix each command with `cd <WORKTREE> && `.
 - Inputs in `WORKTREE/logs/issue_work/`: `issue.json` (the issue), `design.md` (the orchestrator's mandatory decisions, files not to touch, required tests), `locator.md` (code map) and, from round 2 on, `audit_round<k>.md` (the auditor's required changes).
 - Output: `WORKTREE/logs/issue_work/fixer_report.md` (full report; the folder is gitignored) plus a short final response.
-- Under Claude Code a guard (`scripts/hooks/issue_fixer_guard.py`) enforces these limits; under agy no guard runs: if a command or edit falls outside these limits, do NOT run it. The limits:
+- Your limits (see invariant 9 for who enforces them):
   - File edits target absolute paths inside WORKTREE; never the main checkout, another worktree, `.git/`, `.claude/` (generated), `.agents/hooks.json`, or `logs/` other than `logs/issue_work/` (and never its `guard_heartbeat.json` or `fixer_binding.json`).
   - Every shell command starts with `cd <WORKTREE> && `; a later `cd` stays inside WORKTREE.
   - Allowed shell: read-only shell tools, read-only git (diff, status, log, show, grep...), `python3 -m unittest|compileall|py_compile|pytest`, test files under `tests/` and `python3 scripts/dev/sync_claude_assets.py`. Shell paths stay inside WORKTREE, `/dev/null` or the temp dir; `VAR=value` only for harmless names such as `PYTHONDONTWRITEBYTECODE`.
-  - Denied: git writes, gh, network, package managers, desk scripts, `python -c`, heredocs, command substitution, `$VAR` expansions outside single quotes, find -exec, awk, launchers (setsid, flock...), tar and zip.
+  - Anything outside the Allowed list is denied; notable examples: git writes, gh and the network, desk scripts, `python -c`.
+  - Pass WORKTREE's absolute path to every grep_search and list_dir call: without it they search your working directory, the main checkout, where a search with a glob filter is denied (it holds the heartbeat keys).
   - Create files with write_to_file, not with the shell.
 </operational_environment>
 
@@ -64,6 +65,7 @@ You start with a clean context. Everything you need is in the task message and i
 6. Fail-closed semantics: in PROD, uncertainty (missing data, failed reads, malformed input) rejects an order; risk-reducing paths stay available. TESTNET behaviour changes only when the design says so.
 7. Docs: update the docstrings and docs the design lists. AGENTS.md has a byte cap enforced by a test; keep edits there net-neutral or shorter.
 8. Honest reporting: report test counts and failures exactly as observed. If the suite is red, say which tests fail and why; never claim success you did not see.
+9. Enforcement of your limits (`<operational_environment>`): Under Claude Code a guard (`scripts/hooks/issue_fixer_guard.py`) enforces these limits; under agy no guard runs: if a command or edit falls outside these limits, do NOT run it.
 </invariants_and_rules>
 
 <negative_constraints>

@@ -58,11 +58,13 @@ agy transcripts: rows truncated in `transcript.jsonl` are read from `transcript_
 ## Issue workflow
 
 "Work issue N" runs the `issue-orchestrator` skill in the main session: `scripts/dev/issue_workspace.py init`
-(worktree + branch), `issue_locator` (read-only), your `design.md`, `issue_fixer` (edits and tests; its edits and
-Bash go through `scripts/hooks/issue_fixer_guard.py`, Claude Code only and a confinement policy, not a sandbox: a
+(worktree + branch), `issue_locator` (read-only), your `design.md`, `issue_fixer` (edits and tests; its edits, Bash and
+Read/Grep/Glob go through `scripts/hooks/issue_fixer_guard.py`, Claude Code only and a confinement policy, not a sandbox: a
 denylist plus path rules that keep it in the issue worktree, never the main checkout, with no git writes, gh,
-network or desk scripts; `init` writes a binding marker the guard claims for the fixer's session, and
-`issue_workspace.py check-guard` verifies the guard's heartbeat after round 1),
+network or desk scripts; `init` writes a binding marker the guard claims for the fixer's session and a per-issue
+key in `logs/issue_work_keys/<N>.key` of the main checkout (gitignored, deleted by `cleanup`), with which the guard
+signs its heartbeat (HMAC); `issue_workspace.py check-guard` verifies that signed heartbeat after round 1, and
+`issue_workspace.py rebind <N> [--force]` resets a stale binding),
 `issue_workspace.py review-context` + `issue_auditor` (read-only, up to 3 rounds), your own full-suite run, PR,
 `pr-review`, merge on green CI, follow-up issues, `issue_workspace.py record-route` (appends to
 `logs/issue_routing.jsonl`) and `issue_workspace.py cleanup`. Model and effort are routed per call by the skill's

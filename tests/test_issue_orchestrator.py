@@ -6,6 +6,8 @@ write tools confined to guarded agents.
 import io
 import json
 import os
+import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -36,6 +38,8 @@ def _make_repo(root: str, name: str = "trading") -> str:
     _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init")
     return repo
 
+
+FAKE_HOME = "/nonexistent-issue-fixer-test-home"  # never under the temp dir, never read
 
 # {wt} = the linked issue worktree, {main} = the main checkout (where the running hooks live)
 ALLOWED = [
@@ -79,6 +83,20 @@ ALLOWED = [
     'cd {wt} && python3 -m unittest tests.test_x; echo "exit=$?"',
     "cd {wt} && echo $? && printf '%s\\n' \"$?\"",
     "cd {wt} && git ls-files | xargs wc -l",
+    # #230: character sets, field / key / delimiter values are not paths; a cd chain followed by `;` is tracked
+    "cd {wt} && tr / .",
+    "cd {wt} && git log --format=%an | tr / . | sort -u",
+    "cd {wt} && cut -d/ -f1 f",
+    "cd {wt} && cut --delimiter=/ --fields=2 f",
+    "cd {wt} && sort -t/ -k2 f",
+    "cd {wt} && sort -S 1M -t / -k 2 f",
+    "cd {wt} && uniq -f 1 -s 2 -w 3 f",
+    "cd {wt} && cd scripts; git status",
+    "cd {wt}/scripts && cd ..; ls tests",
+    "cd {wt} && cd scripts\nls",
+    "cd {wt} && cd scripts && cd ..; ls",
+    "cd {wt} && cd scripts && python3 ../tests/x.py; ls",
+    "cd {wt} && rg -n pattern scripts",
 ]
 
 DENIED = [
@@ -196,12 +214,14 @@ DENIED = [
     ("cd {wt} && ls # \"\ngit push", "read-only git"),
     ("cd {wt} && ls # \"\ngit push\n\"", "unparseable"),
     ("cd {wt} && ls \\\\\ngit push", "read-only git"),
-    # a `#` starts a comment only at a word start; a carriage return is an ordinary character, as in bash
+    # a `#` starts a comment only at a word start; a carriage return (an ordinary character in bash) is denied
+    # outright (#230)
     ("cd {wt} && ls x\\ #; git push", "read-only git"),
     ("cd {wt} && ls x\\;#; git push", "read-only git"),
-    ("cd {wt} && ls x\r#; git push", "read-only git"),
-    ("cd {wt} && ls \\\r\ngit push", "read-only git"),
-    ("cd {wt}\ncd scripts\r\ncp a ../trading/README.md", "not an existing directory"),
+    ("cd {wt} && ls x\r#; git push", "carriage return in command; send LF line endings"),
+    ("cd {wt} && ls \\\r\ngit push", "carriage return in command; send LF line endings"),
+    ("cd {wt}\ncd scripts\r\ncp a ../trading/README.md", "carriage return in command; send LF line endings"),
+    ("cd {wt}\r\ngit status", "carriage return in command; send LF line endings"),
     # globs: unknown programs (they may write) take none; the directory part before the glob is checked
     ("cd {wt} && unlink ../[^x]rading/scripts/hooks/issue_fixer_guard.py", "may write"),
     ("cd {wt} && mkdir -p tests/x && unlink tests/x/../../../[t]rading/scripts/hooks/issue_fixer_guard.py",
@@ -225,6 +245,30 @@ DENIED = [
     ("cd {wt} && cd {wt2}", "leaves the issue worktree"),
     ("cd {wt} && cat {wt2}/README.md", "another issue worktree"),
     ("cd {wt} && cp README.md {wt2}/x", "another issue worktree"),
+    # #230: bracket globs are matched as bash reads them ([^x] is a negation), so the sibling checkout is found
+    ("cd {wt} && cat ../[^x]rading/README.md", "main checkout"),
+    ("cd {wt} && cat ../[!x]rading/README.md", "main checkout"),
+    ("cd {wt} && cat ../[[:alpha:]]rading/README.md", "main checkout"),
+    ("cd {wt} && cat ../tr[]a]ding/README.md", "main checkout"),
+    # #230: options that run programs
+    ("cd {wt} && rg --pre x pattern scripts", "rg --pre"),
+    ("cd {wt} && rg --pre=x pattern scripts", "rg --pre"),
+    ("cd {wt} && rg --pre-glob '*.py' --pre x pattern", "rg --pre"),
+    ("cd {wt} && rg --hostname-bin x --hyperlink-format default pattern", "rg --pre"),
+    ("cd {wt} && rg --hostname-bin=x pattern", "rg --pre"),
+    ("cd {wt} && sort --compress-program=x f", "sort --compress-program"),
+    ("cd {wt} && sort --compress-program x f", "sort --compress-program"),
+    ("cd {wt} && sort --compress x f", "sort --compress-program"),
+    ("cd {wt} && sort --co=x f", "sort --compress-program"),
+    # #230: conditional cd chains: only cds may precede a skippable cd; each possible directory is checked
+    ("cd {wt} && ls && cd scripts; cp a ../x", "conditional cd"),
+    ("cd {wt}/scripts && cd ..; cat ../../trading/README.md", "a conditional cd may have been skipped"),
+    ("cd {wt} && cd scripts; ls || cat x", "conditional cd"),
+    ("cd {wt} && cd scripts && ls & cat x", "background list"),
+    ("cd {wt} && cd scripts; (ls)", "conditional cd"),
+    # #230: a background list holding the leading cd leaves the rest in the session's directory
+    ("cd {wt} && ls & echo x > README.md", "background list"),
+    ("cd {wt} && (ls) & echo x > README.md", "background list"),
 ]
 
 
@@ -248,7 +292,7 @@ class TestIssueFixerGuard(unittest.TestCase):
         subprocess.run(["rm", "-rf", cls.tmp], check=False)
 
     def fmt(self, cmd):
-        return cmd.format(wt=self.wt, main=self.main, wt2=self.wt2, home=os.path.expanduser("~"),
+        return cmd.format(wt=self.wt, main=self.main, wt2=self.wt2, home=FAKE_HOME,
                           stdlib=os.path.dirname(json.__file__))
 
     def run_hook(self, payload, project_dir=None):
@@ -266,11 +310,14 @@ class TestIssueFixerGuard(unittest.TestCase):
                 self.assertEqual(guard.evaluate(self.fmt(cmd), self.conf), "", cmd)
 
     def test_denied_commands(self):
-        for cmd, why in DENIED:
-            with self.subTest(cmd=cmd):
-                reason = guard.evaluate(self.fmt(cmd), self.conf)
-                self.assertTrue(reason, f"should be denied: {cmd!r}")
-                self.assertIn(why, reason, cmd)
+        # A home directory outside the temp dir, whatever HOME the suite runs with (review-context sets a fresh
+        # temporary one)
+        with mock.patch.dict(os.environ, {"HOME": FAKE_HOME}):
+            for cmd, why in DENIED:
+                with self.subTest(cmd=cmd):
+                    reason = guard.evaluate(self.fmt(cmd), self.conf)
+                    self.assertTrue(reason, f"should be denied: {cmd!r}")
+                    self.assertIn(why, reason, cmd)
 
     def test_edit_tools_are_confined_to_the_worktree(self):
         allowed = [f"{self.wt}/scripts/app.py", f"{self.wt}/tests/test_new.py", f"{self.wt}/AGENTS.md",
@@ -401,12 +448,13 @@ class TestIssueFixerGuard(unittest.TestCase):
         self.assertEqual(guard.evaluate(f"cd {self.wt} && cat logs/issue_work/fixer_binding.json", self.conf), "")
 
     # ----- #129.6: binding -----
-    def _bind(self, tree, session_id=None, worktree=None):
+    def _bind(self, tree, session_id=None, worktree=None, issue=8):
         work = os.path.join(tree, "logs", "issue_work")
         os.makedirs(work, exist_ok=True)
         marker = os.path.join(work, "fixer_binding.json")
-        Path(marker).write_text(json.dumps({"issue": 8, "worktree": worktree or tree, "branch": "fix/issue-8-y",
-                                            "created_ts": 1, "session_id": session_id}))
+        Path(marker).write_text(json.dumps({"issue": issue, "worktree": worktree or tree,
+                                            "branch": f"fix/issue-{issue}-y", "created_ts": 1,
+                                            "session_id": session_id}))
         self.addCleanup(lambda: os.path.exists(marker) and os.remove(marker))
         return marker
 
@@ -501,23 +549,239 @@ class TestIssueFixerGuard(unittest.TestCase):
         beat = json.loads(Path(hb).read_text())
         self.assertEqual((beat["decision"], beat["session_id"]), ("deny", "s1"))
 
+    def check_guard(self, tree, since):
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf):
+            code = iw.main(["check-guard", tree, "--since", str(since)])
+        return code, json.loads(buf.getvalue())
+
+    def _heartbeat(self, tree):
+        hb = Path(tree, "logs", "issue_work", "guard_heartbeat.json")
+        if hb.exists():
+            hb.unlink()
+        self.addCleanup(lambda: hb.exists() and hb.unlink())
+        return hb
+
+    def _key(self, issue=8):
+        keys = os.path.join(self.main, "logs", "issue_work_keys")
+        os.makedirs(keys, exist_ok=True)
+        path = os.path.join(keys, f"{issue}.key")
+        Path(path).write_text("ab" * 32 + "\n")
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        return path
+
     def test_check_guard_reads_the_guard_heartbeat(self):
-        tree = tempfile.mkdtemp()
-        self.addCleanup(subprocess.run, ["rm", "-rf", tree], check=False)
+        # A legacy worktree (no marker, no key; issue 7 from its -wt-issue-7 name) passes on the timestamp alone
+        hb = self._heartbeat(self.wt)
+        legacy = {"signed": False, "sig_ok": None, "issue": 7}
+        self.assertEqual(self.check_guard(self.wt, 100),
+                         (2, {"ok": False, "heartbeat_ts": None, "since": 100, "session_id": None,
+                              "binding_claim": None, **legacy}))
+        guard.write_heartbeat(self.wt, "Bash", "", "s1")
+        ts = json.loads(hb.read_text())["ts"]
+        self.assertEqual(self.check_guard(self.wt, ts),
+                         (0, {"ok": True, "heartbeat_ts": ts, "since": ts, "session_id": "s1",
+                              "binding_claim": "n/a", **legacy}))
+        self.assertEqual(self.check_guard(self.wt, ts + 1)[0], 2)  # stale: written before the fixer launch
+        hb.write_text("{bad")
+        self.assertEqual(self.check_guard(self.wt, 0)[0], 2)
+        # Outside a repository the key cannot be looked up: fail closed
+        plain = tempfile.mkdtemp()
+        self.addCleanup(subprocess.run, ["rm", "-rf", plain], check=False)
+        guard.write_heartbeat(plain, "Bash", "", "s1")
+        code, out = self.check_guard(plain, 0)
+        self.assertEqual(code, 2)
+        self.assertFalse(out["ok"])
+        self.assertIn("cannot resolve the main checkout", out["warning"])
 
-        def check(since):
-            buf = io.StringIO()
-            with mock.patch("sys.stdout", buf):
-                code = iw.main(["check-guard", tree, "--since", str(since)])
-            return code, json.loads(buf.getvalue())
+    # ----- #230: signed heartbeat -----
+    def test_signed_heartbeat_verifies_and_tampering_fails(self):
+        self._bind(self.wt2)
+        self._key(8)
+        hb = self._heartbeat(self.wt2)
+        before = int(time.time())
+        ok = {"tool_name": "Bash", "tool_input": {"command": f"cd {self.wt2} && git status"}, "session_id": "sess-A"}
+        self.assertEqual(self.run_hook(ok), (0, ""))
+        beat = json.loads(hb.read_text())
+        self.assertEqual((beat["signed"], beat["issue"], beat["binding_claim"], beat["worktree"]),
+                         (True, 8, "claimed", os.path.realpath(self.wt2)))
+        self.assertEqual(beat["sig"], iw.heartbeat_signature(bytes.fromhex("ab" * 32), beat))
+        code, out = self.check_guard(self.wt2, before)
+        self.assertEqual(code, 0, out)
+        self.assertEqual((out["signed"], out["sig_ok"], out["binding_claim"], out["issue"]), (True, True, "claimed", 8))
+        self.assertNotIn("warning", out)
+        self.assertEqual(self.run_hook(ok), (0, ""))
+        beat = json.loads(hb.read_text())
+        self.assertEqual(beat["binding_claim"], "already_bound")
+        self.assertEqual(self.check_guard(self.wt2, before)[0], 0)
+        # Any signed field changed, a missing signature or a signature made with another key fails (exit 2)
+        tampered = [dict(beat, **{field: value}) for field, value in (
+            ("ts", beat["ts"] + 60), ("decision", "deny"), ("session_id", "sess-X"), ("binding_claim", "n/a"),
+            ("issue", 7), ("worktree", self.wt))]
+        unsigned = {k: v for k, v in beat.items() if k != "sig"}
+        tampered += [unsigned, dict(unsigned, signed=False),
+                     dict(beat, sig=guard.heartbeat_signature(b"\x01" * 32, beat)), dict(beat, sig="é")]
+        for forged in tampered:
+            with self.subTest(forged=forged):
+                hb.write_text(json.dumps(forged))
+                code, out = self.check_guard(self.wt2, before)
+                self.assertEqual(code, 2)
+                self.assertFalse(out["sig_ok"])
+                self.assertIn("heartbeat signature missing or invalid", out["warning"])
+        # A heartbeat written by an old guard (no signature) in a worktree that has a key fails too
+        hb.write_text(json.dumps({"ts": int(time.time()), "tool": "Bash", "decision": "allow", "reason": None,
+                                  "session_id": "sess-A"}))
+        self.assertEqual(self.check_guard(self.wt2, before)[0], 2)
+        # The guard and check-guard sign the same fields the same way
+        self.assertEqual(guard.SIGNED_FIELDS, iw.SIGNED_FIELDS)
+        self.assertEqual(guard.KEYS_DIR, iw.KEYS_DIR.replace(os.sep, "/"))
+        self.assertEqual(guard.heartbeat_signature(b"k", beat), iw.heartbeat_signature(b"k", beat))
 
-        self.assertEqual(check(100), (2, {"ok": False, "heartbeat_ts": None, "since": 100, "session_id": None}))
-        guard.write_heartbeat(tree, "Bash", "", "s1")
-        ts = json.loads(Path(tree, "logs", "issue_work", "guard_heartbeat.json").read_text())["ts"]
-        self.assertEqual(check(ts), (0, {"ok": True, "heartbeat_ts": ts, "since": ts, "session_id": "s1"}))
-        self.assertEqual(check(ts + 1)[0], 2)  # stale: written before the fixer launch
-        Path(tree, "logs", "issue_work", "guard_heartbeat.json").write_text("{bad")
-        self.assertEqual(check(0)[0], 2)
+    def test_heartbeat_is_unsigned_without_marker_or_key(self):
+        hb = self._heartbeat(self.wt2)
+        ok = {"tool_name": "Bash", "tool_input": {"command": f"cd {self.wt2} && git status"}, "session_id": "sess-A"}
+        # Key but no marker: legacy worktree, unsigned
+        self._key(8)
+        self.assertEqual(self.run_hook(ok), (0, ""))
+        beat = json.loads(hb.read_text())
+        self.assertEqual((beat["signed"], beat["issue"], beat["binding_claim"]), (False, None, "n/a"))
+        self.assertNotIn("sig", beat)
+        # Marker but no key: unsigned, and check-guard passes on the timestamp (no key to verify against)
+        self._bind(self.wt2, issue=9)
+        self.assertEqual(self.run_hook(ok), (0, ""))
+        beat = json.loads(hb.read_text())
+        self.assertEqual((beat["signed"], beat["issue"]), (False, 9))
+        code, out = self.check_guard(self.wt2, beat["ts"])
+        self.assertEqual((code, out["signed"], out["sig_ok"], out["issue"]), (0, False, None, 9))
+        # A malformed key never changes the decision; the heartbeat stays unsigned and check-guard fails
+        Path(self._key(9)).write_text("not hex\n")
+        self.assertEqual(self.run_hook(ok), (0, ""))
+        self.assertFalse(json.loads(hb.read_text())["signed"])
+        code, out = self.check_guard(self.wt2, 0)
+        self.assertEqual(code, 2)
+        self.assertIn("unreadable heartbeat key", out["warning"])
+
+    # ----- #230: heartbeat keys are not readable through Read / Grep / Glob -----
+    def test_heartbeat_keys_are_unreadable(self):
+        key = self._key(8)
+        keys = os.path.dirname(key)
+        link = os.path.join(self.wt, "tests", "key_link")
+        os.makedirs(os.path.dirname(link), exist_ok=True)
+        os.symlink(key, link)
+        self.addCleanup(os.remove, link)
+        denied = [
+            ("Read", {"file_path": key}),
+            ("Read", {"file_path": f"{self.main}/logs/x/../issue_work_keys/8.key"}),
+            ("Read", {"file_path": link}),
+            ("Grep", {"pattern": ".", "path": keys}),
+            ("Grep", {"pattern": ".", "path": key}),
+            ("Grep", {"pattern": ".", "path": f"{self.main}/logs", "glob": "*.key"}),
+            ("Grep", {"pattern": ".", "path": self.main, "glob": "**/*"}),
+            ("Grep", {"pattern": ".", "glob": "*.key"}),  # no path: the session's directory, the main checkout
+            ("Grep", {"pattern": ".", "path": self.wt, "glob": "../trading/logs/issue_work_keys/*"}),
+            ("Glob", {"pattern": "*.key", "path": keys}),
+            ("Glob", {"pattern": f"{keys}/*"}),
+            ("Glob", {"pattern": "logs/issue_work_keys/*.key"}),
+        ]
+        for tool, tool_input in denied:
+            with self.subTest(tool=tool, tool_input=tool_input):
+                payload = {"tool_name": tool, "tool_input": tool_input, "cwd": self.main}
+                self.assertIn("heartbeat keys", guard.evaluate_payload(payload, self.conf))
+                code, err = self.run_hook(payload)
+                self.assertEqual(code, 2)
+                self.assertIn("heartbeat keys", err)
+        # Every other read passes, and reads neither claim a binding nor write a heartbeat
+        hb = self._heartbeat(self.wt)
+        allowed = [
+            ("Read", {"file_path": "/etc/hosts"}),
+            ("Read", {"file_path": f"{self.main}/README.md"}),
+            ("Read", {"file_path": f"{self.wt}/README.md"}),
+            ("Grep", {"pattern": "x", "path": self.wt, "glob": "*.py"}),
+            ("Grep", {"pattern": "x", "path": self.main}),
+            ("Grep", {"pattern": "issue_work_keys", "path": self.wt}),
+            ("Glob", {"pattern": "**/*.py", "path": self.wt}),
+            ("Glob", {"pattern": "**/*.md"}),
+        ]
+        for tool, tool_input in allowed:
+            with self.subTest(tool=tool, tool_input=tool_input):
+                payload = {"tool_name": tool, "tool_input": tool_input, "cwd": self.main, "session_id": "s1"}
+                self.assertEqual(self.run_hook(payload), (0, ""))
+        self.assertFalse(hb.exists())
+
+    def test_generated_fixer_hook_covers_read_tools(self):
+        text = (REPO_ROOT / ".claude" / "agents" / "issue_fixer.md").read_text(encoding="utf-8")
+        head = text.split("\n---\n", 1)[0]
+        matcher = next(ln for ln in head.splitlines() if "matcher:" in ln).split("matcher:", 1)[1].strip()
+        self.assertEqual(set(matcher.split("|")),
+                         {"Bash", "Edit", "Write", "MultiEdit", "NotebookEdit", "Read", "Grep", "Glob"})
+
+    # ----- #230: the heartbeat goes only to the worktree the decision validated -----
+    def test_heartbeat_target_is_the_validated_worktree(self):
+        hb1, hb2 = self._heartbeat(self.wt), self._heartbeat(self.wt2)
+
+        def call(command, session_id="sess-A"):
+            return self.run_hook({"tool_name": "Bash", "tool_input": {"command": command},
+                                  "session_id": session_id})[0]
+
+        # Binding denial: wt2 is bound to another session; the denied call leaves wt2's heartbeat alone
+        self._bind(self.wt2, session_id="sess-B")
+        self.assertEqual(call(f"cd {self.wt2} && git status"), 2)
+        self.assertFalse(hb2.exists())
+        # Cross-tree denial: the caller is bound to wt; a denied call aimed at unbound wt2 writes nothing there
+        self._bind(self.wt, session_id="sess-A", issue=7)
+        self._bind(self.wt2)
+        self.assertEqual(call(f"cd {self.wt2} && git push"), 2)
+        self.assertFalse(hb2.exists())
+        self.assertEqual(json.loads(Path(self.wt2, "logs", "issue_work", "fixer_binding.json").read_text())
+                         ["session_id"], None)
+        # ... nor at a legacy worktree (no marker)
+        os.remove(os.path.join(self.wt2, "logs", "issue_work", "fixer_binding.json"))
+        self.assertEqual(call(f"cd {self.wt2} && git push"), 2)
+        self.assertFalse(hb2.exists())
+        # A marker naming another worktree: nothing is written
+        self._bind(self.wt2, worktree=self.wt)
+        self.assertEqual(call(f"cd {self.wt2} && git push", session_id="sess-C"), 2)
+        self.assertFalse(hb2.exists())
+        # A deny inside the caller's own bound worktree still writes the heartbeat, also when the command names
+        # another worktree
+        self.assertEqual(call(f"cd {self.wt} && git push"), 2)
+        self.assertEqual(json.loads(hb1.read_text())["decision"], "deny")
+        hb1.unlink()
+        self.assertEqual(call(f"cd {self.wt} && cat {self.wt2}/README.md"), 2)
+        self.assertIn("another issue worktree", json.loads(hb1.read_text())["reason"])
+        self.assertFalse(hb2.exists())
+        # An allowed call writes to its worktree
+        self.assertEqual(call(f"cd {self.wt} && git status"), 0)
+        self.assertEqual(json.loads(hb1.read_text())["decision"], "allow")
+        self.assertFalse(hb2.exists())
+
+    # ----- #230: a failed claim is recorded and reported -----
+    def test_failed_binding_claim_is_recorded(self):
+        marker = self._bind(self.wt2)
+        hb = self._heartbeat(self.wt2)
+        real_write = guard._atomic_write_json
+
+        def marker_write_fails(path, data):
+            if path.endswith(guard.BINDING_FILE):
+                raise OSError("read-only marker")
+            return real_write(path, data)
+
+        ok = {"tool_name": "Bash", "tool_input": {"command": f"cd {self.wt2} && git status"}, "session_id": "sess-A"}
+        before = int(time.time())
+        with mock.patch.object(guard, "_atomic_write_json", side_effect=marker_write_fails):
+            self.assertEqual(self.run_hook(ok), (0, ""))  # the decision never changes
+        self.assertIsNone(json.loads(Path(marker).read_text())["session_id"])
+        self.assertEqual(json.loads(hb.read_text())["binding_claim"], "failed")
+        code, out = self.check_guard(self.wt2, before)
+        self.assertEqual((code, out["binding_claim"], out["warning"]), (0, "failed", "binding claim failed"))
+        # The statuses of claim_binding
+        self.assertEqual(guard.claim_binding("", "sess-A"), "n/a")
+        self.assertEqual(guard.claim_binding(self.wt2, None), "n/a")
+        self.assertEqual(guard.claim_binding(self.wt, "sess-A"), "n/a")  # legacy: no marker
+        self.assertEqual(guard.claim_binding(self.wt2, "sess-A"), "claimed")
+        self.assertEqual(guard.claim_binding(self.wt2, "sess-A"), "already_bound")
+        Path(marker).write_text("{bad")
+        self.assertEqual(guard.claim_binding(self.wt2, "sess-A"), "failed")
 
 
 class TestIssueWorkspaceReviewContext(unittest.TestCase):
@@ -574,6 +838,54 @@ class TestIssueWorkspaceReviewContext(unittest.TestCase):
         with self.assertRaises(iw.WorkspaceError):
             iw.cmd_review_context(plain)
 
+    # ----- #230: the checks never see the orchestrator's credentials or home directory -----
+    CREDENTIALS = {"BINANCE_API_KEY": "k", "BINANCE_API_SECRET": "s", "BINANCE_MCP_OAUTH_PATH": "/x/oauth.json",
+                   "NOTION_TOKEN": "n", "GITHUB_TOKEN": "g", "GMAIL_APP_PASSWORD": "p", "ENV_FILE": "/x/.env",
+                   "GH_TOKEN": "t", "GH_ENTERPRISE_TOKEN": "e", "GEMINI_API_KEY": "m"}
+
+    def test_checks_run_without_credentials_or_home(self):
+        home = os.path.join(self.tmp, "orchestrator-home")
+        os.makedirs(home)
+        Path(self.repo, "tests", "test_env.py").write_text(
+            "import os\nimport unittest\n\n\nclass Env(unittest.TestCase):\n"
+            "    def test_scrubbed(self):\n"
+            "        leaked = sorted(k for k in os.environ if k.startswith(('BINANCE_', 'NOTION_', 'GITHUB_', "
+            "'GMAIL_', 'GH_')) or k in ('ENV_FILE', 'GEMINI_API_KEY'))\n"
+            "        self.assertEqual(leaked, [])\n"
+            f"        self.assertNotEqual(os.path.realpath(os.environ['HOME']), {os.path.realpath(home)!r})\n"
+            "        self.assertTrue(os.path.isdir(os.environ['HOME']))\n"
+            "        self.assertEqual(os.environ.get('TZ'), 'UTC')\n")
+        with mock.patch.dict(os.environ, dict(self.CREDENTIALS, HOME=home, TZ="UTC")):
+            out = iw.cmd_review_context(self.repo)
+        log = Path(self.repo, "logs", "issue_work", "review", "checks.log").read_text()
+        self.assertTrue(out["checks_ok"], log)
+        self.assertIn("Ran 2 tests", out["checks"]["unittest"])
+
+    def test_check_env_drops_credentials_and_replaces_home(self):
+        with mock.patch.dict(os.environ, dict(self.CREDENTIALS, HOME="/home/orchestrator", TZ="UTC", LANG="C.UTF-8",
+                                              PYTHONHASHSEED="0")):
+            env = iw.check_env("/tmp/fresh-home")
+            path = os.environ["PATH"]
+        self.assertFalse(set(self.CREDENTIALS) & set(env))
+        self.assertEqual(env["HOME"], "/tmp/fresh-home")
+        self.assertEqual((env["PATH"], env["TZ"], env["LANG"], env["PYTHONHASHSEED"]), (path, "UTC", "C.UTF-8", "0"))
+        self.assertTrue(env["PYTHONUSERBASE"])
+        # The temporary home of a run is removed afterwards
+        homes = []
+        real_run = subprocess.run
+
+        def spy(cmd, *args, **kwargs):
+            if kwargs.get("env") is not None:
+                homes.append(kwargs["env"]["HOME"])
+                self.assertFalse(set(self.CREDENTIALS) & set(kwargs["env"]))
+            return real_run(cmd, *args, **kwargs)
+
+        with mock.patch.dict(os.environ, self.CREDENTIALS), mock.patch.object(iw.subprocess, "run", side_effect=spy):
+            iw.cmd_review_context(self.repo)
+        self.assertEqual(len(homes), 3)
+        self.assertEqual(len(set(homes)), 1)
+        self.assertFalse(os.path.exists(homes[0]))
+
 
 class TestIssueWorkspaceInitCleanup(unittest.TestCase):
     """init/cleanup with gh and the network faked; git runs for real on a temp repo with a local 'origin'."""
@@ -626,9 +938,18 @@ class TestIssueWorkspaceInitCleanup(unittest.TestCase):
                                       "created_ts": marker["created_ts"], "session_id": None})
             tree = guard.Confinement.from_project_dir(self.repo).worktree_of(out["worktree"])
             guard.check_binding(tree, "sess-A")
-            guard.claim_binding(tree, "sess-A")
+            self.assertEqual(guard.claim_binding(tree, "sess-A"), "claimed")
             with self.assertRaises(guard.Denied):
                 guard.check_binding(tree, "sess-B")
+            # #230: the heartbeat key lives in the main checkout, 0600, 32 random bytes as hex
+            key = os.path.join(self.repo, "logs", "issue_work_keys", "7.key")
+            self.assertEqual(out["key_file"], key)
+            self.assertEqual(stat.S_IMODE(os.stat(key).st_mode), 0o600)
+            self.assertRegex(Path(key).read_text(), r"^[0-9a-f]{64}\n$")
+            # ... and the guard signs the worktree's heartbeat with it, which check-guard verifies
+            guard.write_heartbeat(tree, "Bash", "", "sess-A", "claimed", os.path.realpath(self.repo))
+            check = iw.cmd_check_guard(out["worktree"], 0)
+            self.assertEqual((check["ok"], check["signed"], check["sig_ok"], check["issue"]), (True, True, True, 7))
             # A second init for the same issue refuses to reuse the worktree
             with self.assertRaises(iw.WorkspaceError):
                 iw.cmd_init(7, "again", "origin/main", cwd=self.repo)
@@ -638,6 +959,8 @@ class TestIssueWorkspaceInitCleanup(unittest.TestCase):
         self.assertFalse(os.path.exists(out["worktree"]))
         self.assertEqual(res["deleted_branch"], "fix/issue-7-fix-thing")
         self.assertNotIn("fix/issue-7", _git(self.repo, "branch"))
+        self.assertFalse(os.path.exists(key))
+        self.assertTrue(res["removed_key"])
 
     def test_init_routes_risk_gate_issue_to_deep(self):
         with mock.patch.object(iw, "run", self.fake_run(labels=["bug", "cat:risk_gate"])):
@@ -866,6 +1189,84 @@ class TestRecordRoute(unittest.TestCase):
         self.assertEqual(len(self.lines()), 1)
 
 
+class TestRebind(unittest.TestCase):
+    """#230: rebind <N> resets the fixer binding on a real temp repo with a linked issue worktree."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.repo = _make_repo(self.tmp)
+        self.wt = iw.worktree_path(self.repo, 5)
+        _git(self.repo, "worktree", "add", "-q", self.wt, "-b", "fix/issue-5-x")
+        work = os.path.join(self.wt, "logs", "issue_work")
+        os.makedirs(work)
+        self.marker = os.path.join(work, "fixer_binding.json")
+        self.hb = os.path.join(work, "guard_heartbeat.json")
+        self.write_marker("sess-A")
+
+    def tearDown(self):
+        subprocess.run(["rm", "-rf", self.tmp], check=False)
+
+    def write_marker(self, session_id):
+        Path(self.marker).write_text(json.dumps({"issue": 5, "worktree": self.wt, "branch": "fix/issue-5-x",
+                                                 "created_ts": 1, "session_id": session_id}))
+
+    def beat(self, session_id, age):
+        Path(self.hb).write_text(json.dumps({"ts": int(time.time()) - age, "session_id": session_id}))
+
+    def bound(self):
+        return json.loads(Path(self.marker).read_text())["session_id"]
+
+    def main(self, *args):
+        real_root = iw.main_repo_root
+        buf = io.StringIO()
+        with mock.patch.object(iw, "main_repo_root", lambda cwd=None: real_root(self.wt)), \
+                mock.patch("sys.stdout", buf):
+            code = iw.main(["rebind", "5", *args])
+        return code, json.loads(buf.getvalue())
+
+    def test_rebind_resets_the_session(self):
+        out = iw.cmd_rebind(5, cwd=self.repo)
+        self.assertEqual((out["ok"], out["previous_session_id"], out["forced"]), (True, "sess-A", False))
+        self.assertIsNone(self.bound())
+        marker = json.loads(Path(self.marker).read_text())
+        self.assertEqual(marker, {"issue": 5, "worktree": self.wt, "branch": "fix/issue-5-x", "created_ts": 1,
+                                  "session_id": None})
+        # A heartbeat older than 10 minutes, or one without a session id, does not block it
+        for session_id, age in (("sess-A", iw.REBIND_LIVE_SECONDS + 1), (None, 5)):
+            with self.subTest(session_id=session_id, age=age):
+                self.write_marker("sess-A")
+                self.beat(session_id, age)
+                code, out = self.main()
+                self.assertEqual(code, 0, out)
+                self.assertEqual(out["previous_session_id"], "sess-A")
+                self.assertIsNone(self.bound())
+
+    def test_rebind_refuses_while_a_session_looks_live_unless_forced(self):
+        # The bound session or another one wrote the heartbeat less than 10 minutes ago
+        for session_id in ("sess-A", "sess-B"):
+            with self.subTest(session_id=session_id):
+                self.write_marker("sess-A")
+                self.beat(session_id, 30)
+                with self.assertRaises(iw.RebindRefused):
+                    iw.cmd_rebind(5, cwd=self.repo)
+                code, out = self.main()
+                self.assertEqual(code, 2)
+                self.assertFalse(out["ok"])
+                self.assertIn("--force", out["error"])
+                self.assertEqual(self.bound(), "sess-A")
+                code, out = self.main("--force")
+                self.assertEqual(code, 0)
+                self.assertTrue(out["forced"])
+                self.assertEqual(out["heartbeat_session_id"], session_id)
+                self.assertIsNone(self.bound())
+
+    def test_rebind_without_marker_fails(self):
+        os.remove(self.marker)
+        code, out = self.main()
+        self.assertEqual(code, 1)
+        self.assertIn("no readable binding marker", out["error"])
+
+
 class TestGeneratorWriteAgents(unittest.TestCase):
     BASE = ("---\nname: {name}\ndescription: >-\n  Test agent.\ntools:\n{tools}model: opus\n---\nbody\n")
 
@@ -948,6 +1349,30 @@ class TestGeneratorWriteAgents(unittest.TestCase):
             self.assertIn(item, auditor)
         self.assertLess(auditor.index("## Verdict Checklist"),
                         auditor.index("VERDICT: APPROVE | VERDICT: CHANGES_REQUESTED"))
+        # #231: the auditor's checklist and its marking rules sit in <deliberation_protocol>, just before
+        # <output_contract>, as the fixer's do
+        a_start, a_end = auditor.index("<deliberation_protocol>"), auditor.index("</deliberation_protocol>")
+        self.assertLess(auditor.index("</few_shot_examples>"), a_start)
+        self.assertLess(a_start, auditor.index("## Verdict Checklist"))
+        self.assertLess(auditor.index("## Verdict Checklist"), a_end)
+        self.assertLess(auditor.index("any item left `- [ ]` is a required change"), a_end)
+        self.assertLess(a_start, auditor.index("Never mark an item you did not verify"))
+        self.assertLess(auditor.index("Never mark an item you did not verify"), a_end)
+        self.assertEqual(auditor[a_end:auditor.index("<output_contract>")].strip(), "</deliberation_protocol>")
+        contract = auditor.split("<output_contract>", 1)[1].split("</output_contract>", 1)[0]
+        self.assertNotIn("## Verdict Checklist", contract)
+        self.assertNotIn("- [ ]", contract)
+        self.assertIn("the Verdict Checklist from `<deliberation_protocol>` first", contract)
+        # #231: a compact evidence list for bundled issues
+        self.assertIn("with many criteria, one compact line", auditor)
+        # #231: the fixer's agy rule is an invariant; the Allowed list is the source of truth
+        operational = fixer.split("<operational_environment>", 1)[1].split("</operational_environment>", 1)[0]
+        fixer_invariants = fixer.split("<invariants_and_rules>", 1)[1].split("</invariants_and_rules>", 1)[0]
+        agy_rule = "under agy no guard runs: if a command or edit falls outside these limits, do NOT run it."
+        self.assertIn(agy_rule, fixer_invariants)
+        self.assertNotIn(agy_rule, operational)
+        self.assertIn("Anything outside the Allowed list is denied; notable examples:", operational)
+        self.assertNotIn("  - Denied:", operational)
         # #130.3: the quantitative axioms in the auditor's invariants
         invariants = auditor.split("<invariants_and_rules>", 1)[1].split("</invariants_and_rules>", 1)[0]
         for axiom in ("risk_pct_equity", "1.8R", "4.0R", "+0.2%", "+2.0 × ATR_15m", "-3.34", "1,000", "10-day",
@@ -966,10 +1391,42 @@ class TestGeneratorWriteAgents(unittest.TestCase):
         self.assertNotIn("together with the audit", step_7a)
         self.assertIn("issue_workspace.py check-guard <WORKTREE> --since <launch_ts>", skill)
         self.assertIn("a confinement policy, not a sandbox", skill)
-        # A binding denial after an escalation or a restarted / resumed orchestrator session has a remedy
+        # A binding denial after an escalation or a restarted / resumed orchestrator session has a remedy (#230:
+        # through rebind, never a hand edit)
         recovery = next(line for line in skill.splitlines() if "bound to another session" in line)
-        for text in ("step 7c", "restarted or resumed", "`session_id` to null"):
+        for text in ("step 7c", "restarted or resumed", "`session_id` to null",
+                     "python3 scripts/dev/issue_workspace.py rebind <N>", "never edit the marker by hand",
+                     "--force", "confirm no other session works in that worktree"):
             self.assertIn(text, recovery)
+        # #230: under agy the user confirms an unguarded fixer before it is launched; a failed claim is reported
+        guard_check = next(line for line in skill.splitlines() if "**Guard check.**" in line)
+        for text in ("Under agy no guard runs: before launching `issue_fixer`", "ask whether to proceed",
+                     "launch it only after an explicit yes", "`binding_claim: failed`", "`signed`, `sig_ok`"):
+            self.assertIn(text, guard_check)
+        self.assertNotIn("tell the user once", guard_check)
+        # #230: the main-checkout writes and the scrubbed review checks
+        self.assertIn("`logs/issue_work_keys/<N>.key`", skill)
+        self.assertIn("the routing log and the issue key above are the only exceptions", skill)
+        self.assertIn("the fixer's own test runs are not scrubbed", skill)
+
+    def test_auditor_axioms_match_the_trading_risk_reviewer(self):
+        """#231: every axiom token the auditor pins also appears in the trading_risk_reviewer source."""
+        auditor = (REPO_ROOT / ".agents" / "agents" / "issue_auditor" / "agent.md").read_text(encoding="utf-8")
+        reviewer = (REPO_ROOT / ".agents" / "agents" / "trading_risk_reviewer" / "agent.md").read_text(
+            encoding="utf-8")
+
+        def normalized(text):
+            # `+2.0 × ATR_15m` (auditor), `$+2.0 \times \text{ATR}_{15m}$` and `+2.0x ATR_15m` (reviewer)
+            text = re.sub(r"\\text\{(\w+)\}", r"\1", text)
+            text = re.sub(r"_\{(\w+)\}", r"_\1", text)
+            return re.sub(r"\s*(?:×|\\times|x)\s*(?=ATR)", " x ", text)
+
+        invariants = auditor.split("<invariants_and_rules>", 1)[1].split("</invariants_and_rules>", 1)[0]
+        for axiom in ("risk_pct_equity", "1.8R", "4.0R", "+0.2%", "+2.0 × ATR_15m", "-3.34", "1,000", "10-day"):
+            with self.subTest(axiom=axiom):
+                self.assertIn(axiom, invariants)
+                self.assertIn(normalized(axiom), normalized(reviewer))
+        self.assertIn("+2.0 x ATR_15m", normalized(reviewer))
 
     def test_skill_is_generated_and_names_every_subagent(self):
         skill = (REPO_ROOT / ".claude" / "skills" / "issue-orchestrator" / "SKILL.md").read_text(encoding="utf-8")
