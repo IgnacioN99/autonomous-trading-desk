@@ -12,6 +12,7 @@ Issue #206: squeeze filter for SHORT candidates and the macro rule for altcoin s
 Offline: urllib is blocked, the brief and the pipeline write only to temp directories.
 """
 
+import io
 import json
 import math
 import os
@@ -20,6 +21,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+import urllib.error
 from unittest.mock import patch
 
 import numpy as np
@@ -84,6 +86,30 @@ class TestSqueezeFilter(unittest.TestCase):
         self.assertEqual(sqf.short_squeeze_reasons({"oi_z_score": 2.91, "funding_rate_pct": -0.0211}),
                          ["oi_z>=2.0 (oi_z=2.91)", "funding<=-0.01% (funding=-0.0211%)"])
 
+    def test_normalized_funding_wins(self):
+        # 4h symbol: raw -0.006% is -0.012%/8h -> squeeze; the raw value alone would not trigger
+        micro = {"oi_z_score": 0.2, "funding_rate_pct": -0.006, "funding_rate_8h_pct": -0.012}
+        self.assertEqual(sqf.short_squeeze_reasons(micro), ["funding<=-0.01% (funding=-0.0120%)"])
+        self.assertEqual(sqf.short_squeeze_reasons(dict(micro, funding_rate_8h_pct=-0.006)), [])
+        self.assertEqual(sqf.short_squeeze_reasons(dict(micro, funding_rate_8h_pct=None)), ["micro_unavailable"])
+        self.assertEqual(len(sqf.long_crowding_reasons({"oi_z_score": 2.0, "funding_rate_pct": 0.025,
+                                                        "funding_rate_8h_pct": 0.05})), 2)
+
+    def test_funding_interval_helpers(self):
+        payload = [{"symbol": "AUSDT", "fundingIntervalHours": 4}, {"symbol": "BUSDT", "fundingIntervalHours": 1},
+                   {"symbol": "CUSDT", "fundingIntervalHours": "4"}, {"symbol": "DUSDT", "fundingIntervalHours": 0},
+                   {"symbol": "EUSDT", "fundingIntervalHours": True}, "junk", {"fundingIntervalHours": 4}]
+        intervals = sqf.parse_funding_intervals(payload)
+        self.assertEqual(intervals, {"AUSDT": 4, "BUSDT": 1})
+        self.assertEqual(sqf.parse_funding_intervals({"code": -1}), {})
+        self.assertEqual(sqf.funding_interval_h("AUSDT", intervals), 4)
+        self.assertEqual(sqf.funding_interval_h("ZUSDT", intervals), 8)  # not listed: Binance default
+        self.assertEqual(sqf.funding_interval_h("AUSDT", None), 8)
+        self.assertAlmostEqual(sqf.normalize_funding_8h(-0.006, 4), -0.012)
+        self.assertAlmostEqual(sqf.normalize_funding_8h(-0.006, 8), -0.006)
+        self.assertAlmostEqual(sqf.normalize_funding_8h(0.01, 1), 0.08)
+        self.assertIsNone(sqf.normalize_funding_8h(None, 4))
+
     def test_numpy_scalars_are_numbers(self):
         self.assertEqual(sqf.short_squeeze_reasons({"oi_z_score": np.float32(2.5), "funding_rate_pct": np.int64(0)}),
                          ["oi_z>=2.0 (oi_z=2.50)"])
@@ -121,11 +147,22 @@ class TestSqueezeFilter(unittest.TestCase):
         neutral = {"btc_regime": "NEUTRAL_CONSOLIDATION", "btc_absorption": "NONE", "allows_alt_shorts": True}
         self.assertIsNone(sqf.alt_short_macro_reason("BTCUSDT", False, None))  # BTC exempt
         self.assertIsNone(sqf.alt_short_macro_reason("BTCUSDT", False, dict(neutral, allows_alt_shorts=False)))
+        squeeze = dict(neutral, btc_regime="SHORT_SQUEEZE")
         for allows in (False, None, "true", 1):
-            self.assertEqual(sqf.alt_short_macro_reason("ETHUSDT", True, dict(neutral, allows_alt_shorts=allows)),
+            self.assertEqual(sqf.alt_short_macro_reason("ETHUSDT", True, dict(squeeze, allows_alt_shorts=allows)),
                              "btc_short_squeeze")
-        self.assertEqual(sqf.alt_short_macro_reason("ETHUSDT", True, None), "btc_short_squeeze")
-        self.assertIsNone(sqf.alt_short_macro_reason("ETHUSDT", False, dict(neutral, btc_absorption="BEARISH_ABSORPTION")))
+            # not allowed for another cause: never labelled a squeeze
+            self.assertEqual(sqf.alt_short_macro_reason("ETHUSDT", True, dict(neutral, allows_alt_shorts=allows)),
+                             "alt_shorts_not_allowed")
+        # unavailable BTC data: no macro, regime UNKNOWN, or the error-path marker (even if allows were True)
+        self.assertEqual(sqf.alt_short_macro_reason("ETHUSDT", True, None), "btc_data_unavailable")
+        self.assertEqual(sqf.alt_short_macro_reason("ETHUSDT", True, dict(neutral, btc_regime="UNKNOWN")),
+                         "btc_data_unavailable")
+        self.assertEqual(sqf.alt_short_macro_reason("ETHUSDT", True, dict(neutral, btc_data_ok=False)),
+                         "btc_data_unavailable")
+        self.assertEqual(sqf.alt_short_macro_reason("ETHUSDT", True, _macro(regime="UNKNOWN")), "btc_data_unavailable")
+        self.assertIsNone(sqf.alt_short_macro_reason("ETHUSDT", False,
+                                                     dict(neutral, btc_absorption="BEARISH_ABSORPTION")))
         self.assertIsNone(sqf.alt_short_macro_reason("ETHUSDT", True, neutral, 2.5))
         self.assertEqual(sqf.alt_short_macro_reason("ETHUSDT", False, neutral, 2.49),
                          "no_btc_rejection_and_climax<2.5x (vol_ratio=2.49)")
@@ -142,7 +179,7 @@ class TestSqueezeFilter(unittest.TestCase):
 # =============================================================================
 class TestRadarSqueezeCap(unittest.TestCase):
 
-    def _enrich(self, direction, micro="default", confidence=70, **micro_kw):
+    def _enrich(self, direction, micro="default", confidence=70, intervals=None, **micro_kw):
         absorption = "BULLISH_ABSORPTION" if direction == "LONG" else "BEARISH_ABSORPTION"
         snap = (dict(tac.micro_snapshot("AAAUSDT"), absorption=absorption, absorption_desc="desc", **micro_kw)
                 if micro == "default" else micro)
@@ -150,7 +187,22 @@ class TestRadarSqueezeCap(unittest.TestCase):
                 "interval": "15m", "wick_candle_open_time": 1, "tier_s_eligible": True,
                 "tier": "Tier S (radar)", "tier_code": "S", "score_components": {"rsi": confidence}}
         with patch("microstructure_engine.get_symbol_microstructure", return_value=snap):
-            return bmr.enrich_candidate_microstructure(cand)
+            return bmr.enrich_candidate_microstructure(cand, intervals)
+
+    def test_four_hour_funding_normalized_to_8h(self):
+        # 4h symbol at -0.006% raw = -0.012%/8h -> squeeze; the same raw rate on an 8h symbol is clean
+        cand = self._enrich("SHORT", intervals={"AAAUSDT": 4}, funding_rate_pct=-0.006)
+        self.assert_capped(cand, "funding<=-0.01% (funding=-0.0120%)")
+        self.assertEqual((cand["funding_rate_pct"], cand["funding_rate_8h_pct"], cand["funding_interval_h"]),
+                         (-0.006, -0.012, 4))
+        self.assertNotIn("funding_rate_8h_pct", cand["micro"])  # the micro contract is unchanged
+        clean = self._enrich("SHORT", intervals={"OTHERUSDT": 4}, funding_rate_pct=-0.006)
+        self.assertFalse(clean["squeeze_risk"])
+        self.assertEqual((clean["funding_rate_8h_pct"], clean["funding_interval_h"]), (-0.006, 8))
+        self.assertEqual(clean["confidence"], 85)
+        # crowding uses the normalized rate too: +0.025% per 4h = +0.05%/8h
+        crowded = self._enrich("LONG", intervals={"AAAUSDT": 4}, oi_z_score=2.0, funding_rate_pct=0.025)
+        self.assertTrue(crowded["long_crowding_risk"])
 
     def assert_capped(self, cand, reason_prefix):
         self.assertEqual(cand["confidence"], 64)
@@ -263,9 +315,81 @@ class TestRadarClimaxFlag(unittest.TestCase):
 # =============================================================================
 # 3. Screening pipeline
 # =============================================================================
-def _short_setup(symbol, vol_ratio, climax_ok=False):
-    return _setup(symbol).model_copy(update={"direction": "SHORT", "vol_ratio": vol_ratio,
-                                             "alt_short_climax_ok": climax_ok})
+class TestScanFundingInfo(unittest.TestCase):
+    """scan_all_liquid_pairs fetches /fapi/v1/fundingInfo once and falls back to 8h with a warning."""
+
+    SYMBOLS = ("AAAUSDT", "DDDUSDT")  # (a symbol containing "BUSD" is filtered out of the universe)
+
+    def scan(self, funding_info):
+        info = {"symbols": [{"symbol": s, "underlyingType": "COIN", "contractType": "PERPETUAL", "quoteAsset": "USDT",
+                             "status": "TRADING"} for s in self.SYMBOLS]}
+        tickers = [{"symbol": s, "quoteVolume": "1000000"} for s in self.SYMBOLS]
+        calls = []
+
+        def get_json(url, timeout):
+            calls.append(url)
+            if "exchangeInfo" in url:
+                return info
+            if "ticker/24hr" in url:
+                return tickers
+            if "fundingInfo" in url:
+                if isinstance(funding_info, Exception):
+                    raise funding_info
+                return funding_info
+            raise AssertionError(url)
+
+        def analyze(sym, interval):
+            return {"symbol": sym, "direction": "SHORT", "confidence": 70, "reasons": [], "interval": interval,
+                    "wick_candle_open_time": 1, "tier_s_eligible": True, "score_components": {"rsi": 70}}
+
+        def micro(sym, **kw):
+            return dict(tac.micro_snapshot(sym), funding_rate_pct=-0.006)
+
+        status = {}
+        with patch.object(bmr, "_get_json", side_effect=get_json), \
+             patch.object(bmr, "analyze_single_symbol", side_effect=analyze), \
+             patch("microstructure_engine.get_symbol_microstructure", side_effect=micro), \
+             patch("sys.stderr", new_callable=io.StringIO):
+            rows = bmr.scan_all_liquid_pairs(top_n=10, interval="15m", funding_status=status)
+        return {r["symbol"]: r for r in rows}, status, calls
+
+    def test_listed_symbol_normalized_once_per_scan(self):
+        rows, status, calls = self.scan([{"symbol": "AAAUSDT", "fundingIntervalHours": 4}])
+        self.assertEqual(sum("fundingInfo" in u for u in calls), 1)
+        self.assertTrue(rows["AAAUSDT"]["squeeze_risk"])      # -0.012%/8h
+        self.assertEqual(rows["AAAUSDT"]["confidence"], 64)
+        self.assertFalse(rows["DDDUSDT"]["squeeze_risk"])     # not listed: 8h, -0.006% stays clean
+        self.assertEqual(status, {})
+
+    def test_failure_falls_back_to_8h_with_warning(self):
+        rows, status, _ = self.scan(urllib.error.URLError("down"))
+        self.assertEqual({r["funding_interval_h"] for r in rows.values()}, {8})
+        self.assertFalse(rows["AAAUSDT"]["squeeze_risk"])
+        self.assertIn("fundingInfo unavailable", status["warning"])
+
+    def test_rate_limit_ban_propagates(self):
+        from utils import rate_limit_guard
+        with self.assertRaises(rate_limit_guard.RateLimitedError):
+            self.scan(rate_limit_guard.RateLimitedError("banned"))
+
+    def test_http_429_on_funding_info_trips_the_guard(self):
+        # the real _get_json: a 429 trips the enabled guard and raises, so the run reports UNAVAILABLE as usual
+        from utils import rate_limit_guard
+        rate_limit_guard.reset_for_tests()
+        self.addCleanup(rate_limit_guard.reset_for_tests)
+        rate_limit_guard.enable()
+
+        def urlopen(req, timeout=None):
+            raise urllib.error.HTTPError(req.full_url, 429, "rate limit", {"Retry-After": "20"}, None)
+
+        with patch("urllib.request.urlopen", side_effect=urlopen):
+            with self.assertRaises(rate_limit_guard.RateLimitedError):
+                bmr.fetch_funding_intervals()
+        self.assertTrue(rate_limit_guard.is_banned())
+
+
+def _short_row(symbol, vol_ratio=1.0, climax_ok=False):
+    return {"symbol": symbol, "direction": "SHORT", "vol_ratio": vol_ratio, "alt_short_climax_ok": climax_ok}
 
 
 class TestPipelineMacroGate(_PipelineFakes):
@@ -278,10 +402,14 @@ class TestPipelineMacroGate(_PipelineFakes):
             {"symbol": "SOLUSDT", "direction": "LONG", "vol_ratio": 0.5}]
 
     def run_gate(self, macro, rows=None):
-        def enrich(c, env=None):  # the real enrich_and_size_candidate copies the flag with `is True`
+        self.enriched = []
+
+        def enrich(c, env=None):  # like enrich_and_size_candidate: copies the flag and the gate's check
+            self.enriched.append(c["symbol"])
             s = _setup(c["symbol"])
             return s.model_copy(update={"direction": c["direction"], "vol_ratio": c["vol_ratio"],
-                                        "alt_short_climax_ok": c.get("alt_short_climax_ok") is True})
+                                        "alt_short_climax_ok": c.get("alt_short_climax_ok") is True,
+                                        "macro_short_check": c.get("macro_short_check")})
         for p in (patch("screening_pipeline.fetch_macro_btc", return_value=macro),
                   patch("broad_market_radar.scan_all_liquid_pairs", return_value=list(rows or self.ROWS)),
                   patch("screening_pipeline.enrich_and_size_candidate", side_effect=enrich)):
@@ -312,29 +440,51 @@ class TestPipelineMacroGate(_PipelineFakes):
             self.assertEqual(kept["AAAUSDT"].macro_short_check, "btc_rejection")
 
     def test_alt_shorts_dropped_when_not_allowed(self):
-        kept, payload = self.run_gate(_macro(absorption="BEARISH_ABSORPTION", allows=False))
-        self.assertEqual(set(kept), {"BTCUSDT", "SOLUSDT"})
-        # candidate order follows thread completion, so compare sorted
-        self.assertEqual(sorted((r["symbol"], r["reason"]) for r in payload.macro_rejected_shorts),
-                         [("AAAUSDT", "btc_short_squeeze"), ("BBBUSDT", "btc_short_squeeze"),
-                          ("CCCUSDT", "btc_short_squeeze")])
+        for regime, reason in (("SHORT_SQUEEZE", "btc_short_squeeze"),
+                               ("NEUTRAL_CONSOLIDATION", "alt_shorts_not_allowed")):
+            kept, payload = self.run_gate(_macro(regime=regime, absorption="BEARISH_ABSORPTION", allows=False))
+            self.assertEqual(set(kept), {"BTCUSDT", "SOLUSDT"})
+            self.assertEqual(sorted((r["symbol"], r["reason"]) for r in payload.macro_rejected_shorts),
+                             [("AAAUSDT", reason), ("BBBUSDT", reason), ("CCCUSDT", reason)])
 
-    def test_unknown_btc_regime_needs_climax(self):
-        kept, _ = self.run_gate(_macro(regime="UNKNOWN"))
-        self.assertEqual(set(kept), {"BBBUSDT", "BTCUSDT", "SOLUSDT"})
+    def test_unknown_btc_regime_drops_alt_shorts(self):
+        # Round 4: unavailable BTC data blocks every alt SHORT, even one with a climax (fail closed)
+        for macro in (_macro(regime="UNKNOWN"), _macro().model_copy(update={"btc_data_ok": False})):
+            kept, payload = self.run_gate(macro)
+            self.assertEqual(set(kept), {"BTCUSDT", "SOLUSDT"})
+            self.assertEqual({r["reason"] for r in payload.macro_rejected_shorts}, {"btc_data_unavailable"})
 
     def test_rejected_list_bounded(self):
-        rows = [{"symbol": f"S{i:02d}USDT", "direction": "SHORT", "vol_ratio": 1.0} for i in range(10)]
-        rows += [{"symbol": "XUSDT", "direction": "SHORT", "vol_ratio": 1.0}]
+        rows = [_short_row(f"S{i:02d}USDT") for i in range(11)]
         with patch.object(sp, "MACRO_REJECTED_SHORTS_MAX", 3):
             kept, payload = self.run_gate(_macro(), rows=rows)
         self.assertEqual(kept, {})
         self.assertEqual(len(payload.macro_rejected_shorts), 3)
 
-    def test_gate_helper_bounded_at_ten(self):
-        cands = [_short_setup(f"S{i:02d}USDT", 1.0) for i in range(12)]
-        kept, rejected = sp.apply_alt_short_macro_gate(cands, _macro())
-        self.assertEqual((kept, len(rejected)), ([], 10))
+    def test_gate_runs_before_the_enrichment_slice(self):
+        # Round 4: two dropped alt SHORTs ranked first no longer use enrichment slots; 10 LONGs fill them
+        rows = [_short_row("S1USDT"), _short_row("S2USDT")]
+        rows += [{"symbol": f"L{i:02d}USDT", "direction": "LONG", "vol_ratio": 1.0} for i in range(11)]
+        self.run_gate(_macro(), rows=rows)
+        self.assertEqual(sorted(self.enriched), [f"L{i:02d}USDT" for i in range(10)])
+
+    def test_funding_info_warning_reaches_the_payload(self):
+        def radar(*a, funding_status=None, **k):
+            funding_status["warning"] = "fundingInfo unavailable (URLError): funding read as 8h for every symbol"
+            return list(self.ROWS)
+        _, payload = self.run_gate(_macro())
+        self.assertIsNone(payload.funding_info_warning)
+        with patch("broad_market_radar.scan_all_liquid_pairs", side_effect=radar):
+            payload = self.run_pipeline(include_yolo=False)
+        self.assertIn("fundingInfo unavailable", payload.funding_info_warning)
+        self.assertTrue(payload.top_candidates)  # the scan is not blocked
+
+    def test_gate_helper_is_pure_and_bounded_at_ten(self):
+        rows = [_short_row(f"S{i:02d}USDT") for i in range(12)] + [_short_row("OKUSDT", 3.0, True), "junk"]
+        kept, rejected = sp.apply_alt_short_macro_gate(rows, _macro())
+        self.assertEqual(([r["symbol"] for r in kept], len(rejected)), (["OKUSDT"], 10))
+        self.assertEqual(kept[0]["macro_short_check"], "climax>=2.5x")
+        self.assertNotIn("macro_short_check", rows[0])  # dropped rows are not touched
 
 
 class TestFetchMacroFailClosed(unittest.TestCase):
@@ -345,18 +495,34 @@ class TestFetchMacroFailClosed(unittest.TestCase):
         self.assertFalse(macro.allows_alt_shorts)
         self.assertEqual(macro.btc_regime, "UNKNOWN")
         self.assertIn("BTC data unavailable", macro.macro_warning)
-        self.assertEqual(sqf.alt_short_macro_reason("ETHUSDT", True, macro, 9.0), "btc_short_squeeze")
+        self.assertIs(macro.btc_data_ok, False)
+        self.assertEqual(sqf.alt_short_macro_reason("ETHUSDT", True, macro, 9.0), "btc_data_unavailable")
 
-    def test_missing_btc_micro_keeps_flag_but_no_rejection(self):
-        with patch("microstructure_engine.get_symbol_microstructure", return_value=None), \
-             patch("microstructure_engine.get_live_aggtrades_tape", return_value=None), \
-             patch("microstructure_engine.fetch_json", return_value={"price": "60000"}):
-            macro = sp.fetch_macro_btc()
-        self.assertEqual(macro.btc_regime, "UNKNOWN")
-        self.assertTrue(macro.allows_alt_shorts)
-        self.assertFalse(sqf.btc_rejects_resistance(macro))
-        self.assertIsNotNone(sqf.alt_short_macro_reason("ETHUSDT", False, macro, 2.49))
-        self.assertIsNone(sqf.alt_short_macro_reason("ETHUSDT", True, macro, 2.5))
+    def test_empty_btc_micro_blocks_alt_shorts(self):
+        # Round 4: empty micro data (regime UNKNOWN) now blocks alt shorts like the exception path
+        for empty in (None, {}):
+            with patch("microstructure_engine.get_symbol_microstructure", return_value=empty), \
+                 patch("microstructure_engine.get_live_aggtrades_tape", return_value=None), \
+                 patch("microstructure_engine.fetch_json", return_value={"price": "60000"}):
+                macro = sp.fetch_macro_btc()
+            self.assertEqual(macro.btc_regime, "UNKNOWN")
+            self.assertFalse(macro.allows_alt_shorts)
+            self.assertIs(macro.btc_data_ok, False)
+            self.assertIn("BTC data unavailable", macro.macro_warning)
+            self.assertEqual(sqf.alt_short_macro_reason("ETHUSDT", True, macro, 2.5), "btc_data_unavailable")
+
+    def test_live_regimes(self):
+        for regime, allows in (("SHORT_SQUEEZE", False), ("NEUTRAL_CONSOLIDATION", True), ("SHORT_BUILDUP", True)):
+            with patch("microstructure_engine.get_symbol_microstructure", return_value={"regime": regime}), \
+                 patch("microstructure_engine.get_live_aggtrades_tape", return_value=None), \
+                 patch("microstructure_engine.fetch_json", return_value={"price": "60000"}):
+                macro = sp.fetch_macro_btc()
+            self.assertEqual((macro.allows_alt_shorts, macro.btc_data_ok), (allows, True), regime)
+        self.assertEqual(sqf.alt_short_macro_reason("ETHUSDT", True, macro.model_copy(
+            update={"btc_regime": "SHORT_SQUEEZE", "allows_alt_shorts": False})), "btc_short_squeeze")
+
+    def test_rate_limited_macro_marks_btc_data_unavailable(self):
+        self.assertIs(sp._rate_limited_macro("x").btc_data_ok, False)
 
 
 class TestCandidateSetupFields(unittest.TestCase):
@@ -384,6 +550,10 @@ class TestCandidateSetupFields(unittest.TestCase):
                           .alt_short_climax_ok, True)
             self.assertIs(sp.enrich_and_size_candidate(dict(row, alt_short_climax_ok=1), "prod")
                           .alt_short_climax_ok, False)
+            four_h = sp.enrich_and_size_candidate(dict(row, funding_rate_8h_pct=-0.0422, funding_interval_h=4,
+                                                       macro_short_check="climax>=2.5x"), "prod")
+        self.assertEqual((four_h.funding_rate_8h_pct, four_h.funding_interval_h, four_h.macro_short_check),
+                         (-0.0422, 4, "climax>=2.5x"))
         legacy = _setup("SOLUSDT")  # keyword construction without the new fields still works
         self.assertEqual((legacy.squeeze_risk, legacy.squeeze_reasons, legacy.funding_rate_pct,
                           legacy.alt_short_climax_ok), (False, [], None, False))
@@ -416,6 +586,8 @@ class TestBriefFlags(unittest.TestCase):
                  "long_crowding_risk": False, "macro_short_check": "climax>=2.5x", "alt_short_climax_ok": True}
         long_ = dict(short, symbol="SOLUSDT", direction="LONG", reasons=["RSI 22"], squeeze_risk=False,
                      squeeze_reasons=[], long_crowding_risk=True, macro_short_check=None, funding_rate_pct=0.06)
+        short.update(funding_rate_8h_pct=-0.0211, funding_interval_h=8)
+        long_.update(funding_rate_8h_pct=0.12, funding_interval_h=4)
         return {"top_candidates": [short, long_], "run_id": "x",
                 "macro": {"btc_price": 60000.0, "allows_alt_shorts": True},
                 "macro_rejected_shorts": [{"symbol": "FILUSDT", "direction": "SHORT", "reason": "btc_short_squeeze"},
@@ -424,19 +596,28 @@ class TestBriefFlags(unittest.TestCase):
     def test_flags_forwarded_and_marked(self):
         brief = self.brief(self.screening())
         opps = {o["symbol"]: o for o in brief["filtered_opportunities"]}
-        for key in ("funding_rate_pct", "squeeze_risk", "squeeze_reasons", "long_crowding_risk",
-                    "macro_short_check"):
+        for key in ("funding_rate_pct", "squeeze_risk", "squeeze_reasons", "macro_short_check"):
             self.assertIn(key, opps["RLCUSDT"], key)
         self.assertTrue(opps["RLCUSDT"]["squeeze_risk"])
         for opp in opps.values():  # pipeline-only gate input, never in the evaluator brief
             self.assertNotIn("alt_short_climax_ok", opp)
         self.assertEqual(opps["RLCUSDT"]["macro_short_check"], "climax>=2.5x")
         self.assertTrue(opps["SOLUSDT"]["long_crowding_risk"])
+        # Round 4: unset values are dropped (token budget); set values stay
+        self.assertNotIn("long_crowding_risk", opps["RLCUSDT"])
+        for key in ("squeeze_risk", "squeeze_reasons", "macro_short_check"):
+            self.assertNotIn(key, opps["SOLUSDT"], key)
+        # 8h-normalized funding only for a non-8h symbol
+        self.assertNotIn("funding_rate_8h_pct", opps["RLCUSDT"])
+        self.assertNotIn("funding_interval_h", opps["RLCUSDT"])
+        self.assertEqual((opps["SOLUSDT"]["funding_rate_8h_pct"], opps["SOLUSDT"]["funding_interval_h"]), (0.12, 4))
         self.assertEqual(brief["macro_rejected_shorts"], ["FILUSDT", "UNIUSDT"])
         md = peb.format_markdown_brief(brief)
         rlc = next(l for l in md.splitlines() if "**RLCUSDT**" in l)
         sol = next(l for l in md.splitlines() if "**SOLUSDT**" in l)
-        self.assertIn("| SQZ; ⚠️ Squeeze risk:", rlc)
+        # one representation of the squeeze in the table: the SQZ marker, not the radar reason line too
+        self.assertIn("| SQZ; RSI 81 |", rlc)
+        self.assertNotIn("Squeeze risk", rlc)
         self.assertIn("| LONG-CROWD; RSI 22", sol)
         self.assertNotIn("SQZ", sol)
         self.assertIn("**Macro-rejected alt SHORTs (2):** FILUSDT, UNIUSDT", md)
@@ -446,6 +627,14 @@ class TestBriefFlags(unittest.TestCase):
         self.assertIs(rows["RLCUSDT"]["squeeze_risk"], True)
         self.assertNotIn("alt_short_climax_ok", rows["RLCUSDT"])  # not an audit field either
         self.assertIs(rows["SOLUSDT"]["squeeze_risk"], False)
+
+    def test_unset_values_dropped_but_falsy_lookalikes_kept(self):
+        row = {"symbol": "X", "squeeze_risk": False, "squeeze_reasons": [], "long_crowding_risk": False,
+               "macro_short_check": None, "funding_rate_pct": None, "confidence": 60}
+        self.assertEqual(peb._brief_opportunity(row), {"symbol": "X", "confidence": 60})
+        kept = dict(row, funding_rate_pct=0.0, squeeze_risk=True)  # a real 0.0 funding is a value
+        self.assertEqual(peb._brief_opportunity(kept),
+                         {"symbol": "X", "confidence": 60, "funding_rate_pct": 0.0, "squeeze_risk": True})
 
     def test_no_rejected_shorts_no_key(self):
         screening = self.screening()
@@ -483,10 +672,49 @@ class TestEvaluatorPrompt(unittest.TestCase):
     def test_squeeze_check_in_checklist(self):
         items = self.text.split("<checklist_items>")[1].split("</checklist_items>")[0]
         self.assertIn("K5", items)
-        self.assertIn("squeeze_risk", items.split("K5")[1].split("\n")[0])
+        k5 = items.split("- K5")[1].split("\n")[0]
+        self.assertIn("squeeze_risk", k5)
+        # Round 4: K5 is informational (caps, never rejects) and LONGs carry no K5 line
+        self.assertIn("LONGs have no K5 line", k5)
+        self.assertIn("Always `[x]`", k5)
+        semantics = next(l for l in self.text.splitlines() if l.startswith("- Checkbox semantics"))
+        self.assertIn("C2.2, K5, C4.1) are ALWAYS `[x]`", semantics)
+        self.assertNotIn("K1-K5", semantics)
+        self.assertNotIn("K1-K3 and K5 lines", self.text)
+        self.assertEqual(self.text.count("(K5 CAPPED limits the tier to A)"), 2)
+        for line in re.findall(r"- \[.\] \S+ \S+ K5 .*", self.text):
+            self.assertTrue(line.startswith("- [x]"), line)
+            self.assertIn(" SHORT K5 ", line)
+
+    def test_one_list_of_squeeze_reasons(self):
+        rule9 = self.text.split("- RULE 9")[1].split("</operational_rules>")[0]
+        self.assertIn("oi_z >= 2.0, funding <= -0.01%/8h, or micro data missing", rule9)
+        with open(os.path.join(BASE_DIR, "AGENTS.md"), encoding="utf-8") as f:
+            agents = f.read()
+        self.assertIn("OI z ≥ 2, funding ≤ -0.01%/8h or no micro data", agents)
+        with open(os.path.join(BASE_DIR, ".agents", "skills", "market-radar", "SKILL.md"), encoding="utf-8") as f:
+            skill = f.read()
+        self.assertIn("-0.01% per 8h", skill)
+        self.assertIn("or without micro data", skill)
+
+    def test_approved_shots_carry_basket_and_verdict_sections(self):
+        finals = re.findall(r"<final_response>([\s\S]*?)</final_response>", self.text)
+        approved = 0
+        for final in finals:
+            dossier = json.loads(re.search(r"<dossier_json>([\s\S]*?)</dossier_json>", final).group(1))
+            if dossier["status"] != "APPROVED":
+                continue
+            approved += 1
+            head = final.split("<dossier_json>")[0]
+            self.assertIn("## 2. Approved Quantitative Basket", head, dossier["approved_symbols"])
+            self.assertIn("## 6. Execution Verdict", head, dossier["approved_symbols"])
+            self.assertLess(head.index("## 2. Approved Quantitative Basket"), head.index("## 6. Execution Verdict"))
+        self.assertEqual(approved, 4)
 
     def test_squeezed_short_few_shot(self):
-        shot = re.search(r'<example id="eval_neg_08_squeeze_short_tier_a">([\s\S]*?)</example>', self.text)
+        self.assertNotIn("eval_neg_08_squeeze_short_tier_a", self.text)
+        self.assertIn("<!-- EXAMPLE 12: POSITIVE - SQUEEZED SHORT CAPPED", self.text)
+        shot = re.search(r'<example id="eval_pos_04_squeeze_short_capped">([\s\S]*?)</example>', self.text)
         self.assertIsNotNone(shot)
         body = shot.group(1)
         self.assertIn("oi_z 2.91", body)
@@ -498,6 +726,12 @@ class TestEvaluatorPrompt(unittest.TestCase):
         self.assertIs(cand["requires_user_confirmation"], True)
         self.assertIn("C1.1 Portfolio delta_bias_incl_resting:", body)
         self.assertIn("Tier A, confidence 64 = score 64", body)
+        # macro_short_check is per-candidate evidence: on the K1 line, not on the BTC-level C2.1 line
+        c21 = next(l for l in body.splitlines() if "C2.1" in l)
+        k1 = next(l for l in body.splitlines() if "RLCUSDT SHORT K1" in l)
+        self.assertNotIn("macro_short_check", c21)
+        self.assertIn("macro_short_check climax>=2.5x", k1)
+        self.assertIn("Pending User Confirmation", body.split("## 6. Execution Verdict")[1])
 
     def test_eval_pos_01_passes_macro_gate(self):
         shot = re.search(r'<example id="eval_pos_01_tier_s_approved">([\s\S]*?)</example>', self.text).group(1)

@@ -362,14 +362,19 @@ def analyze_single_symbol(symbol, interval=DEFAULT_INTERVAL):
         row["disqualify_reason"] = f"risk_pct {risk_pct:.2f}% > {MAX_RISK_PCT}% intraday ceiling"
     return row
 
-def enrich_candidate_microstructure(cand):
+def enrich_candidate_microstructure(cand, funding_intervals=None):
+    """Order-flow enrichment of one radar row. `funding_intervals` ({symbol: hours} from fetch_funding_intervals)
+    normalizes funding to 8h for the squeeze thresholds (issue #206); a symbol not in it (or None) uses 8h."""
     sym = cand['symbol']
     # Same wick candle as the scan, so the ORDER FLOW text and the wick fields describe one candle (issue #20)
     micro = me.get_symbol_microstructure(sym, period=cand.get('interval', DEFAULT_INTERVAL),
                                          wick_candle_open_time=cand.get('wick_candle_open_time'))
+    interval_h = sqf.funding_interval_h(sym, funding_intervals)
+    cand['funding_interval_h'] = interval_h
     if not micro:
         # Issue #206: a SHORT without micro data cannot be checked for squeeze risk, so it is capped (fail closed)
         cand['funding_rate_pct'] = None
+        cand['funding_rate_8h_pct'] = None
         if cand.get('direction') == 'SHORT':
             comps = dict(cand.get('score_components') or {"base": int(cand['confidence'])})
             cand['confidence'] = _apply_squeeze_cap(cand, comps, int(cand['confidence']),
@@ -378,7 +383,11 @@ def enrich_candidate_microstructure(cand):
             _set_tier(cand)
         return cand
     cand['micro'] = micro
-    cand['funding_rate_pct'] = micro.get('funding_rate_pct')
+    cand['funding_rate_pct'] = micro.get('funding_rate_pct')  # raw, per funding interval
+    funding_8h = sqf.normalize_funding_8h(micro.get('funding_rate_pct'), interval_h)
+    cand['funding_rate_8h_pct'] = round(funding_8h, 4) if funding_8h is not None else None
+    # Squeeze / crowding thresholds are per 8h: the helpers read the normalized value (the micro dict is unchanged)
+    squeeze_micro = dict(micro, funding_rate_8h_pct=funding_8h)
     score = cand['confidence']
     direction = cand['direction']
     reasons = cand['reasons']
@@ -416,7 +425,7 @@ def enrich_candidate_microstructure(cand):
         elif regime == 'SHORT_SQUEEZE':
             score += add("flow_regime", 10)
             reasons.append(f"🔬 ORDER FLOW: {micro['regime_desc']}")
-        # Penalize if funding rate is deeply negative (crowded short)
+        # Penalize if funding rate is deeply negative (crowded short; raw per-interval rate, unchanged by #206)
         if funding_rate < -0.015:
             score += add("funding", -15)
             reasons.append(f"⚠️ CROWDED: Negative funding ({funding_rate:.4f}%)")
@@ -446,9 +455,10 @@ def enrich_candidate_microstructure(cand):
     cand['confidence'] = max(20, min(95, score))
     _add_cap_component(comps, cand['confidence'])
     if direction == 'SHORT':
-        cand['confidence'] = _apply_squeeze_cap(cand, comps, cand['confidence'], sqf.short_squeeze_reasons(micro))
+        cand['confidence'] = _apply_squeeze_cap(cand, comps, cand['confidence'],
+                                                sqf.short_squeeze_reasons(squeeze_micro))
     elif direction == 'LONG':
-        crowding = sqf.long_crowding_reasons(micro)
+        crowding = sqf.long_crowding_reasons(squeeze_micro)
         cand['long_crowding_risk'] = bool(crowding)
         cand['long_crowding_reasons'] = crowding
     cand['score_components'] = comps
@@ -465,8 +475,8 @@ def _apply_squeeze_cap(cand, comps, confidence, reasons):
     if confidence > sqf.SQUEEZE_SCORE_CAP:
         comps['squeeze_cap'] = comps.get('squeeze_cap', 0) + sqf.SQUEEZE_SCORE_CAP - confidence
         confidence = sqf.SQUEEZE_SCORE_CAP
-    # First line, so the brief's two-reason table shows it
-    cand.setdefault('reasons', []).insert(0, f"⚠️ Squeeze risk: {', '.join(reasons)} → capped at Tier A")
+    # First line (the brief table shows the SQZ marker instead and skips it)
+    cand.setdefault('reasons', []).insert(0, f"{sqf.SQUEEZE_REASON_PREFIX} {', '.join(reasons)} → capped at Tier A")
     return confidence
 
 def _set_tier(cand):
@@ -482,9 +492,24 @@ def _set_tier(cand):
     cand['tier_code'] = tier_code(cand['confidence']) if cand['confidence'] >= 55 else "DISQUALIFIED"
     return cand
 
-def scan_all_liquid_pairs(top_n=DEFAULT_UNIVERSE, interval=DEFAULT_INTERVAL):
+FUNDING_INFO_URL = 'https://fapi.binance.com/fapi/v1/fundingInfo'
+
+def fetch_funding_intervals():
+    """({symbol: fundingIntervalHours}, warning) from the public /fapi/v1/fundingInfo, fetched once per scan (issue
+    #206). It lists only symbols with adjusted funding parameters; the rest use Binance's 8h default. Any failure
+    except an active rate-limit ban returns ({}, warning): every symbol is then read as 8h and the scan continues
+    (a 429/418 still trips the guard in _get_json, so the run reports UNAVAILABLE as usual)."""
+    try:
+        return sqf.parse_funding_intervals(_get_json(FUNDING_INFO_URL, 8)), None
+    except rate_limit_guard.RateLimitedError:
+        raise
+    except Exception as e:
+        return {}, f"fundingInfo unavailable ({type(e).__name__}): funding read as 8h for every symbol"
+
+def scan_all_liquid_pairs(top_n=DEFAULT_UNIVERSE, interval=DEFAULT_INTERVAL, funding_status=None):
     """Scans the `top_n` most liquid USDT-M perpetuals on `interval` candles.
-    Raises on exchangeInfo / ticker failures so callers can fail loudly instead of reporting 'no setups'."""
+    Raises on exchangeInfo / ticker failures so callers can fail loudly instead of reporting 'no setups'.
+    `funding_status` (optional dict) receives {"warning": ...} when fundingInfo failed (issue #206)."""
     if interval not in SUPPORTED_INTERVALS:
         raise ValueError(f"Unsupported interval '{interval}'. Must be one of: {', '.join(SUPPORTED_INTERVALS)}")
     # Fetch liquid symbols
@@ -512,9 +537,15 @@ def scan_all_liquid_pairs(top_n=DEFAULT_UNIVERSE, interval=DEFAULT_INTERVAL):
             if res:
                 raw_results.append(res)
 
+    funding_intervals, funding_warning = fetch_funding_intervals() if raw_results else ({}, None)
+    if funding_warning:
+        print(f"Radar: {funding_warning}.", file=sys.stderr)
+        if isinstance(funding_status, dict):
+            funding_status["warning"] = funding_warning
+
     # Filter and enrich candidate microstructure concurrently
     with ThreadPoolExecutor(max_workers=8) as ex:
-        enriched_results = list(ex.map(enrich_candidate_microstructure, raw_results))
+        enriched_results = list(ex.map(lambda c: enrich_candidate_microstructure(c, funding_intervals), raw_results))
 
     # Filter qualified candidates only (>= 55% confidence, risk_pct within the intraday ceiling, issue #84)
     qualified = [c for c in enriched_results if c['confidence'] >= 55 and not c.get('risk_pct_over_ceiling')]

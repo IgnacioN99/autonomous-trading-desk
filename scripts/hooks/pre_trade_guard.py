@@ -6081,8 +6081,11 @@ def evaluate_trade_opening(cmd: str, args: dict, mcp_args: dict, base_dir: str,
         if is_prod and isinstance(cand, dict) and not is_confirmed:
             calib_msg = _tier_s_calibration_message(cand, env, user_prof, base_dir, now_ts)
             if calib_msg:
+                # Issue #206: the same helper also asks for a radar-flagged squeeze SHORT (RULE 9 backstop)
+                header = ("Squeeze Risk SHORT" if scal is not None
+                          and calib_msg.startswith(scal.SQUEEZE_CONFIRMATION_REASON) else "Uncalibrated Tier S Score")
                 return "deny", (
-                    f"🚨 BLOCKED BY PRE-TOOL-USE HOOK (Uncalibrated Tier S Score): {target_sym}: {calib_msg}\n"
+                    f"🚨 BLOCKED BY PRE-TOOL-USE HOOK ({header}): {target_sym}: {calib_msg}\n"
                     + CONFIRM_RE_RUN_HINT
                 )
 

@@ -33,6 +33,7 @@ SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
 from utils.yolo_scan_health import RUN_ID_ENV, YOLO_DISABLED_STATUS  # stdlib-only module (no pipeline import)
+from utils.squeeze_filter import SQUEEZE_REASON_PREFIX  # stdlib-only (issue #206)
 
 BASE_DIR = os.path.dirname(SCRIPTS_DIR)
 LOGS_DIR = os.path.join(BASE_DIR, "logs")
@@ -363,8 +364,22 @@ def assemble_primed_brief(target_env: str = "prod", out_path: Optional[str] = No
 _SIDECAR_ONLY_KEYS = ("score_components", "tier_s_eligible", "alt_short_climax_ok")
 
 
+# Issue #206 flags reach the brief only when set (token budget): these values are dropped from a row.
+_DROP_WHEN_UNSET = {"squeeze_risk": False, "squeeze_reasons": [], "long_crowding_risk": False,
+                    "macro_short_check": None, "funding_rate_pct": None}
+# The 8h-normalized funding and the interval add nothing for an 8h symbol (normalized == raw)
+_FUNDING_8H_KEYS = ("funding_rate_8h_pct", "funding_interval_h")
+
+
 def _brief_opportunity(o: Any) -> Any:
-    return {k: v for k, v in o.items() if k not in _SIDECAR_ONLY_KEYS} if isinstance(o, dict) else o
+    if not isinstance(o, dict):
+        return o
+    out = {k: v for k, v in o.items() if k not in _SIDECAR_ONLY_KEYS
+           and not (k in _DROP_WHEN_UNSET and v == _DROP_WHEN_UNSET[k] and type(v) is type(_DROP_WHEN_UNSET[k]))}
+    if out.get("funding_interval_h") in (None, 8):
+        for k in _FUNDING_8H_KEYS:
+            out.pop(k, None)
+    return out
 
 
 def scores_sidecar_path() -> str:
@@ -448,10 +463,13 @@ def format_markdown_brief(brief: dict) -> str:
         for o in opps:
             trig = o.get('trigger_price')
             # abs:unscored: the wick/taker candles did not match, so absorption gave no confluence (issue #135)
-            # SQZ: SHORT squeeze risk, capped at Tier A; LONG-CROWD: crowded LONG, flag only (issue #206)
-            factors = ((["SQZ"] if o.get('squeeze_risk') is True else [])
+            # SQZ: SHORT squeeze risk, capped at Tier A; LONG-CROWD: crowded LONG, flag only (issue #206). With SQZ
+            # shown, the radar's "Squeeze risk" reason line is left out so the two factors show real confluences.
+            sqz = o.get('squeeze_risk') is True
+            shown = [r for r in o.get('reasons', []) if not (sqz and str(r).startswith(SQUEEZE_REASON_PREFIX))]
+            factors = ((["SQZ"] if sqz else [])
                        + (["LONG-CROWD"] if o.get('long_crowding_risk') is True else [])
-                       + (["abs:unscored"] if o.get('absorption_scored') is False else []) + o.get('reasons', [])[:2])
+                       + (["abs:unscored"] if o.get('absorption_scored') is False else []) + shown[:2])
             lines.append(f"| **{o.get('symbol')}** | {o.get('direction')} | {_tier_label(o)} | score {o.get('confidence')} | {o.get('current_price')} | {trig if trig is not None else '-'} | {o.get('sl_price')} | {o.get('tp1_price')} / {o.get('tp2_price')} | {o.get('rr_ratio')}R | ${o.get('target_dollar_risk', default_risk)} | {'; '.join(factors)} |")
     else:
         lines.append("*(No intraday setups passing institutional microstructure filter)*")
