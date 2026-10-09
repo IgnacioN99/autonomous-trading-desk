@@ -404,6 +404,40 @@ class TestReviewAssembler(unittest.TestCase):
                         self.assertEqual(len(errors), 1)
                         self.assertTrue(errors[0].startswith("agentic_harness: "), errors[0])
 
+    def test_marker_quoted_before_the_verdict_row_is_not_an_error(self):
+        """Issue #224: a reviewer quoting '\\n<truncated 5 bytes>' before its final verdict row still assembles;
+        the same quote after the verdict row is still reported as an error."""
+        conv = "11111111-aaaa-bbbb-cccc-000000000005"
+        system = {"step_index": 0, "source": "SYSTEM", "type": "USER_INPUT", "status": "DONE",
+                  "created_at": "2026-10-05T00:00:00Z", "content": "sender=aaaaaaaa-0000-0000-0000-000000000000"}
+        quote = {"source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE",
+                 "created_at": "2026-10-05T00:00:03Z",
+                 "content": "The diff writes 'head\n<truncated 5 bytes>\ntail' for a cut row."}
+        verdict = {"source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE",
+                   "created_at": "2026-10-05T00:00:05Z", "content": "",
+                   "tool_calls": [{"name": "send_message", "args": {"Message": json.dumps(
+                       "### Verdict: agentic_harness\n- **Status:** [APPROVED]\n- **Findings:** ok")}}]}
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = Path(tmp) / "brain"
+            logs = brain / conv / ".system_generated" / "logs"
+            logs.mkdir(parents=True)
+            with mock.patch.dict(os.environ, {"AGY_BRAIN_DIRS": str(brain)}):
+                for label, model_rows, ok in (("quote before verdict", (quote, verdict), True),
+                                              ("quote after verdict", (verdict, quote), False)):
+                    with self.subTest(label):
+                        rows = [system] + [dict(r, step_index=i + 1) for i, r in enumerate(model_rows)]
+                        (logs / "transcript.jsonl").write_text(
+                            "\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+                        sections, _, errors = assemble_review.collect_sections(
+                            ["agentic_harness"], {"agentic_harness": conv}, {})
+                        if ok:
+                            self.assertEqual(errors, [])
+                            self.assertIn("[APPROVED]", sections["agentic_harness"])
+                        else:
+                            self.assertEqual(sections, {})
+                            self.assertEqual(len(errors), 1)
+                            self.assertIn("no truncated_fields", errors[0])
+
     def test_assemble_marks_missing_reviewers_incomplete(self):
         manifest = {"required_reviewers": ["prompt_engineering"], "changed_files": ["docs/a.md"]}
         report, result = assemble_review.build_report(manifest, {}, {}, pr="")

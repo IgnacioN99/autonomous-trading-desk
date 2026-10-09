@@ -11,9 +11,10 @@ block) into its own transcript. Two runtimes are supported:
     agy truncates long fields in transcript.jsonl (row key "truncated_fields"; content/thinking keep
     head + "\\n<truncated N bytes>\\n" + tail, tool_call args keep a JSON-encoded prefix +
     "\\n<truncated N bytes>"). read_agy_steps() takes those scanned rows from the sibling
-    transcript_full.jsonl (paired by step_index, unique in both files) only after cross-checking every
-    untruncated field, the head/tail/prefix and N (UTF-8 bytes removed) against transcript.jsonl, and fails
-    closed otherwise (also on a marker without truncated_fields and on malformed rows: always ProvenanceError).
+    transcript_full.jsonl (paired by step_index; each needed step_index must occur once in each file) only after
+    cross-checking every untruncated field, the head/tail/prefix and N (UTF-8 bytes removed) against
+    transcript.jsonl, and fails closed otherwise (also on malformed rows, and on a marker without truncated_fields
+    in the winning row or a later one, or in any row when there is no winner: always ProvenanceError).
     Untruncated rows are read from transcript.jsonl exactly as before.
   * Claude Code: the subagent transcript lives next to its parent session,
         ~/.claude/projects/<project-slug>/<parentSessionId>/subagents/agent-<agentId>.jsonl
@@ -40,7 +41,7 @@ import math
 import os
 import re
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 EVALUATOR_NAME = "isolated_market_evaluator"
 TTL_SECONDS = 1200  # 20 minutes, counted from the moment the evaluator emitted the dossier
@@ -215,14 +216,15 @@ def _step_key(row: dict) -> Optional[int]:
     return idx if isinstance(idx, int) and not isinstance(idx, bool) else None
 
 
-def _rows_by_step_index(rows: list, label: str) -> dict:
-    """step_index -> row for the JSON-object rows of one file; a duplicate step_index fails closed."""
+def _rows_by_step_index(rows: list, label: str, wanted: set) -> dict:
+    """step_index -> row for the JSON-object rows of one file whose step_index is in `wanted`; a wanted
+    step_index that occurs more than once fails closed (duplicates of other indices are ignored)."""
     by_index = {}
     for row in rows:
         if not isinstance(row, dict):
             continue
         idx = _step_key(row)
-        if idx is None:
+        if idx is None or idx not in wanted:
             continue
         if idx in by_index:
             raise ProvenanceError(f"{TRANSCRIPT_FULL_NAME} mismatch at step {idx}: duplicate step_index in {label}")
@@ -283,8 +285,10 @@ def _resolve_tool_calls(short_calls: Any, full_calls: Any, truncated: bool, bad)
     """Cross-checks tool_calls and returns them in transcript.jsonl form (JSON-encoded arg values).
     Truncated args keep a prefix of json.dumps(full_value, ensure_ascii=False) + '\\n<truncated N bytes>',
     N = UTF-8 bytes removed from that encoded value. A prefix cannot be parsed, so that comparison stays
-    sensitive to agy's encoder (separators, escaping). Every other arg must decode to the full value: compared
-    with json.loads on the short side (so encoder differences do not matter), else as before."""
+    sensitive to agy's encoder (separators, escaping); it is kept exact on purpose (#224): without a real agy
+    truncated row to design against, any tolerance would only weaken the check. Every other arg must decode to
+    the full value: compared with json.loads on the short side (so encoder differences do not matter), else as
+    before."""
     if not isinstance(short_calls, list) or not isinstance(full_calls, list) or len(short_calls) != len(full_calls):
         raise bad("tool_calls count differs")
     out = []
@@ -360,34 +364,29 @@ def _resolve_truncated_row(short: dict, full: Any) -> dict:
     return resolved
 
 
-def read_agy_steps(path: str) -> Tuple[list, list]:
+def read_agy_steps(path: str, is_winner: Optional[Callable[[list], bool]] = None) -> Tuple[list, list]:
     """Rows of an agy transcript.jsonl, with every truncated row whose model text is scanned replaced by its
-    verified counterpart from transcript_full.jsonl, paired by step_index (unique in both files; rows of the full
-    file that no truncated row needs are ignored, so line layouts may differ). Other rows are returned exactly as
-    in transcript.jsonl. Returns (steps, resolved_rows). Raises ProvenanceError (never another exception type) if
-    a row is not a JSON object or is malformed, if a needed row cannot be resolved, or if a scanned row that is
-    not resolved carries the '<truncated N bytes>' marker (agy truncated it without listing truncated_fields)."""
+    verified counterpart from transcript_full.jsonl, paired by step_index (each needed step_index must occur once
+    in each file; other duplicates and rows of the full file that no truncated row needs are ignored, so line
+    layouts may differ). Other rows are returned exactly as in transcript.jsonl. Returns (steps, resolved_rows).
+    is_winner(texts) -> True when a row's model texts (_model_texts of the resolved row) carry the item the caller
+    reads; the winner is the last such row in file order. Raises ProvenanceError (never another exception type)
+    if a row is not a JSON object or is malformed, if a needed row cannot be resolved, or if a scanned row that is
+    not resolved carries the '<truncated N bytes>' marker (agy truncated it without listing truncated_fields) at
+    or after the winner (anywhere when there is no winner or no is_winner): earlier rows cannot change the winner."""
     try:
-        return _read_agy_steps(path)
+        return _read_agy_steps(path, is_winner)
     except (TypeError, AttributeError, ValueError, RecursionError) as e:
         raise ProvenanceError(f"Malformed agy transcript ({path}): {type(e).__name__}: {e}")
 
 
-def _read_agy_steps(path: str) -> Tuple[list, list]:
+def _read_agy_steps(path: str, is_winner: Optional[Callable[[list], bool]]) -> Tuple[list, list]:
     rows = [row for row in _read_rows_by_line(path) if row is not None]
     for row in rows:
         if not isinstance(row, dict):
             raise ProvenanceError(f"Transcript row is not a JSON object ({type(row).__name__}) in {path}")
     needed = [row for row in rows if _needs_full_row(row)]
     needed_ids = {id(row) for row in needed}
-    for row in rows:
-        if id(row) in needed_ids:
-            continue
-        if any(TRUNCATED_MARKER_RE.search(text) for text in _model_texts(row)):
-            raise ProvenanceError(
-                f"transcript.jsonl step {row.get('step_index')} carries a '<truncated N bytes>' marker in the "
-                f"subagent output but no truncated_fields: cannot read it safely ({path})."
-            )
     full_by_index = {}
     if needed:
         full_path = full_transcript_path(path)
@@ -398,8 +397,9 @@ def _read_agy_steps(path: str) -> Tuple[list, list]:
                 f"transcript.jsonl truncates the subagent output at step {needed[0].get('step_index')} and "
                 f"{TRANSCRIPT_FULL_NAME} is missing or unreadable ({full_path}): {e}"
             )
-        _rows_by_step_index(rows, "transcript.jsonl")
-        full_by_index = _rows_by_step_index(full_rows, TRANSCRIPT_FULL_NAME)
+        wanted = {_step_key(row) for row in needed} - {None}
+        _rows_by_step_index(rows, "transcript.jsonl", wanted)
+        full_by_index = _rows_by_step_index(full_rows, TRANSCRIPT_FULL_NAME, wanted)
     steps, resolved = [], []
     for row in rows:
         if id(row) in needed_ids:
@@ -410,6 +410,19 @@ def _read_agy_steps(path: str) -> Tuple[list, list]:
             row = _resolve_truncated_row(row, full_by_index.get(idx))
             resolved.append(row)
         steps.append(row)
+    start = 0
+    if is_winner is not None:
+        for pos, step in enumerate(steps):
+            if is_winner(_model_texts(step)):
+                start = pos
+    for row in rows[start:]:
+        if id(row) in needed_ids:
+            continue
+        if any(TRUNCATED_MARKER_RE.search(text) for text in _model_texts(row)):
+            raise ProvenanceError(
+                f"transcript.jsonl step {row.get('step_index')} carries a '<truncated N bytes>' marker in the "
+                f"subagent output but no truncated_fields: cannot read it safely ({path})."
+            )
     return steps, resolved
 
 
@@ -460,10 +473,16 @@ def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _has_dossier_block(texts: list) -> bool:
+    """True when some text holds a <dossier_json> block that parses to a JSON object (a candidate winner)."""
+    return any(_parse_block_ex(m.group(1).strip())[0] is not None
+               for text in texts for m in DOSSIER_RE.finditer(text))
+
+
 def extract_dossier_from_transcript(path: str) -> Dict[str, Any]:
     """Returns the last <dossier_json> block the subagent model emitted, with its provenance.
     Truncated scanned rows are resolved from transcript_full.jsonl (read_agy_steps)."""
-    steps, resolved = read_agy_steps(path)
+    steps, resolved = read_agy_steps(path, is_winner=_has_dossier_block)
     if not steps:
         raise ProvenanceError(f"Transcript is empty or unreadable: {path}")
 
