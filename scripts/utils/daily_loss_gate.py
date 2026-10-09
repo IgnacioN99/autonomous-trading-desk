@@ -11,7 +11,8 @@ fills' realizedPnl minus their USDT commissions; a non-USDT commission is left o
 per-trade list of trades closed today (trade_outcomes.closed_trades_today: exit_ms, realized_r_net or, when None,
 realized_r_gross, is_yolo). Three limits, from the profile (user_profile.get_daily_loss_limits):
   - Daily loss (every order): start_equity = equity_now - day_net_realized_usdt (equity before today's realized
-    result), limit_usdt = daily_stop_r x risk_pct x start_equity; blocked when day_net_realized_usdt <= -limit_usdt.
+    result; today's funding payments and transfers are not in userTrades, so they are left out),
+    limit_usdt = daily_stop_r x risk_pct x start_equity; blocked when day_net_realized_usdt <= -limit_usdt.
   - Full-SL streak (every order): walking today's closed trades from the newest exit back, a trade at R <= -0.8 adds
     1, a scratch (|R| < 0.05) or a winner (R >= 0.05) ends the walk, a partial loss (-0.8 < R <= -0.05) or a trade
     without R is skipped (the latter counted as "unscored_closed" and named in the reason); blocked when the streak
@@ -49,18 +50,24 @@ def day_start_ms(now: Optional[float] = None) -> int:
     return int(dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
 
 
-def day_net_realized(fills: Iterable[dict]) -> Tuple[float, bool]:
-    """(sum of realizedPnl - USDT commissions, True when some commission was in another asset and left out)."""
-    net, other_asset = 0.0, False
+def day_net_realized(fills: Iterable[dict], stats: Optional[dict] = None) -> Tuple[float, bool]:
+    """(sum of realizedPnl - USDT commissions, True when some commission was in another asset and left out).
+    `stats` (optional dict) receives "malformed_fills": fills whose realizedPnl or commission is present but not
+    numeric (read as 0, issue #187)."""
+    net, other_asset, malformed = 0.0, False, 0
     for f in fills or []:
         if not isinstance(f, dict):
             continue
+        if any(f.get(k) is not None and _num(f.get(k)) is None for k in ("realizedPnl", "commission")):
+            malformed += 1
         net += _num(f.get("realizedPnl")) or 0.0
         commission = _num(f.get("commission")) or 0.0
         if str(f.get("commissionAsset") or "USDT").upper() == "USDT":
             net -= commission
         elif commission:
             other_asset = True
+    if stats is not None:
+        stats["malformed_fills"] = malformed
     return round(net, 8), other_asset
 
 
@@ -136,6 +143,22 @@ def note_fills_scope(state: dict, info: Any) -> dict:
     if isinstance(info, dict) and info.get("per_symbol_fallback"):
         state["per_symbol_fallback"] = True
         state["fills_scope"] = info.get("fills_scope")
+    return state
+
+
+def note_malformed_inputs(state: dict, malformed_audit_lines: Any = 0, malformed_fills: Any = 0) -> dict:
+    """Informational only (issue #187; never blocks): skipped trades-audit lines (malformed_audit_lines) and fills
+    whose realizedPnl or commission is not numeric (malformed_fills, read as 0). Each count > 0 is set on the state
+    and named in the reason."""
+    for key, count, what in (("malformed_audit_lines", malformed_audit_lines, "trades-audit lines skipped"),
+                             ("malformed_fills", malformed_fills, "fills with a non-numeric realizedPnl or "
+                                                                 "commission, read as 0")):
+        n = int(_num(count) or 0)
+        if n > 0:
+            state[key] = n
+            note = f"{key}={n} ({what})"
+            state["reason"] = (f"{state['reason']}; {note}" if state.get("reason")
+                               else f"DAILY LOSS GATE: inactive; {note}")
     return state
 
 

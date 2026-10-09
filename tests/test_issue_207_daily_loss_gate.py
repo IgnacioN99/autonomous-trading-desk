@@ -817,12 +817,16 @@ class TestSyncState(unittest.TestCase):
 # =============================================================================
 class TestBrief(unittest.TestCase):
 
-    def assemble(self, state, screening=None):
+    def assemble(self, state, screening=None, insights_file=None):
+        """insights_file (issue #187): the real lesson selector reads this ledger instead of the [] mock."""
         tmp = tempfile.mkdtemp()
-        with patch.object(peb, "BRIEF_FILE", os.path.join(tmp, "primed_brief.json")), \
+        self.brief_file = os.path.join(tmp, "primed_brief.json")  # the file the evaluator reads
+        lessons_patch = (patch.object(peb, "INSIGHTS_FILE", insights_file) if insights_file
+                         else patch.object(peb, "load_recent_insights", return_value=[]))
+        with patch.object(peb, "BRIEF_FILE", self.brief_file), \
              patch.object(peb, "ensure_fresh_state", return_value=dict(state)), \
              patch.object(peb, "get_latest_screening_payload", return_value=dict(screening or {})), \
-             patch.object(peb, "load_recent_insights", return_value=[]), \
+             lessons_patch, \
              patch.object(peb, "_get_equity", return_value=1000.0), \
              patch("user_profile.load_user_profile", return_value={"risk_pct_equity": 0.02, "daily_stop_r": 2.5}):
             return peb.assemble_primed_brief(target_env="prod")
@@ -876,6 +880,28 @@ class TestBrief(unittest.TestCase):
     def test_brief_budget_with_every_flag_set(self):
         """Token budget (< 1,800 tokens, estimated as bytes / 4 as in #23) with 10 macro-rejected SHORTs, every
         brief-level flag, the daily-loss-gate state and two flagged candidates."""
+        self.check_every_flag_budget()
+
+    def test_brief_budget_with_every_flag_and_realistic_lessons(self):
+        """Issue #187: the same brief plus the current ledger's lessons (9 active, 150-720 characters, a truncated-id
+        correction and a tombstone) through the real selector: still < 1,800 tokens; the correction is present and
+        the lesson it corrects is absent."""
+        import test_issue_187_lesson_selection as t187  # fixtures only (lazy: that module imports this one)
+        path = os.path.join(tempfile.mkdtemp(), "trade_insights.jsonl")
+        ledger = t187.real_shaped_ledger()
+        t187.write_jsonl(path, ledger)
+        brief = self.check_every_flag_budget(insights_file=path)
+        shown = json.dumps(brief["committed_memory_lessons"], ensure_ascii=False)
+        by_id = {r["id"]: r for r in ledger}
+        self.assertIn(json.dumps(by_id[t187.CORRECTION_ID]["insight"], ensure_ascii=False), shown)
+        self.assertNotIn(json.dumps(by_id[t187.FLAWED_ID]["insight"], ensure_ascii=False), shown)
+        self.assertGreaterEqual(len(brief["committed_memory_lessons"]), 5)
+        # a plain brief (no flags, no candidates) carries every active lesson except the corrected one
+        plain = self.assemble({"target_env": "prod"}, insights_file=path)
+        self.assertEqual(len(plain["committed_memory_lessons"]), 8)
+        self.assertLess(os.path.getsize(self.brief_file) / 4, 1800)
+
+    def check_every_flag_budget(self, insights_file=None):
         cand = {"symbol": "AAAUSDT", "direction": "SHORT", "tier": "Tier A (Strong Confluence / Hedge)",
                 "tier_code": "A", "confidence": 64, "current_price": 1.2345, "trigger_price": 1.2301,
                 "sl_price": 1.2551, "tp1_price": 1.1849, "tp2_price": 1.1297, "rr_ratio": 4.0, "risk_pct": 2.03,
@@ -899,13 +925,20 @@ class TestBrief(unittest.TestCase):
                                                                  "counted): XUSDT", "fills_error": "x" * 200},
                  "portfolio_exposure": {"delta_bias_incl_resting": "UNKNOWN"}}
         with patch.object(peb, "SYNC_FAILED_KEY", "_sync_failed_test"):
-            brief = self.assemble(dict(state, _sync_failed_test=True), screening)
+            brief = self.assemble(dict(state, _sync_failed_test=True), screening, insights_file=insights_file)
         self.assertEqual(len(brief["macro_rejected_shorts"]), 10)
         self.assertEqual(brief["pending_entries_status"], "UNREADABLE")
         self.assertEqual(brief["state_sync"], "FAILED")
         self.assertNotIn("score_schema_version", brief["filtered_opportunities"][0])  # sidecar only
-        size = len(json.dumps(brief, ensure_ascii=False).encode("utf-8"))
+        # Issue #187: measured on the file the evaluator reads (until #187 this measured json.dumps of the dict
+        # while the file was written with indent=2, so the real file was larger than the asserted size)
+        size = os.path.getsize(self.brief_file)
         self.assertLess(size / 4, 1800, f"{size} bytes")
+        with open(self.brief_file, encoding="utf-8") as f:
+            text = f.read()
+        self.assertEqual(json.loads(text), json.loads(json.dumps(brief, ensure_ascii=False)))
+        self.assertLessEqual(max(len(line) for line in text.splitlines()), 2000)  # no line a viewer would cut
+        return brief
 
 
 # =============================================================================
@@ -952,7 +985,7 @@ class TestPrompt(unittest.TestCase):
         self.assertIn("or the daily loss gate is active (scope all)", contract)
         shot = self.text.split('<example id="eval_neg_08_daily_loss_gate_active">')[1].split("</example>")[0]
         self.assertIn("C0.1 Brief source: view_file logs/primed_brief.json -> file", shot)
-        self.assertIn("C0.4 Risk profile: risk_pct_equity 0.005, leverage_standard 3 -> PASS", shot)
+        self.assertIn("C0.4 Risk profile: risk_per_trade_usdt 2.67, leverage_standard 3 -> PASS", shot)
         with open(os.path.join(BASE_DIR, "AGENTS.md"), encoding="utf-8") as f:
             agents = f.read()
         mcp = next(l for l in agents.splitlines() if l.strip().startswith("* `MCP`:"))

@@ -10,6 +10,11 @@ append a tombstone ({"id": "...", "superseded": true}).
 
 Usage:
   python3 scripts/remember_trade_lesson.py add --symbol HBARUSDT --dir LONG --outcome STOPPED_OUT --loss 1.68 --cause BTC_DUMP --insight "..." --tags macro,altcoins
+      [--pin] [--corrects <id or id prefix>]
+    --pin       tag the lesson `pinned`: always included in the evaluator brief
+    --corrects  tag it corrects_<full id> of the matching active lesson (most recent match, printed before the
+                write; the prefix must be at least ins-<10-digit timestamp>; exit 2 when shorter or no match):
+                the brief shows the correction and never the corrected lesson
   python3 scripts/remember_trade_lesson.py list [--tag macro]
   python3 scripts/remember_trade_lesson.py prune --id <id>
 """
@@ -21,6 +26,12 @@ import time
 import uuid
 import datetime
 import argparse
+import re
+
+SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, SCRIPTS_DIR)
+from utils.lessons import active_lessons, read_records  # noqa: E402  (stdlib-only, issue #187)
 
 LOGS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
 INSIGHTS_FILE = os.path.join(LOGS_DIR, "trade_insights.jsonl")
@@ -39,33 +50,9 @@ def append_record(record: dict):
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 def read_all_insights(active_only=True):
-    file_path = get_insights_path()
-    if not os.path.exists(file_path):
-        return []
-    
-    records = []
-    superseded_ids = set()
-    
-    with open(file_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                item = json.loads(line)
-                if item.get("superseded") is True:
-                    superseded_ids.add(item.get("id"))
-                records.append(item)
-            except Exception:
-                continue
-                
+    records = read_records(get_insights_path())  # shared reader (issue #187)
     if active_only:
-        active = []
-        for r in records:
-            r_id = r.get("id")
-            if r_id and r_id not in superseded_ids and not r.get("superseded"):
-                active.append(r)
-        return active
+        return [r for r in active_lessons(records) if r.get("id")]
     return records
 
 def add_insight(symbol: str, direction: str, outcome: str, loss_usdt: float, root_cause: str, insight_text: str, tags: list):
@@ -122,10 +109,22 @@ def list_insights(tag_filter=None):
         print(f"  👉 \"{i.get('insight')}\"{tags_str}")
     print("-" * 75 + "\n")
 
-if __name__ == "__main__":
+CORRECTS_MIN_PREFIX_RE = re.compile(r"ins-\d{10}", re.IGNORECASE)  # --corrects: at least ins-<epoch seconds>
+
+
+def resolve_lesson_id(ref: str):
+    """Full id of the most recent active lesson whose id starts with `ref` (case-insensitive), else None."""
+    ref = str(ref or "").strip().lower()
+    if not ref:
+        return None
+    matches = [r["id"] for r in read_all_insights(active_only=True) if str(r["id"]).lower().startswith(ref)]
+    return matches[-1] if matches else None
+
+
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Committed Memory Ledger - Trade Insights")
     subparsers = parser.add_subparsers(dest="command")
-    
+
     # add
     p_add = subparsers.add_parser("add")
     p_add.add_argument("--symbol", default="MACRO")
@@ -135,19 +134,36 @@ if __name__ == "__main__":
     p_add.add_argument("--cause", default="UNSPECIFIED")
     p_add.add_argument("--insight", required=True)
     p_add.add_argument("--tags", default="general")
-    
+    p_add.add_argument("--pin", action="store_true", help="Tag the lesson `pinned` (always in the evaluator brief)")
+    p_add.add_argument("--corrects", default=None, metavar="ID",
+                       help="Id (or id prefix) of the active lesson this one corrects: tags corrects_<full id>, "
+                            "and the brief then shows this lesson instead of the corrected one")
+
     # list
     p_list = subparsers.add_parser("list")
     p_list.add_argument("--tag", default=None)
-    
+
     # prune
     p_prune = subparsers.add_parser("prune")
     p_prune.add_argument("--id", required=True)
-    
-    args = parser.parse_args()
-    
+
+    args = parser.parse_args(argv)
+
     if args.command == "add":
         tags_list = [t.strip() for t in args.tags.split(",")]
+        if args.corrects is not None:
+            if not CORRECTS_MIN_PREFIX_RE.match(str(args.corrects).strip()):
+                print(f"❌ --corrects {args.corrects!r}: give at least ins-<10-digit timestamp> of the lesson id.",
+                      file=sys.stderr)
+                return 2
+            target = resolve_lesson_id(args.corrects)
+            if target is None:
+                print(f"❌ --corrects {args.corrects!r}: no active lesson id starts with it.", file=sys.stderr)
+                return 2
+            print(f"↪ --corrects resolved to [{target}]")
+            tags_list.append(f"corrects_{target}")
+        if args.pin:
+            tags_list.append("pinned")
         add_insight(args.symbol, args.dir, args.outcome, args.loss, args.cause, args.insight, tags_list)
     elif args.command == "list":
         list_insights(args.tag)
@@ -155,3 +171,8 @@ if __name__ == "__main__":
         prune_insight(args.id)
     else:
         list_insights()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

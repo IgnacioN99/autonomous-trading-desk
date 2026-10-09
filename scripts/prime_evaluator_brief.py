@@ -91,28 +91,160 @@ def ensure_fresh_state(max_age_sec: int = 600, target_env: str = "prod") -> dict
     return state
 
 
-def load_recent_insights(limit: int = 3) -> List[dict]:
-    """Loads the last K active lessons from trade_insights.jsonl."""
-    if not os.path.exists(INSIGHTS_FILE):
-        return []
-    active = []
-    superseded = set()
+# Issue #187: the brief file is written with one JSON element per line and no indentation or separator spaces
+# (fewer tokens than indent=2, no long single line for view_file). BRIEF_BUDGET_BYTES: the whole file (< 1,800
+# tokens at bytes / 4); the lesson block gets what the rest of the brief leaves, at most LESSON_BUDGET_BYTES.
+BRIEF_JSON_FORMAT = {"indent": 0, "separators": (",", ":")}
+BRIEF_BUDGET_BYTES = 7199
+LESSON_BUDGET_BYTES = 5000  # committed_memory_lessons block as written in the brief file
+# Lesson symbols that are not tradable pairs: global lessons (issue #187); any "MARKET_*" symbol is global too
+GLOBAL_LESSON_SYMBOLS = ("MACRO", "ACCOUNT_CAPITAL", "SHADOW_DESK", "ALTS_BASKET")
+CORRECTION_TAG_PREFIXES = ("supersedes_", "corrects_")
+_QUOTE_SUFFIXES = ("USDT", "USDC", "BUSD")
+_SIZE_PREFIXES = ("1000000", "1000")
+
+
+BRIEF_LESSON_OTHER_TAGS = 3  # tags per brief entry besides `pinned` and supersedes_/corrects_ (token budget)
+
+
+def _brief_tags(tags: Any) -> list:
+    """The lesson's tags for the brief, in ledger order: `pinned`, supersedes_* / corrects_*, and at most
+    BRIEF_LESSON_OTHER_TAGS others (the ledger keeps them all)."""
+    out, others = [], 0
+    for t in tags if isinstance(tags, list) else []:
+        key = str(t).strip().lower()
+        if key == "pinned" or key.startswith(CORRECTION_TAG_PREFIXES):
+            out.append(t)
+        elif others < BRIEF_LESSON_OTHER_TAGS:
+            out.append(t)
+            others += 1
+    return out
+
+
+def _brief_lesson(rec: dict) -> dict:
+    """The brief's committed_memory_lessons entry of a lesson record (text never cut; tags per _brief_tags)."""
+    return {"tag": _brief_tags(rec.get("tags", [])), "lesson": rec.get("insight")}
+
+
+def _base_asset(symbol: Any) -> str:
+    """UNIUSDT -> UNI, 1000PEPEUSDT -> PEPE, PEPE -> PEPE."""
+    s = str(symbol or "").strip().upper()
+    for q in _QUOTE_SUFFIXES:
+        if s.endswith(q) and len(s) > len(q):
+            s = s[:-len(q)]
+            break
+    for p in _SIZE_PREFIXES:
+        if s.startswith(p) and len(s) > len(p):
+            s = s[len(p):]
+            break
+    return s
+
+
+def _is_global_symbol(symbol: Any) -> bool:
+    s = str(symbol or "").strip().upper()
+    return s in GLOBAL_LESSON_SYMBOLS or s.startswith("MARKET_")
+
+
+def _lesson_tags(rec: dict) -> List[str]:
+    tags = rec.get("tags")
+    return [str(t).strip().lower() for t in tags] if isinstance(tags, list) else []
+
+
+def brief_lesson_candidates(screening: Any, yolo_slot: Optional[dict] = None) -> List[tuple]:
+    """(BASE_ASSET, DIRECTION) pairs of the brief's candidates (screening top_candidates, the brief yolo_slot's
+    candidates as LONG, both stat-arb legs with direction None) for the lesson relevance ranking. yolo_slot: the
+    brief's slot (build_yolo_slot_brief(screening) when None: candidates only when ACTIVE)."""
+    out = []
+    if not isinstance(screening, dict):
+        return out
+    for c in screening.get("top_candidates") or []:
+        if isinstance(c, dict) and c.get("symbol"):
+            out.append((_base_asset(c["symbol"]), str(c.get("direction") or "").upper() or None))
+    slot = build_yolo_slot_brief(screening) if yolo_slot is None else yolo_slot
+    for c in (slot.get("candidates") or []) if isinstance(slot, dict) else []:
+        if isinstance(c, dict) and c.get("symbol"):
+            out.append((_base_asset(c["symbol"]), str(c.get("direction") or "LONG").upper()))
+    for p in screening.get("actionable_stat_arb") or []:
+        if isinstance(p, dict):
+            out.extend((_base_asset(p[k]), None) for k in ("symbol_a", "symbol_b") if p.get(k))
+    return out
+
+
+def select_lessons(active: List[dict], candidates: Any = None, budget_bytes: int = LESSON_BUDGET_BYTES) -> List[dict]:
+    """Deterministic lesson selection for the brief (issue #187). `active`: active lessons in file order (a later
+    position is more recent). `candidates`: (symbol, direction) pairs of the current candidates.
+    1. Correction pairing: a lesson tagged supersedes_<id> / corrects_<id> with a non-empty <id> is a correction;
+       <id> (possibly truncated) matches the most recent lesson recorded before the correction (earlier in file
+       order) whose id starts with it, and that lesson is suppressed (never shown).
+    2. Then lessons tagged `pinned` and lessons with a global pseudo-symbol (GLOBAL_LESSON_SYMBOLS, MARKET_*).
+       Corrections and pinned lessons are always included (stderr warning when they exceed the budget).
+    3. Relevance: lessons whose base asset matches a candidate's (same direction first).
+    4. Recency fill with the remaining lessons.
+    Within a priority, most recent first. A lesson that would take the committed_memory_lessons block (as written in
+    the brief file, _brief_bytes) over budget_bytes is skipped and the next ones are tried; a lesson's text is
+    never cut."""
+    active = [r for r in active if isinstance(r, dict)]
+    ids = [str(r.get("id") or "") for r in active]
+    suppressed, corrections = set(), set()
+    for i, rec in enumerate(active):
+        for tag in _lesson_tags(rec):
+            ref = next((tag[len(p):] for p in CORRECTION_TAG_PREFIXES if tag.startswith(p)), None)
+            ref = (ref or "").strip()
+            if not ref:  # no tag, or an empty reference: not a correction
+                continue
+            corrections.add(i)
+            # only a lesson recorded before the correction (earlier in file order) can be corrected by it
+            match = next((j for j in range(i - 1, -1, -1) if ids[j] and ids[j].lower().startswith(ref)), None)
+            if match is not None:
+                suppressed.add(match)
+    corrections -= suppressed  # a correction that is itself corrected stays suppressed
+    want = {}
+    for base, direction in candidates or []:
+        base = _base_asset(base)
+        if base:
+            want.setdefault(base, set()).add(str(direction or "").upper())
+
+    def always(i):
+        return i in corrections or "pinned" in _lesson_tags(active[i])
+
+    def rank(i):
+        rec = active[i]
+        if i in corrections:
+            return 0
+        if always(i) or _is_global_symbol(rec.get("symbol")):
+            return 1
+        dirs = want.get(_base_asset(rec.get("symbol")))
+        if dirs is not None:
+            return 2 if str(rec.get("direction") or "").upper() in dirs else 3
+        return 4
+
+    order = sorted((i for i in range(len(active)) if i not in suppressed), key=lambda i: (rank(i), -i))
+    selected, entries = [], []
+    for i in order:
+        entry = _brief_lesson(active[i])
+        if _brief_bytes(entries + [entry]) > budget_bytes:  # the exact size of the block in the brief file
+            if not always(i):
+                continue
+            print(f"Lesson budget: {active[i].get('id')} (correction or pinned) included over the "
+                  f"{budget_bytes}-byte cap", file=sys.stderr)
+        selected.append(active[i])
+        entries.append(entry)
+    return selected
+
+
+def load_recent_insights(limit: Optional[int] = None, *, candidates: Any = None,
+                         budget_bytes: int = LESSON_BUDGET_BYTES) -> List[dict]:
+    """Active lessons of trade_insights.jsonl chosen by select_lessons (issue #187), in brief order. `limit`
+    (compatibility) caps the count after the selection. Any error: a one-line stderr warning and [] (fail-open: the
+    brief is still built, without lessons)."""
     try:
-        with open(INSIGHTS_FILE, "r", encoding="utf-8") as f:
-            lines = [l.strip() for l in f if l.strip()]
-            for l in lines:
-                try:
-                    obj = json.loads(l)
-                    if obj.get("superseded"):
-                        superseded.add(obj.get("id"))
-                    else:
-                        active.append(obj)
-                except Exception:
-                    continue
-        valid = [a for a in active if a.get("id") not in superseded]
-        return valid[-limit:]
-    except Exception:
+        from utils.lessons import read_active_lessons
+        selected = select_lessons(read_active_lessons(INSIGHTS_FILE), candidates, budget_bytes)
+    except Exception as e:
+        print(f"Committed lessons not loaded ({type(e).__name__}: {' '.join(str(e).split())[:120]}): brief built without lessons",
+              file=sys.stderr)
         return []
+    return selected[:limit] if limit is not None else selected
 
 
 def get_latest_screening_payload(target_env: str = "prod", run_id: Optional[str] = None) -> dict:
@@ -245,17 +377,28 @@ def build_yolo_slot_brief(screening: dict) -> dict:
             "candidates": [c for c in (candidates or []) if isinstance(c, dict)]}
 
 
-def _write_json(path: str, data: dict) -> None:
+def _write_json(path: str, data: dict, indent: Optional[int] = 2, separators: Optional[tuple] = None) -> None:
     try:
         from utils.atomic_writer import atomic_write_json
     except ImportError:
         atomic_write_json = None
     if atomic_write_json is not None:
-        atomic_write_json(path, data)
+        atomic_write_json(path, data, indent=indent, separators=separators)
         return
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+        json.dump(data, f, indent=indent, separators=separators, ensure_ascii=False)
+
+
+def _write_brief(path: str, brief: dict) -> None:
+    """The brief file in BRIEF_JSON_FORMAT (the bytes _brief_bytes counts)."""
+    _write_json(path, brief, **BRIEF_JSON_FORMAT)
+
+
+def _brief_bytes(data: Any) -> int:
+    """UTF-8 size of `data` serialized as the brief file. With indent 0 a nested value serializes to the same text
+    as on its own, so a part's size adds up exactly inside the whole brief."""
+    return len(json.dumps(data, ensure_ascii=False, **BRIEF_JSON_FORMAT).encode("utf-8"))
 
 
 def assemble_primed_brief(target_env: str = "prod", out_path: Optional[str] = None) -> dict:
@@ -265,7 +408,6 @@ def assemble_primed_brief(target_env: str = "prod", out_path: Optional[str] = No
         state = {}
     sync_failed = bool(state.pop(SYNC_FAILED_KEY, False))
     screening = get_latest_screening_payload(target_env=target_env, run_id=run_id)
-    insights = load_recent_insights(limit=3)
     risk_profile = build_risk_profile(target_env)
 
     portfolio = state.get("portfolio_exposure", {})
@@ -333,12 +475,7 @@ def assemble_primed_brief(target_env: str = "prod", out_path: Optional[str] = No
         "stat_arb_pairs": screening.get("actionable_stat_arb", []),
         "funding_arbitrage_desk": screening.get("top_funding_arbitrage", []),
         "yolo_slot": yolo_slot,
-        "committed_memory_lessons": [
-            {
-                "tag": i.get("tags", []),
-                "lesson": i.get("insight")
-            } for i in insights
-        ]
+        "committed_memory_lessons": []  # filled last (issue #187): its budget is what the rest of the brief leaves
     }
 
     if resting_bias == "UNKNOWN":
@@ -358,11 +495,17 @@ def assemble_primed_brief(target_env: str = "prod", out_path: Optional[str] = No
     data_quality = closed_today_data_quality(closed_today)
     if data_quality:
         brief["ground_truth_portfolio"]["closed_today_data"] = data_quality
+    # Issue #187: lessons last, ranked against the candidates this brief shows; the block gets the bytes the rest of
+    # the brief leaves under BRIEF_BUDGET_BYTES ("[]" is already counted), at most LESSON_BUDGET_BYTES
+    lesson_budget = min(LESSON_BUDGET_BYTES, BRIEF_BUDGET_BYTES - _brief_bytes(brief) + 2)
+    insights = load_recent_insights(candidates=brief_lesson_candidates(screening, yolo_slot),
+                                    budget_bytes=lesson_budget)
+    brief["committed_memory_lessons"] = [_brief_lesson(i) for i in insights]
 
     # Atomic write: the evaluator subagent reads logs/primed_brief.json with view_file
-    _write_json(BRIEF_FILE, brief)
+    _write_brief(BRIEF_FILE, brief)
     if out_path and os.path.abspath(out_path) != os.path.abspath(BRIEF_FILE):
-        _write_json(out_path, brief)
+        _write_brief(out_path, brief)
     _write_scores_sidecar(screening, yolo_slot, generated_at_ts, target_env)
 
     return brief
@@ -376,7 +519,8 @@ def brief_daily_loss_gate(state: Any, target_env: str) -> dict:
     if not same_env or not isinstance(gate, dict):
         return {"blocked": True, "scope": "all", "reason": "unavailable: ledger has no daily_loss_gate state"}
     blocked = gate.get("blocked") is not False
-    scope = gate.get("scope") if gate.get("scope") in ("all", "yolo") else ("all" if blocked else None)
+    # An inactive gate has no scope (issue #187 carry: a leftover scope never reads as ACTIVE)
+    scope = (gate.get("scope") if gate.get("scope") in ("all", "yolo") else "all") if blocked else None
     # The reason only when blocked: an inactive gate's informational notes (unscored / unaudited trades) stay in the
     # ledger cache and the doctor, never in the evaluator's brief
     reason = gate.get("reason") if blocked else None
@@ -492,7 +636,7 @@ def format_markdown_brief(brief: dict) -> str:
                  + (" | **Pending entries status:** `UNREADABLE`" if brief.get("pending_entries_status") else "")
                  + (" | **State sync:** `FAILED`" if brief.get("state_sync") else ""))
     dlg = brief.get("daily_loss_gate") or {}
-    if dlg.get("blocked") or dlg.get("scope"):  # issue #207
+    if dlg.get("blocked"):  # issue #207; ACTIVE only when blocked (#187)
         lines.append(f"- **Daily Loss Gate:** `ACTIVE ({dlg.get('scope') or 'all'})` {dlg.get('reason') or ''}".rstrip())
     if p.get("closed_today_data"):
         lines.append(f"- **Closed-today data:** {json.dumps(p['closed_today_data'], ensure_ascii=False)}")

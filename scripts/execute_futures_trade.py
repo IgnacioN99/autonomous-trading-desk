@@ -1891,6 +1891,7 @@ def check_daily_loss_gate(target_env, is_yolo_order, prof, equity_now, *, open_p
       snapshot; read from positionRisk when None). Fail closed: MCP mode (the gateway does not serve userTrades), an
       unreadable or truncated fill read, an unreadable audit, trades not countable per trade (counted_by != "trades")
       or any exception refuses the opening. state: the evaluate() dict plus "is_yolo_order" (audit field).
+      Skipped audit lines and non-numeric fills are informational notes, never a refusal (issue #187).
     """
     is_yolo_order = bool(is_yolo_order)
     try:
@@ -1918,8 +1919,9 @@ def check_daily_loss_gate(target_env, is_yolo_order, prof, equity_now, *, open_p
         from utils import daily_loss_gate as dlg
         start_ms = sss.get_start_of_day_utc(now)
         audit_path = os.path.join(_workspace_dir(), 'logs', 'trades_audit.jsonl')
+        audit_stats = {}  # issue #187: malformed_lines, an informational note (never an audit_read_error)
         try:
-            records = read_audit_tail(audit_path) if os.path.exists(audit_path) else []
+            records = read_audit_tail(audit_path, stats=audit_stats) if os.path.exists(audit_path) else []
         except OSError as e:
             return unreadable(f"trades audit unreadable: {e}")
         if open_positions is None:
@@ -1941,12 +1943,15 @@ def check_daily_loss_gate(target_env, is_yolo_order, prof, equity_now, *, open_p
         if view.get("counted_by") != "trades":
             return refuse(f"DAILY LOSS GATE: today's trades cannot be counted per trade ({view.get('day_error')}): "
                           "the consecutive-SL streak is unverifiable — opening refused (fail closed)")
-        net, other_asset = dlg.day_net_realized(fills)
+        fill_stats = {}
+        net, other_asset = dlg.day_net_realized(fills, stats=fill_stats)
         state = dlg.evaluate(net, view.get("trades") or [], risk_pct=profile_risk_fraction(prof),
                              equity_now=equity_now, is_yolo_order=is_yolo_order, **up.get_daily_loss_limits(prof))
         state["is_yolo_order"] = is_yolo_order
         dlg.note_unaudited_closing_symbols(state, view.get("unaudited_closing_symbols") or [])  # informational
         dlg.note_fills_scope(state, fills_info)  # informational
+        dlg.note_malformed_inputs(state, audit_stats.get("malformed_lines"),
+                                  fill_stats.get("malformed_fills"))  # informational
         if other_asset:
             state["non_usdt_commission"] = True  # left out of the USDT sum; those trades have gross R only
         if state.get("blocked"):

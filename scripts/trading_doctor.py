@@ -517,17 +517,23 @@ def ledger_counted_by_warning(state, target_env: str):
             "win/loss counts may be wrong and the Daily Loss Gate refuses PROD openings until they are countable.")
 
 
-def daily_loss_gate_line(state, target_env: str):
+MCP_GATE_CAUSE = "MCP mode: the gateway has no userTrades, so the gate refuses PROD openings"
+
+
+def daily_loss_gate_line(state, target_env: str, mcp: bool = False):
     """Issue #207: ("ok" | "warn", text) for the Daily Loss Gate state cached by the ledger sync (the executor
     re-reads the exchange). A missing state or another env's ledger is a WARN (sync required); TESTNET is "info"
-    (the executor skips the gate there)."""
+    (the executor skips the gate there). mcp: the doctor runs in MCP auth mode; an "unavailable:" gate then names
+    MCP_GATE_CAUSE (issue #187)."""
     if pt.norm_env(target_env) == "testnet":
         return "info", "Daily Loss Gate skipped (TESTNET)."
     if not isinstance(state, dict) or pt.norm_env(state.get("target_env")) != pt.norm_env(target_env):
         return "warn", "Daily Loss Gate state unknown (no same-env ledger): run sync_session_state.py."
     gate = state.get("daily_loss_gate")
     text = sss.format_daily_loss_gate(gate)
-    if not isinstance(gate, dict) or gate.get("blocked") is not False or gate.get("scope"):
+    if not isinstance(gate, dict) or gate.get("blocked") is not False:
+        if mcp and isinstance(gate, dict) and str(gate.get("reason") or "").startswith("unavailable:"):
+            text += f" ({MCP_GATE_CAUSE})"
         return "warn", f"Daily Loss Gate: {text}"
     unaudited = gate.get("unaudited_closing_symbols") or []
     if unaudited:  # round 4: informational (never blocks), but the streak cannot see those trades
@@ -834,7 +840,7 @@ def run_doctor(target_env: str = None, auto_heal: bool = False) -> int:
         if counted_warning:
             warnings.append(counted_warning)
             print(f"⚠️  [STATE LEDGER] {counted_warning}")
-        gate_level, gate_msg = daily_loss_gate_line(ledger_state, target_env)
+        gate_level, gate_msg = daily_loss_gate_line(ledger_state, target_env, mcp=api_key == "MCP_OAUTH_ACTIVE")
         if gate_level == "warn":
             warnings.append(gate_msg)
             print(f"⚠️  [DAILY LOSS GATE] {gate_msg}")
