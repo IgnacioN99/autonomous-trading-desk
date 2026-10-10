@@ -66,14 +66,16 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    another or an unknown distro names another filesystem). With a native Linux cwd (/mnt/c/..., /home/...) or none,
    /c/x and //wsl.../x are Linux paths: not sanctioned (ask) (issue #110).
    Read-only analysis scripts (READ_ONLY_SCRIPTS, issue #191: scripts/trade_outcomes.py, scripts/trading_scorecard.py,
-   scripts/exit_policy_sim.py; issue #280: scripts/trading_lease.py --status, whose --take is force-asked; they place,
-   change or cancel no order) are auto-allowed ("read-only analysis script")
+   scripts/exit_policy_sim.py; issue #269: scripts/entry_policy_sim.py; issue #280: scripts/trading_lease.py
+   --status, whose --take is force-asked; they place, change or cancel no order) are auto-allowed ("read-only
+   analysis script")
    only as the single sub-command of a flat line, run by their exact repo path (never a linked worktree copy)
    through a bare interpreter name (python / python3[.x]; ./python3 or /tmp/python3 never count), with
    the same prefix / metacharacter / redirect rules as above, only their own flags, and every --output / --out /
-   --outcomes value inside logs/ (lexically and by os.path.realpath); a write flag (--output / --out) must name the
-   script's own output (trade_outcomes.py: logs/trade_outcomes.jsonl, trading_scorecard.py:
-   logs/trading_scorecard.json, exit_policy_sim.py: logs/exit_policy_sim.json; never GROUND_TRUTH_FILES,
+   --outcomes / --shadow value inside logs/ (lexically and by os.path.realpath); a write flag (--output / --out) must
+   name the script's own output (trade_outcomes.py: logs/trade_outcomes.jsonl, trading_scorecard.py:
+   logs/trading_scorecard.json, exit_policy_sim.py: logs/exit_policy_sim.json, entry_policy_sim.py:
+   logs/entry_policy_sim.json; never GROUND_TRUTH_FILES,
    READ_ONLY_FOREIGN_OUTPUTS or logs/evaluations/). The ground-truth check (8) lets trade_outcomes.py name its own
    ground-truth output logs/trade_outcomes.jsonl (its sole sanctioned writer); naming any other ground-truth file
    (logs/score_calibration.json included: the scorecard writes it itself, never through --out), also through
@@ -702,9 +704,9 @@ RISK_REDUCING_SCRIPTS: Dict[str, Tuple[set, Dict[str, bool]]] = {
     "scripts/user_profile.py": (set(HELP_FLAGS), dict(HELP_FLAGS)),
 }
 # Read-only analysis scripts (issue #191): offline reports that never place, change or cancel orders (trade_outcomes:
-# GET userTrades and public klines / exchangeInfo; the scorecard: local files; the simulator: public klines and
-# exchangeInfo). Each entry: ({allowed flag: takes a value}, {path flag: "write" | "read"}, its own outputs). A single
-# plain invocation by the exact repo path (never a linked worktree copy) with only these flags is auto-allowed when
+# GET userTrades and public klines / exchangeInfo; the scorecard: local files; the exit and entry simulators (issue
+# #269): public klines and exchangeInfo). Each entry: ({allowed flag: takes a value}, {path flag: "write" | "read"},
+# its own outputs). A single plain invocation by the exact repo path (never a linked worktree copy) with only these flags is auto-allowed when
 # every path flag resolves inside logs/ and every write flag names one of its own outputs
 READ_ONLY_SCRIPTS: Dict[str, Tuple[Dict[str, bool], Dict[str, str], Tuple[str, ...]]] = {
     "scripts/trade_outcomes.py": (
@@ -720,6 +722,11 @@ READ_ONLY_SCRIPTS: Dict[str, Tuple[Dict[str, bool], Dict[str, str], Tuple[str, .
          "--maker-fee": True, "--trail-cadence": True, "--exact-entry-only": False, "--json": False, "--out": True,
          **HELP_FLAGS},
         {"--out": "write", "--outcomes": "read"}, ("logs/exit_policy_sim.json",)),
+    "scripts/entry_policy_sim.py": (
+        {"--env": True, "--outcomes": True, "--shadow": True, "--policies": True, "--horizon-hours": True,
+         "--taker-fee": True, "--maker-fee": True, "--trail-cadence": True, "--confirm-minutes": True,
+         "--pullback-minutes": True, "--exact-entry-only": False, "--json": False, "--out": True, **HELP_FLAGS},
+        {"--out": "write", "--outcomes": "read", "--shadow": "read"}, ("logs/entry_policy_sim.json",)),
     # Issue #280: the lease status (reads one local file; --take is force-asked, never auto-allowed)
     "scripts/trading_lease.py": ({"--status": False, "--json": False, "--env": True, **HELP_FLAGS}, {}, ()),
 }

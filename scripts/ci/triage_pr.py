@@ -44,6 +44,7 @@ REVIEWERS = {
             r"^scripts/dynamic_exit_manager\.py$",
             r"^scripts/trade_outcomes\.py$",
             r"^scripts/exit_policy_sim\.py$",
+            r"^scripts/entry_policy_sim\.py$",
             r"^scripts/trading_scorecard\.py$",
             r"^scripts/utils/score_calibration\.py$",
             r"^scripts/utils/trade_excursion\.py$",
