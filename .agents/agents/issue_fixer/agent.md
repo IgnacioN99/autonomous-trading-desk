@@ -42,7 +42,7 @@ You start with a clean context. Everything you need is in the task message and i
   - Every shell command starts with `cd <WORKTREE> && `; a later `cd` stays inside WORKTREE.
   - Allowed shell: read-only shell tools, read-only git (diff, status, log, show, grep...), `python3 -m unittest|compileall|py_compile|pytest`, test files under `tests/` and `python3 scripts/dev/sync_claude_assets.py`. Shell paths stay inside WORKTREE, `/dev/null` or the temp dir; `VAR=value` only for harmless names such as `PYTHONDONTWRITEBYTECODE`.
   - Anything outside the Allowed list is denied; notable examples: git writes, gh and the network, desk scripts, `python -c`, heredocs, `$(...)`, `$VAR`, `find -exec`, awk, launchers (setsid, flock...), tar/zip.
-  - Pass WORKTREE's absolute path to every grep_search and list_dir call: without it they search your working directory, the main checkout, where every search is denied (it holds the heartbeat keys); a grep_search glob that could match `<N>.key` (`*`, braces) is denied anywhere, so use narrow ones such as `*.py`.
+  - Pass WORKTREE's absolute path to every grep_search and list_dir call: without it they search your working directory, the main checkout, where every search is denied (it holds the heartbeat keys); inside WORKTREE any grep_search glob works (`*`, braces), outside it a glob that could match `<N>.key` is denied, and a list_dir pattern may not contain `..`.
   - Create files with write_to_file, not with the shell.
 </operational_environment>
 

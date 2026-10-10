@@ -17,8 +17,9 @@ it never touches the exchange, the ledger or any desk runtime file).
       Read <worktree>/logs/issue_work/guard_heartbeat.json (written by issue_fixer_guard.py on every decision) and
       print {"ok", "heartbeat_ts", "since", "session_id", "signed", "sig_ok", "binding_claim",
       "marker_session_id_null", "issue"} plus a "warning" when there is one: exit 0 when the heartbeat exists,
-      ts >= since and, if the issue has a key, its HMAC verifies; else exit 2 (the guard did not run, e.g. the Claude Code build ignored the fixer's
-      frontmatter hook, or the heartbeat is unsigned, tampered with or from another worktree). The issue number
+      ts >= since and, if the issue has a key, its HMAC verifies; else exit 2 (the guard did not run, e.g. the
+      Claude Code build ignored the fixer's frontmatter hook, or the heartbeat is unsigned, tampered with or from
+      another worktree). The issue number
       comes from the binding marker, else from the -wt-issue-<N> directory name; a legacy worktree without a key
       reports `signed: false`, `sig_ok: null` and passes on the timestamp alone. A main checkout that cannot be
       resolved fails closed. session_id is the one the last hook payload carried (null if none);
@@ -448,7 +449,9 @@ def check_env(home: str) -> dict:
     TZ, TERM, TMPDIR) and the CHECK_ENV_PREFIXES variables (LC_*, PYTHON*) are inherited; every other variable,
     credentials included (BINANCE_*, ANTHROPIC_API_KEY, AWS_*...), is dropped. HOME is set to `home` (a fresh
     empty directory). PYTHONUSERBASE keeps pointing at the real user site-packages, so user-installed
-    dependencies still import."""
+    dependencies still import. SSL_CERT_FILE, HTTP_PROXY and HTTPS_PROXY are dropped on purpose: the checks are
+    hermetic (compileall, the generator check and the unit tests, which fake every network client), so none of
+    them needs a certificate bundle or a proxy."""
     env = {k: v for k, v in os.environ.items() if k in CHECK_ENV_NAMES or k.startswith(CHECK_ENV_PREFIXES)}
     user_base = site.getuserbase()
     if user_base:
