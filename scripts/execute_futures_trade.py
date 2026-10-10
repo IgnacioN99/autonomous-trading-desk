@@ -18,7 +18,8 @@ and --json; modes are mutually exclusive):
   python3 scripts/execute_futures_trade.py --auto-heal [--env prod]
   python3 scripts/execute_futures_trade.py --protect-pending [--env prod]   # also run by the position guardian
 
-  # New position (requires an APPROVED clean-room dossier; always emits JSON)
+  # New position (requires an APPROVED clean-room dossier and, in PROD, that its session holds the trading lease,
+  # issue #280: check_trading_lease; always emits JSON)
   python3 scripts/execute_futures_trade.py --symbol BTCUSDT --direction LONG --sl-price ... --tp1-price ... --tp2-price ...
 
 JSON schemas (stable; extra keys may be added, existing keys are never renamed):
@@ -1853,6 +1854,68 @@ def enforce_evaluation_dossier(symbol, direction, target_env=None, bypass_eval_g
                                f"{calib_msg}"), cand
 
     return True, reason, cand
+
+
+def check_trading_lease(symbol, direction, target_env=None, cand=None, confirmed=False, is_yolo=False, base_dir=None,
+                        now_ts=None):
+    """Issue #280 cross-check of the PROD trading lease (logs/trading_lease.json, utils/trading_lease.py; written only
+    by the hooks). Secondary to the PreToolUse hook, which claims it, and also covers openings that never pass the
+    hook (daemons). Called right after enforce_evaluation_dossier for NEW positions only; risk-reducing paths never
+    call it. Returns (ok, reason, candidate):
+    - TESTNET, no lease or a stale one -> ok (the executor never claims), candidate unchanged.
+    - Unreadable / malformed lease -> rejected (fail closed).
+    - The approving dossier's session (dossier_session, from the verified record) is the holder -> ok.
+    - Otherwise (the newest approving record came from another session) the holder's own
+      logs/evaluations/dossier_<holder>.json must approve symbol + direction: ok with that candidate, after the same
+      PROD confirmation rules as enforce_evaluation_dossier (requires_user_confirmation, YOLO, uncalibrated Tier S);
+      else rejected naming the holder."""
+    try:
+        env = resolve_env(target_env)
+    except Exception as e:
+        return False, ("MECHANICAL HARD GATE REJECTION (Trading Lease): FAIL-CLOSED — environment resolution failed "
+                       f"({e})."), None
+    if env != 'prod':
+        return True, "TESTNET: the trading lease is not applied.", cand
+    label = "MECHANICAL HARD GATE REJECTION (Trading Lease, PROD)"
+    base_dir = base_dir or _workspace_dir()
+    now_ts = int(now_ts if now_ts is not None else time.time())
+    try:
+        from utils import trading_lease as tl
+        lease = tl.load(base_dir)
+    except Exception as e:
+        return False, f"{label}: FAIL-CLOSED — {e}. PROD openings are blocked until it is repaired or taken over.", None
+    if lease is None or tl.is_stale(lease, now_ts):
+        return True, "Trading lease free or stale.", cand
+    holder = lease["session_id"]
+    if isinstance(cand, dict) and cand.get('dossier_session') == holder:
+        return True, "The approving dossier's session holds the trading lease.", cand
+    sym, side = str(symbol).upper(), str(direction).upper()
+    own = None
+    if validate_dossier_for_trade is not None:
+        try:
+            from utils.dossier_provenance import session_dossier_path
+            path = session_dossier_path(base_dir, holder)
+            if path and os.path.exists(path):
+                ok, _reason, own = validate_dossier_for_trade(symbol, direction, env, base_dir=base_dir,
+                                                              dossier_path=path, now_ts=now_ts)
+                if not ok or not isinstance(own, dict) or own.get('dossier_session') != holder:
+                    own = None
+        except Exception:
+            own = None
+    if own is None:
+        other = cand.get('dossier_session') if isinstance(cand, dict) else None
+        return False, (f"{label}: the trading lease is held by {tl.describe(lease, now_ts)}, but the dossier approving "
+                       f"{sym} {side} came from {'session ' + tl.abbreviate(other) if other else 'an unknown session'}"
+                       " and the holder's own dossier does not approve it. Only the holder may open PROD positions "
+                       f"(takeover: `{tl.TAKE_COMMAND}` from the agent session, with the user's approval)."), None
+    if not confirmed:
+        if _truthy(own.get('requires_user_confirmation')) or _dossier_candidate_is_yolo(own) or _truthy(is_yolo):
+            return False, (f"{label}: the holder's dossier approves {sym} pending explicit user confirmation (or as "
+                           "a YOLO entry). Re-run with confirmed=True / --confirmed after the user confirms."), own
+        calib_msg = _tier_s_calibration_message(own, env, base_dir)
+        if calib_msg:
+            return False, f"{label}: {sym}: {calib_msg}", own
+    return True, "The trading lease holder's own dossier approves the order.", own
 
 
 def _tier_s_calibration_message(cand, env, base_dir):
@@ -4106,6 +4169,12 @@ def _execute_complete_trade_pass(
     )
     if not eval_ok:
         return {"success": False, "hard_gate_rejection": True, "evaluation_gate_rejection": True, "error": eval_reason}
+    if is_prod:  # Issue #280: the approving dossier's session must hold the trading lease
+        lease_ok, lease_reason, _eval_cand = check_trading_lease(symbol, direction, target_env, _eval_cand,
+                                                                 confirmed=confirmed, is_yolo=is_yolo)
+        if not lease_ok:
+            return {"success": False, "hard_gate_rejection": True, "evaluation_gate_rejection": True,
+                    "error": lease_reason}
     score_meta = build_score_meta(_eval_cand, symbol, direction)  # audit only (issue #202)
 
     try:

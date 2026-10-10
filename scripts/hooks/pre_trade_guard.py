@@ -66,7 +66,8 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    another or an unknown distro names another filesystem). With a native Linux cwd (/mnt/c/..., /home/...) or none,
    /c/x and //wsl.../x are Linux paths: not sanctioned (ask) (issue #110).
    Read-only analysis scripts (READ_ONLY_SCRIPTS, issue #191: scripts/trade_outcomes.py, scripts/trading_scorecard.py,
-   scripts/exit_policy_sim.py; they place, change or cancel no order) are auto-allowed ("read-only analysis script")
+   scripts/exit_policy_sim.py; issue #280: scripts/trading_lease.py --status, whose --take is force-asked; they place,
+   change or cancel no order) are auto-allowed ("read-only analysis script")
    only as the single sub-command of a flat line, run by their exact repo path (never a linked worktree copy)
    through a bare interpreter name (python / python3[.x]; ./python3 or /tmp/python3 never count), with
    the same prefix / metacharacter / redirect rules as above, only their own flags, and every --output / --out /
@@ -85,7 +86,8 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    delta_bias, when missing or UNKNOWN; in PROD a missing or UNKNOWN value while the registry holds a same-env entry
    without an open position denies, issue #160) is checked too. The hook makes no network call, so this reads only the
    caches: the executor's live-anchored PROD gates (positionRisk, resting opening orders and the new order; issues
-   #101 / #119) are authoritative and reject what a forged fresh file lets through here.
+   #101 / #119) are authoritative and reject what a forged fresh file lets through here. The trading lease (12) is
+   read the same way: one small local file, no network.
 6. EVALUATION DOSSIER PROVENANCE (scripts/utils/dossier_provenance.py):
    PROD requires a schema v2 dossier whose provenance hash is re-verified against the
    isolated_market_evaluator subagent transcript (agy brain or Claude Code subagents/ with
@@ -94,14 +96,16 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    hook reads that session's own logs/evaluations/dossier_<session>.json (a scan in another session never replaces
    it); a session without one reads latest_dossier.json (the newest scan overall), denied as "not for the current
    conversation" when that scan came from another one. Sha-bound readers (squeeze fallback, Tier S calibration)
-   read the file holding the validated sha256. TESTNET is relaxed and reads latest_dossier.json.
+   read the file holding the validated sha256. TESTNET is relaxed and reads latest_dossier.json. Issue #280: a PROD
+   opening also needs the calling session to hold (or claim) the trading lease (12).
 7. EVALUATION TRAIL PROTECTION:
    Writes into logs/evaluations/, Antigravity brain transcripts or Claude Code subagent transcripts
    are denied, and so are agent-set transcript-root overrides (AGY_BRAIN_DIRS / CLAUDE_PROJECTS_DIRS);
    harness files (incl. .claude/agents/) and the gate modules (scripts/utils/gate_limits.py,
    scripts/execute_futures_trade.py, scripts/utils/portfolio_exposure.py, scripts/utils/env_resolver.py,
    scripts/user_profile.py; issue #79; scripts/utils/score_calibration.py, issue #202; scripts/utils/daily_loss_gate.py,
-   scripts/utils/calibration_fallback.py, scripts/sync_session_state.py, scripts/trade_outcomes.py, issue #207) require explicit confirmation (force_ask) from the file tools and from shell
+   scripts/utils/calibration_fallback.py, scripts/sync_session_state.py, scripts/trade_outcomes.py, issue #207;
+   scripts/utils/trading_lease.py and scripts/trading_lease.py, issue #280) require explicit confirmation (force_ask) from the file tools and from shell
    writes (redirect target, cp / mv / tee / rm, sed -i / perl -i, git checkout / restore, inline code that writes,
    PowerShell write cmdlets); running the executor, user_profile.py, sync_session_state.py or trade_outcomes.py is
    never a write. So do file-tool writes to
@@ -122,7 +126,8 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    scripts/trade_outcomes.py; logs/trades_audit.jsonl (entry ledger, the outcomes' source) <-
    scripts/execute_futures_trade.py; logs/primed_brief.json and logs/primed_brief_scores.json (evaluator brief and
    its radar scores) <- scripts/prime_evaluator_brief.py; logs/gate_denials.jsonl (delta-gate denials of approved
-   candidates for the shadow desk, see 11) <- this hook itself (issue #261). File tools targeting them are denied: relative, absolute and Windows paths, NTFS aliases
+   candidates for the shadow desk, see 11) <- this hook itself (issue #261); logs/trading_lease.json (single trading
+   writer, see 12) <- this hook and scripts/hooks/post_trade_sync.py (issue #280). File tools targeting them are denied: relative, absolute and Windows paths, NTFS aliases
    (trailing dot/space, ::$DATA streams) and targets whose os.path.realpath / samefile is a protected file
    (symlinked directory, hard link).
    Shell commands. The program of a sub-command is found past VAR=value / VAR+=value assignments, shell keywords
@@ -329,7 +334,21 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    --context-file / --output-file). Likewise, after a Delta-Neutral denial (5) of a dossier-approved candidate the
    hook appends one line to logs/gate_denials.jsonl (issue #261: symbol, direction, dossier prices / score / sha,
    cached delta and book; record-only, best effort, bounded size, never alters the decision); the shadow tracker
-   turns it into a DELTA_GATE_POST_APPROVAL shadow row. Executor-only denials are not recorded.
+   turns it into a DELTA_GATE_POST_APPROVAL shadow row. Executor-only denials are not recorded. The trading lease (12)
+   is the one hook-written file that changes a decision: written only at an allowed PROD opening.
+12. TRADING LEASE (issue #280, scripts/utils/trading_lease.py; PROD openings only):
+   logs/trading_lease.json {session_id, runtime, acquired_at, heartbeat_at, env} names the one session (agy
+   conversationId / Claude Code session_id) that may open PROD positions. evaluate_trade_opening checks it read-only
+   after the PROD bypass denial and, once every gate passed, claims or refreshes it atomically under its lock (bounded
+   wait, a lock not acquired denies): no lease or a stale one (heartbeat older than LEASE_STALE_SECONDS) -> this
+   session claims it; held by this session -> heartbeat refreshed (idempotent across wsl / PowerShell re-evaluations);
+   held by another session and fresh -> denied naming the holder; any lease (stale included) with an unknown caller ->
+   denied (no lease and an unknown caller -> allowed, never claimed); unreadable / malformed -> denied. A denial writes
+   nothing.
+   Takeover: `scripts/trading_lease.py --take` is force_ask; scripts/hooks/post_trade_sync.py (PostToolUse, after the
+   approved command ran) commits it and refreshes the holder's lease after its brief / record commands. Risk-reducing
+   paths (4, MCP reduce-only / cancel, the MCP leverage gate), --positions and TESTNET never read it. The executor
+   cross-checks the approving dossier's session against the holder.
 
 Target latency: < 15ms (plus dossier provenance re-verification on trade openings, and reading / judging the shell
 script files a command runs).
@@ -400,6 +419,11 @@ try:
     from utils.atomic_writer import atomic_write_json
 except ImportError:  # pragma: no cover
     atomic_write_json = None
+
+try:
+    from utils import trading_lease as tl  # issue #280: single trading writer for PROD openings
+except ImportError:  # pragma: no cover - fail closed: PROD openings deny when the module is missing
+    tl = None
 
 
 HOOK_NAME = "pre_trade_guard"
@@ -629,6 +653,8 @@ DEPLOY_BATCH_RE = re.compile(r"\bdeploy_[A-Za-z0-9_]+\.py\b")
 AUTO_DEPLOY_LOOP_RE = re.compile(r"\bclimax_watcher_loop(?:\.py)?\b")
 RECORD_EVALUATION_RE = re.compile(r"\brecord_evaluation(?:\.py)?\b")
 USER_PROFILE_SET_RE = re.compile(r"\buser_profile(?:\.py)?\b.*\s--(?:set|setup)\b", re.IGNORECASE)
+# Issue #280: a trading lease takeover needs the user's explicit approval (force_ask); post_trade_sync.py commits it
+TRADING_LEASE_TAKE_RE = re.compile(r"\btrading_lease(?:\.py)?\b.*\s--take\b", re.IGNORECASE)
 
 # Risk-reducing auto-allow (_subcommand_is_risk_reducing). Identity = the script a sub-command actually executes
 # (_executed_script, also through python / wsl.exe), resolved lexically against the cwd (else the workspace root) and
@@ -694,6 +720,8 @@ READ_ONLY_SCRIPTS: Dict[str, Tuple[Dict[str, bool], Dict[str, str], Tuple[str, .
          "--maker-fee": True, "--trail-cadence": True, "--exact-entry-only": False, "--json": False, "--out": True,
          **HELP_FLAGS},
         {"--out": "write", "--outcomes": "read"}, ("logs/exit_policy_sim.json",)),
+    # Issue #280: the lease status (reads one local file; --take is force-asked, never auto-allowed)
+    "scripts/trading_lease.py": ({"--status": False, "--json": False, "--env": True, **HELP_FLAGS}, {}, ()),
 }
 # logs/ files with another sanctioned writer: a read-only script's write flag may name none of them except its own
 # outputs (with GROUND_TRUTH_FILES: the desk's audit / brief / journal files and the read-only scripts' outputs)
@@ -788,6 +816,9 @@ TRANSCRIPT_ROOT_OVERRIDE_RE = re.compile(
 # primed_brief_scores.json (the radar scores the recorder joins into the dossier for the calibrated-bucket gate).
 # gate_denials.jsonl is appended by this guard from Python on a delta-gate denial of an approved candidate
 # (_record_gate_denial, issue #261) and read by scripts/shadow_tracker.py; a forged line would forge shadow rows.
+# trading_lease.json names the one session that may open PROD positions (issue #280): this guard claims / refreshes
+# it at an allowed opening and post_trade_sync.py refreshes it for the holder's brief / record and commits an approved
+# takeover, both from Python (utils/trading_lease.py); a forged one would let another session open.
 GROUND_TRUTH_FILES = {
     "logs/session_state.json": "`python3 scripts/sync_session_state.py`",
     "logs/guardian_state.json": "`python3 scripts/loops/position_guardian_loop.py`",
@@ -799,6 +830,8 @@ GROUND_TRUTH_FILES = {
     "logs/primed_brief.json": "`python3 scripts/prime_evaluator_brief.py`",
     "logs/primed_brief_scores.json": "`python3 scripts/prime_evaluator_brief.py`",
     "logs/gate_denials.jsonl": "`scripts/hooks/pre_trade_guard.py` itself (delta-gate denials of approved candidates)",
+    "logs/trading_lease.json": ("`scripts/hooks/pre_trade_guard.py` and `scripts/hooks/post_trade_sync.py` (the "
+                                "trading lease; takeover: `python3 scripts/trading_lease.py --take`)"),
 }
 GROUND_TRUTH_BASENAMES = {path.rsplit("/", 1)[-1].lower(): path for path in GROUND_TRUTH_FILES}
 GROUND_TRUTH_RE = re.compile("|".join(re.escape(n) for n in GROUND_TRUTH_BASENAMES), re.IGNORECASE)
@@ -990,7 +1023,9 @@ HARNESS_PATH_CMD_RE = re.compile(
     r"scripts[\\/]+report_issue\.sh|"
     # Gate modules never run as programs (issue #79): path and bare basename
     r"(?<![\w-])(?:gate_limits|portfolio_exposure|env_resolver|score_calibration|daily_loss_gate|"
-    r"calibration_fallback)\.py",
+    # (trading_lease: utils/trading_lease.py and the scripts/trading_lease.py CLI, issue #280; running the CLI is
+    # never a write)
+    r"calibration_fallback|trading_lease)\.py",
     re.IGNORECASE,
 )
 # Gate modules that are also run as programs (issue #79; #207: the ledger sync and trade_outcomes feed the Daily Loss
@@ -1099,6 +1134,9 @@ HARNESS_FILES = {
     # trade_outcomes matching that feed the gate (counted_by, closed_trades_today)
     "scripts/utils/daily_loss_gate.py", "scripts/utils/calibration_fallback.py",
     "scripts/sync_session_state.py", "scripts/trade_outcomes.py",
+    # Issue #280: the trading lease decision (single writer for PROD openings) and its CLI (auto-allowed --status: an
+    # edited copy could write the lease)
+    "scripts/utils/trading_lease.py", "scripts/trading_lease.py",
 }
 HARNESS_DIRS = ("scripts/hooks/", ".agents/agents/", ".claude/agents/")
 BRAIN_PATH_RE = re.compile(r"(?:^|/)\.gemini/[^/]+/brain(?:/|$)", re.IGNORECASE)
@@ -5543,6 +5581,9 @@ def _analyze_run_command(command_line: str, cwd: str, base_dir: str, shell: str 
             result["force_ask"] = HARNESS_WRITE_REASON
         if USER_PROFILE_SET_RE.search(text):
             result["force_ask"] = "Command changes the trading user profile (risk/autonomy/YOLO settings). Explicit confirmation required."
+        if TRADING_LEASE_TAKE_RE.search(text):
+            result["force_ask"] = ("Command takes over the trading lease: this session becomes the only one allowed "
+                                   "to open PROD positions (issue #280). Explicit user confirmation required.")
 
         # 6. Executing scripts outside scripts/ that embed trading primitives
         script = _unsanctioned_trading_script(tokens, cwd, base_dir)
@@ -6072,9 +6113,29 @@ def _record_gate_denial(base_dir: str, env: str, now_ts: int, symbol: Optional[s
         pass
 
 
+def _trading_lease_denial(base_dir: str, conversation_id: Optional[str], runtime: Optional[str], now_ts: int,
+                          claim: bool) -> Optional[str]:
+    """Issue #280, PROD openings only: the denial reason of the trading lease, None when the opening may proceed.
+    claim=False: read-only check (utils.trading_lease.check_opening); claim=True: the atomic check-and-set under the
+    lease lock (claim_or_refresh: no lease or a stale one -> this session claims it; held by this session -> heartbeat
+    refreshed; an unknown caller never claims). Another session's fresh lease, a lease with an unknown caller, an
+    unreadable / malformed lease, a lock not acquired, a missing module or any error -> denied (fail closed)."""
+    if tl is None:
+        return ("🚨 FAIL-CLOSED (Trading Lease): the lease module (scripts/utils/trading_lease.py) is unavailable. "
+                "PROD opening blocked.")
+    try:
+        result = (tl.claim_or_refresh(base_dir, conversation_id, runtime, now_ts) if claim
+                  else tl.check_opening(base_dir, conversation_id, now_ts))
+        if result.get("allow"):
+            return None
+        return "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Trading Lease): " + tl.denial_reason(result, now_ts)
+    except Exception as e:
+        return f"🚨 FAIL-CLOSED (Trading Lease): lease check failed ({type(e).__name__}). PROD opening blocked."
+
+
 def evaluate_trade_opening(cmd: str, args: dict, mcp_args: dict, base_dir: str,
                            conversation_id: Optional[str], env_hint_cmd: str = "",
-                           tokens: Optional[List[str]] = None) -> Tuple[str, str]:
+                           tokens: Optional[List[str]] = None, runtime: Optional[str] = None) -> Tuple[str, str]:
     now_ts = int(time.time())
     target_sym = extract_target_symbol(cmd, args)
 
@@ -6101,6 +6162,12 @@ def evaluate_trade_opening(cmd: str, args: dict, mcp_args: dict, base_dir: str,
             "🚨 PROD INVARIANT VIOLATION: Gate bypasses (--bypass-eval-gate, --bypass-delta-gate) "
             "are strictly FORBIDDEN in PROD environment."
         )
+
+    # Issue #280: one trading writer for PROD openings (read-only here; claimed at the end, once every gate passed)
+    if is_prod:
+        lease_denial = _trading_lease_denial(base_dir, conversation_id, runtime, now_ts, claim=False)
+        if lease_denial:
+            return "deny", lease_denial
 
     # Only what the executor would parse as --confirmed / --user-confirmed (agy/MCP args: executor truthiness)
     is_confirmed = executor_confirmed(cmd, tokens)
@@ -6332,6 +6399,12 @@ def evaluate_trade_opening(cmd: str, args: dict, mcp_args: dict, base_dir: str,
                 "Opening additional Shorts without Long hedging is strictly prohibited."
             )
 
+    # Issue #280: claim / refresh the trading lease atomically (a denial writes nothing; an unknown caller never claims)
+    if is_prod:
+        lease_denial = _trading_lease_denial(base_dir, conversation_id, runtime, now_ts, claim=True)
+        if lease_denial:
+            return "deny", lease_denial
+
     return "allow", "Mechanical hard gates and subagent validation PASSED successfully."
 
 
@@ -6339,16 +6412,17 @@ def evaluate_trade_opening(cmd: str, args: dict, mcp_args: dict, base_dir: str,
 # Decision engine
 # =============================================================================
 def evaluate_shell_command(command_line: str, cwd: str, base_dir: str, conversation_id: Optional[str],
-                           shell: str = "bash", wsl_depth: int = 0) -> Tuple[str, str]:
+                           shell: str = "bash", wsl_depth: int = 0, runtime: Optional[str] = None) -> Tuple[str, str]:
     """(decision, reason) for a shell command line (Bash, or PowerShell text normalised by scan_powershell). An
     "allow" (risk-reducing exit or gated trade opening) needs a flat single-line command (_auto_allow_blocker);
     otherwise it is downgraded to "ask". Bash: the joined arguments of each wsl.exe call without -e/--exec are
     judged once more as the Linux default shell re-parses them (_bash_wsl_shell_commands, nested wsl calls up to
-    NESTED_DEPTH_LIMIT levels); the most restrictive result wins."""
+    NESTED_DEPTH_LIMIT levels); the most restrictive result wins. runtime ("claude" | "agy"): recorded in a trading
+    lease the opening claims (issue #280)."""
     if wsl_depth > NESTED_DEPTH_LIMIT:
         return "deny", (f"🚨 FAIL-CLOSED: wsl.exe calls nested deeper than {NESTED_DEPTH_LIMIT} levels cannot be "
                         "audited.")
-    decision, reason = _evaluate_shell_command(command_line, cwd, base_dir, conversation_id, shell)
+    decision, reason = _evaluate_shell_command(command_line, cwd, base_dir, conversation_id, shell, runtime=runtime)
     if decision == "allow":
         blocker = _auto_allow_blocker(command_line)
         if blocker:
@@ -6358,14 +6432,15 @@ def evaluate_shell_command(command_line: str, cwd: str, base_dir: str, conversat
         return decision, reason
     results = [(decision, reason)]
     for line in _bash_wsl_shell_commands(command_line):
-        results.append(evaluate_shell_command(line, cwd, base_dir, conversation_id, "bash", wsl_depth + 1))
+        results.append(evaluate_shell_command(line, cwd, base_dir, conversation_id, "bash", wsl_depth + 1,
+                                              runtime=runtime))
         if results[-1][0] == "deny":
             return results[-1]
     return max(results, key=lambda r: PS_DECISION_RANK.get(r[0], PS_DECISION_RANK["deny"]))
 
 
 def _evaluate_shell_command(command_line: str, cwd: str, base_dir: str, conversation_id: Optional[str],
-                            shell: str = "bash") -> Tuple[str, str]:
+                            shell: str = "bash", runtime: Optional[str] = None) -> Tuple[str, str]:
     analysis = analyze_run_command(command_line, cwd, base_dir, shell=shell)
     if analysis["deny"]:
         return "deny", analysis["deny"]
@@ -6406,7 +6481,7 @@ def _evaluate_shell_command(command_line: str, cwd: str, base_dir: str, conversa
         sub = analysis["trading"][0]
         sub_tokens = analysis["trading_tokens"][0] if analysis["trading_tokens"] else None
         decision, reason = evaluate_trade_opening(sub, {"CommandLine": sub}, {}, base_dir, conversation_id,
-                                                  env_hint_cmd=command_line, tokens=sub_tokens)
+                                                  env_hint_cmd=command_line, tokens=sub_tokens, runtime=runtime)
         # A risk-reducing sub-command that may not be auto-allowed on its own never rides on a gated opening (a
         # line without one keeps the trade gates' decision: `cd repo && <opening>` is judged as before)
         if decision == "allow" and (not analysis["all_safe"]
@@ -6436,7 +6511,7 @@ def _evaluate_shell_command(command_line: str, cwd: str, base_dir: str, conversa
 
 
 def evaluate_powershell_command(command: str, cwd: str, base_dir: str, conversation_id: Optional[str],
-                                depth: int = 0) -> Tuple[str, str]:
+                                depth: int = 0, runtime: Optional[str] = None) -> Tuple[str, str]:
     """(decision, reason) for a Claude Code PowerShell command, fail closed:
     1. scan_powershell (quotes, escapes, comments, nested bodies); unparseable text is denied;
     2. the whole command (bodies inlined): payload denials (encoded payloads, raw HTTP to Binance) and the backstop;
@@ -6460,24 +6535,25 @@ def evaluate_powershell_command(command: str, cwd: str, base_dir: str, conversat
         wsl_lines = _powershell_wsl_shell_commands(outer)
     except Exception as e:
         return fail(str(e))
-    results = [evaluate_shell_command(outer, cwd, base_dir, conversation_id, shell="powershell")]
+    results = [evaluate_shell_command(outer, cwd, base_dir, conversation_id, shell="powershell", runtime=runtime)]
     if results[0][0] == "deny":
         return results[0]
     if ps_deny:
         return "deny", ps_deny
     # wsl.exe without -e/--exec: the Linux default shell re-parses the joined arguments, judged as Bash
     for line in wsl_lines:
-        results.append(evaluate_shell_command(line, cwd, base_dir, conversation_id))
+        results.append(evaluate_shell_command(line, cwd, base_dir, conversation_id, runtime=runtime))
         if results[-1][0] == "deny":
             return results[-1]
     if ps_force_ask:
         results.append(("force_ask", ps_force_ask))
     if bodies:
-        whole = evaluate_shell_command(full, cwd, base_dir, conversation_id, shell="powershell")
+        whole = evaluate_shell_command(full, cwd, base_dir, conversation_id, shell="powershell", runtime=runtime)
         if whole[0] == "deny":
             return whole
         for body in bodies:
-            results.append(evaluate_powershell_command(body, cwd, base_dir, conversation_id, depth + 1))
+            results.append(evaluate_powershell_command(body, cwd, base_dir, conversation_id, depth + 1,
+                                                      runtime=runtime))
             if results[-1][0] == "deny":
                 return results[-1]
     decision, reason = max(results, key=lambda r: PS_DECISION_RANK.get(r[0], PS_DECISION_RANK["deny"]))
@@ -6500,6 +6576,7 @@ def evaluate_payload(payload: dict) -> Tuple[str, str, str]:
     if conversation_id is None and "toolCall" not in payload and isinstance(payload.get("session_id"), str):
         # Claude Code: the evaluator subagent transcript records the parent session as its sessionId
         conversation_id = payload["session_id"] or None
+    runtime = "agy" if "toolCall" in payload else "claude"  # recorded in the trading lease (issue #280)
 
     # ---------------------------------------------------------------- file writes
     if call["kind"] == "file_write":
@@ -6551,9 +6628,10 @@ def evaluate_payload(payload: dict) -> Tuple[str, str, str]:
         with _audit_scope():  # one work budget for every statement / body / wsl line of this command
             if call["shell"] == "powershell":
                 decision, reason = evaluate_powershell_command(call["command"], call["cwd"], base_dir,
-                                                               conversation_id)
+                                                               conversation_id, runtime=runtime)
             else:
-                decision, reason = evaluate_shell_command(call["command"], call["cwd"], base_dir, conversation_id)
+                decision, reason = evaluate_shell_command(call["command"], call["cwd"], base_dir, conversation_id,
+                                                          runtime=runtime)
         return decision, reason, tool_label
 
     # ---------------------------------------------------------------- anything else

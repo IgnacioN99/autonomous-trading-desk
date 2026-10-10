@@ -88,6 +88,7 @@ Whenever the user explicitly requests crypto trading operations, Binance Futures
      * The primary agent is **mechanically blocked** from placing orders directly in chat without prior clean-room evaluation.
      * Runtime hooks (`pre_trade_guard.py` in PreToolUse) and the executor require `logs/evaluations/latest_dossier.json` recorded with `record_evaluation.py --from-subagent` (provenance verified against the `isolated_market_evaluator` transcript), < 20 min old, approving the symbol AND direction.
      * If absent, the platform **denies tool execution outright**. Never write the dossier by hand; `--symbols` / `--json-file` are refused in PROD (TESTNET only).
+     * PROD: one session opens at a time (lease; `scripts/trading_lease.py --take` only if the user approves).
    - **Autonomous Immediate Execution Protocol (Fast-Track / Zero Latency):**
      * **Tier S** candidates (score ≥ 80, `requires_user_confirmation: false`) are executed without chat confirmation **only if** the profile enables `autonomous_execution_tier_s` and, with `require_calibrated_tier_s`, the score bucket is calibrated; otherwise ask the user.
      * Tier A+ / Tier A candidates (`requires_user_confirmation: true`) always need the user's explicit confirmation in chat.
