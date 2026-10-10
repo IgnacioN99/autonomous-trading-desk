@@ -148,7 +148,8 @@ def attach_recheck(record: dict, base_dir: Optional[str] = None, now_ts: Optiona
     `brief_generated_at_ts` equals the brief's `generated_at_ts` (issue #279: a dossier without that field is never
     linked). Never blocks recording; nothing is stored without a link. Returns a warning (the caller prints
     `Re-check: NOT LINKED (no verdict)`) when the brief is missing or unparseable, or is a re-check brief this
-    dossier is not linked to; None for a normal brief or a linked dossier."""
+    dossier is not linked to; None for a normal brief or a linked dossier (issue #298: a normal brief that replaced
+    this dossier's own brief is reported by brief_replaced_warning)."""
     path = os.path.join(base_dir or BASE_DIR, "logs", "primed_brief.json")
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -190,6 +191,27 @@ def attach_recheck(record: dict, base_dir: Optional[str] = None, now_ts: Optiona
     return None
 
 
+def brief_replaced_warning(record: dict, base_dir: Optional[str] = None) -> Optional[str]:
+    """Issue #298: a warning when logs/primed_brief.json is a normal brief whose generated_at_ts differs from this
+    dossier's brief_generated_at_ts (both present): another brief replaced the one the dossier was evaluated on before
+    it was recorded. The dossier itself does not say whether that brief was a --recheck brief, so the warning names
+    the consequence for a re-check (no verdict) without claiming it is one. None otherwise (also when the brief is
+    missing, unreadable or a re-check brief: attach_recheck reports those). Never raises."""
+    try:
+        with open(os.path.join(base_dir or BASE_DIR, "logs", "primed_brief.json"), "r", encoding="utf-8") as f:
+            brief = json.load(f)
+        if not isinstance(brief, dict) or isinstance(brief.get("recheck_of"), dict) or brief.get("recheck") is not None:
+            return None
+        raw = (record.get("raw_payload") or {}).get("brief_generated_at_ts")
+        if raw is None or brief.get("generated_at_ts") is None or int(raw) == int(brief["generated_at_ts"]):
+            return None
+    except Exception:
+        return None
+    return (f"logs/primed_brief.json (generated_at_ts {brief.get('generated_at_ts')}) is not the brief this dossier "
+            f"was evaluated on (brief_generated_at_ts {raw}): another brief replaced it before recording. If this "
+            "dossier answers a --recheck, it has no re-check verdict: ask the user again before executing")
+
+
 SESSION_DOSSIER_PRUNE_AFTER_S = 6 * 3600  # per-session files untouched for longer are deleted (best effort)
 
 
@@ -205,9 +227,48 @@ def _prune_session_dossiers(base: str, keep: str, now_ts: Optional[float] = None
             continue
 
 
-def _persist(record: dict, base_dir: Optional[str] = None, shadow: bool = True) -> str:
+def _superseded_approvals(session_file: Optional[str], record: dict, now_ts: int) -> list:
+    """Issue #298: approvals of the session's previous record (read before it is overwritten) that `record` does not
+    approve and that have not expired: [{symbol, direction, tier, valid_until_ts}]. Informational only (the
+    previous record is not verified here); [] when there is none or it is unreadable. Never raises."""
+    try:
+        if not session_file or not os.path.isfile(session_file):
+            return []
+        previous = dp.load_dossier(session_file)
+        valid_until = int(previous.get("valid_until_ts") or 0)
+        if str(previous.get("status") or "").upper() != "APPROVED" or valid_until <= now_ts:
+            return []
+        kept = {(str(c.get("symbol") or "").upper(), str(c.get("direction") or "").upper())
+                for c in record.get("approved_candidates") or [] if isinstance(c, dict)}
+        out = []
+        for c in previous.get("approved_candidates") or []:
+            if not isinstance(c, dict):
+                continue
+            key = (str(c.get("symbol") or "").upper(), str(c.get("direction") or "").upper())
+            if key[0] and key not in kept:
+                out.append({"symbol": key[0], "direction": key[1], "tier": c.get("tier"),
+                            "valid_until_ts": valid_until})
+        return out
+    except Exception:
+        return []
+
+
+def _recheck_candidate_fields(recheck_of) -> dict:
+    """Issue #298: {recheck_symbol, recheck_direction} of a re-check's `recheck_of` snapshot; {} when it is not a
+    re-check or either value is missing (the row then counts as an old row: every candidate of the original is
+    refused)."""
+    if not isinstance(recheck_of, dict):
+        return {}
+    sym, dirn = str(recheck_of.get("symbol") or "").strip().upper(), str(recheck_of.get("direction") or "").strip().upper()
+    return {"recheck_symbol": sym, "recheck_direction": dirn} if sym and dirn else {}
+
+
+def _persist(record: dict, base_dir: Optional[str] = None, shadow: bool = True,
+             superseded: Optional[list] = None) -> str:
     """Issue #270: writes the record to its session's file (dossier_<parent_conversation_id>.json, when the
-    session is known) and, as a full copy, to latest_dossier.json (the newest scan overall). Returns the latter."""
+    session is known) and, as a full copy, to latest_dossier.json (the newest scan overall). Returns the latter.
+    Issue #298: `superseded` (a list, when given) receives _superseded_approvals of the session's previous record;
+    the history row then carries `superseded_symbols` ("SYMBOL:DIRECTION", only when non-empty)."""
     base, dossier_file, history_file = _paths(base_dir)
     try:
         snapshots = build_radar_snapshots(record, base)
@@ -216,6 +277,9 @@ def _persist(record: dict, base_dir: Optional[str] = None, shadow: bool = True) 
     if snapshots is not None:
         record["radar_snapshots"] = snapshots
     session_file = dp.session_dossier_path(base, record.get("parent_conversation_id"))
+    dropped = _superseded_approvals(session_file, record, int(record.get("recorded_at_ts") or time.time()))
+    if superseded is not None:
+        superseded.extend(dropped)
     if session_file:
         atomic_write_json(session_file, record)
     atomic_write_json(dossier_file, record)
@@ -239,6 +303,11 @@ def _persist(record: dict, base_dir: Optional[str] = None, shadow: bool = True) 
         **({"recheck_of": (record.get("recheck_of") or {}).get("sha256"),
             "recheck_within_bounds": bool((record.get("recheck_bounds") or {}).get("within_bounds"))}
            if isinstance(record.get("recheck_of"), dict) else {}),
+        # Issue #298: the candidate this re-check consumed, from the verified plan of the brief (never the evaluator's
+        # answer, so a NEUTRAL / REJECTED re-check still names it); the per-candidate chain guard of recheck_brief
+        **_recheck_candidate_fields(record.get("recheck_of")),
+        # Issue #298: optional, only when the previous scan of the session had unexpired approvals this one dropped
+        **({"superseded_symbols": [f"{s['symbol']}:{s['direction']}" for s in dropped]} if dropped else {}),
     })
     if shadow:
         _register_shadow()
@@ -256,7 +325,8 @@ def _recheck_deadline(record: dict) -> Optional[int]:
 
 
 def _print_summary(record: dict, dossier_file: str, base: str, now_ts: int,
-                   recheck_not_linked: bool = False) -> None:
+                   recheck_not_linked: bool = False, superseded: Optional[list] = None,
+                   brief_replaced: bool = False) -> None:
     status = record.get("status")
     cands = record.get("approved_candidates") or []
     valid_until = int(record.get("valid_until_ts") or 0)
@@ -287,6 +357,12 @@ def _print_summary(record: dict, dossier_file: str, base: str, now_ts: int,
         print("   No trade authorized by this dossier.")
     if record.get("summary"):
         print(f"   Summary: {record['summary']}")
+    if superseded:  # issue #298: a newer scan never silently cancels the session's pending approvals
+        print("   Superseded approvals of the previous scan of this session (re-check with "
+              "`prime_evaluator_brief.py --recheck SYMBOL:DIRECTION` while still inside the window):")
+        for s in superseded:
+            print(f"     - {s.get('symbol')} {s.get('direction')} | tier={s.get('tier')} | valid until "
+                  f"{_fmt_utc(s.get('valid_until_ts') or 0, '%H:%M:%S UTC')}")
     old = record.get("recheck_of")
     if isinstance(old, dict):  # issue #267
         from utils import recheck_bounds as rb
@@ -304,6 +380,8 @@ def _print_summary(record: dict, dossier_file: str, base: str, now_ts: int,
               f"execute before {_fmt_utc(deadline, '%H:%M:%S UTC')} ({left // 60}m {left % 60:02d}s left)")
     elif recheck_not_linked:  # issue #279: never a silent missing verdict
         print("   Re-check: NOT LINKED (no verdict)")
+    elif brief_replaced:  # issue #298: not a re-check verdict line, the dossier may be a normal scan
+        print("   Brief replaced before recording: if this dossier answers a --recheck, there is no re-check verdict")
     prov = record.get("provenance") or {}
     if prov.get("source") in dp.SUBAGENT_SOURCES:
         runtime = "Claude Code" if prov.get("source") == dp.CLAUDE_SOURCE else "agy"
@@ -409,9 +487,14 @@ def _record_extracted(
     recheck_warning = attach_recheck(record, base, now_ts)
     if recheck_warning:
         print(f"⚠️ RE-CHECK NOT LINKED: {recheck_warning}", file=sys.stderr)
-    dossier_file = _persist(record, base, shadow=shadow)
+    replaced_warning = None if recheck_warning else brief_replaced_warning(record, base)
+    if replaced_warning:
+        print(f"⚠️ BRIEF REPLACED: {replaced_warning}", file=sys.stderr)
+    superseded: list = []
+    dossier_file = _persist(record, base, shadow=shadow, superseded=superseded)
     if verbose:
-        _print_summary(record, dossier_file, base, now_ts, recheck_not_linked=bool(recheck_warning))
+        _print_summary(record, dossier_file, base, now_ts, recheck_not_linked=bool(recheck_warning),
+                       superseded=superseded, brief_replaced=bool(replaced_warning))
     return record
 
 
@@ -458,8 +541,9 @@ def record_evaluation_dossier(
         "provenance": {"source": "manual_testnet"},
         "raw_payload": raw_payload or {},
     }
-    dossier_file = _persist(record, base, shadow=shadow)
-    _print_summary(record, dossier_file, base, now_ts)
+    superseded: list = []
+    dossier_file = _persist(record, base, shadow=shadow, superseded=superseded)
+    _print_summary(record, dossier_file, base, now_ts, superseded=superseded)
     return record
 
 

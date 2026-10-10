@@ -645,9 +645,11 @@ class TestRecorderRecheckLink(_RecheckWorkspace):
                     brief_bytes = f.read()
                 code, _, err = self.run_brief()
                 self.assertEqual(code, 2)
-                # Issue #284: the refusal names the session of the dossier that is already a re-check
-                self.assertIn(f"the dossier of session {record['parent_conversation_id']} is already a re-check: "
-                              "ask the user again or run a full scan", err)
+                # Issue #284: the refusal names the session of the dossier that is already a re-check; issue #298: and
+                # the requested candidate
+                self.assertIn(f"the dossier of session {record['parent_conversation_id']} is already a re-check and "
+                              f"cannot be re-checked for {SYMBOL} {DIRECTION}: ask the user again or run a full scan",
+                              err)
                 self.fetch.assert_not_called()
                 with open(self.brief_path, "rb") as f:
                     self.assertEqual(f.read(), brief_bytes)  # no new brief written
