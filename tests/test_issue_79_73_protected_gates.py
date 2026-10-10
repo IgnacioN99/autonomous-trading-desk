@@ -5,7 +5,8 @@ test_issue_79_73_protected_gates.py - Issues #79 and #73.
 #79: the gate-bearing modules (scripts/utils/gate_limits.py, scripts/execute_futures_trade.py,
 scripts/utils/portfolio_exposure.py, scripts/utils/env_resolver.py, scripts/user_profile.py) are harness files:
 agent writes from the file tools, Bash and PowerShell require explicit confirmation (force_ask) in the main
-checkout, linked worktrees keep a plain ask, reads and the risk-reducing executor calls keep their decision.
+checkout (a registered issue worktree allows them unless guard-defining, issue #307), reads and the
+risk-reducing executor calls keep their decision.
 #73: logs/hook_heartbeat.json is ground truth written only by the guard itself; the doctor validates the Claude
 Code PreToolUse matcher (.claude/settings.json / settings.local.json).
 
@@ -104,11 +105,15 @@ class TestGateModulesFileTools(t49.PowerShellHarness):
 
 
 class TestGateModulesLinkedWorktree(t148._Base):
+    # #307: gate modules the hook imports to take its decisions are guard-defining (WORKTREE_GUARD_DEFINING)
+    GUARD_DEFINING = ("scripts/utils/env_resolver.py", "scripts/utils/score_calibration.py",
+                      "scripts/utils/calibration_fallback.py", "scripts/user_profile.py")
 
-    def test_worktree_copies_keep_plain_ask_main_checkout_force_asks(self):
+    def test_worktree_copies_allowed_except_guard_defining_main_checkout_force_asks(self):
         for rel in GATE_MODULES:
             with self.subTest(rel=rel):
-                self.assertEqual(self.decision(os.path.join(self.wt, *rel.split("/")), "x = 1\n"), "ask")
+                expected = "force_ask" if rel in self.GUARD_DEFINING else "allow"
+                self.assertEqual(self.decision(os.path.join(self.wt, *rel.split("/")), "x = 1\n"), expected)
                 self.assertEqual(self.decision(os.path.join(self.repo, *rel.split("/")), "x = 1\n"), "force_ask")
 
 
