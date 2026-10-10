@@ -27,6 +27,21 @@ record_evaluation.py, and, issue #275, by --audit and --loop) turns recent event
 notional_usdt / risk_usdt when it could derive them), once per dossier_sha256 + symbol + direction (an event without
 a sha: env + symbol + direction + time window). Denials by the executor's own Gate 1 (live book) are not recorded.
 
+Score buckets (issue #265; advisory early signal for #202, never a gate input, fail-open): every row also carries
+radar_score (the brief's confidence), dossier_score (null on rejected rows), tier, is_yolo, score_schema_version (only
+from logs/primed_brief_scores.json when its generated_at_ts matches the brief's, else null), source ("rejected" |
+"approved_not_executed") and reason (null | "delta_denied" | "not_executed"). Approved-but-not-executed candidates:
+every recorder intake appends each APPROVED candidate to the shadow-owned append-only ledger
+logs/shadow_approved_ledger.jsonl (snapshot_approved_candidates, once per dossier sha256 + symbol + direction, also
+without a brief); sweep_approved_ledger (same intake and --audit; no network) registers the ones whose dossier
+expired and that left no order: no trades_audit.jsonl entry record and no pending_entries.json record carrying the
+sha, at the dossier's own timestamp_ts, gate APPROVED_NOT_EXECUTED, PROD dossiers only. LIMITATION: from disk only
+"delta_denied" (the hook's denial row) is certain; every other case is reason "not_executed" because declined, expired
+and entry_failed cannot be told apart (no subtypes are invented). A resting entry carrying the sha marks the ledger
+row processed (order_placed): it is never registered, also after a timeout-cancel. A candidate whose entry was placed
+and cancelled between two sweeps, with no audit record, can still register. These sweep rows are left out of FER,
+regret, the replay and calculate_efficacy_metrics (is_advisory_row); shadow_analytics reports them by score bucket.
+
 Resolution scheduling (issue #312):
   - AUTOMATIC: every position_guardian_loop.py cycle (not --dry-run, only with the real logs/ dir) runs a bounded
     audit_shadow_trades (guardian SHADOW_AUDIT_BUDGET_SECONDS / SHADOW_AUDIT_MAX_ROWS, at most every
@@ -70,7 +85,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from utils.atomic_writer import atomic_write_json, atomic_append_jsonl
 # Shared with shadow_analytics.py (issue #290), re-exported here: st.GATE_ENUM, st.row_gate, ... keep working
 from utils.shadow_common import (  # noqa: F401
-    GATE_ENUM, GATE_FALLBACK, POST_APPROVAL_GATE, BLOCKER_GATES, DEDUPE_WINDOW_SECONDS, row_gate, gate_event_key)
+    GATE_ENUM, GATE_FALLBACK, POST_APPROVAL_GATE, BLOCKER_GATES, DEDUPE_WINDOW_SECONDS, row_gate, gate_event_key,
+    SOURCE_REJECTED, SOURCE_APPROVED_NOT_EXECUTED, NOT_EXECUTED_REASONS, NOT_EXECUTED_GATE, is_advisory_row)
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOGS_DIR = os.path.join(BASE_DIR, "logs")
@@ -84,6 +100,8 @@ TRADES_AUDIT_FILE = os.path.join(LOGS_DIR, "trades_audit.jsonl")
 GATE_DENIALS_FILE = os.path.join(LOGS_DIR, "gate_denials.jsonl")
 
 # GATE_ENUM, GATE_FALLBACK, POST_APPROVAL_GATE, BLOCKER_GATES, DEDUPE_WINDOW_SECONDS: utils/shadow_common.py
+APPROVED_LEDGER_FILE_NAME = "shadow_approved_ledger.jsonl"  # issue #265, beside SHADOW_TRADES_FILE (call-time path)
+SCORES_SIDECAR_FILE_NAME = "primed_brief_scores.json"       # read-only, beside BRIEF_FILE
 GATE_DETAIL_MAX_CHARS = 300
 GATE_DENIAL_MAX_AGE_SECONDS = 86400  # older events would expire at once in the kline audit (24 h)
 GATE_DENIAL_TAIL_LINES = 500
@@ -471,7 +489,10 @@ def _register_gate_denial(ev, now_ts: int, seen: set, stats: Optional[dict] = No
              "book_source": str(ev.get("source") or "session_state_cache"),
              "gate_event_env": env, "delta_bias_at_denial": ev.get("delta_bias"),
              "net_notional_delta_usdt_at_denial": net, "session_state_age_seconds": _to_float(ev.get("age_seconds")),
-             "tier": ev.get("tier"), "is_yolo": ev.get("is_yolo")}
+             "tier": ev.get("tier"), "is_yolo": ev.get("is_yolo"),
+             # issue #265: the hook's event carries the dossier score only (no radar snapshot)
+             "radar_score": None, "dossier_score": _to_float(ev.get("score")), "score_schema_version": None,
+             "source": SOURCE_APPROVED_NOT_EXECUTED, "reason": "delta_denied"}
     if ev.get("book_truncated"):
         extra["book_truncated"] = True
     if ev.get("book_error"):
@@ -547,11 +568,237 @@ def _gate_denials_note(stats: dict) -> str:
         note += f", gate_denials unreadable ({stats['gate_denials_error']})"
     return note
 
+def approved_ledger_path() -> str:
+    """logs/shadow_approved_ledger.jsonl (issue #265), beside SHADOW_TRADES_FILE (resolved at call time)."""
+    return os.path.join(os.path.dirname(SHADOW_TRADES_FILE), APPROVED_LEDGER_FILE_NAME)
+
+
+def _read_json_dict(path: str) -> dict:
+    """The JSON object at path; {} when missing, unreadable or not an object. Never raises."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _norm_dir(value) -> str:
+    return str(value or "").upper().strip()
+
+
+def _int_or_none(value) -> Optional[int]:
+    f = _to_float(value)
+    return int(f) if f is not None else None
+
+
+def _sidecar_schema_versions(brief_data: dict) -> Dict[tuple, int]:
+    """{(SYMBOL, DIRECTION): score_schema_version} of logs/primed_brief_scores.json (beside BRIEF_FILE), only when
+    its generated_at_ts equals the brief's (the replaced-brief guard); {} otherwise. Never raises."""
+    try:
+        data = _read_json_dict(os.path.join(os.path.dirname(os.path.abspath(BRIEF_FILE)), SCORES_SIDECAR_FILE_NAME))
+        gen, brief_gen = _int_or_none(data.get("generated_at_ts")), _int_or_none(brief_data.get("generated_at_ts"))
+        if gen is None or brief_gen is None or gen != brief_gen or not isinstance(data.get("rows"), list):
+            return {}
+        out = {}
+        for r in data["rows"]:
+            v = r.get("score_schema_version") if isinstance(r, dict) else None
+            if isinstance(v, int) and not isinstance(v, bool):
+                out.setdefault((str(r.get("symbol") or "").upper(), _norm_dir(r.get("direction"))), v)
+        return out
+    except Exception:
+        return {}
+
+
+def snapshot_approved_candidates(dossier_data: dict) -> int:
+    """Issue #265: appends to logs/shadow_approved_ledger.jsonl one row per APPROVED candidate of the recorded dossier
+    ({sha, symbol, direction, timestamp_ts, valid_until_ts, entry, stop_loss, tp1, tp2, score, tier, is_yolo,
+    target_env, radar_score, score_schema_version}), idempotent per (dossier sha256, symbol, direction). Needs the
+    dossier's provenance sha256, timestamp_ts and valid_until_ts (else nothing is written). Returns the rows
+    appended; fail-open (never raises, never blocks the recorder)."""
+    try:
+        if str(dossier_data.get("status") or "").upper() != "APPROVED":
+            return 0
+        prov = dossier_data.get("provenance") if isinstance(dossier_data.get("provenance"), dict) else {}
+        sha = prov.get("sha256") if isinstance(prov.get("sha256"), str) and prov.get("sha256") else None
+        ts, valid_until = _to_float(dossier_data.get("timestamp_ts")), _to_float(dossier_data.get("valid_until_ts"))
+        cands = [c for c in dossier_data.get("approved_candidates") or [] if isinstance(c, dict)]
+        if sha is None or not ts or ts <= 0 or not valid_until or valid_until <= ts or not cands:
+            return 0
+        raw = dossier_data.get("raw_payload") if isinstance(dossier_data.get("raw_payload"), dict) else {}
+        env = _env_name(dossier_data.get("target_env") or raw.get("target_env"))
+        snaps = dossier_data.get("radar_snapshots") if isinstance(dossier_data.get("radar_snapshots"), dict) else {}
+        path = approved_ledger_path()
+        have = {(r.get("sha"), r.get("symbol"), r.get("direction")) for r in load_jsonl(path)
+                if isinstance(r, dict) and not r.get("event")}
+        added = 0
+        for c in cands:
+            sym, direction = str(c.get("symbol") or "").upper().strip(), _norm_dir(c.get("direction"))
+            if not sym or direction not in ("LONG", "SHORT") or (sha, sym, direction) in have:
+                continue
+            snap = (snaps.get(f"{sym}|{direction}") or {}).get("radar_snapshot") if isinstance(
+                snaps.get(f"{sym}|{direction}"), dict) else None
+            snap = snap if isinstance(snap, dict) else {}
+            version = snap.get("score_schema_version")
+            atomic_append_jsonl(path, {
+                "sha": sha, "symbol": sym, "direction": direction, "timestamp_ts": int(ts),
+                "valid_until_ts": int(valid_until), "entry": _to_float(c.get("entry")),
+                "stop_loss": _to_float(c.get("stop_loss")), "tp1": _to_float(c.get("tp1")),
+                "tp2": _to_float(c.get("tp2")), "score": _to_float(c.get("score")), "tier": c.get("tier"),
+                "is_yolo": bool(c.get("is_yolo")), "target_env": env or None,
+                "radar_score": _to_float(snap.get("confidence")),
+                "score_schema_version": version if isinstance(version, int) and not isinstance(version, bool) else None,
+                "recorded_at_ts": int(time.time())})
+            have.add((sha, sym, direction))
+            added += 1
+        return added
+    except Exception:
+        return 0
+
+
+def _ledger_mark(path: str, row: dict, state: str, now_ts: int) -> None:
+    """Appends the processed mark of a ledger row (append-only: the sweep never rewrites the ledger)."""
+    atomic_append_jsonl(path, {"event": "processed", "sha": row.get("sha"), "symbol": row.get("symbol"),
+                               "direction": row.get("direction"), "state": state, "ts": now_ts})
+
+
+def sweep_approved_ledger(now_ts: Optional[int] = None, stats: Optional[dict] = None) -> int:
+    """Issue #265: registers as source "approved_not_executed" shadow rows the ledger's approved candidates whose
+    dossier expired (valid_until_ts past) and that left no trace of an order: no logs/trades_audit.jsonl entry record
+    and no logs/pending_entries.json record that carries the dossier sha256 (score_meta.dossier_sha256) or is for the
+    same symbol and direction (same env when the record names one) at or after the dossier's timestamp_ts: a rescan
+    re-approves the candidate under a newer sha and the executor uses the newest, so the sha alone would miss the
+    trade (over-suppression is the safe direction; the registry is read before the audit). INFERENCE ONLY: the reason is "not_executed" because declined, expired and
+    entry_failed cannot be told apart from disk (the hook's delta_denied rows come from register_from_gate_denials,
+    which wins the (sha, symbol, direction) key). Each ledger row ends in exactly one processed mark: "registered",
+    "deduped" (register_shadow_trade refused it), "executed" (an audit record exists), "order_placed" (a resting entry
+    carrying the sha exists or existed when the sweep ran: it may still fill, and a later timeout-cancel must not
+    register it), "not_prod" or "no_prices". There is no age cutoff: the kline audit replays old rows from their
+    registration time, so a candidate found after a weekend gap is still registered. A candidate whose dossier is still valid and has no order yet stays unprocessed. Late rows are registered at the
+    dossier's timestamp_ts (the kline audit starts there; dedupe_ref_ts = the same). Unreadable audit / registry:
+    nothing is registered (uncertain). Returns the rows registered; stats receives "approved_not_executed". Never
+    raises, no network."""
+    try:
+        path = approved_ledger_path()
+        rows = load_jsonl(path)
+        if not rows:
+            return 0
+        now = int(time.time()) if now_ts is None else int(now_ts)
+        done = {(r.get("sha"), r.get("symbol"), r.get("direction")) for r in rows
+                if isinstance(r, dict) and r.get("event") == "processed"}
+        todo = [r for r in rows if isinstance(r, dict) and not r.get("event") and isinstance(r.get("sha"), str)
+                and (r.get("sha"), r.get("symbol"), r.get("direction")) not in done]
+        if not todo:
+            return 0
+        # (sha, symbol, direction, env, time) of each record; the registry is read FIRST and the audit second, so a fill
+        # between the two reads (pending popped, audit appended) is always seen in the audit
+        resting = []
+        if os.path.exists(PENDING_ENTRIES_FILE):
+            with open(PENDING_ENTRIES_FILE, "r", encoding="utf-8") as f:
+                reg = json.load(f)
+            if not isinstance(reg, dict) or not isinstance(reg.get("entries"), dict):
+                return 0
+            for rec in reg["entries"].values():
+                if not isinstance(rec, dict):
+                    continue
+                meta = rec.get("score_meta") if isinstance(rec.get("score_meta"), dict) else {}
+                resting.append((meta.get("dossier_sha256"), _norm_dir(rec.get("symbol")), _norm_dir(rec.get("direction")),
+                                _env_name(rec.get("target_env")), _to_float(rec.get("placed_at_ts"))))
+        traded = []
+        if os.path.exists(TRADES_AUDIT_FILE):
+            with open(TRADES_AUDIT_FILE, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(rec, dict) and not rec.get("event"):
+                        traded.append((rec.get("dossier_sha256"), _norm_dir(rec.get("symbol")),
+                                       _norm_dir(rec.get("direction")), _env_name(rec.get("target_env")),
+                                       _to_float(rec.get("timestamp"))))
+    except Exception:
+        return 0
+
+    def traced(records, r) -> bool:
+        """A record of this candidate: its own dossier sha, or the same symbol + direction (and env, when the record
+        names one) at or after the dossier's time (a rescan's newer dossier is the one the executor uses). A record
+        without a usable time counts (over-suppression is the safe direction)."""
+        ts, env = _to_float(r.get("timestamp_ts")), _env_name(r.get("target_env"))
+        for sha, sym, direction, rec_env, rec_ts in records:
+            if sha == r["sha"] and sym == r.get("symbol") and direction == r.get("direction"):
+                return True
+            if (sym == r.get("symbol") and direction == r.get("direction") and (not rec_env or rec_env == env)
+                    and (rec_ts is None or ts is None or rec_ts >= ts)):
+                return True
+        return False
+
+    registered = 0
+    for r in todo:
+        try:
+            if traced(traded, r):
+                _ledger_mark(path, r, "executed", now)
+                continue
+            if traced(resting, r):
+                _ledger_mark(path, r, "order_placed", now)
+                continue
+            valid_until, ts = _to_float(r.get("valid_until_ts")), _to_float(r.get("timestamp_ts"))
+            if valid_until is None or ts is None or now <= valid_until:
+                continue
+            if _env_name(r.get("target_env")) != "prod":
+                _ledger_mark(path, r, "not_prod", now)
+                continue
+            prices = [_to_float(r.get(k)) for k in ("entry", "stop_loss", "tp1", "tp2")]
+            if any(p is None or p <= 0 for p in prices):
+                _ledger_mark(path, r, "no_prices", now)
+                continue
+            entry, sl, tp1, tp2 = prices
+            detail = ("approved by the dossier, no order or fill found after it expired (declined, expired or entry "
+                      "failed: not distinguishable from disk)")
+            res = register_shadow_trade(
+                symbol=r["symbol"], direction=r["direction"], trigger_price=entry, sl_price=sl, tp1_price=tp1,
+                tp2_price=tp2, current_price=entry,
+                rejection_reason=f"[{NOT_EXECUTED_GATE}] {detail}"[:GATE_DETAIL_MAX_CHARS],
+                rejection_category=NOT_EXECUTED_GATE, gate=NOT_EXECUTED_GATE, gate_detail=detail,
+                gate_source="approved_ledger", score=_to_float(r.get("score")), dossier_sha256=r["sha"],
+                extra={"radar_score": _to_float(r.get("radar_score")), "dossier_score": _to_float(r.get("score")),
+                       "tier": r.get("tier"), "is_yolo": r.get("is_yolo") is True,
+                       "score_schema_version": r.get("score_schema_version"),
+                       "source": SOURCE_APPROVED_NOT_EXECUTED, "reason": NOT_EXECUTED_REASONS[1],
+                       "target_env": "prod", "approved_valid_until_ts": int(valid_until)},
+                registered_at_ts=int(ts), stats=stats, dedupe_ref_ts=ts)
+            _ledger_mark(path, r, "registered" if res else "deduped", now)
+            if res:
+                registered += 1
+        except Exception:
+            continue
+    if registered and stats is not None:
+        stats["approved_not_executed"] = stats.get("approved_not_executed", 0) + registered
+    return registered
+
+
 def register_from_evaluation(stats: Optional[dict] = None) -> int:
     """Reads latest evaluation brief and dossier, auto-registering rejected setups, and first the hook's recent
     delta-gate denials of approved candidates (register_from_gate_denials, issue #261; also without a brief).
-    stats: optional dict that receives the "deduped_window" count (issue #262, register_shadow_trade)."""
+    Issue #265: then, also without a brief, it snapshots the dossier's approved candidates into the ledger and sweeps
+    the expired ones that left no order (snapshot_approved_candidates, sweep_approved_ledger).
+    stats: optional dict that receives the "deduped_window" count (issue #262, register_shadow_trade) and the
+    "approved_not_executed" count."""
     registered_count = register_from_gate_denials(stats=stats)
+
+    # Latest dossier: which candidates were rejected or approved
+    dossier_data = {}
+    if os.path.exists(DOSSIER_FILE):
+        try:
+            with open(DOSSIER_FILE, "r", encoding="utf-8") as f:
+                dossier_data = json.load(f)
+        except Exception:
+            pass
+    if not isinstance(dossier_data, dict):
+        dossier_data = {}
+
+    # Issue #265: advisory approved-but-not-executed intake, independent of the brief; fail-open
+    snapshot_approved_candidates(dossier_data)
+    registered_count += sweep_approved_ledger(stats=stats)
 
     # 1. Read candidates from primed brief
     brief_data = {}
@@ -566,15 +813,7 @@ def register_from_evaluation(stats: Optional[dict] = None) -> int:
     if not opps:
         return registered_count
 
-    # 2. Check latest dossier to see which were rejected or if all were rejected
-    dossier_data = {}
-    if os.path.exists(DOSSIER_FILE):
-        try:
-            with open(DOSSIER_FILE, "r", encoding="utf-8") as f:
-                dossier_data = json.load(f)
-        except Exception:
-            pass
-
+    schema_versions = _sidecar_schema_versions(brief_data)
     approved_symbols = set(dossier_data.get("approved_symbols", []))
     dossier_status = dossier_data.get("status", "").upper()
 
@@ -621,6 +860,12 @@ def register_from_evaluation(stats: Optional[dict] = None) -> int:
                 flags = typed_flags
             if flags:
                 extra["gate_flags"] = flags
+            # Issue #265: the brief's radar score and tier on every rejected row (dossier_score: a rejected candidate
+            # has none); score_schema_version only from the sidecar of the same brief
+            extra.update(radar_score=_to_float(o.get("confidence")), dossier_score=None,
+                         tier=o.get("tier_code") or o.get("tier"), is_yolo=o.get("is_yolo") is True,
+                         score_schema_version=schema_versions.get((sym, direction)),
+                         source=SOURCE_REJECTED, reason=None)
             if _to_float(o.get("notional_usdt")):
                 extra["notional_usdt"] = _to_float(o.get("notional_usdt"))
             if gate in BLOCKER_GATES:
@@ -1064,9 +1309,11 @@ def largest_risk_rows(rows: List[dict], n: int = 3) -> List[dict]:
              "status": r.get("status"), "classification": r.get("classification")} for r in sized[:n]]
 
 def calculate_efficacy_metrics(rolling_window: int = ROLLING_WINDOW_SIZE) -> dict:
-    """Calculates Filter Efficacy Ratio (FER) all-time, clean intraday (<=4h), and rolling window."""
-    resolved = load_jsonl(SHADOW_RESOLVED_FILE)
-    active = load_jsonl(SHADOW_TRADES_FILE)
+    """Calculates Filter Efficacy Ratio (FER) all-time, clean intraday (<=4h), and rolling window. Issue #265:
+    approved-but-not-executed rows of the ledger sweep (is_advisory_row) are not filter decisions and are left out of
+    every figure here (they are reported by shadow_analytics.run_score_bucket_analysis)."""
+    resolved = [r for r in load_jsonl(SHADOW_RESOLVED_FILE) if not is_advisory_row(r)]
+    active = [r for r in load_jsonl(SHADOW_TRADES_FILE) if not is_advisory_row(r)]
 
     # 1. All-time global metrics
     tn_count = sum(1 for r in resolved if r.get("classification") == "TRUE_NEGATIVE")
@@ -1207,7 +1454,8 @@ def _register_and_print() -> int:
     stats = {"deduped_window": 0}
     count = register_from_evaluation(stats)
     print(f"📥 Registered {count} candidate(s) into shadow ledger (deduped_window {stats['deduped_window']}: "
-          f"same symbol/direction/gate within {DEDUPE_WINDOW_SECONDS} s; {_gate_denials_note(stats)}).")
+          f"same symbol/direction/gate within {DEDUPE_WINDOW_SECONDS} s; {_gate_denials_note(stats)}; "
+          f"approved-but-not-executed {stats.get('approved_not_executed', 0)}).")
     return count
 
 
@@ -1218,7 +1466,11 @@ def _register_gate_denials_and_print(stream=None) -> int:
     count = register_from_gate_denials(stats=stats)
     print(f"📥 Registered {count} hook gate denial(s) into shadow ledger ({_gate_denials_note(stats)}).",
           file=stream or sys.stdout)
-    return count
+    swept = sweep_approved_ledger(stats=stats)  # issue #265: expired approved candidates without an order
+    if swept:
+        print(f"📥 Registered {swept} approved-but-not-executed candidate(s) into shadow ledger (inferred from the "
+              f"absence of an order: reason not_executed).", file=stream or sys.stdout)
+    return count + swept
 
 
 def main():

@@ -27,7 +27,11 @@ open / fills_unavailable rows and rows without realized R are excluded and count
 5. Meta-improver: below MIN_SAMPLE resolved trades only an insufficient-sample line; above it R-based data notes only
    (never instructions: any change needs the user's explicit decision). The profit-factor note needs net R on every
    resolved row (no gross fallback).
-6. Shadow desk counterfactual metrics (best effort; an error is reported, never raised).
+6. Shadow desk counterfactual metrics (best effort; an error is reported, never raised). Issue #265: the TOP-LEVEL
+   "shadow_score_buckets" block (simulated: true, from logs/shadow_resolved.jsonl, never written to the calibration
+   store and never a gate input) gives shadow n / hit rate / mean gross R with a bootstrap CI per dossier-score bucket
+   next to this run's real PROD n / mean net R, plus a radar-score view of the rows without a dossier score; an advisory
+   early signal for #202 whose simulation bias (fill at the trigger, no fees) the real column shows.
 7. Fees (issue #268, new top-level keys over the resolved trades): "fees" (total / mean fees_r, rows with and
    without it: older rows and non-USDT commissions such as a BNB discount have none), "fees_by_stop_bucket" (stop
    distance <1.5, 1.5-2, 2-3, 3-4, >=4 % of the entry; stop_distance_pct, else initial_risk / entry_price),
@@ -455,6 +459,30 @@ def _shadow_delta_regret():
         return {"error": f"{type(e).__name__}: {e}"}
 
 
+def _shadow_score_buckets(store):
+    """Issue #265: SIMULATED shadow outcomes by score bucket (shadow_analytics.run_score_bucket_analysis over
+    logs/shadow_resolved.jsonl), compact, beside the real PROD columns of `store` (this run's calibration store; n / mean
+    net R, None without one). Advisory early signal for #202: never written to the store and never a gate input. Never
+    raises (an error is returned as {"simulated": True, "error"})."""
+    try:
+        import shadow_analytics as sa
+        rep = sa.run_score_bucket_analysis(sa.load_jsonl(os.path.join(_logs_dir(), "shadow_resolved.jsonl")),
+                                           store if isinstance(store, dict) else None)
+        keys = ("n", "hit_rate", "mean_r", "ci95_low", "ci95_high", "insufficient_sample")
+        views = {}
+        for name, view in rep["views"].items():
+            views[name] = {"buckets": [dict({"bucket": b["bucket"]}, **{k: b[k] for k in keys},
+                                            by_source={s: x["n"] for s, x in b["by_source"].items()},
+                                            real=b["real"]) for b in view["buckets"]],
+                           "unscored": view["unscored"], "out_of_range": view["out_of_range"],
+                           "yolo_excluded": view["yolo_excluded"]}
+        return {"simulated": True, "basis": "shadow_resolved.jsonl, gross R (fill at the trigger, no fees or slippage)",
+                "min_sample": rep["min_sample"], "resolved_rows": rep["rows"], "real_store": rep["real_store"],
+                "views": views, "warnings": rep["warnings"]}
+    except Exception as e:
+        return {"simulated": True, "error": f"{type(e).__name__}: {e}"}
+
+
 def generate_scorecard(env, outcomes_path=None, now=None, write_calibration=False) -> dict:
     """write_calibration (the CLI): persist the merged logs/score_calibration.json when the run has PROD rows and
     the outcomes file is the workspace's logs/trade_outcomes.jsonl (never a custom --outcomes path)."""
@@ -542,6 +570,7 @@ def generate_scorecard(env, outcomes_path=None, now=None, write_calibration=Fals
                                             gross_fallback),
         "warnings": warnings,
         "shadow": _shadow(),
+        "shadow_score_buckets": _shadow_score_buckets(store),
     }
 
 
@@ -673,6 +702,26 @@ def format_scorecard_report(sc: dict) -> str:
                          f"n={dr['n']} | n_clusters={dr['n_clusters']} | unresolved blockers "
                          f"{dr['blocker_unresolved']}{' | insufficient_sample' if dr['insufficient_sample'] else ''} "
                          f"(scripts/shadow_analytics.py)")
+
+    ssb = sc.get("shadow_score_buckets")
+    if ssb and "error" in ssb:
+        lines.append("-" * 70)
+        lines.append(f"🎚️ SHADOW SCORE BUCKETS unavailable: {ssb['error']}")
+    elif ssb and ssb.get("resolved_rows"):
+        lines.append("-" * 70)
+        lines.append("🎚️ SHADOW SCORE BUCKETS (SIMULATED gross R, advisory early signal for #202, never a gate input; "
+                     "dossier score; real PROD column = net R of closed trades):")
+        for b in ssb["views"]["dossier_score"]["buckets"]:
+            real = b.get("real")
+            real_txt = "real n/a (no store)" if real is None else (
+                f"real n={real['n']} net {_fmt(real['expectancy_r_net'], '+.3f')}R")
+            ci = "-" if b["ci95_low"] is None else f"[{b['ci95_low']:+.3f}, {b['ci95_high']:+.3f}]"
+            lines.append(f"  - {b['bucket']}: shadow n={b['n']} | hit {_fmt(b['hit_rate'] * 100 if b['hit_rate'] is not None else None, '.1f')}% | "
+                         f"mean {_fmt(b['mean_r'], '+.3f')}R 95% CI {ci}"
+                         f"{' | insufficient_sample' if b['insufficient_sample'] else ''} | {real_txt}")
+        v = ssb["views"]["dossier_score"]
+        lines.append(f"  unscored: {v['unscored']} | out of range: {v['out_of_range']} | YOLO excluded: "
+                     f"{v['yolo_excluded']} (scripts/shadow_analytics.py has the radar-score view, source and gate splits)")
 
     lines.append("=" * 70)
     return "\n".join(lines)

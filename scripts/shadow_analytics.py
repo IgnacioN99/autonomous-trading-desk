@@ -36,6 +36,15 @@ Delta-gate opportunity cost (issue #251; report-only, read-only: it never writes
   equity_source session_state or primed_brief) when it could derive it, else derived at the default
   target_dollar_risk (rows without an equity source, counted notional_derived_default); a row with a
   truncated book, or a snapshot error and an empty book, is not replayed (skipped no_book).
+Score buckets (issue #265; SIMULATED, advisory early signal for #202, never a gate input; read-only):
+  6. run_score_bucket_analysis: resolved rows by dossier_score bucket (score_calibration.BUCKET_LABELS 55-64 ... 90-95,
+     plus unscored and out_of_range; YOLO rows excluded) with n, hit rate (TP1 before SL), mean gross R with a cluster
+     bootstrap CI (EXPIRED = 0 R), MFE / MAE, insufficient_sample below MIN_SAMPLE, split by source (rejected |
+     approved_not_executed) and by gate, next to the real PROD n / mean net R of logs/score_calibration.json (n/a without
+     a store) to show the simulation bias; a second view keys rows without a dossier score on their radar score.
+     approved_not_executed rows (shadow_tracker's ledger sweep; reason not_executed is inferred from the absence of an
+     order, only delta_denied is certain) are left out of 1-5 above (shadow_common.is_advisory_row); --json adds the
+     "score_buckets" key.
 Data freshness (issue #312): the report starts with "Last shadow audit: <UTC> (<age>)" (or "never") from
 logs/shadow_state.json, the heartbeat shadow_tracker's audit writes (bounded each guardian cycle, whole backlog with
 shadow_tracker.py --audit), and the 3 rows with the largest target_dollar_risk (USDT totals mix row sizes; R does not);
@@ -60,7 +69,9 @@ from typing import List, Dict, Any, Optional
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from utils.portfolio_exposure import LONG_HEAVY, SHORT_HEAVY, book_exposure, project_order
 from utils.shadow_common import (  # not shadow_tracker: no import coupling (#290)
-    DEDUPE_WINDOW_SECONDS, POST_APPROVAL_GATE, row_gate)
+    DEDUPE_WINDOW_SECONDS, POST_APPROVAL_GATE, row_gate, is_advisory_row, SOURCE_REJECTED,
+    SOURCE_APPROVED_NOT_EXECUTED)
+from utils import score_calibration as scal  # read only (issue #265: the real PROD bucket columns)
 
 RESOLVED_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "logs", "shadow_resolved.jsonl"))
 TRADES_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "logs", "shadow_trades.jsonl"))
@@ -157,8 +168,15 @@ def largest_risk_note(rows: List[Dict[str, Any]], n: int = 3) -> str:
     return ("Largest target_dollar_risk rows (USDT totals mix row sizes, R does not): "
             + ", ".join(f"{r.get('id')} {r.get('symbol')} ${_num(r.get('target_dollar_risk')):g}" for r in sized))
 
+def _filter_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The rows that are filter decisions: without the approved-but-not-executed rows of the ledger sweep (issue #265,
+    is_advisory_row), which only the score-bucket report reads."""
+    return [r for r in rows if not is_advisory_row(r)]
+
+
 def run_calibration_analysis(resolved: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Analyzes win/loss rates across different vol_ratio buckets."""
+    resolved = _filter_rows(resolved)
     buckets = {
         "<= 0.2x (Extreme Illiquidity)": {"total": 0, "tn": 0, "fn": 0, "saved": 0.0, "missed": 0.0},
         "0.21x - 0.5x (Thin Volume)": {"total": 0, "tn": 0, "fn": 0, "saved": 0.0, "missed": 0.0},
@@ -205,7 +223,8 @@ def run_calibration_analysis(resolved: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 def run_alpha_leakage_analysis(resolved: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Deep forensic inspection of False Negatives (missed TP1s)."""
-    fns = [r for r in resolved if r.get("classification") == "FALSE_NEGATIVE"]
+    resolved = _filter_rows(resolved)
+    fns =[r for r in resolved if r.get("classification") == "FALSE_NEGATIVE"]
     leakage = []
     for r in fns:
         leakage.append({
@@ -223,7 +242,8 @@ def run_alpha_leakage_analysis(resolved: List[Dict[str, Any]]) -> List[Dict[str,
 
 def run_dodge_audit(resolved: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Deep forensic inspection of True Negatives (avoided losses / dodged bullets)."""
-    tns = [r for r in resolved if r.get("classification") == "TRUE_NEGATIVE"]
+    resolved = _filter_rows(resolved)
+    tns =[r for r in resolved if r.get("classification") == "TRUE_NEGATIVE"]
     dodges = []
     for r in tns:
         dodges.append({
@@ -242,6 +262,7 @@ def run_dodge_audit(resolved: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 def run_intraday_hygiene_audit(resolved: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Segregates trades by holding horizon (<=4h intraday vs >4h drift vs timeouts)."""
+    resolved = _filter_rows(resolved)
     intraday = []
     drift = []
     timeouts = []
@@ -419,7 +440,7 @@ def regret_pairs(resolved: List[Dict[str, Any]], index: Dict[str, Any],
     pairs = []
     counts = {"rows": 0, "no_shadow_r": 0, "no_blockers": 0, "blockers_error": 0, "expired_blocked_rows": 0,
               "blocker_unresolved": 0}
-    rows = [r for r in resolved if row_gate(r)[0] in REGRET_GATES]
+    rows = [r for r in _filter_rows(resolved) if row_gate(r)[0] in REGRET_GATES]
     for r, cluster in zip(rows, row_clusters(rows)):
         gate, _source = row_gate(r)
         counts["rows"] += 1
@@ -521,6 +542,155 @@ def regret_report(resolved: List[Dict[str, Any]], guardian_actions: List[Dict[st
     }
 
 
+# ------------------------------------------------------------------ score buckets (issue #265)
+
+SIMULATED_NOTE = ("SIMULATED, advisory early signal for #202, never a gate input: shadow R is GROSS (fill at the trigger, "
+                  "SL -1R, TP1 +1.8R, 5m kline replay, no fees or slippage) next to the real column, which is NET R of "
+                  "real PROD trades (logs/score_calibration.json); the gap shows the simulation bias. Selection bias: "
+                  "rejected rows are not a random sample and approved_not_executed rows skew toward what the user "
+                  "declines.")
+NOT_EXECUTED_NOTE = ("approved_not_executed rows are inferred from the absence of an order: only delta_denied (the hook's "
+                     "denial) is certain; declined, expired and entry_failed cannot be told apart from disk and are all "
+                     "not_executed.")
+
+
+def run_score_bucket_analysis(resolved: List[Dict[str, Any]], calibration: Optional[Dict[str, Any]] = None,
+                              resamples: int = DEFAULT_RESAMPLES, seed: int = DEFAULT_SEED) -> Dict[str, Any]:
+    """Issue #265, report only (read-only, simulated): resolved shadow rows by score bucket, with the buckets of the
+    real store (scal.BUCKET_LABELS: 55-64, 65-74, 75-79, 80-89, 90-95) plus unscored (no usable score; every row
+    written before #265 and every rejected row in the dossier view) and out_of_range. Two views: "dossier_score"
+    (compared with the real PROD store, `calibration` = scal.load_calibration's dict or None: real n / mean net R, None
+    without a store) and "radar_score" (rows without a dossier score, keyed on the brief's radar score). YOLO rows are
+    counted (yolo_excluded) and kept out of the buckets. Per bucket: n (rows with a shadow R; EXPIRED rows count 0 R),
+    mean R with a seeded cluster bootstrap CI (bootstrap_mean_ci), hit_rate = TP1 before SL over the conclusive rows,
+    mean MFE / MAE of the triggered rows, insufficient_sample below MIN_SAMPLE, and the same figures split by source
+    and by gate. Nothing here reads or writes a gate input."""
+    rows = [r for r in resolved if isinstance(r, dict)]
+    return {"simulated": True, "min_sample": MIN_SAMPLE, "rows": len(rows),
+            "real_store": isinstance(calibration, dict) and isinstance(calibration.get("buckets"), dict),
+            "views": {"dossier_score": _score_view(rows, "dossier_score", calibration, resamples, seed),
+                      "radar_score": _score_view([r for r in rows if _num(r.get("dossier_score")) is None],
+                                                 "radar_score", None, resamples, seed)},
+            "warnings": [SIMULATED_NOTE, NOT_EXECUTED_NOTE]}
+
+
+def _score_view(rows: List[Dict[str, Any]], field: str, calibration: Optional[Dict[str, Any]], resamples: int,
+                seed: int) -> Dict[str, Any]:
+    groups: Dict[str, List[Dict[str, Any]]] = {label: [] for label in scal.BUCKET_LABELS}
+    unscored = out_of_range = yolo = 0
+    for r in rows:
+        if r.get("is_yolo") is True:
+            yolo += 1
+            continue
+        value = _num(r.get(field))
+        if value is None:
+            unscored += 1
+            continue
+        label = scal.bucket_for(value)
+        if label is None:
+            out_of_range += 1
+            continue
+        groups[label].append(r)
+    real = calibration.get("buckets") if isinstance(calibration, dict) and isinstance(
+        calibration.get("buckets"), dict) else None
+    buckets = []
+    for label in scal.BUCKET_LABELS:
+        members = groups[label]
+        entry = dict({"bucket": label}, **_bucket_stats(members, resamples, seed))
+        entry["by_source"] = {s: _bucket_stats([r for r in members if (r.get("source") or "unknown") == s],
+                                               resamples, seed)
+                              for s in sorted({r.get("source") or "unknown" for r in members})}
+        entry["by_gate"] = {g: _bucket_stats([r for r in members if row_gate(r)[0] == g], resamples, seed)
+                            for g in sorted({row_gate(r)[0] for r in members})}
+        if real is not None:
+            b = real.get(label) if isinstance(real.get(label), dict) else {}
+            entry["real"] = {"n": int(_num(b.get("n")) or 0), "expectancy_r_net": _num(b.get("expectancy_r_net"))}
+        else:
+            entry["real"] = None
+        buckets.append(entry)
+    return {"field": field, "buckets": buckets, "unscored": unscored, "out_of_range": out_of_range,
+            "yolo_excluded": yolo}
+
+
+def _bucket_stats(rows: List[Dict[str, Any]], resamples: int, seed: int) -> Dict[str, Any]:
+    pairs = []
+    no_r = tp1 = sl = expired = timeouts = 0
+    mfe: List[float] = []
+    mae: List[float] = []
+    for r, cluster in zip(rows, row_clusters(rows)):
+        value = shadow_r(r)
+        if value is None:
+            no_r += 1
+            continue
+        pairs.append({"cluster": cluster, "r": value})
+        c = r.get("classification")
+        if c == "FALSE_NEGATIVE":
+            tp1 += 1
+        elif c == "TRUE_NEGATIVE":
+            sl += 1
+        elif c in EXPIRED_CLASSIFICATIONS:
+            expired += 1
+            continue  # never triggered: no excursion
+        elif c == "TIMEOUT_CLOSED":
+            timeouts += 1
+        for values, key in ((mfe, "max_favorable_excursion_pct"), (mae, "max_adverse_excursion_pct")):
+            v = _num(r.get(key))
+            if v is not None:
+                values.append(v)
+    ci = bootstrap_mean_ci(pairs, resamples, seed, key="r")
+    conclusive = tp1 + sl
+    return {"n": ci["n"], "n_clusters": ci["n_clusters"], "mean_r": ci["mean_regret_r"], "ci95_low": ci["ci95_low"],
+            "ci95_high": ci["ci95_high"], "insufficient_sample": ci["n"] < MIN_SAMPLE,
+            "hit_rate": round(tp1 / conclusive, 4) if conclusive else None, "n_conclusive": conclusive,
+            "tp1_hits": tp1, "sl_hits": sl, "expired": expired, "timeouts": timeouts, "no_r": no_r,
+            "mean_mfe_pct": round(sum(mfe) / len(mfe), 4) if mfe else None,
+            "mean_mae_pct": round(sum(mae) / len(mae), 4) if mae else None}
+
+
+def _bucket_line(label: str, s: Dict[str, Any], real: Any = False) -> str:
+    ci = "-" if s["ci95_low"] is None else f"[{s['ci95_low']:+.3f}, {s['ci95_high']:+.3f}]"
+    hit = "-" if s["hit_rate"] is None else f"{s['hit_rate'] * 100:.1f}%"
+    mfe = "-" if s["mean_mfe_pct"] is None else f"{s['mean_mfe_pct']:+.2f}%"
+    mae = "-" if s["mean_mae_pct"] is None else f"{s['mean_mae_pct']:+.2f}%"
+    line = (f"  • {label:<26} n={s['n']:<4} hit {hit:<6} (n={s['n_conclusive']}) | mean {_fmt_r(s['mean_r'])}R "
+            f"95% CI {ci} | MFE {mfe} MAE {mae}")
+    if s["insufficient_sample"]:
+        line += " | insufficient_sample"
+    if real is not False:
+        line += (" | real PROD n/a (no store)" if real is None else
+                 f" | real PROD n={real['n']} mean net {_fmt_r(real['expectancy_r_net'])}R")
+    return line
+
+
+def format_score_bucket_report(analysis: Dict[str, Any]) -> str:
+    """Terminal section of run_score_bucket_analysis (simulated; no conclusion below MIN_SAMPLE)."""
+    lines = ["🎚️ APPLICATION F: SHADOW SCORE BUCKETS (simulated, advisory early signal for #202; never a gate input)",
+             "-" * 80]
+    lines += [f"  ! {w}" for w in analysis["warnings"]]
+    for name, title in (("dossier_score", "by dossier score (real PROD column = net R of closed trades)"),
+                        ("radar_score", "rows without a dossier score, by radar score")):
+        view = analysis["views"][name]
+        lines.append(f"  {title}:")
+        for b in view["buckets"]:
+            lines.append(_bucket_line(b["bucket"], b, b["real"] if name == "dossier_score" else False))
+            for kind in ("by_source", "by_gate"):
+                for key, s in b[kind].items():
+                    lines.append("      " + _bucket_line(f"{kind[3:]} {key}", s).lstrip())
+        lines.append(f"  unscored {view['unscored']} | out of range {view['out_of_range']} | YOLO excluded "
+                     f"{view['yolo_excluded']}")
+    lines.append("=" * 80)
+    return "\n".join(lines)
+
+
+def _load_real_store(logs_dir: str) -> Optional[Dict[str, Any]]:
+    """The real PROD calibration store (read only, score_calibration.load_calibration) of the workspace that owns
+    logs_dir; None when missing or unreadable. Never raises."""
+    try:
+        return scal.load_calibration(os.path.dirname(os.path.abspath(logs_dir)))
+    except Exception:
+        return None
+
+
 def _r_label(value: float) -> str:
     return f"{value:+g}R" if value else "0R"
 
@@ -619,8 +789,8 @@ def replay_policies(resolved: List[Dict[str, Any]], index: Dict[str, Any],
 def _replay(resolved: List[Dict[str, Any]], index: Dict[str, Any], resting_age_min: float, resting_weight: float,
             swap_margin: float, unknown_r: float) -> Dict[str, Any]:
     """replay_policies with blockers of unknown outcome counted at unknown_r."""
-    rows = [r for r in resolved if row_gate(r)[0] in REPLAY_GATES]
-    skipped = {"no_book": 0, "no_shadow_r": 0, "notional_missing": 0}
+    rows = [r for r in _filter_rows(resolved) if row_gate(r)[0] in REPLAY_GATES]
+    skipped ={"no_book": 0, "no_shadow_r": 0, "notional_missing": 0}
     events: Dict[Any, Dict[str, Any]] = {}
     notional_derived = notional_derived_default = 0
     for r in rows:
@@ -1005,12 +1175,14 @@ def main(argv=None):
 
     delta = delta_gate_analysis(resolved, LOGS_DIR, args.resamples, args.seed, args.resting_age_min,
                                 args.resting_weight, args.swap_margin)
+    buckets = run_score_bucket_analysis(resolved, _load_real_store(LOGS_DIR), args.resamples, args.seed)
     if args.json_output:
         delta["last_audit_ts"] = audit_ts
+        delta["score_buckets"] = buckets
         print(json.dumps(delta, indent=2))
         return
     print(freshness_line(audit_ts))
-    print(largest_risk_note(resolved))
+    print(largest_risk_note(_filter_rows(resolved)))
 
     calibration = run_calibration_analysis(resolved)
     leakage = run_alpha_leakage_analysis(resolved)
@@ -1020,6 +1192,7 @@ def main(argv=None):
     report = format_terminal_report(calibration, leakage, dodges, hygiene)
     print(report)
     print(format_delta_gate_report(delta["regret"], delta["replay"]))
+    print(format_score_bucket_report(buckets))
 
 if __name__ == "__main__":
     main()

@@ -16,6 +16,24 @@ POST_APPROVAL_GATE = "DELTA_GATE_POST_APPROVAL"
 BLOCKER_GATES = ("DELTA_GATE", "DUPLICATE_RESTING", POST_APPROVAL_GATE)
 DEDUPE_WINDOW_SECONDS = 3600  # one row per (symbol, direction, gate) within this window, across dossiers (#262)
 
+# Issue #265 (advisory score buckets, never a gate input): where a shadow row came from. A dossier-rejected candidate is
+# "rejected"; a dossier-approved one that never became an order or a fill is "approved_not_executed". Only the hook's
+# denial is certain ("delta_denied"); everything else the disk can show is "not_executed" (declined, expired and
+# entry_failed cannot be told apart).
+SOURCE_REJECTED = "rejected"
+SOURCE_APPROVED_NOT_EXECUTED = "approved_not_executed"
+NOT_EXECUTED_REASONS = ("delta_denied", "not_executed")
+NOT_EXECUTED_GATE = "APPROVED_NOT_EXECUTED"  # marker gate of the ledger sweep's rows (not in GATE_ENUM: never typed)
+
+
+def is_advisory_row(row: dict) -> bool:
+    """True for a row that is NOT a filter decision: an approved-but-not-executed candidate found by the ledger sweep
+    (issue #265). Such rows stay out of FER, regret, the replay and the dodge / leakage / hygiene audits. The hook's own
+    denials (reason "delta_denied", gate DELTA_GATE_POST_APPROVAL) also carry source approved_not_executed but are
+    existing regret / replay rows (issue #261) and are not advisory-only."""
+    return (isinstance(row, dict) and row.get("source") == SOURCE_APPROVED_NOT_EXECUTED
+            and row.get("reason") != "delta_denied")
+
 
 def gate_event_key(sha, env, symbol, direction, ts):
     """Identity of a logs/gate_denials.jsonl event (issue #275; mirrored by pre_trade_guard._gate_denial_key):
