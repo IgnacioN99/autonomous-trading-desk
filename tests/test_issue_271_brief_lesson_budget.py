@@ -236,7 +236,7 @@ class TestLessonFloor(BriefCase):
 
     def test_actionable_rows_and_setups_are_never_trimmed(self):
         actionable = [pair_row(a, "ETH", z=2.5, coint_p=0.01, coint=True, actionable=True, r2=0.6, hl=10.0,
-                               rec="🚨 VALID STAT-ARB OPPORTUNITY " + "y" * 200) for a in ("SOL", "LINK", "OP")]
+                               rec="🚨 VALID STAT-ARB OPPORTUNITY " + "y" * 900) for a in ("SOL", "LINK", "OP")]
         screening = session_screening(6)
         screening["actionable_stat_arb"] = actionable + session_pairs()
         with contextlib.redirect_stderr(io.StringIO()):
@@ -247,7 +247,9 @@ class TestLessonFloor(BriefCase):
         self.assertEqual(len(brief["filtered_opportunities"]), 6)
 
     def test_assemble_uses_the_trimmed_brief_for_the_budget(self):
-        screening = session_screening(5)
+        screening = session_screening(6)
+        # issue #271 reopened: 6 trimmed rows leave more than the floor, so the macro-rejected list fills the brief
+        screening["macro_rejected_shorts"] = [{"symbol": f"S{i:03d}USDT"} for i in range(260)]
         path = self.ledger_file([t187.lesson("ins-1700000001-aaaaaa", "MACRO", text="a" * 200)])
         with patch.object(peb, "load_recent_insights", wraps=peb.load_recent_insights) as fn:
             brief = self.assemble(screening, path)
@@ -255,7 +257,8 @@ class TestLessonFloor(BriefCase):
         self.assertEqual(brief["stat_arb_pairs"]["near_miss"], [])  # trimmed before the budget was computed
         budget = fn.call_args.kwargs["budget_bytes"]
         rest = peb._brief_bytes(dict(brief, committed_memory_lessons=[]))
-        self.assertEqual(budget, min(peb.LESSON_BUDGET_BYTES, peb.BRIEF_BUDGET_BYTES - rest + 2))
+        self.assertEqual(budget, max(peb.LESSON_FLOOR_BYTES,
+                                     min(peb.LESSON_BUDGET_BYTES, peb.BRIEF_BUDGET_BYTES - rest + 2)))
         self.assertNotIn("dropped_lessons", brief)
 
 
@@ -338,8 +341,9 @@ class TestSessionBrief(BriefCase):
             brief = self.assemble(screening)
         raw = dict(brief, stat_arb_pairs=screening["actionable_stat_arb"],
                    funding_arbitrage_desk=screening["top_funding_arbitrage"])
-        self.assertGreater(peb._brief_bytes(raw), peb.BRIEF_BUDGET_BYTES + 4000)  # the old brief, lessons aside
-        self.assertLess(peb.BRIEF_BUDGET_BYTES - peb._brief_bytes(raw) + 2, 0)  # the old negative budget
+        old_budget = 7199  # BRIEF_BUDGET_BYTES of that session (issue #271 reopened re-measured it)
+        self.assertGreater(peb._brief_bytes(raw), old_budget + 4000)  # the old brief, lessons aside
+        self.assertLess(old_budget - peb._brief_bytes(raw) + 2, 0)  # the old negative budget
 
     def run_session(self, setups):
         ledger = t187.real_shaped_ledger()
@@ -355,12 +359,15 @@ class TestSessionBrief(BriefCase):
         by_text = {r["insight"]: r["id"] for r in ledger if r.get("insight")}
         active = {r["id"] for r in ledger if r.get("insight")} - {t187.FLAWED_ID, "ins-1791250000-c5ea21"}
         shown_ids = [by_text[t] for t in shown]
+        self.assertEqual(shown_ids, [les["id"] for les in brief["committed_memory_lessons"]])  # issue #271: the id
         # never dropped silently: every active lesson is shown or listed, and the WARNING names the listed ones
-        self.assertEqual(set(shown_ids) | set(brief["dropped_lessons"]), active)
-        self.assertFalse(set(shown_ids) & set(brief["dropped_lessons"]))
+        dropped = brief.get("dropped_lessons", [])
+        self.assertEqual(set(shown_ids) | set(dropped), active)
+        self.assertFalse(set(shown_ids) & set(dropped))
         warnings = [line for line in err.getvalue().splitlines() if line.startswith("WARNING")]
-        self.assertEqual(len(warnings), 1)
-        self.assertIn(", ".join(brief["dropped_lessons"]), warnings[0])
+        self.assertEqual(len(warnings), 1 if dropped else 0)
+        if dropped:
+            self.assertIn(", ".join(dropped), warnings[0])
         self.assertEqual(shown_ids[0], t187.CORRECTION_ID)
         self.assertEqual((brief["stat_arb_pairs"]["pairs_scanned"], brief["stat_arb_pairs"]["actionable"]), (10, 0))
         self.assertEqual(len(brief["filtered_opportunities"]), setups)  # never trimmed
@@ -372,7 +379,7 @@ class TestSessionBrief(BriefCase):
         (the SHORT-squeeze lesson the evaluator missed on 2026-10-09)."""
         brief, shown_ids, budget, size = self.run_session(4)
         self.assertLessEqual(size, peb.BRIEF_BUDGET_BYTES)
-        self.assertLess(size / 4, 1800)
+        self.assertLess(size / 4, 3000)
         self.assertGreaterEqual(budget, peb.LESSON_FLOOR_BYTES)
         self.assertEqual(len(brief["stat_arb_pairs"]["near_miss"]), 3)  # not trimmed: the floor already fits
         self.assertEqual(brief["funding_arbitrage_desk"], {"rows": 3, "top": "MOODENGUSDT"})
@@ -380,27 +387,22 @@ class TestSessionBrief(BriefCase):
         self.assertGreaterEqual(len(shown_ids), 2)
         self.assertIn("ins-1791500000-ecc33c", shown_ids)  # MARKET_SHORTS, ranked for the SHORT candidates
 
-    def test_five_setups_trim_both_optional_blocks(self):
-        brief, shown_ids, budget, size = self.run_session(5)
-        self.assertEqual(brief["stat_arb_pairs"]["near_miss"], [])
-        self.assertEqual(brief["funding_arbitrage_desk"], {"rows": 3})
-        self.assertLess(budget, peb.LESSON_FLOOR_BYTES)  # trimming could not reach the floor
-        self.assertLessEqual(size, peb.BRIEF_BUDGET_BYTES)
-        self.assertGreaterEqual(len(shown_ids), 2)  # more than the forced lesson
-        self.assertNotIn("lesson_budget_exceeded", brief)
-
-    def test_six_setups_keep_only_the_forced_lesson_and_say_so(self):
-        """Six full radar rows leave less than the forced correction needs (a known limit of the 7,199-byte budget,
-        issue #23): the correction is kept over the budget, every other lesson is listed in dropped_lessons."""
-        brief, shown_ids, budget, size = self.run_session(6)
-        self.assertGreaterEqual(budget, 0)
-        self.assertLess(budget, peb.LESSON_FLOOR_BYTES)
-        self.assertEqual(shown_ids, [t187.CORRECTION_ID])
-        self.assertIs(brief["lesson_budget_exceeded"], True)
-        forced_excess = peb._brief_bytes(brief["committed_memory_lessons"]) - budget
-        flags = peb._brief_bytes(brief) - peb._brief_bytes({k: v for k, v in brief.items()
-                                                            if k not in ("dropped_lessons", "lesson_budget_exceeded")})
-        self.assertLessEqual(size, peb.BRIEF_BUDGET_BYTES + forced_excess + flags)  # over only by the forced lesson
+    def test_five_and_six_setups_carry_every_lesson(self):
+        """Issue #271 reopened: until the re-measured budget, five setups trimmed both optional blocks and six kept only
+        the forced correction (over the budget) with every other lesson in dropped_lessons. Now the trimmed rows and
+        the larger budget carry all 8 active lessons, within BRIEF_BUDGET_BYTES."""
+        self.assertEqual({d for _s, d in SESSION_SETUPS}, {"LONG", "SHORT"})
+        for setups in (5, 6):
+            with self.subTest(setups=setups):
+                brief, shown_ids, budget, size = self.run_session(setups)
+                self.assertEqual(len(shown_ids), 8)
+                # LONG and SHORT candidates: the global lessons by recency (14123c, then ecc33c)
+                self.assertEqual(shown_ids[:3], [t187.CORRECTION_ID, "ins-1791600000-14123c",
+                                                 "ins-1791500000-ecc33c"])
+                self.assertNotIn("dropped_lessons", brief)
+                self.assertNotIn("lesson_budget_exceeded", brief)
+                self.assertGreaterEqual(budget, peb.LESSON_FLOOR_BYTES)
+                self.assertLessEqual(size, peb.BRIEF_BUDGET_BYTES)
 
 
 # =============================================================================

@@ -479,7 +479,7 @@ class TestBriefSizeWithFeeR(t271.BriefCase):
         self.assertTrue(all(o["fee_r"] == 0.049 and "expected_fee_r" not in o for o in brief["filtered_opportunities"]))
         self.assertLessEqual(os.path.getsize(self.brief_file), peb.BRIEF_BUDGET_BYTES)
         self.assertGreaterEqual(budget, peb.LESSON_FLOOR_BYTES)
-        self.assertEqual((peb.BRIEF_BUDGET_BYTES, peb.LESSON_BUDGET_BYTES, peb.LESSON_FLOOR_BYTES), (7199, 5000, 1500))
+        self.assertEqual((peb.BRIEF_BUDGET_BYTES, peb.LESSON_BUDGET_BYTES, peb.LESSON_FLOOR_BYTES), (11600, 5000, 3000))
 
 
 class TestEvaluatorPrompt(unittest.TestCase):

@@ -11,7 +11,7 @@ parameters of the user profile (config/user_profile.json).
 The brief is always written to logs/primed_brief.json. The isolated_market_evaluator subagent
 reads that file with view_file and rejects it when it is older than 10 minutes (generated_at_ts).
 
-Target size: < 1,800 tokens (vs 35,000 tokens of accumulated chat history).
+Target size: < 3,000 tokens (vs 35,000 tokens of accumulated chat history).
 Zero information loss, zero hallucination in clean-room instances.
 
 Usage:
@@ -95,14 +95,16 @@ def ensure_fresh_state(max_age_sec: int = 600, target_env: str = "prod") -> dict
 
 
 # Issue #187: the brief file is written with one JSON element per line and no indentation or separator spaces
-# (fewer tokens than indent=2, no long single line for view_file). BRIEF_BUDGET_BYTES: the whole file (< 1,800
-# tokens at bytes / 4); the lesson block gets what the rest of the brief leaves, at most LESSON_BUDGET_BYTES.
+# (fewer tokens than indent=2, no long single line for view_file). BRIEF_BUDGET_BYTES: the whole file (< 3,000
+# tokens at bytes / 4; issue #271 measured 11,487 bytes for 6 radar rows plus the 8 active lessons); the lesson block
+# gets what the rest of the brief leaves, at most LESSON_BUDGET_BYTES and never less than LESSON_FLOOR_BYTES (a
+# reserved floor: when the rest is too big it wins over BRIEF_BUDGET_BYTES, with a stderr note).
 # Issue #271: when the rest leaves less than LESSON_FLOOR_BYTES, optional blocks are trimmed first (stat-arb
 # near-miss rows, then the funding desk's top symbol); actionable pairs and the core blocks are never trimmed.
 BRIEF_JSON_FORMAT = {"indent": 0, "separators": (",", ":")}
-BRIEF_BUDGET_BYTES = 7199
+BRIEF_BUDGET_BYTES = 11600
 LESSON_BUDGET_BYTES = 5000  # committed_memory_lessons block as written in the brief file
-LESSON_FLOOR_BYTES = 1500  # lesson room the optional-block trim tries to leave (issue #271)
+LESSON_FLOOR_BYTES = 3000  # lesson block always guaranteed, even over BRIEF_BUDGET_BYTES (issue #271)
 # Lesson symbols that are not tradable pairs: global lessons (issue #187); any "MARKET_*" symbol is global too
 GLOBAL_LESSON_SYMBOLS = ("MACRO", "ACCOUNT_CAPITAL", "SHADOW_DESK", "ALTS_BASKET")
 CORRECTION_TAG_PREFIXES = ("supersedes_", "corrects_")
@@ -128,8 +130,11 @@ def _brief_tags(tags: Any) -> list:
 
 
 def _brief_lesson(rec: dict) -> dict:
-    """The brief's committed_memory_lessons entry of a lesson record (text never cut; tags per _brief_tags)."""
-    return {"tag": _brief_tags(rec.get("tags", [])), "lesson": rec.get("insight")}
+    """The brief's committed_memory_lessons entry of a lesson record: its ledger `id` (issue #271: the evaluator can
+    cite it and it matches the dropped_lessons ids; omitted for an id-less legacy record), tags per _brief_tags and
+    the text, never cut."""
+    return dict({"id": rec["id"]} if rec.get("id") else {},
+                tag=_brief_tags(rec.get("tags", [])), lesson=rec.get("insight"))
 
 
 def _base_asset(symbol: Any) -> str:
@@ -185,7 +190,9 @@ def select_lessons(active: List[dict], candidates: Any = None, budget_bytes: int
        reference is not (it suppresses nothing, no exemption). <id> (possibly truncated) matches the most recent
        lesson recorded before the correction (earlier in file order) whose id starts with it, and that lesson is
        suppressed (never shown).
-    2. Then lessons tagged `pinned` and lessons with a global pseudo-symbol (GLOBAL_LESSON_SYMBOLS, MARKET_*).
+    2. Then lessons tagged `pinned` and lessons with a global pseudo-symbol (GLOBAL_LESSON_SYMBOLS, MARKET_*); issue
+       #271: a LONG / SHORT one whose direction no candidate has comes after the others (NEUTRAL or undirected
+       lessons count as matching; it stays eligible).
        Corrections and pinned lessons are always included (stderr warning when they exceed the budget).
     3. Relevance: lessons whose base asset matches a candidate's (same direction first).
     4. Recency fill with the remaining lessons.
@@ -212,11 +219,13 @@ def select_lessons(active: List[dict], candidates: Any = None, budget_bytes: int
             if match is not None:
                 suppressed.add(match)
     corrections -= suppressed  # a correction that is itself corrected stays suppressed
-    want = {}
+    want, cand_dirs = {}, set()
     for base, direction in candidates or []:
         base = _base_asset(base)
         if base:
             want.setdefault(base, set()).add(str(direction or "").upper())
+        if direction:  # stat-arb legs carry no direction
+            cand_dirs.add(str(direction).upper())
 
     def always(i):
         return i in corrections or "pinned" in _lesson_tags(active[i])
@@ -232,7 +241,12 @@ def select_lessons(active: List[dict], candidates: Any = None, budget_bytes: int
             return 2 if str(rec.get("direction") or "").upper() in dirs else 3
         return 4
 
-    order = sorted((i for i in range(len(active)) if i not in suppressed), key=lambda i: (rank(i), -i))
+    def off_direction(i):  # issue #271: within rank 1, a LONG / SHORT lesson no candidate's direction shares comes
+        d = str(active[i].get("direction") or "").upper()  # later; a NEUTRAL / undirected lesson applies to every one
+        return rank(i) == 1 and bool(cand_dirs) and d in ("LONG", "SHORT") and d not in cand_dirs
+
+    order = sorted((i for i in range(len(active)) if i not in suppressed),
+                   key=lambda i: (rank(i), off_direction(i), -i))
     selected, entries, dropped = [], [], []
     for i in order:
         entry = _brief_lesson(active[i])
@@ -543,31 +557,37 @@ def assemble_primed_brief(target_env: str = "prod", out_path: Optional[str] = No
         brief["ground_truth_portfolio"]["closed_today_data"] = data_quality
     _trim_optional_blocks(brief)  # issue #271: leave LESSON_FLOOR_BYTES for the lessons when trimming can
     # Issue #187: lessons last, ranked against the candidates this brief shows; the block gets the bytes the rest of
-    # the brief leaves under BRIEF_BUDGET_BYTES ("[]" is already counted), at most LESSON_BUDGET_BYTES
-    lesson_budget = min(LESSON_BUDGET_BYTES, BRIEF_BUDGET_BYTES - _brief_bytes(brief) + 2)
+    # the brief leaves under BRIEF_BUDGET_BYTES ("[]" is already counted), at most LESSON_BUDGET_BYTES. Issue #271:
+    # and at least LESSON_FLOOR_BYTES (the floor wins over BRIEF_BUDGET_BYTES)
+    budget = _lesson_budget(brief)
     lesson_candidates = brief_lesson_candidates(screening, yolo_slot)
-    budget = lesson_budget
     while True:
         lesson_report = {}
         insights = load_recent_insights(candidates=lesson_candidates, budget_bytes=budget, report=lesson_report)
         brief["committed_memory_lessons"] = [_brief_lesson(i) for i in insights]
         dropped = lesson_report.get("dropped") or []
         # Issue #271: the dropped_lessons key counts toward BRIEF_BUDGET_BYTES too, so its room comes out of the
-        # lesson block: select again with that room when the block does not fit it (the budget shrinks on every pass:
-        # the loop ends). A brief already over the budget because of forced (correction / pinned) lessons is not
-        # squeezed further.
+        # lesson block (never under LESSON_FLOOR_BYTES): select again with that room when the block does not fit it
+        # (the budget shrinks on every pass and stops at the floor: the loop ends). A brief already over the budget
+        # because of forced (correction / pinned) lessons is not squeezed further.
         if not dropped or lesson_report.get("budget_exceeded"):
             break
-        room = min(LESSON_BUDGET_BYTES, _lesson_room(dict(brief, committed_memory_lessons=[], dropped_lessons=dropped)))
-        if _brief_bytes(brief["committed_memory_lessons"]) <= room or budget <= 0:
+        room = _lesson_budget(dict(brief, committed_memory_lessons=[], dropped_lessons=dropped))
+        if _brief_bytes(brief["committed_memory_lessons"]) <= room or room >= budget:
             break
-        budget = max(0, room)
+        budget = room
     if lesson_report.get("budget_exceeded"):  # corrections / pinned kept over the budget (omitted otherwise)
         brief["lesson_budget_exceeded"] = True
     if dropped:  # issue #271: never dropped silently (omitted when nothing was dropped)
         brief["dropped_lessons"] = dropped
-        print(f"WARNING: lesson budget {max(0, budget)} bytes: {len(dropped)} committed lesson(s) left out of the "
+        print(f"WARNING: lesson budget {budget} bytes: {len(dropped)} committed lesson(s) left out of the "
               f"brief: {', '.join(str(d) for d in dropped)}", file=sys.stderr)
+    size, lesson_bytes = _brief_bytes(brief), _brief_bytes(brief["committed_memory_lessons"])
+    room = _lesson_room(dict(brief, committed_memory_lessons=[]))
+    # only when the floor raised the budget (a forced lesson over the cap is flagged by lesson_budget_exceeded)
+    if size > BRIEF_BUDGET_BYTES and room < LESSON_FLOOR_BYTES and lesson_bytes > max(2, room):
+        print(f"NOTE: brief {size} bytes, over BRIEF_BUDGET_BYTES {BRIEF_BUDGET_BYTES}: the lesson block "
+              f"({lesson_bytes} bytes, floor {LESSON_FLOOR_BYTES}) is kept over the budget", file=sys.stderr)
 
     # Atomic write: the evaluator subagent reads logs/primed_brief.json with view_file
     _write_brief(BRIEF_FILE, brief)
@@ -620,22 +640,38 @@ _SIDECAR_ONLY_KEYS = ("score_components", "tier_s_eligible", "alt_short_climax_o
 # Issue #206 flags reach the brief only when set (token budget): these values are dropped from a row.
 _DROP_WHEN_UNSET = {"squeeze_risk": False, "squeeze_reasons": [], "long_crowding_risk": False,
                     "macro_short_check": None, "funding_rate_pct": None, "funding_interval_unknown": False,
-                    "fee_r": None}
+                    "fee_r": None,
+                    # Issue #271: the neutral defaults (screening_pipeline); no prompt rule or brief reader uses them
+                    "cascade_risk": "BASELINE", "whale_bias": "BALANCED"}
+# Issue #271: executor sizing the evaluator never uses (it sizes from risk_profile; no prompt rule, brief reader or
+# shadow_tracker reads them); the full row stays in the screener JSON
+_BRIEF_DROP_KEYS = ("required_margin", "step_qty", "actual_notional")
+BRIEF_REASONS_MAX = 2  # radar reasons per brief row (format_markdown_brief shows two as well)
+BRIEF_REASON_MAX = 120  # characters of a brief row reason (cut ones end in "…"); the sidecar keeps them whole
 # The 8h-normalized funding and the interval add nothing for an 8h symbol (normalized == raw)
 _FUNDING_8H_KEYS = ("funding_rate_8h_pct", "funding_interval_h")
 # Issue #268: the candidate's expected_fee_r (taker entry + taker SL fee in R, a plan-time estimate) under a short key
 _BRIEF_KEY_RENAMES = {"expected_fee_r": "fee_r"}
 
 
+def _brief_reason(r: Any) -> str:
+    r = str(r)
+    return r if len(r) <= BRIEF_REASON_MAX else r[:BRIEF_REASON_MAX - 1] + "…"
+
+
 def _brief_opportunity(o: Any) -> Any:
     if not isinstance(o, dict):
         return o
     o = {_BRIEF_KEY_RENAMES.get(k, k): v for k, v in o.items()}
-    out = {k: v for k, v in o.items() if k not in _SIDECAR_ONLY_KEYS
+    out = {k: v for k, v in o.items() if k not in _SIDECAR_ONLY_KEYS and k not in _BRIEF_DROP_KEYS
            and not (k in _DROP_WHEN_UNSET and v == _DROP_WHEN_UNSET[k] and type(v) is type(_DROP_WHEN_UNSET[k]))}
     if out.get("funding_interval_h") in (None, 8):
         for k in _FUNDING_8H_KEYS:
             out.pop(k, None)
+    if out.get("tier_code") in _TIER_CODES:  # issue #271: the long label repeats the code (_tier_label reads the code)
+        out.pop("tier", None)
+    if isinstance(out.get("reasons"), list):  # issue #271: the first two, capped (the radar's full list in the sidecar)
+        out["reasons"] = [_brief_reason(r) for r in out["reasons"][:BRIEF_REASONS_MAX]]
     return out
 
 
@@ -695,10 +731,17 @@ def _lesson_room(brief: dict) -> int:
     return BRIEF_BUDGET_BYTES - _brief_bytes(brief) + 2
 
 
+def _lesson_budget(brief: dict) -> int:
+    """Issue #271: the lesson block's budget: the room the brief leaves (_lesson_room), at most LESSON_BUDGET_BYTES and
+    at least LESSON_FLOOR_BYTES (a real reservation: the floor wins over BRIEF_BUDGET_BYTES)."""
+    return max(LESSON_FLOOR_BYTES, min(LESSON_BUDGET_BYTES, _lesson_room(brief)))
+
+
 def _trim_optional_blocks(brief: dict) -> None:
     """Issue #271: while the brief leaves less than LESSON_FLOOR_BYTES for the lessons, trim in this order: (a) the
     stat-arb near-miss rows (counts kept), (b) the funding desk's top symbol (row count kept). Actionable stat-arb
-    rows, filtered_opportunities and the core blocks are never trimmed, so the floor may still not fit."""
+    rows, filtered_opportunities and the core blocks are never trimmed, so the brief may still end over
+    BRIEF_BUDGET_BYTES (the lesson floor is kept: _lesson_budget)."""
     stat_arb = brief.get("stat_arb_pairs")
     if _lesson_room(brief) < LESSON_FLOOR_BYTES and isinstance(stat_arb, dict) and stat_arb.get("near_miss"):
         stat_arb["near_miss"] = []
