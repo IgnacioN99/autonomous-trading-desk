@@ -36,6 +36,11 @@ Delta-gate opportunity cost (issue #251; report-only, read-only: it never writes
   equity_source session_state or primed_brief) when it could derive it, else derived at the default
   target_dollar_risk (rows without an equity source, counted notional_derived_default); a row with a
   truncated book, or a snapshot error and an empty book, is not replayed (skipped no_book).
+Data freshness (issue #312): the report starts with "Last shadow audit: <UTC> (<age>)" (or "never") from
+logs/shadow_state.json, the heartbeat shadow_tracker's audit writes (bounded each guardian cycle, whole backlog with
+shadow_tracker.py --audit), and the 3 rows with the largest target_dollar_risk (USDT totals mix row sizes; R does not);
+--json carries last_audit_ts. Durations and the replay's placement end use resolved_bar_ts (the resolving bar) when a
+row has it, else resolved_at_ts (the audit time).
 
 Usage:
   python3 scripts/shadow_analytics.py [--json] [--resting-age-min 30] [--resting-weight 0.5] [--swap-margin 10]
@@ -46,8 +51,10 @@ import os
 import sys
 import json
 import math
+import time
 import random
 import argparse
+import datetime
 from typing import List, Dict, Any, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -116,6 +123,40 @@ def load_jsonl(path: str) -> List[Dict[str, Any]]:
                     pass
     return records
 
+
+def _resolved_ts(r: Dict[str, Any]) -> float:
+    """Real resolution time (issue #312): resolved_bar_ts when present, else resolved_at_ts (0)."""
+    bar = _num(r.get("resolved_bar_ts"))
+    return bar if bar is not None else (r.get("resolved_at_ts", 0) or 0)
+
+
+def last_audit_ts(logs_dir: Optional[str] = None) -> Optional[float]:
+    """last_audit_ts of logs_dir's shadow_state.json (the audit heartbeat, issue #312); None when missing / unreadable."""
+    try:
+        with open(os.path.join(logs_dir or LOGS_DIR, "shadow_state.json"), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return _num(data.get("last_audit_ts")) if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def freshness_line(ts: Optional[float], now: Optional[float] = None) -> str:
+    if ts is None:
+        return "Last shadow audit: never (no logs/shadow_state.json)"
+    age = max(0, int((time.time() if now is None else now) - ts))
+    utc = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    return f"Last shadow audit: {utc} ({age // 3600}h {age % 3600 // 60}m ago)"
+
+
+def largest_risk_note(rows: List[Dict[str, Any]], n: int = 3) -> str:
+    """The n resolved rows with the largest target_dollar_risk (rows of another size dominate the USDT totals)."""
+    sized = sorted((r for r in rows if _num(r.get("target_dollar_risk")) is not None),
+                   key=lambda r: -_num(r.get("target_dollar_risk")))[:n]
+    if not sized:
+        return "Largest target_dollar_risk rows: none"
+    return ("Largest target_dollar_risk rows (USDT totals mix row sizes, R does not): "
+            + ", ".join(f"{r.get('id')} {r.get('symbol')} ${_num(r.get('target_dollar_risk')):g}" for r in sized))
+
 def run_calibration_analysis(resolved: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Analyzes win/loss rates across different vol_ratio buckets."""
     buckets = {
@@ -174,7 +215,7 @@ def run_alpha_leakage_analysis(resolved: List[Dict[str, Any]]) -> List[Dict[str,
             "simulated_pnl_usdt": r.get("simulated_pnl_usdt"),
             "mfe_pct": r.get("max_favorable_excursion_pct"),
             "mae_pct": r.get("max_adverse_excursion_pct"),
-            "duration_hours": round((r.get("resolved_at_ts", 0) - r.get("activated_at_ts", 0)) / 3600, 1),
+            "duration_hours": round((_resolved_ts(r) - r.get("activated_at_ts", 0)) / 3600, 1),
             "rejection_reason": r.get("rejection_reason"),
             "risk_profile": "EXTREME_SLIPPAGE_OR_DRAWDOWN" if abs(r.get("max_adverse_excursion_pct", 0)) > 2.0 else "CLEAN_BOUNCE"
         })
@@ -192,7 +233,7 @@ def run_dodge_audit(resolved: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "simulated_loss_avoided_usdt": abs(r.get("simulated_pnl_usdt", -1.50)),
             "mfe_pct": r.get("max_favorable_excursion_pct"),
             "mae_pct": r.get("max_adverse_excursion_pct"),
-            "duration_to_sl_hours": round((r.get("resolved_at_ts", 0) - r.get("activated_at_ts", 0)) / 3600, 1),
+            "duration_to_sl_hours": round((_resolved_ts(r) - r.get("activated_at_ts", 0)) / 3600, 1),
             "rejection_reason": r.get("rejection_reason")
         })
     # Sort by worst MAE (most violent adverse moves dodged)
@@ -208,7 +249,7 @@ def run_intraday_hygiene_audit(resolved: List[Dict[str, Any]]) -> Dict[str, Any]
     for r in resolved:
         c = r.get("classification")
         act = r.get("activated_at_ts") or r.get("registered_at_ts", 0)
-        res = r.get("resolved_at_ts", 0)
+        res = _resolved_ts(r)
         dur_h = round((res - act) / 3600, 1) if res > act else 0.0
 
         if c == "TIMEOUT_CLOSED":
@@ -682,7 +723,7 @@ def _replay(resolved: List[Dict[str, Any]], index: Dict[str, Any], resting_age_m
                                 items = rest
                                 swapped += 1
                 if place:
-                    until = _num(row.get("resolved_at_ts")) or ts
+                    until = _num(row.get("resolved_bar_ts")) or _num(row.get("resolved_at_ts")) or ts
                     p = {"kind": "resting", "symbol": row.get("symbol"), "direction": row.get("direction"),
                          "notional": row["_notional"], "since_ts": ts, "until_ts": until, "entry_id": None}
                     placed.append(p)
@@ -956,15 +997,20 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     resolved = load_jsonl(RESOLVED_FILE)
+    audit_ts = last_audit_ts(LOGS_DIR)
     if not resolved:
         print(f"No resolved shadow trades found in {RESOLVED_FILE}")
+        print(freshness_line(audit_ts))
         sys.exit(0)
 
     delta = delta_gate_analysis(resolved, LOGS_DIR, args.resamples, args.seed, args.resting_age_min,
                                 args.resting_weight, args.swap_margin)
     if args.json_output:
+        delta["last_audit_ts"] = audit_ts
         print(json.dumps(delta, indent=2))
         return
+    print(freshness_line(audit_ts))
+    print(largest_risk_note(resolved))
 
     calibration = run_calibration_analysis(resolved)
     leakage = run_alpha_leakage_analysis(resolved)

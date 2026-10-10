@@ -571,7 +571,12 @@ def sync_session_state(target_env: str = None) -> dict:
                 "intraday_fer_pct": shadow_metrics.get("intraday_fer_pct", 0.0),
                 "intraday_net_edge_usdt": shadow_metrics.get("intraday_net_edge_usdt", 0.0),
                 "rolling_fer_pct": shadow_metrics.get("rolling_fer_pct", 0.0),
-                "rolling_net_edge_usdt": shadow_metrics.get("rolling_net_edge_usdt", 0.0)
+                "rolling_net_edge_usdt": shadow_metrics.get("rolling_net_edge_usdt", 0.0),
+                # issue #312: R totals (the USDT totals mix row sizes)
+                "capital_saved_r": shadow_metrics.get("capital_saved_r", 0.0),
+                "missed_alpha_r": shadow_metrics.get("missed_alpha_r", 0.0),
+                "net_filter_edge_r": shadow_metrics.get("net_filter_edge_r", 0.0),
+                "r_rows_skipped": shadow_metrics.get("r_rows_skipped", 0)
             }
     except Exception:
         pass
@@ -808,6 +813,8 @@ def format_markdown_summary(state: dict) -> str:
         lines.append(f"* **Resolved Audits:** {sh['total_resolved']} (✅ Dodged Losses / TN: {sh['true_negatives']} | ⚠️ Missed Alpha / FN: {sh['false_negatives']} | ⏳ Timeouts: {sh.get('timeouts', 0)})")
         lines.append(f"* **Intraday Clean Edge (<=4h):** **{'+' if sh.get('intraday_net_edge_usdt', 0) >= 0 else ''}${sh.get('intraday_net_edge_usdt', 0):.2f} USDT** (Rolling FER: {sh.get('rolling_fer_pct', 0.0)}%)")
         lines.append(f"* **Global Capital Saved:** **+${sh['capital_saved_usdt']:.2f} USDT** | **Missed Alpha:** -${sh['missed_alpha_usdt']:.2f} USDT (Monitoring {sh.get('active_shadow_trades', 0)} setups)")
+        if sh.get("net_filter_edge_r") is not None:  # issue #312
+            lines.append(f"* **In R (USDT above mixes row sizes):** Saved +{sh.get('capital_saved_r', 0.0)}R | Missed -{sh.get('missed_alpha_r', 0.0)}R | Net {sh['net_filter_edge_r']:+}R ({sh.get('r_rows_skipped', 0)} row(s) without risk skipped)")
 
     return "\n".join(lines)
 

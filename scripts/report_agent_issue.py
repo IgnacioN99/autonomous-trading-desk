@@ -21,15 +21,17 @@ Resilience Features:
    `gh issue list`); a hit is counted locally instead of creating a duplicate, and any lookup failure creates or
    queues as before. Issue #284: a hit whose `severity:*` label is LESS severe than the new report does not swallow
    it (the new issue is created), and neither does a local 24 h record of a less severe report (records keep their
-   severity; one written before #284 deduplicates as before). An open issue without a `severity:*` label still
-   swallows even a CRITICAL report (both reporters always label their issues). Extra latency besides
+   severity; one written before #284 deduplicates as before). Issue #309: an open issue without a `severity:*`
+   label counts as the lowest severity: a CRITICAL or HIGH report is filed as a new issue, a MEDIUM or LOW one
+   still deduplicates. Extra latency besides
    the GitHub POST itself: the lookup plus up to 3 fingerprint-lock waits per call (the 24 h check, the hit or the
    new record, and the backlog record when that write fails). In-process callers (executor, guardian, night
    cutoff: report_issue() defaults) are bounded to INPROCESS_LOOKUP_TIMEOUT_S = 3 s + 3 x INPROCESS_LOCK_WAIT_S
    = 1 s (worst case 6 s); the CLI keeps DEDUPE_LOOKUP_TIMEOUT_S = 5 s + 3 x file_lock.LOCK_WAIT_S = 2 s.
    `--find-open-issue` exposes the same fingerprint, lookup and severity rule to report_issue.sh and records a hit
    locally. Backlog sync (--sync-backlog, report_issue.sh --sync) does no lookup: it only skips fingerprints this
-   machine already published. The logs directory follows ISSUE_REPORTER_LOGS_DIR when set (as report_issue.sh).
+   machine already published, and (issue #309) files one issue per fingerprint, the most severe queued entry
+   (ties: the oldest), dropping the others once it is filed. The logs directory follows ISSUE_REPORTER_LOGS_DIR when set (as report_issue.sh).
 
 6. Structured Report: six-section body (scripts/utils/issue_telemetry.py, same headings as report_issue.sh)
    with runtime/ledger telemetry and mandatory severity:* + priority:* labels that are never silently dropped.
@@ -257,6 +259,14 @@ def severity_outranks(new: Any, existing: Any) -> bool:
     order = issue_telemetry.SEVERITIES
     new, existing = str(new or "").upper(), str(existing or "").upper()
     return new in order and existing in order and order.index(new) < order.index(existing)
+
+def open_issue_outranked(new: Any, existing: Any) -> bool:
+    """Issue #309: severity_outranks for a matching OPEN issue. One without a `severity:*` label (existing None) is
+    severity unknown = lowest: a CRITICAL or HIGH report is then filed as a new issue; MEDIUM / LOW still
+    deduplicate (an unlabelled hand-made issue is the same failure)."""
+    if existing is None:
+        return str(new or "").upper() in ("CRITICAL", "HIGH")
+    return severity_outranks(new, existing)
 
 def find_open_issue(fingerprint: str, repo: Optional[str],
                     timeout: float = DEDUPE_LOOKUP_TIMEOUT_S) -> Optional[Dict[str, Any]]:
@@ -545,10 +555,12 @@ def report_issue(
     if occurrences is None and not force_sync and target_repo and os.getenv("GITHUB_TOKEN"):
         # Issue #270: another session (or reporter) may already have an OPEN issue for this fingerprint
         found = find_open_issue(fingerprint, target_repo, timeout=lookup_timeout_s)
-        if found and severity_outranks(severity, found.get("severity")):
-            # Issue #284: a less severe open issue never swallows this report
+        if found and open_issue_outranked(severity, found.get("severity")):
+            # Issue #284: a less severe open issue never swallows this report (#309: nor does an unlabelled one
+            # a CRITICAL or HIGH report)
             print(f"ℹ️ Open issue #{found.get('number')} carries fingerprint {fingerprint} at severity "
-                  f"{found.get('severity')}, lower than {severity}: creating a new issue.")
+                  f"{found.get('severity') or 'unknown (no severity label)'}, lower than {severity}: "
+                  f"creating a new issue.")
         elif found:
             occurrences = record_open_issue_hit(fingerprint, clean_title, found, now_ts, wait_s=lock_wait_s,
                                                 severity=severity)
@@ -697,15 +709,44 @@ def sync_backlog(repo: Optional[str] = None):
     success_count = 0
     skipped_count = 0
 
-    for line in lines:
+    # Issue #309: one issue per fingerprint: the most severe queued entry (ties: the oldest, i.e. the first line)
+    # is dispatched; the others wait for its outcome. Entries without a fingerprint are untouched.
+    def _rank(item: Any) -> int:
+        sev = str(item.get("severity") or "").upper()
+        if sev not in issue_telemetry.SEVERITIES:
+            sev = _issue_severity(item.get("labels")) or ""
+        return issue_telemetry.SEVERITIES.index(sev) if sev in issue_telemetry.SEVERITIES \
+            else len(issue_telemetry.SEVERITIES)
+
+    keeper_line: Dict[str, int] = {}
+    keeper_rank: Dict[str, int] = {}
+    for idx, line in enumerate(lines):
+        try:
+            queued = json.loads(line)
+            fp = queued.get("fingerprint")
+            if not fp or not isinstance(fp, str):
+                continue
+            rank = _rank(queued)
+        except Exception:
+            continue  # unreadable entries fail in the loop below and stay queued
+        if fp not in keeper_line or rank < keeper_rank[fp]:
+            keeper_line[fp], keeper_rank[fp] = idx, rank
+    deferred: Dict[str, List[str]] = {}
+    resolved = set()  # fingerprints whose kept entry was filed (or is already published)
+
+    for idx, line in enumerate(lines):
         item = {}
         try:
             item = json.loads(line)
             # Entries without a fingerprint (legacy, bash-written) are always dispatched
             fp = item.get("fingerprint")
+            if fp and isinstance(fp, str) and keeper_line.get(fp) != idx:
+                deferred.setdefault(fp, []).append(line)
+                continue
             if fp and _fingerprint_published(fp_cache.get(fp)):
                 print(f"   ⏭️ Skipped '{item.get('title')}': fingerprint {fp} is already published; dropped from the backlog.")
                 skipped_count += 1
+                resolved.add(fp)
                 continue
             res = dispatch_github_issue(
                 title=item["title"],
@@ -721,6 +762,7 @@ def sync_backlog(repo: Optional[str] = None):
                 print(f"   ✅ Issue #{res.get('issue_number')} published: {item['title']} -> {res.get('html_url')}")
             success_count += 1
             if fp:
+                resolved.add(fp)
                 # Mark it published so a later duplicate entry (same sync or a later one) is skipped
                 entry = fp_cache.get(fp) if isinstance(fp_cache.get(fp), dict) else {}
                 entry.update({
@@ -737,6 +779,14 @@ def sync_backlog(repo: Optional[str] = None):
         except Exception as e:
             print(f"   ❌ Failed to dispatch '{item.get('title')}': {e}")
             remaining.append(line)
+
+    for fp, dups in deferred.items():
+        if fp in resolved:
+            print(f"   ⏭️ Dropped {len(dups)} queued entr{'y' if len(dups) == 1 else 'ies'} of fingerprint {fp}: "
+                  f"the most severe one is filed.")
+            skipped_count += len(dups)
+        else:
+            remaining.extend(dups)  # the kept entry failed: nothing is lost
 
     if fp_dirty:
         # Merge into the current file under the lock: other reporters may have written meanwhile (issue #270)
@@ -826,11 +876,11 @@ def main():
         fingerprint = compute_fingerprint(clean_title, args.error)
         print(f"fingerprint\t{fingerprint}")
         found = find_open_issue(fingerprint, args.repo) if args.repo else None
-        if found and not severity_outranks(args.severity, found.get("severity")):
+        if found and not open_issue_outranked(args.severity, found.get("severity")):
             try:  # issue #284: a shell dedupe hit is counted locally too (best effort: the dedupe stands)
                 record_open_issue_hit(fingerprint, clean_title, found, int(time.time()), severity=args.severity)
-            except Exception:
-                pass
+            except Exception as e:  # issue #309: one stderr line (class only), never a failure
+                print(f"note: local hit record failed ({type(e).__name__})", file=sys.stderr)
             print(f"open_issue\t{found['url']}")
         return
 
