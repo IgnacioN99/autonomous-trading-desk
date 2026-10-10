@@ -36,8 +36,10 @@ class FakeExchange:
     """Stateful in-memory stand-in for send_signed_request. Records every call."""
 
     def __init__(self, positions, algos=None, open_orders=None, index_new_stops=True, reject_new_stops=False,
-                 fail_cancel=False, reject_response=None):
+                 fail_cancel=False, reject_response=None, ticker_price=100.0, cancel_executed_qty=None):
         self.positions = [dict(p) for p in positions]
+        self.cancel_executed_qty = cancel_executed_qty   # executedQty of a LIMIT cancel response (issue #298)
+        self.ticker_price = ticker_price   # GET /fapi/v1/ticker/price (issue #298 crossed check); None -> {}
         self.algos = [dict(a) for a in (algos or [])]
         self.open_orders = [dict(o) for o in (open_orders or [])]
         self.index_new_stops = index_new_stops
@@ -78,9 +80,14 @@ class FakeExchange:
             return {"orderId": 1, "status": "FILLED"}
         if endpoint == "/fapi/v1/order" and method == "DELETE":
             self.open_orders = [o for o in self.open_orders if str(o.get("orderId")) != str(params.get("orderId"))]
+            if self.cancel_executed_qty is not None:
+                return {"orderId": params.get("orderId"), "status": "CANCELED",
+                        "executedQty": str(self.cancel_executed_qty)}
             return {"orderId": params.get("orderId"), "status": "CANCELED"}
         if endpoint == "/fapi/v1/allOpenOrders":
             return []
+        if endpoint == "/fapi/v1/ticker/price" and self.ticker_price is not None:
+            return {"symbol": sym, "price": str(self.ticker_price)}
         return {}
 
     def writes(self):

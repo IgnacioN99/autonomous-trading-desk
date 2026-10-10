@@ -17,6 +17,8 @@ and --json; modes are mutually exclusive):
   python3 scripts/execute_futures_trade.py --audit-orphans [--env prod]
   python3 scripts/execute_futures_trade.py --auto-heal [--env prod]
   python3 scripts/execute_futures_trade.py --protect-pending [--env prod]   # also run by the position guardian
+  # Cancel resting entries of a symbol (exit 0 success, 1 failure, 2 refused: a position is open)
+  python3 scripts/execute_futures_trade.py --cancel-pending --symbol BTCUSDT [--entry-id N] [--env prod]
 
   # New position (requires an APPROVED clean-room dossier and, in PROD, that its session holds the trading lease,
   # issue #280: check_trading_lease; always emits JSON)
@@ -86,18 +88,40 @@ JSON schemas (stable; extra keys may be added, existing keys are never renamed):
       ("unknown": openAlgoOrders unreadable after retries; never healed, not counted in orphans_count)
   --protect-pending (exit 0 iff ok): {"ok": bool, "env": str, "dry_run": bool,
       "actions": [{"type": "pending_protect_sl" | "pending_tp_placed" | "pending_abort" | "pending_timeout_cancel" |
-                           "pending_dropped" | "pending_sl_crossed_close" | "pending_record_mismatch", "key", "symbol",
+                           "pending_dropped" | "pending_sl_crossed_close" | "pending_record_mismatch" |
+                           "pending_sl_crossed_cancel", "key", "symbol",
                 "success": bool,
                 "dry_run": bool, "detail": {...}}],
       "errors": [{"key", "symbol", "stage", "error"}],
       "warnings"?: [{"key", "symbol", "stage": "loss_cap_check" | "loss_cap_profile" | "qty_check" | "loss_cap_drift" |
-                     "registry_lock" | "deferral_report", "warning"}]}   # check deferred / drift tolerated / not errors
+                     "registry_lock" | "deferral_report" | "sl_crossed_price" | "sl_crossed_entry_not_found",
+                     "warning"}]}   # not errors
+      (issue #298: an unexpired, unfilled resting entry whose planned SL the last price has crossed is cancelled
+      through cancel_pending_record, pending_sl_crossed_cancel {kind, entry_id, direction, sl_price, price, cancel};
+      a failed cancel is a "sl_crossed_cancel" error, a -2011 on it (trigger race) a "sl_crossed_entry_not_found"
+      warning (record kept), an unreadable price a "sl_crossed_price" warning. The hook's
+      cached logs/session_state.json may still count the entry until the next ledger sync, <= its 300 s limit)
       (issue #118 loss cap; issue #126 total_qty: a record whose total_qty is below margin_usdt x leverage / price
       x 0.98 minus one stepSize is untrusted, pending_record_mismatch; issue #156: 3 consecutive deferred runs of a
       record (check_deferrals) file a HIGH issue, issue #180: the first for a filled record deferred on a non-user
       profile (loss_cap_profile); pending_tp_placed detail has fill_quality_flags; issue #273: a verified
       pending_protect_sl of mode "place" (stop not a verified pre-arm) has fill_ts, fill_ts_source, fill_detected_ts,
       stop_placed_ts, fill_to_stop_s)
+  --cancel-pending (issue #298; exit 0 iff success, 2 when refused, else 1; risk-reducing: no dossier, confirmation,
+      lease or gate; cancel_pending_entries / cancel_pending_record):
+      {"success": bool, "refused": bool, "reason": "cancelled" | "filled" | "no_match" | "no_registry" |
+       "registry_unreadable" | "failed" | "invalid_env", "message": str, "error"?: str, "env", "symbol",
+       "entry_id": str | null, "cancelled": [{"key", "kind", "entry_id", "reason": "cancelled"}],
+       "results": [{"key", "symbol", "kind", "entry_id", "direction", "reason", "message", "entry_cancelled",
+                    "record_dropped", "cancel_result"?, "executed_qty"?, "missing_mark_error"?, "position_amt"?,
+                    "prearm_cancelled"?, "prearm_cancel_result"?}]}
+      Without --entry-id: every unexpired record of the symbol and env; with it: that record only. Per record: a
+      position on the symbol, or a LIMIT cancel response with executedQty > 0, refuses ("filled": use
+      --close-position); the exchange order is cancelled first, then the pre-arm, then the record is popped; any
+      failure keeps the record. A -2011 on the entry cancel is "entry_not_found" (exit 1): record and pre-arm kept,
+      the record marked missing_since_ts for protect-pending's pending_dropped grace path (positionRisk can lag
+      behind a trigger). Executor Gate 1 reads the exchange, so the delta budget is freed at once; the hook's cached
+      logs/session_state.json is refreshed by the post-command sync (post_trade_sync.py).
   trade deployment: {"success": bool, "symbol", "direction", "leverage", "entry_price", "total_qty",
       "sl_price", "tp1_price", "tp2_price", ..., "error"?: str, "hard_gate_rejection"?: bool}
       Resting entries (untriggered STOP_MARKET via the algo order API, resting LIMIT) return
@@ -2777,6 +2801,166 @@ def cancel_resting_entry(symbol, kind, entry_id, target_env=None):
     return not _is_api_error(res), res
 
 
+def _is_unknown_order(res):
+    """Issue #298: True for a Binance -2011 "Unknown order" cancel response (the order is no longer on the book)."""
+    if not isinstance(res, dict):
+        return False
+    return str(res.get('code')) == '-2011' or 'unknown order' in str(res.get('msg') or res.get('error') or '').lower()
+
+
+def cancel_pending_record(key, rec, target_env):
+    """
+    Issue #298: risk-reducing cancel of ONE unfilled resting entry of logs/pending_entries.json (--cancel-pending and
+    the guardian's planned-SL-crossed cancel). Never places an order or moves a stop; needs no dossier, confirmation,
+    lease or gate. Fail-safe order (exchange first, record last):
+      1. positionRisk of the symbol (_read_open_position, any side): a position (a filled or partially filled entry,
+         or another position) refuses, reason "filled" (nothing cancelled or popped; close it with
+         --close-position); unreadable refuses;
+      2. the entry is cancelled (cancel_resting_entry). A -2011 "Unknown order" is NOT proof the entry is gone
+         without a fill (positionRisk can lag behind a trigger): reason "entry_not_found", the record and the pre-arm
+         are kept and the record is marked missing_since_ts (when not yet), so protect-pending's pending_dropped path
+         decides after PENDING_MISSING_GRACE_SECONDS. Any other failure keeps the record ("cancel_failed"). A LIMIT
+         cancel response with executedQty > 0 is a fill: reason "filled", record and pre-arm kept;
+      3. positionRisk is re-read: a position (a fill racing the cancel) keeps the record and the pre-arm for the
+         guardian's planned SL/TPs (reason "filled"); unreadable keeps the record;
+      4. the pre-armed stop is cancelled by prearm_algo_id (cancel_prearmed_stop); a failure keeps the record (the
+         guardian retries it on the pending_dropped path);
+      5. only then the record is popped (update_pending_entries); a failure leaves a record whose entry is gone (the
+         guardian drops it after PENDING_MISSING_GRACE_SECONDS).
+    Returns (ok, detail): detail {"key", "symbol", "kind", "entry_id", "direction", "reason": "cancelled" |
+    "filled" | "entry_not_found" | "position_query_failed" | "cancel_failed" | "position_reread_failed" |
+    "prearm_cancel_failed" | "registry_write_failed", "message", "entry_cancelled", "record_dropped",
+    "cancel_result"?, "executed_qty"?, "missing_mark_error"?, "position_amt"?, "prearm_cancelled"?,
+    "prearm_cancel_result"?}.
+    """
+    sym = str(rec.get('symbol') or '').upper()
+    kind = 'STOP_MARKET' if str(rec.get('kind', '')).upper() == 'STOP_MARKET' else 'LIMIT'
+    entry_id = str(rec.get('entry_id'))
+    is_long = str(rec.get('direction', '')).upper() == 'LONG'
+    pa_id = rec.get('prearm_algo_id')
+    detail = {"key": key, "symbol": sym, "kind": kind, "entry_id": entry_id, "direction": 'LONG' if is_long else 'SHORT',
+              "entry_cancelled": False, "record_dropped": False}
+
+    def done(ok, reason, message, **extra):
+        detail.update(reason=reason, message=message, **extra)
+        (logger.info if ok else logger.warning)(f"{sym} {key}: {message}")
+        return ok, detail
+
+    row, err = _read_open_position(sym, target_env=target_env)
+    if err:
+        return done(False, "position_query_failed", f"position state unknown ({err}); nothing cancelled, record kept")
+    if row is not None:
+        return done(False, "filled", f"{sym} has an open position ({row.get('positionAmt')}; a filled or partially "
+                                     f"filled entry, or another position): nothing cancelled. Use --close-position "
+                                     f"--symbol {sym}.", position_amt=row.get('positionAmt'))
+    ok, res = cancel_resting_entry(sym, kind, entry_id, target_env=target_env)
+    detail["cancel_result"] = res
+    if not ok and _is_unknown_order(res):
+        # positionRisk can lag behind a trigger: never "gone" here. The pending_dropped grace path decides later.
+        def mark_missing(entries):
+            if isinstance(entries.get(key), dict) and entries[key].get('missing_since_ts') is None:
+                entries[key]['missing_since_ts'] = int(time.time())
+        try:
+            update_pending_entries(mark_missing)
+        except Exception as e:
+            detail["missing_mark_error"] = f"{type(e).__name__}: {e}"
+        return done(False, "entry_not_found", f"{kind} entry {entry_id} not found on the exchange (-2011): it may "
+                                              "have just triggered or been cancelled elsewhere; record and pre-arm "
+                                              "kept. Check --positions; --protect-pending (the guardian) protects a "
+                                              "fill or drops the record after the grace period.")
+    if not ok:
+        return done(False, "cancel_failed", f"cancel of {kind} entry {entry_id} failed ({res}); record kept")
+    detail["entry_cancelled"] = True
+    executed = _to_float(res.get('executedQty')) if kind == 'LIMIT' and isinstance(res, dict) else 0.0
+    if executed > 0:
+        return done(False, "filled", f"LIMIT entry {entry_id} was partially filled ({executed}) before the cancel: "
+                                     f"record and pre-arm kept for the guardian's planned SL/TPs. Use "
+                                     f"--close-position --symbol {sym}.", executed_qty=executed)
+    row, err = _read_open_position(sym, target_env=target_env)
+    if err:
+        return done(False, "position_reread_failed", f"entry {entry_id} cancelled but the position re-read "
+                                                     f"failed ({err}); record kept for the guardian")
+    if row is not None:
+        return done(False, "filled", f"a position appeared in {sym} ({row.get('positionAmt')}) after the cancel of "
+                                     f"entry {entry_id}: record kept for the guardian's planned SL/TPs. Use "
+                                     f"--close-position --symbol {sym}.", position_amt=row.get('positionAmt'))
+    if pa_id is not None:
+        pa_ok, pa_res = cancel_prearmed_stop(sym, 'SELL' if is_long else 'BUY', pa_id, target_env=target_env)
+        detail.update(prearm_cancelled=pa_ok, prearm_cancel_result=pa_res)
+        if not pa_ok:
+            return done(False, "prearm_cancel_failed", f"entry {entry_id} cancelled but its pre-armed stop {pa_id} "
+                                                       f"was not ({pa_res}); record kept, the guardian retries it")
+    try:
+        update_pending_entries(lambda entries: entries.pop(key, None))
+    except Exception as e:
+        return done(False, "registry_write_failed", f"entry {entry_id} cancelled but its record was not removed "
+                                                    f"({type(e).__name__}: {e}); the guardian drops it once the entry "
+                                                    "stays gone")
+    detail["record_dropped"] = True
+    return done(True, "cancelled", f"{kind} entry {entry_id} cancelled, record removed")
+
+
+def cancel_pending_entries(symbol, entry_id=None, target_env=None):
+    """
+    Issue #298 (--cancel-pending): cancels the resting entries of symbol in target_env through cancel_pending_record,
+    one at a time: every record whose expires_at_ts has not passed (expired ones are --protect-pending's timeout
+    cancel), or only the record of entry_id (whatever its expiry). Risk-reducing: never places an order or moves a
+    stop, never acts on a symbol with an open position. Returns the --cancel-pending JSON of the module docstring.
+    """
+    symbol = str(symbol or '').upper()
+    out = {"success": False, "refused": False, "reason": None, "message": "", "env": None, "symbol": symbol,
+           "entry_id": str(entry_id) if entry_id is not None else None, "cancelled": [], "results": []}
+
+    def finish(success, reason, message, refused=False):
+        out.update(success=success, refused=refused, reason=reason, message=message)
+        if not success:
+            out["error"] = message
+        return out
+
+    try:
+        target_env = resolve_env(target_env)
+    except ValueError as e:
+        return finish(False, "invalid_env", str(e))
+    out["env"] = target_env
+    entries, err, missing = load_pending_entries_status()
+    if err:
+        return finish(False, "registry_unreadable", f"{err}; nothing cancelled")
+    if missing:
+        return finish(False, "no_registry", "logs/pending_entries.json not found: no resting entry is registered; "
+                                            "nothing cancelled")
+    now = time.time()
+    selected = []
+    for key in sorted(entries):
+        rec = entries[key]
+        if not isinstance(rec, dict) or rec.get('target_env') != target_env \
+                or str(rec.get('symbol') or '').upper() != symbol:
+            continue
+        if entry_id is not None:
+            if str(rec.get('entry_id')) == str(entry_id).strip():
+                selected.append((key, rec))
+        elif _to_float(rec.get('expires_at_ts')) > now:
+            selected.append((key, rec))
+    if not selected:
+        what = f"entry {entry_id}" if entry_id is not None else "unexpired resting entry"
+        return finish(False, "no_match", f"no {what} of {symbol} in logs/pending_entries.json for {target_env}; "
+                                         "nothing cancelled (expired entries: --protect-pending)")
+    for key, rec in selected:
+        ok, detail = cancel_pending_record(key, rec, target_env)
+        out["results"].append(detail)
+        if ok:
+            out["cancelled"].append({"key": key, "kind": detail["kind"], "entry_id": detail["entry_id"],
+                                     "reason": detail["reason"]})
+    reasons = {d["reason"] for d in out["results"]}
+    if len(out["cancelled"]) == len(selected):
+        return finish(True, "cancelled", f"{len(selected)} resting entr{'y' if len(selected) == 1 else 'ies'} of "
+                                         f"{symbol} cancelled and removed from the registry")
+    if not out["cancelled"] and reasons == {"filled"}:
+        return finish(False, "filled", f"{symbol}: the resting entry is filled or partially filled, or another "
+                                       "position is open; nothing removed from the registry. Use --close-position "
+                                       f"--symbol {symbol}.", refused=True)
+    return finish(False, "failed", "; ".join(d["message"] for d in out["results"] if d["reason"] != "cancelled"))
+
+
 def check_guardian_alive(target_env, now=None):
     """(ok, reason): logs/guardian_state.json was written by a running guardian LOOP (mode "loop", not a single
     --once run) for target_env, not in --dry-run, with interval_seconds <= GUARDIAN_MAX_INTERVAL_FOR_RESTING and a
@@ -3371,7 +3555,9 @@ def protect_pending_entries(target_env=None, dry_run=False, keys=None):
         an audit record is appended (with
         realized_rr_tp2, tp1_distance_pct and fill_quality_flags, issue #39, log only) and the record dropped.
         A partially filled LIMIT keeps its record (remainder cancelled at expiry, TPs on a later run).
-      - not filled and still open: cancelled once expires_at_ts is reached, else kept.
+      - not filled and still open: cancelled once expires_at_ts is reached; before that, cancelled (issue #298,
+        cancel_pending_record, pending_sl_crossed_cancel) when the last price has crossed the planned SL, else kept
+        (an unreadable price is a "sl_crossed_price" warning).
       - not filled and no longer open: marked missing_since_ts and dropped only if still so on a run at least
         PENDING_MISSING_GRACE_SECONDS later (positionRisk can lag behind a trigger).
       - every path that ends the entry without a position (timeout, drop, untrusted cancel) also cancels the
@@ -3401,7 +3587,7 @@ def protect_pending_entries(target_env=None, dry_run=False, keys=None):
     Returns {"ok", "env", "dry_run", "actions": [{"type", "key", "symbol", "success", "dry_run", "detail"}],
              "errors": [{"key", "symbol", "stage", "error"}]}
     with action types pending_protect_sl | pending_tp_placed | pending_abort | pending_timeout_cancel | pending_dropped |
-    pending_sl_crossed_close | pending_record_mismatch.
+    pending_sl_crossed_close | pending_record_mismatch | pending_sl_crossed_cancel.
     """
     dry_run = _truthy(dry_run)
     out = {"ok": False, "env": None, "dry_run": dry_run, "actions": [], "errors": []}
@@ -3578,6 +3764,56 @@ def _pending_loss_cap_problem(rec, position, target_env, run_ctx):
                       f"stored at placement {stored:.2f} USDT (bounded by live x {PENDING_DRIFT_CAP_TOLERANCE:g}): "
                       "equity drift since placement; record kept trusted"), 'loss_cap_drift'
     return out["message"], None, None
+
+
+def planned_sl_crossed(is_long, sl_price, price):
+    """Issue #298 (pure): True when price is at or beyond the planned SL (LONG: price <= sl_price; SHORT: price >=
+    sl_price), the crossed_close rule of a filled record. A non-positive input is never crossed."""
+    sl, px = _to_float(sl_price), _to_float(price)
+    if sl <= 0 or px <= 0:
+        return False
+    return px <= sl if is_long else px >= sl
+
+
+def _cancel_pending_if_sl_crossed(key, rec, target_env, act, fail, out):
+    """Issue #298: an unexpired, unfilled resting entry whose planned SL the last price (GET /fapi/v1/ticker/price,
+    the pre-arm's crossed basis) has already crossed is cancelled through cancel_pending_record (thesis invalidated
+    before the fill): a "pending_sl_crossed_cancel" action with kind, entry_id, direction, sl_price, price and the
+    cancel detail; a failed or refused cancel is also a "sl_crossed_cancel" error (like timeout_cancel), except an
+    "entry_not_found" (-2011, a trigger racing the cancel): action success false plus a "sl_crossed_entry_not_found"
+    warning, record kept for the pending_dropped grace path. An
+    unreadable price is only a "sl_crossed_price" warning (a ticker glitch never blocks new entries). In dry run
+    (act's dry_run) the cancel is only reported. Returns None."""
+    sym = str(rec['symbol']).upper()
+    is_long = str(rec.get('direction', '')).upper() == 'LONG'
+    sl = _to_float(rec.get('sl_price'))
+    try:
+        res = send_signed_request('GET', '/fapi/v1/ticker/price', {'symbol': sym}, target_env=target_env)
+    except Exception as e:
+        res = {"error": str(e)}
+    price = _to_float(res.get('price')) if isinstance(res, dict) else 0.0
+    if price <= 0:
+        out.setdefault("warnings", []).append({"key": key, "symbol": sym, "stage": "sl_crossed_price",
+                                               "warning": f"last price unreadable ({res}); planned-SL crossed check "
+                                                          "skipped this run"})
+        return None
+    if not planned_sl_crossed(is_long, sl, price):
+        return None
+    detail = dict(kind='STOP_MARKET' if str(rec.get('kind', '')).upper() == 'STOP_MARKET' else 'LIMIT',
+                  entry_id=str(rec['entry_id']), direction='LONG' if is_long else 'SHORT', sl_price=sl, price=price)
+    if out.get("dry_run"):
+        return act("pending_sl_crossed_cancel", False, **detail)
+    ok, cancel = cancel_pending_record(key, rec, target_env)
+    act("pending_sl_crossed_cancel", ok, cancel=cancel, **detail)
+    if not ok and cancel.get('reason') == 'entry_not_found':
+        # A trigger racing the cancel at the SL: a warning, never a pending_* error stage (check_guardian_alive would
+        # block PROD resting entries); the record was marked missing (pending_dropped grace path).
+        out.setdefault("warnings", []).append({"key": key, "symbol": sym, "stage": "sl_crossed_entry_not_found",
+                                               "warning": cancel.get('message')})
+    elif not ok:
+        fail("sl_crossed_cancel", f"Planned SL {sl} crossed (last price {price}) before the fill but the cancel of "
+                                  f"entry {detail['entry_id']} did not complete: {cancel.get('message')}")
+    return None
 
 
 def _protect_pending_entry(key, rec, target_env, dry_run, now, out, run_ctx=None):
@@ -3856,7 +4092,7 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out, run_ctx=None
                                              f"{rec.get('prearm_algo_id')} was not cancelled ({pa_res}); record kept.")
             return drop()
         if now < expires:
-            return None
+            return _cancel_pending_if_sl_crossed(key, rec, target_env, act, fail, out)   # issue #298
         if dry_run:
             return act("pending_timeout_cancel", False, kind=kind, entry_id=entry_id, expires_at_ts=expires)
         ok, res = cancel_resting_entry(sym, kind, entry_id, target_env=target_env)
@@ -5765,6 +6001,8 @@ def main():
     parser.add_argument("--audit-orphans", "--audit_orphans", action="store_true", dest="audit_orphans", help="Audit all open positions for missing Stop Loss")
     parser.add_argument("--auto-heal", "--auto_heal", action="store_true", dest="auto_heal", help="Audit and automatically heal orphan positions lacking Stop Loss")
     parser.add_argument("--protect-pending", "--protect_pending", action="store_true", dest="protect_pending", help="Place the planned SL/TPs of filled resting entries (logs/pending_entries.json); cancel expired ones")
+    parser.add_argument("--cancel-pending", "--cancel_pending", action="store_true", dest="cancel_pending", help="Cancel the unexpired resting entries of --symbol (logs/pending_entries.json; refused when a position is open)")
+    parser.add_argument("--entry-id", "--entry_id", type=str, default=None, dest="entry_id", help="With --cancel-pending: cancel only this entry order id")
     parser.add_argument("--positions", action="store_true", help="Read-only list of open positions with attached SL/TP orders")
     parser.add_argument("--move-breakeven", "--move_breakeven", action="store_true", dest="move_breakeven", help="Move the Stop Loss of --symbol to True Net Break-Even (place-then-cancel)")
     parser.add_argument("--force", action="store_true", help="With --move-breakeven: override the YOLO-before-TP1 and anti-truncation rules")
@@ -5773,13 +6011,18 @@ def main():
     args = parser.parse_args()
 
     new_modes = [m for m in ("positions", "move_breakeven") if getattr(args, m)]
-    other_modes = [m for m in ("close_position", "audit_orphans", "auto_heal", "protect_pending") if getattr(args, m)]
+    other_modes = [m for m in ("close_position", "audit_orphans", "auto_heal", "protect_pending", "cancel_pending")
+                   if getattr(args, m)]
     if new_modes and (len(new_modes) > 1 or other_modes or args.direction):
         print(json.dumps({"success": False, "error": "--positions and --move-breakeven are exclusive modes; they cannot be combined with other modes or --direction."}, indent=2))
         sys.exit(1)
         return
     if args.protect_pending and (len(other_modes) > 1 or args.direction):
         print(json.dumps({"success": False, "error": "--protect-pending is an exclusive mode; it cannot be combined with other modes or --direction."}, indent=2))
+        sys.exit(1)
+        return
+    if args.cancel_pending and (len(other_modes) > 1 or args.direction):
+        print(json.dumps({"success": False, "error": "--cancel-pending is an exclusive mode; it cannot be combined with other modes or --direction."}, indent=2))
         sys.exit(1)
         return
 
@@ -5819,6 +6062,17 @@ def main():
         res = protect_pending_entries(target_env=target_env)
         print(json.dumps(res, indent=2))
         sys.exit(0 if res.get("ok") else 1)
+        return
+
+    # 0d. Cancel resting entries of a symbol (risk-reducing, issue #298: never with an open position)
+    if args.cancel_pending:
+        if not args.symbol:
+            print(json.dumps({"success": False, "error": "--symbol is required for --cancel-pending"}, indent=2))
+            sys.exit(1)
+            return
+        res = cancel_pending_entries(args.symbol.upper(), entry_id=args.entry_id, target_env=target_env)
+        print(json.dumps(res, indent=2))
+        sys.exit(0 if res.get("success") else (2 if res.get("refused") else 1))
         return
 
     # 1. Close Position

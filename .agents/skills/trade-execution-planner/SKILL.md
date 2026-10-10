@@ -63,7 +63,8 @@ Follow these steps in order. Skipping one is a hard failure: the PreToolUse hook
    - `python3 scripts/execute_futures_trade.py --positions --json` (read-only snapshot)
    - `python3 scripts/execute_futures_trade.py --move-breakeven --symbol <SYMBOL>` (only after TP1 or a confirmed +2.0×ATR_15m expansion); a forced break-even (`--force`, overrides anti-truncation and the YOLO break-even-after-TP1 rule) always asks for user confirmation. Wrappers such as `sudo`, `doas` or `chroot` in front of any of these commands also get a permission prompt
    - `python3 scripts/execute_futures_trade.py --audit-orphans`, `--auto-heal`
-   - `python3 scripts/execute_futures_trade.py --protect-pending` (places the planned SL/TPs of filled resting entries from `logs/pending_entries.json`, cancels expired ones; the guardian runs it every cycle)
+   - `python3 scripts/execute_futures_trade.py --protect-pending` (places the planned SL/TPs of filled resting entries from `logs/pending_entries.json`, cancels expired ones and, before the fill, those whose planned SL the last price has crossed; the guardian runs it every cycle)
+   - `python3 scripts/execute_futures_trade.py --cancel-pending --symbol <SYMBOL> [--entry-id <ID>]` cancels a resting entry whose thesis is invalid (frees the delta budget at once): exchange order first, then its pre-armed stop, then the `logs/pending_entries.json` record. Refused (exit 2) when the symbol has a position: use `--close-position`
    - Resting entries (untriggered `STOP_MARKET`, `LIMIT`):
      - Stop Loss pre-arm:
        - KEYS `LIMIT`: the SL is pre-armed when it is not crossed; the guardian verifies it at fill and is the fallback. A rejected (except -2021 / -4509, logged only; -4509 is counted in the doctor's `[PREARM]` line) or unverified pre-arm is reported (`prearm_anomaly`); the entry is kept.
