@@ -150,7 +150,9 @@ State file (logs/guardian_state.json):
     "errors": [{"symbol": str | null, "stage": str, "error": str}],
     "pending_warnings": [{"key", "symbol", "stage", "warning"}]  # protect_pending_entries "warnings" (issue #156):
                                        # loss_cap_check / qty_check deferrals, loss_cap_drift, registry_lock,
-                                       # deferral_report; printed, never errors (no effect on cycle_ok or liveness)
+                                       # deferral_report, sl_crossed_price (issue #298: last price unreadable),
+                                       # sl_crossed_entry_not_found (issue #298: -2011 on the crossed cancel);
+                                       # printed, never errors (no effect on cycle_ok or liveness)
     "trail_warnings": [{"symbol", "warning"}]  # dem write-path warnings (issue #172): "stops_requery_failed:<err>",
                                        # old-stop cancel errors, "intrabar_unavailable", exit_management profile
                                        # warnings (#183; once, symbol null, #197); printed, never errors (no effect
@@ -161,8 +163,13 @@ Action record (also one JSON line in logs/guardian_actions.jsonl):
   {"timestamp": int, "env": str, "symbol": str, "dry_run": bool, "success": bool,
    "type": "orphan_heal" | "orphan_close" | "trail_stop" | "dead_alpha_close" | "pending_protect_sl" |
            "pending_tp_placed" | "pending_abort" | "pending_timeout_cancel" | "pending_dropped" |
-           "pending_sl_crossed_close" | "pending_record_mismatch" | "unknown_resting_entry" (report only, success
-           false) | "stop_unknown_heal" (success = heal result healed/kept) | "position_closed", "detail": {...}}
+           "pending_sl_crossed_close" | "pending_record_mismatch" | "pending_sl_crossed_cancel" | "unknown_resting_entry"
+           (report only, success false) | "stop_unknown_heal" (success = heal result healed/kept) | "position_closed",
+           "detail": {...}}
+  pending_sl_crossed_cancel (issue #298): an unfilled resting entry whose planned SL the last price crossed before
+  the fill is cancelled (execute_futures_trade.cancel_pending_record: exchange order, pre-arm, then the record); a
+  failed cancel is a pending_sl_crossed_cancel error. The guardian runs no ledger sync: the hook's cached
+  logs/session_state.json may count the cancelled entry until the next sync (its 300 s staleness limit).
   trail_stop details carry "new_stop" (the new algo stop) when a stop was replaced. position_closed (issue #182,
   observation only, also in --dry-run): a previous "excursions" record whose symbol + side is no longer open; detail =
   that record + "last_stop_r" (last stop in R, favourable sign, null without risk), "disappeared_after_ts" (previous

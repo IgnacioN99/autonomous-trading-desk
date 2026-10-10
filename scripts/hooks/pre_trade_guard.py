@@ -38,8 +38,9 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    exact repo path, resolved lexically against the cwd (else the workspace root; inside wsl a relative or
    /mnt/<drive>/... path mapping to the root), never a name anywhere in the text, with an exclusive flag set:
    scripts/execute_futures_trade.py needs --close-position / --move-breakeven (exactly one --symbol) /
-   --audit-orphans / --auto-heal / --protect-pending (or --help) and only {those, --positions, --symbol, --json,
-   --force, --env, --help, -h, and --is-yolo next to --move-breakeven only}, but --move-breakeven --force (it
+   --audit-orphans / --auto-heal / --protect-pending / --cancel-pending (exactly one --symbol; issue #298) (or
+   --help) and only {those, --positions, --symbol, --json, --force, --env, --help, -h, --is-yolo next to
+   --move-breakeven only, and --entry-id <id> next to --cancel-pending only}, but --move-breakeven --force (it
    overrides the anti-truncation and YOLO break-even-after-TP1 rules) is never auto-allowed: a forced break-even
    asks the user, never a denial (issue #111); scripts/loops/position_guardian_loop.py needs --once (never
    --interval) with {--env, --dry-run, --close-dead-alpha, --json}; scripts/loops/night_cutoff_loop.py {--env,
@@ -122,8 +123,8 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    logs/session_state.json <- scripts/sync_session_state.py; logs/guardian_state.json (guardian liveness
    attestation for resting entries) <- scripts/loops/position_guardian_loop.py; logs/pending_entries.json
    (resting-entry registry / post-fill protection; also counted by this hook's max-open-positions pre-check, see 5)
-   <- scripts/execute_futures_trade.py (registration and --protect-pending); logs/hook_heartbeat.json (hook
-   liveness, see 11) <- this hook itself (issue #73); logs/score_calibration.json (Tier S score calibration,
+   <- scripts/execute_futures_trade.py (registration, --protect-pending, --cancel-pending); logs/hook_heartbeat.json
+   (hook liveness, see 11) <- this hook itself (issue #73); logs/score_calibration.json (Tier S score calibration,
    issue #202) <- scripts/trading_scorecard.py; logs/trade_outcomes.jsonl (the store's only input) <-
    scripts/trade_outcomes.py; logs/trades_audit.jsonl (entry ledger, the outcomes' source) <-
    scripts/execute_futures_trade.py; logs/primed_brief.json and logs/primed_brief_scores.json (evaluator brief and
@@ -669,7 +670,10 @@ TRADING_LEASE_TAKE_RE = re.compile(r"\btrading_lease(?:\.py)?\b.*\s--take\b", re
 HELP_FLAGS = {"--help": False, "-h": False}
 EXECUTOR_RISK_FLAGS = {"--close-position", "--close_position", "--move-breakeven", "--move_breakeven",
                        "--audit-orphans", "--audit_orphans", "--auto-heal", "--auto_heal",
-                       "--protect-pending", "--protect_pending"}
+                       "--protect-pending", "--protect_pending", "--cancel-pending", "--cancel_pending"}
+# Issue #298: --cancel-pending acts on exactly one --symbol; --entry-id only next to it
+EXECUTOR_CANCEL_PENDING_FLAGS = {"--cancel-pending", "--cancel_pending"}
+EXECUTOR_ENTRY_ID_FLAGS = {"--entry-id": True, "--entry_id": True}
 # --is-yolo is an opening flag, except next to --move-breakeven (stricter YOLO break-even rules, never opens)
 EXECUTOR_BREAKEVEN_YOLO_FLAGS = {"--is-yolo": False, "--is_yolo": False}
 # What may precede a risk-reducing script for an auto-allow: these env assignments (VAR=v, env VAR=v) and python
@@ -692,7 +696,7 @@ RISK_REDUCING_SCRIPTS: Dict[str, Tuple[set, Dict[str, bool]]] = {
     "scripts/execute_futures_trade.py": (
         EXECUTOR_RISK_FLAGS | set(HELP_FLAGS),
         {**{f: False for f in EXECUTOR_RISK_FLAGS}, "--positions": False, "--symbol": True, "--json": False,
-         "--force": False, "--env": True, **EXECUTOR_BREAKEVEN_YOLO_FLAGS, **HELP_FLAGS}),
+         "--force": False, "--env": True, **EXECUTOR_BREAKEVEN_YOLO_FLAGS, **EXECUTOR_ENTRY_ID_FLAGS, **HELP_FLAGS}),
     # The guardian never opens positions: only a bounded single cycle (--once), never --interval
     "scripts/loops/position_guardian_loop.py": (
         {"--once"} | set(HELP_FLAGS),
@@ -832,7 +836,7 @@ TRANSCRIPT_ROOT_OVERRIDE_RE = re.compile(
 GROUND_TRUTH_FILES = {
     "logs/session_state.json": "`python3 scripts/sync_session_state.py`",
     "logs/guardian_state.json": "`python3 scripts/loops/position_guardian_loop.py`",
-    "logs/pending_entries.json": "`python3 scripts/execute_futures_trade.py` (resting-entry registration and --protect-pending)",
+    "logs/pending_entries.json": "`python3 scripts/execute_futures_trade.py` (resting-entry registration, --protect-pending and --cancel-pending)",
     "logs/hook_heartbeat.json": "`scripts/hooks/pre_trade_guard.py` itself (refreshed on every live hook invocation)",
     "logs/score_calibration.json": "`python3 scripts/trading_scorecard.py`",
     "logs/trade_outcomes.jsonl": "`python3 scripts/trade_outcomes.py`",
@@ -2687,11 +2691,14 @@ def _risk_flags_allowed(key: str, args: List[str]) -> bool:
         i += 1
     if required and not seen & required:
         return False
-    if key == "scripts/execute_futures_trade.py" and seen & EXECUTOR_MOVE_BREAKEVEN_FLAGS and \
+    if key == "scripts/execute_futures_trade.py" and seen & (EXECUTOR_MOVE_BREAKEVEN_FLAGS
+                                                              | EXECUTOR_CANCEL_PENDING_FLAGS) and \
             sum(1 for a in args if a.partition("=")[0] == "--symbol") != 1:
-        return False  # --move-breakeven acts on exactly one --symbol
+        return False  # --move-breakeven and --cancel-pending act on exactly one --symbol
     if seen & set(EXECUTOR_BREAKEVEN_YOLO_FLAGS) and not seen & EXECUTOR_MOVE_BREAKEVEN_FLAGS:
         return False  # --is-yolo outside --move-breakeven shapes an opening
+    if seen & set(EXECUTOR_ENTRY_ID_FLAGS) and not seen & EXECUTOR_CANCEL_PENDING_FLAGS:
+        return False  # --entry-id only selects the entry of --cancel-pending
     return True
 
 
@@ -5540,7 +5547,7 @@ def _analyze_run_command(command_line: str, cwd: str, base_dir: str, shell: str 
             "using trading primitives (execute_futures_trade, send_signed_request, /fapi/v1 write endpoints, MCP gateway) "
             f"is strictly forbidden. Orders must be routed exclusively through {CHOKE_POINT}; "
             "risk reduction must use the sanctioned CLI flags (--close-position, --move-breakeven, --auto-heal, "
-            "--audit-orphans, --protect-pending) or scripts/loops/position_guardian_loop.py."
+            "--audit-orphans, --protect-pending, --cancel-pending) or scripts/loops/position_guardian_loop.py."
         )
         return result
 
@@ -5779,7 +5786,8 @@ def retired_radar_reason(tool: str) -> str:
         f"and tool '{tool or '?'}' is no longer available. {hint}"
         "Read-only analytics are CLI scripts with --json output (see .agents/skills/market-radar/SKILL.md); "
         f"orders and position management go exclusively through {CHOKE_POINT} "
-        "(--positions, --move-breakeven, --close-position, --audit-orphans, --auto-heal, --protect-pending); trailing stops, dead-alpha "
+        "(--positions, --move-breakeven, --close-position, --audit-orphans, --auto-heal, --protect-pending, "
+        "--cancel-pending); trailing stops, dead-alpha "
         "and orphan audits run in scripts/loops/position_guardian_loop.py. Remove the stale 'crypto_radar' entry "
         "from your MCP client configuration."
     )
