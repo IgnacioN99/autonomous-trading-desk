@@ -697,6 +697,58 @@ def pr_hook_detect_error_line(logs_dir: str, now: float = None) -> str:
     return f"{count} PR review hook detect_error event(s) in the last 24h (those commands did not arm the review)."
 
 
+# Issue #312: shadow-audit staleness (WARN only, never critical)
+SHADOW_WINDOW_GRACE_S = 5400 + 14400 + 3600  # 90 min trigger + 4 h hold + 1 h grace since registration
+SHADOW_RESOLVED_STALE_S = 12 * 3600          # shadow_resolved.jsonl age while rows are past their window
+SHADOW_AUDIT_STALE_S = 6 * 3600              # last audit (shadow_state.json) age while rows are past their window
+
+
+def _age_text(seconds) -> str:
+    if seconds is None:
+        return "never"
+    seconds = max(0, int(seconds))
+    return f"{seconds // 3600}h {seconds % 3600 // 60}m ago" if seconds >= 3600 else f"{seconds // 60}m ago"
+
+
+def shadow_desk_status(now: float = None) -> tuple:
+    """(line, warnings) of the [SHADOW DESK] check (issue #312): counts, FER, USDT and R totals, the last audit age and
+    the 3 rows with the largest target_dollar_risk. One WARN when a pending / active row is older than
+    SHADOW_WINDOW_GRACE_S since registration, also naming a shadow_resolved.jsonl older than SHADOW_RESOLVED_STALE_S
+    and a missing or older than SHADOW_AUDIT_STALE_S heartbeat. No rows: no WARN."""
+    import shadow_tracker as st
+    now = time.time() if now is None else now
+    m = st.calculate_efficacy_metrics()
+    last = st._to_float(st.read_audit_state().get("last_audit_ts"))
+    audit_age = now - last if last is not None else None
+    line = (f"{m.get('active_shadow_trades', 0)} unexecuted candidate(s) under counterfactual monitoring | Resolved: "
+            f"{m.get('total_resolved', 0)} (FER: {m.get('filter_efficacy_ratio_pct', 0.0)}% | Saved: "
+            f"+${m.get('capital_saved_usdt', 0.0)} USDT, mixed row sizes, see R | Net "
+            f"{m.get('net_filter_edge_r', 0.0):+}R, {m.get('r_rows_skipped', 0)} row(s) without risk skipped) | "
+            f"Last audit: {_age_text(audit_age)}")
+    largest = m.get("largest_risk_rows") or []
+    if largest:
+        line += " | Largest row risk: " + ", ".join(f"{r.get('symbol')} ${r.get('target_dollar_risk')}" for r in largest)
+    ages = [now - ts for ts in (st._to_float(t.get("registered_at_ts")) for t in m.get("active_trades") or []
+                                if isinstance(t, dict)) if ts is not None]
+    overdue = [a for a in ages if a > SHADOW_WINDOW_GRACE_S]
+    if not overdue:
+        return line, []
+    reasons = [f"{len(overdue)} shadow row(s) past their window without resolution (oldest {max(overdue) / 3600:.1f}h "
+               f"> {SHADOW_WINDOW_GRACE_S / 3600:.1f}h since registration)"]
+    try:
+        resolved_age = now - os.path.getmtime(st.SHADOW_RESOLVED_FILE)
+    except OSError:
+        resolved_age = None
+    if resolved_age is None or resolved_age > SHADOW_RESOLVED_STALE_S:
+        reasons.append("shadow_resolved.jsonl " + ("missing" if resolved_age is None
+                                                   else f"last written {resolved_age / 3600:.1f}h ago"))
+    if audit_age is None or audit_age > SHADOW_AUDIT_STALE_S:
+        reasons.append("no shadow audit heartbeat (shadow_state.json)" if audit_age is None
+                       else f"last shadow audit {audit_age / 3600:.1f}h ago")
+    return line, ["Shadow desk audit stale: " + "; ".join(reasons) + ". The guardian loop audits a bounded batch each "
+                  "cycle; run python3 scripts/shadow_tracker.py --audit for the whole backlog."]
+
+
 PREARM_STATS_WINDOW_S = 24 * 3600
 
 
@@ -1117,17 +1169,15 @@ def run_doctor(target_env: str = None, auto_heal: bool = False) -> int:
     for tag, msg in prearm_lines:
         print(f"ℹ️  [{tag}] {msg}")
 
-    # 6. Shadow Desk Counterfactual Audit
+    # 6. Shadow Desk Counterfactual Audit (issue #312: audit staleness WARN; fail-open, never critical)
     try:
-        import shadow_tracker
-        shadow_metrics = shadow_tracker.calculate_efficacy_metrics()
-        active_shadows = shadow_metrics.get("active_shadow_trades", 0)
-        resolved_shadows = shadow_metrics.get("total_resolved", 0)
-        fer = shadow_metrics.get("filter_efficacy_ratio_pct", 0.0)
-        saved = shadow_metrics.get("capital_saved_usdt", 0.0)
-        print(f"👻 [SHADOW DESK] {active_shadows} unexecuted candidate(s) under counterfactual monitoring | Resolved: {resolved_shadows} (FER: {fer}% | Saved: +${saved} USDT)")
-    except Exception:
-        pass
+        shadow_msg, shadow_warnings = shadow_desk_status()
+    except Exception as e:
+        shadow_msg, shadow_warnings = f"Shadow desk status unavailable ({type(e).__name__}).", []
+    print(f"👻 [SHADOW DESK] {shadow_msg}")
+    for w in shadow_warnings:
+        warnings.append(w)
+        print(f"⚠️  [SHADOW DESK] {w}")
 
     elapsed = round(time.time() - start_time, 2)
     print("=" * 65)

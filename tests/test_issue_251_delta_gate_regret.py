@@ -524,7 +524,7 @@ class TestAnalyticsBackCompat(unittest.TestCase):
         with patch.object(sa, "RESOLVED_FILE", resolved_path), patch.object(sa, "LOGS_DIR", logs), \
                 contextlib.redirect_stdout(out):
             sa.main(["--json", "--resamples", "20"])
-        self.assertEqual(set(json.loads(out.getvalue())), {"regret", "replay"})
+        self.assertEqual(set(json.loads(out.getvalue())), {"regret", "replay", "last_audit_ts"})  # #312: freshness
         text = io.StringIO()
         with patch.object(sa, "RESOLVED_FILE", resolved_path), patch.object(sa, "LOGS_DIR", logs), \
                 contextlib.redirect_stdout(text):

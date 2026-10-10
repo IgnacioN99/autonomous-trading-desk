@@ -27,6 +27,23 @@ record_evaluation.py, and, issue #275, by --audit and --loop) turns recent event
 notional_usdt / risk_usdt when it could derive them), once per dossier_sha256 + symbol + direction (an event without
 a sha: env + symbol + direction + time window). Denials by the executor's own Gate 1 (live book) are not recorded.
 
+Resolution scheduling (issue #312):
+  - AUTOMATIC: every position_guardian_loop.py cycle (not --dry-run, only with the real logs/ dir) runs a bounded
+    audit_shadow_trades (guardian SHADOW_AUDIT_BUDGET_SECONDS / SHADOW_AUDIT_MAX_ROWS, at most every
+    SHADOW_AUDIT_MIN_INTERVAL_S); fail-open, it never raises into the guardian. Rows not reached stay for the next pass.
+  - USER-LAUNCHED: --audit resolves the whole backlog (unbounded); --loop is an optional service doing the same every
+    --interval s. Both share a non-blocking lock (logs/shadow_audit.lock): a second audit prints one line and exits 0.
+  Every audit writes the heartbeat logs/shadow_state.json (last_audit_ts, last_audit_duration_s, last_audit_resolved,
+  last_audit_remaining, last_audit_partial, last_audit_error), read by trading_doctor.py (staleness WARN) and
+  shadow_analytics.py (freshness line).
+Late audits replay the historical 5m klines from registration (an ACTIVE row from its activation bar), so the 90 min
+trigger and 4 h hold windows are judged on bar time, not audit time. resolved_at_ts stays the audit time; resolved rows
+also carry resolved_bar_ts (open time of the resolving bar, s), audit_lag_s and resolution_basis: "klines",
+"fallback_24h" (klines did not conclude 24 h after registration: EXPIRED, pnl 0) or "no_klines" (KLINE_FAILURE_EXPIRE_AFTER
+counted empty kline reads, at most one per KLINE_FAILURE_COUNT_INTERVAL_SECONDS, and older than
+KLINE_FAILURE_EXPIRE_MIN_AGE_SECONDS: EXPIRED, pnl 0; e.g. a delisted symbol). Readers wanting the real resolution
+time use resolved_bar_ts when present, else resolved_at_ts. USDT totals mix row sizes: R totals are reported next to them.
+
 Usage:
   python3 scripts/shadow_tracker.py --register-from-eval
   python3 scripts/shadow_tracker.py --audit
@@ -37,11 +54,17 @@ import os
 import sys
 import json
 import time
+import errno
 import datetime
 import argparse
 import collections
 import urllib.request
 from typing import Dict, Any, List, Optional
+
+try:
+    import fcntl  # POSIX
+except ImportError:  # pragma: no cover - Windows: no audit lock, the guardian's min interval still spaces audits
+    fcntl = None
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from utils.atomic_writer import atomic_write_json, atomic_append_jsonl
@@ -70,6 +93,16 @@ MAX_TRIGGER_WAIT_SECONDS = 5400    # 90 min max to breach trigger (matches limit
 MAX_INTRADAY_HOLD_SECONDS = 14400  # 4 hours max intraday holding duration (matches Dead Alpha watchdog)
 ROLLING_WINDOW_SIZE = 30           # Sample size for rolling FER calculation
 
+# Issue #312: audit heartbeat, lock and late-resolution limits (state / lock live beside SHADOW_TRADES_FILE)
+SHADOW_STATE_FILE_NAME = "shadow_state.json"
+SHADOW_AUDIT_LOCK_FILE_NAME = "shadow_audit.lock"
+FALLBACK_EXPIRE_SECONDS = 86400                   # klines that never conclude: EXPIRED (fallback_24h)
+KLINE_FAILURE_EXPIRE_AFTER = 5                    # counted empty kline reads before EXPIRED (no_klines) ...
+KLINE_FAILURE_EXPIRE_MIN_AGE_SECONDS = 3 * 86400  # ... and only for a row older than this
+KLINE_FAILURE_COUNT_INTERVAL_SECONDS = 3600       # at most one counted failure per row per hour (a short outage
+                                                  # cannot expire the backlog)
+LOCK_HELD_LINE = "another shadow audit is running (logs/shadow_audit.lock held); skipping this one"
+
 def load_jsonl(filepath: str) -> List[dict]:
     if not os.path.exists(filepath):
         return []
@@ -91,19 +124,35 @@ def rewrite_jsonl(filepath: str, items: List[dict]):
             f.write(json.dumps(it, ensure_ascii=False) + "\n")
     os.replace(temp_path, filepath)
 
-def fetch_klines(symbol: str, start_time_ms: int, interval: str = "5m", limit: int = 500) -> List[list]:
-    """Fetches public klines from Binance USDⓈ-M Futures."""
+def _request_timeout(timeout: float, deadline: Optional[float]) -> Optional[float]:
+    """Per-request timeout capped by a time.monotonic() deadline (issue #312); None when the deadline is spent."""
+    if deadline is None:
+        return timeout
+    remaining = deadline - time.monotonic()
+    return min(timeout, remaining) if remaining > 0.2 else None
+
+
+def fetch_klines(symbol: str, start_time_ms: int, interval: str = "5m", limit: int = 500, timeout: float = 8,
+                 deadline: Optional[float] = None) -> List[list]:
+    """Fetches public klines from Binance USDⓈ-M Futures. deadline (time.monotonic(), issue #312): no request
+    outlives it ([] once spent), so a bounded audit cannot overrun its budget."""
     url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&startTime={start_time_ms}&limit={limit}"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (ShadowTracker/1.0)"})
     try:
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        t = _request_timeout(timeout, deadline)
+        if t is None:
+            return []
+        with urllib.request.urlopen(req, timeout=t) as resp:
             return json.loads(resp.read().decode())
     except Exception as e:
         # Fallback to testnet if symbol only exists in testnet
         try:
             url_testnet = f"https://testnet.binancefuture.com/fapi/v1/klines?symbol={symbol}&interval={interval}&startTime={start_time_ms}&limit={limit}"
             req_t = urllib.request.Request(url_testnet, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req_t, timeout=8) as resp:
+            t = _request_timeout(timeout, deadline)
+            if t is None:
+                return []
+            with urllib.request.urlopen(req_t, timeout=t) as resp:
                 return json.loads(resp.read().decode())
         except Exception:
             return []
@@ -611,168 +660,408 @@ def register_from_evaluation(stats: Optional[dict] = None) -> int:
 
     return registered_count
 
-def audit_shadow_trades() -> dict:
+def shadow_state_path() -> str:
+    """logs/shadow_state.json, the audit heartbeat (issue #312), beside SHADOW_TRADES_FILE (resolved at call time)."""
+    return os.path.join(os.path.dirname(SHADOW_TRADES_FILE), SHADOW_STATE_FILE_NAME)
+
+
+def read_audit_state() -> dict:
+    """The audit heartbeat (shadow_state.json); {} when missing or unreadable. Never raises."""
+    try:
+        with open(shadow_state_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_audit_state(started_mono: float, result: dict, error: Optional[str]) -> None:
+    """Writes the heartbeat (atomic_write_json); never raises."""
+    try:
+        now = int(time.time())
+        atomic_write_json(shadow_state_path(), {
+            "last_audit_ts": now,
+            "last_audit_utc": datetime.datetime.fromtimestamp(now, datetime.timezone.utc).strftime(
+                "%Y-%m-%d %H:%M:%S UTC"),
+            "last_audit_duration_s": round(time.monotonic() - started_mono, 3),
+            "last_audit_resolved": int(result.get("newly_resolved") or 0),
+            "last_audit_remaining": int(result.get("active_remaining") or 0),
+            "last_audit_partial": bool(result.get("partial")),
+            "last_audit_error": error,
+        })
+    except Exception:
+        pass
+
+
+def _acquire_audit_lock() -> tuple:
+    """(held_by_other, fh): non-blocking flock on shadow_audit.lock beside SHADOW_TRADES_FILE. Without fcntl, or when
+    the lock file cannot be opened / locked for another reason, (False, None): the audit runs unlocked. Never blocks."""
+    if fcntl is None:
+        return False, None
+    try:
+        path = os.path.join(os.path.dirname(SHADOW_TRADES_FILE), SHADOW_AUDIT_LOCK_FILE_NAME)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fh = open(path, "a+")
+    except OSError:
+        return False, None
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        try:
+            fh.close()
+        except OSError:
+            pass
+        return e.errno in (errno.EWOULDBLOCK, errno.EAGAIN), None
+    return False, fh
+
+
+def _release_audit_lock(fh) -> None:
+    if fh is None:
+        return
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        fh.close()
+    except OSError:
+        pass
+
+
+def _row_identity(row) -> str:
+    """Identity of a shadow_trades.jsonl row for the audit's final re-read (issue #312): id (shadow_<SYMBOL>_<ts>),
+    direction, registered_at_ts, dossier_sha256 and gate. A row appended by register_shadow_trade during the audit has
+    an identity absent from the audit's starting snapshot and is kept."""
+    if not isinstance(row, dict):
+        return json.dumps(row, sort_keys=True, default=str)
+    return json.dumps([row.get("id"), str(row.get("direction") or "").upper(), row.get("registered_at_ts"),
+                       row.get("dossier_sha256"), row.get("gate")], default=str)
+
+
+def _audit_order_key(row: dict) -> tuple:
+    """Oldest registration first; rows whose klines read failed go behind the others (least recently failed first),
+    so a delisted symbol cannot starve a bounded pass."""
+    return (_to_float(row.get("last_kline_failure_ts")) or 0.0, _to_float(row.get("registered_at_ts")) or 0.0)
+
+
+class _BudgetSpent(Exception):
+    """The klines read came back empty because the audit's deadline was spent: the row stays unprocessed."""
+
+
+def _mark_resolved(t: dict, now_ts: int, now_utc: str, outcome: str, classification: str, pnl: float, basis: str,
+                   bar_ts: Optional[int]) -> None:
+    t["status"] = "RESOLVED"
+    t["resolved_at_utc"] = now_utc
+    t["resolved_at_ts"] = now_ts
+    t["outcome"] = outcome
+    t["classification"] = classification
+    t["simulated_pnl_usdt"] = round(pnl, 2)
+    t["resolution_basis"] = basis
+    t["resolved_bar_ts"] = bar_ts
+    t["audit_lag_s"] = now_ts - bar_ts if bar_ts is not None else None
+
+
+def _kline_failure(t: dict, now_ts: int, now_utc: str) -> bool:
+    """An empty / failed klines read: counts it (at most once per KLINE_FAILURE_COUNT_INTERVAL_SECONDS) and resolves
+    the row as EXPIRED (no_klines, pnl 0) after KLINE_FAILURE_EXPIRE_AFTER counted failures once it is older than
+    KLINE_FAILURE_EXPIRE_MIN_AGE_SECONDS. True when resolved."""
+    last = _to_float(t.get("last_kline_failure_ts"))
+    if last is None or now_ts - last >= KLINE_FAILURE_COUNT_INTERVAL_SECONDS:
+        t["kline_failures"] = int(_to_float(t.get("kline_failures")) or 0) + 1
+        t["last_kline_failure_ts"] = now_ts
+    reg_ts = _to_float(t.get("registered_at_ts"))
+    if (int(_to_float(t.get("kline_failures")) or 0) >= KLINE_FAILURE_EXPIRE_AFTER and reg_ts is not None
+            and now_ts - reg_ts > KLINE_FAILURE_EXPIRE_MIN_AGE_SECONDS):
+        _mark_resolved(t, now_ts, now_utc, "EXPIRED", "EXPIRED", 0.0, "no_klines", None)
+        return True
+    return False
+
+
+def audit_shadow_trades(budget_s: Optional[float] = None, max_rows: Optional[int] = None,
+                        min_interval_s: Optional[float] = None) -> dict:
     """
-    Audits all active and pending shadow trades against live klines.
+    Audits all active and pending shadow trades against historical 5m klines.
     Moves resolved trades to shadow_resolved.jsonl.
+    Issue #312: budget_s (seconds, klines reads capped by the deadline) and max_rows bound one pass; rows are processed
+    oldest-first (_audit_order_key) and every row not reached stays unchanged in shadow_trades.jsonl (partial: True).
+    A non-blocking lock (shadow_audit.lock) makes a concurrent audit return {"skipped": "lock_held"}; min_interval_s
+    skips the pass ({"skipped": "min_interval"}) when the heartbeat's last_audit_ts is younger. The final rewrite
+    re-reads the file and keeps the rows appended meanwhile (_row_identity). Writes the heartbeat
+    (shadow_state.json) after every pass that ran, also when nothing resolved or it failed. Never raises.
     """
+    started = time.monotonic()
+    result = {"active_remaining": 0, "newly_resolved": 0, "total_resolved": 0, "partial": False, "processed": 0,
+              "skipped": None}
+    try:
+        held, fh = _acquire_audit_lock()
+    except Exception:
+        held, fh = False, None
+    if held:
+        result["skipped"] = "lock_held"
+        return result
+    try:
+        if min_interval_s:
+            last = _to_float(read_audit_state().get("last_audit_ts"))
+            if last is not None and 0 <= time.time() - last < min_interval_s:
+                result["skipped"] = "min_interval"
+                return result
+        error = None
+        try:
+            result.update(_audit_pass(started + budget_s if budget_s is not None else None, max_rows))
+        except Exception as e:  # fail-open: the heartbeat records it
+            error = f"{type(e).__name__}: {e}"[:200]
+            result["error"] = error
+        _write_audit_state(started, result, error)
+        return result
+    finally:
+        _release_audit_lock(fh)
+
+
+def _audit_pass(deadline: Optional[float], max_rows: Optional[int]) -> dict:
     trades = load_jsonl(SHADOW_TRADES_FILE)
     if not trades:
-        return {"active": 0, "resolved_new": 0, "total_resolved": len(load_jsonl(SHADOW_RESOLVED_FILE))}
+        return {"active_remaining": 0, "newly_resolved": 0, "total_resolved": len(load_jsonl(SHADOW_RESOLVED_FILE)),
+                "partial": False, "processed": 0}
 
     now_ts = int(time.time())
     now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-    updated_trades = []
-    newly_resolved = []
-
-    for t in trades:
-        if t.get("status") == "RESOLVED":
+    snapshot = {_row_identity(t) for t in trades}
+    kept = {i: t for i, t in enumerate(trades) if not (isinstance(t, dict) and t.get("status") == "RESOLVED")}
+    queue = sorted((i for i, t in kept.items() if isinstance(t, dict)), key=lambda i: _audit_order_key(trades[i]))
+    processed = newly_resolved = 0
+    partial = False
+    for i in queue:
+        if (deadline is not None and time.monotonic() >= deadline) or (max_rows is not None and processed >= max_rows):
+            partial = True
+            break
+        row = dict(trades[i])  # a failing row keeps its original version
+        try:
+            resolved = _audit_row(row, now_ts, now_utc, deadline)
+        except _BudgetSpent:
+            partial = True
+            break
+        except Exception:
+            processed += 1
             continue
-
-        sym = t["symbol"]
-        direction = t["direction"].upper()
-        trigger_p = t["trigger_price"]
-        sl_p = t["sl_price"]
-        tp1_p = t["tp1_price"]
-        tp2_p = t["tp2_price"]
-        risk_dollar = t.get("target_dollar_risk", 1.50)
-
-        # Start from registration timestamp
-        start_ms = (t.get("registered_at_ts", now_ts) - 300) * 1000
-        klines = fetch_klines(sym, start_ms, interval="5m", limit=300)
-        if not klines:
-            updated_trades.append(t)
-            continue
-
-        highest_p = t.get("highest_price", trigger_p)
-        lowest_p = t.get("lowest_price", trigger_p)
-        status = t.get("status", "PENDING_TRIGGER")
-        outcome = None
-        classification = None
-        simulated_pnl = 0.0
-
-        for k in klines:
-            k_open_time = int(k[0]) // 1000
-            k_high = float(k[2])
-            k_low = float(k[3])
-            k_close = float(k[4])
-
-            # 1. State: PENDING_TRIGGER
-            if status == "PENDING_TRIGGER":
-                reg_ts = t.get("registered_at_ts", now_ts)
-                if (k_open_time - reg_ts) > MAX_TRIGGER_WAIT_SECONDS:
-                    status = "RESOLVED"
-                    outcome = "EXPIRED_UNTRIGGERED"
-                    classification = "EXPIRED"
-                    simulated_pnl = 0.0
-                    break
-                elif direction == "LONG" and k_high >= trigger_p:
-                    status = "ACTIVE"
-                    t["activated_at_ts"] = k_open_time
-                    t["activated_at_utc"] = datetime.datetime.fromtimestamp(k_open_time, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-                    highest_p = trigger_p
-                    lowest_p = trigger_p
-                elif direction == "SHORT" and k_low <= trigger_p:
-                    status = "ACTIVE"
-                    t["activated_at_ts"] = k_open_time
-                    t["activated_at_utc"] = datetime.datetime.fromtimestamp(k_open_time, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-                    highest_p = trigger_p
-                    lowest_p = trigger_p
-
-            # 2. State: ACTIVE
-            if status == "ACTIVE":
-                highest_p = max(highest_p, k_high)
-                lowest_p = min(lowest_p, k_low)
-
-                # Check SL hit
-                if direction == "LONG" and k_low <= sl_p:
-                    status = "RESOLVED"
-                    outcome = "STOP_LOSS_HIT"
-                    classification = "TRUE_NEGATIVE"
-                    simulated_pnl = -risk_dollar
-                    break
-                elif direction == "SHORT" and k_high >= sl_p:
-                    status = "RESOLVED"
-                    outcome = "STOP_LOSS_HIT"
-                    classification = "TRUE_NEGATIVE"
-                    simulated_pnl = -risk_dollar
-                    break
-
-                # Check TP1 hit
-                if direction == "LONG" and k_high >= tp1_p:
-                    status = "RESOLVED"
-                    outcome = "TP1_HIT"
-                    classification = "FALSE_NEGATIVE"
-                    simulated_pnl = risk_dollar * 1.8
-                    break
-                elif direction == "SHORT" and k_low <= tp1_p:
-                    status = "RESOLVED"
-                    outcome = "TP1_HIT"
-                    classification = "FALSE_NEGATIVE"
-                    simulated_pnl = risk_dollar * 1.8
-                    break
-
-                # Check Intraday Dead Alpha Timeout (Max 4.0 Hours Holding Horizon)
-                act_ts = t.get("activated_at_ts", k_open_time)
-                if (k_open_time - act_ts) >= MAX_INTRADAY_HOLD_SECONDS:
-                    status = "RESOLVED"
-                    ret_pct = ((k_close - trigger_p) / trigger_p) if direction == "LONG" else ((trigger_p - k_close) / trigger_p)
-                    d_sl = abs(trigger_p - sl_p) / trigger_p if trigger_p > 0 else 0.02
-                    est_notional = (risk_dollar / d_sl) if d_sl > 0 else (risk_dollar * 20.0)
-                    sim_pnl = round(est_notional * ret_pct, 2)
-                    sim_pnl = max(-risk_dollar, min(risk_dollar * 1.8, sim_pnl))
-
-                    outcome = "INTRADAY_TIMEOUT_PROFIT" if sim_pnl >= 0 else "INTRADAY_TIMEOUT_LOSS"
-                    classification = "TIMEOUT_CLOSED"
-                    simulated_pnl = sim_pnl
-                    break
-
-        # Fallback Check Expiration (>24 hours)
-        if status in ["PENDING_TRIGGER", "ACTIVE"] and (now_ts - t.get("registered_at_ts", now_ts)) > 86400:
-            status = "RESOLVED"
-            outcome = "EXPIRED"
-            classification = "EXPIRED"
-            simulated_pnl = 0.0
-
-        # Calculate MFE & MAE
-        if trigger_p > 0:
-            if direction == "LONG":
-                mfe = ((highest_p - trigger_p) / trigger_p) * 100
-                mae = ((lowest_p - trigger_p) / trigger_p) * 100
-            else:
-                mfe = ((trigger_p - lowest_p) / trigger_p) * 100
-                mae = ((trigger_p - highest_p) / trigger_p) * 100
+        processed += 1
+        if resolved:
+            atomic_append_jsonl(SHADOW_RESOLVED_FILE, row)
+            del kept[i]
+            newly_resolved += 1
         else:
-            mfe, mae = 0.0, 0.0
+            kept[i] = row
 
-        t["highest_price"] = highest_p
-        t["lowest_price"] = lowest_p
-        t["max_favorable_excursion_pct"] = round(mfe, 2)
-        t["max_adverse_excursion_pct"] = round(mae, 2)
-        t["last_checked_price"] = float(klines[-1][4])
-        t["last_checked_ts"] = now_ts
-        t["status"] = status
-
-        if status == "RESOLVED":
-            t["resolved_at_utc"] = now_utc
-            t["resolved_at_ts"] = now_ts
-            t["outcome"] = outcome
-            t["classification"] = classification
-            t["simulated_pnl_usdt"] = round(simulated_pnl, 2)
-            newly_resolved.append(t)
-            atomic_append_jsonl(SHADOW_RESOLVED_FILE, t)
-        else:
-            updated_trades.append(t)
-
+    updated_trades = [kept[i] for i in sorted(kept)]
+    # Rows registered while the audit ran (register_shadow_trade appends) are not in the snapshot: keep them
+    updated_trades += [r for r in load_jsonl(SHADOW_TRADES_FILE) if _row_identity(r) not in snapshot]
     # Rewrite shadow_trades.jsonl with remaining unresolved trades
     rewrite_jsonl(SHADOW_TRADES_FILE, updated_trades)
 
     return {
         "active_remaining": len(updated_trades),
-        "newly_resolved": len(newly_resolved),
-        "total_resolved": len(load_jsonl(SHADOW_RESOLVED_FILE))
+        "newly_resolved": newly_resolved,
+        "total_resolved": len(load_jsonl(SHADOW_RESOLVED_FILE)),
+        "partial": partial,
+        "processed": processed,
     }
+
+
+def _audit_row(t: dict, now_ts: int, now_utc: str, deadline: Optional[float]) -> bool:
+    """Replays one pending / active row on 5m klines (mutates t); True when it resolved. Raises _BudgetSpent when the
+    klines read came back empty because the deadline was spent."""
+    sym = t["symbol"]
+    direction = t["direction"].upper()
+    trigger_p = t["trigger_price"]
+    sl_p = t["sl_price"]
+    tp1_p = t["tp1_price"]
+    tp2_p = t["tp2_price"]
+    risk_dollar = t.get("target_dollar_risk", 1.50)
+    status = t.get("status", "PENDING_TRIGGER")
+
+    # Start from registration timestamp; issue #312: an ACTIVE row from its activation bar (no pre-activation bar
+    # can resolve it; highest / lowest prices are carried from the row)
+    active_from = _to_float(t.get("activated_at_ts")) if status == "ACTIVE" else None
+    if active_from is not None:
+        start_ms = int(active_from) * 1000
+    else:
+        start_ms = (t.get("registered_at_ts", now_ts) - 300) * 1000
+    try:
+        if deadline is None:
+            klines = fetch_klines(sym, start_ms, interval="5m", limit=300)
+        else:
+            klines = fetch_klines(sym, start_ms, interval="5m", limit=300, deadline=deadline)
+    except Exception:
+        klines = []
+    if not isinstance(klines, list) or not klines:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise _BudgetSpent()
+        return _kline_failure(t, now_ts, now_utc)
+
+    highest_p = t.get("highest_price", trigger_p)
+    lowest_p = t.get("lowest_price", trigger_p)
+    outcome = None
+    classification = None
+    simulated_pnl = 0.0
+    resolved_bar_ts = None
+
+    for k in klines:
+        k_open_time = int(k[0]) // 1000
+        k_high = float(k[2])
+        k_low = float(k[3])
+        k_close = float(k[4])
+        if active_from is not None and k_open_time < active_from:
+            continue
+
+        # 1. State: PENDING_TRIGGER
+        if status == "PENDING_TRIGGER":
+            reg_ts = t.get("registered_at_ts", now_ts)
+            if (k_open_time - reg_ts) > MAX_TRIGGER_WAIT_SECONDS:
+                status = "RESOLVED"
+                outcome = "EXPIRED_UNTRIGGERED"
+                classification = "EXPIRED"
+                simulated_pnl = 0.0
+                resolved_bar_ts = k_open_time
+                break
+            elif direction == "LONG" and k_high >= trigger_p:
+                status = "ACTIVE"
+                t["activated_at_ts"] = k_open_time
+                t["activated_at_utc"] = datetime.datetime.fromtimestamp(k_open_time, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                highest_p = trigger_p
+                lowest_p = trigger_p
+            elif direction == "SHORT" and k_low <= trigger_p:
+                status = "ACTIVE"
+                t["activated_at_ts"] = k_open_time
+                t["activated_at_utc"] = datetime.datetime.fromtimestamp(k_open_time, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                highest_p = trigger_p
+                lowest_p = trigger_p
+
+        # 2. State: ACTIVE
+        if status == "ACTIVE":
+            highest_p = max(highest_p, k_high)
+            lowest_p = min(lowest_p, k_low)
+
+            # Check SL hit
+            if direction == "LONG" and k_low <= sl_p:
+                status = "RESOLVED"
+                outcome = "STOP_LOSS_HIT"
+                classification = "TRUE_NEGATIVE"
+                simulated_pnl = -risk_dollar
+                resolved_bar_ts = k_open_time
+                break
+            elif direction == "SHORT" and k_high >= sl_p:
+                status = "RESOLVED"
+                outcome = "STOP_LOSS_HIT"
+                classification = "TRUE_NEGATIVE"
+                simulated_pnl = -risk_dollar
+                resolved_bar_ts = k_open_time
+                break
+
+            # Check TP1 hit
+            if direction == "LONG" and k_high >= tp1_p:
+                status = "RESOLVED"
+                outcome = "TP1_HIT"
+                classification = "FALSE_NEGATIVE"
+                simulated_pnl = risk_dollar * 1.8
+                resolved_bar_ts = k_open_time
+                break
+            elif direction == "SHORT" and k_low <= tp1_p:
+                status = "RESOLVED"
+                outcome = "TP1_HIT"
+                classification = "FALSE_NEGATIVE"
+                simulated_pnl = risk_dollar * 1.8
+                resolved_bar_ts = k_open_time
+                break
+
+            # Check Intraday Dead Alpha Timeout (Max 4.0 Hours Holding Horizon)
+            act_ts = t.get("activated_at_ts", k_open_time)
+            if (k_open_time - act_ts) >= MAX_INTRADAY_HOLD_SECONDS:
+                status = "RESOLVED"
+                ret_pct = ((k_close - trigger_p) / trigger_p) if direction == "LONG" else ((trigger_p - k_close) / trigger_p)
+                d_sl = abs(trigger_p - sl_p) / trigger_p if trigger_p > 0 else 0.02
+                est_notional = (risk_dollar / d_sl) if d_sl > 0 else (risk_dollar * 20.0)
+                sim_pnl = round(est_notional * ret_pct, 2)
+                sim_pnl = max(-risk_dollar, min(risk_dollar * 1.8, sim_pnl))
+
+                outcome = "INTRADAY_TIMEOUT_PROFIT" if sim_pnl >= 0 else "INTRADAY_TIMEOUT_LOSS"
+                classification = "TIMEOUT_CLOSED"
+                simulated_pnl = sim_pnl
+                resolved_bar_ts = k_open_time
+                break
+
+    # Fallback Check Expiration (>24 hours): flagged resolution_basis "fallback_24h" (issue #312)
+    basis = "klines"
+    if status in ["PENDING_TRIGGER", "ACTIVE"] and (now_ts - t.get("registered_at_ts", now_ts)) > FALLBACK_EXPIRE_SECONDS:
+        status = "RESOLVED"
+        outcome = "EXPIRED"
+        classification = "EXPIRED"
+        simulated_pnl = 0.0
+        basis = "fallback_24h"
+
+    # Calculate MFE & MAE
+    if trigger_p > 0:
+        if direction == "LONG":
+            mfe = ((highest_p - trigger_p) / trigger_p) * 100
+            mae = ((lowest_p - trigger_p) / trigger_p) * 100
+        else:
+            mfe = ((trigger_p - lowest_p) / trigger_p) * 100
+            mae = ((trigger_p - highest_p) / trigger_p) * 100
+    else:
+        mfe, mae = 0.0, 0.0
+
+    t["highest_price"] = highest_p
+    t["lowest_price"] = lowest_p
+    t["max_favorable_excursion_pct"] = round(mfe, 2)
+    t["max_adverse_excursion_pct"] = round(mae, 2)
+    t["last_checked_price"] = float(klines[-1][4])
+    t["last_checked_ts"] = now_ts
+    t["status"] = status
+
+    if status == "RESOLVED":
+        _mark_resolved(t, now_ts, now_utc, outcome, classification, simulated_pnl, basis, resolved_bar_ts)
+        return True
+    return False
+
+
+def resolution_ts(row: dict) -> float:
+    """Real resolution time of a resolved row (issue #312): resolved_bar_ts when present, else resolved_at_ts (0)."""
+    bar = _to_float(row.get("resolved_bar_ts"))
+    return bar if bar is not None else (row.get("resolved_at_ts", 0) or 0)
+
+
+def _row_r(row: dict) -> Optional[float]:
+    """simulated_pnl_usdt / target_dollar_risk; None when either is missing or the risk is not positive."""
+    pnl, risk = _to_float(row.get("simulated_pnl_usdt")), _to_float(row.get("target_dollar_risk"))
+    if pnl is None or risk is None or risk <= 0:
+        return None
+    return pnl / risk
+
+
+def _r_totals(rows: List[dict]) -> tuple:
+    """(saved_r, missed_r, skipped) over the TN / FN rows: |R| of the true negatives, R of the false negatives; rows
+    without an R are skipped and counted."""
+    saved = missed = 0.0
+    skipped = 0
+    for r in rows:
+        c = r.get("classification")
+        if c not in ("TRUE_NEGATIVE", "FALSE_NEGATIVE"):
+            continue
+        value = _row_r(r)
+        if value is None:
+            skipped += 1
+        elif c == "TRUE_NEGATIVE":
+            saved += abs(value)
+        else:
+            missed += value
+    return saved, missed, skipped
+
+
+def largest_risk_rows(rows: List[dict], n: int = 3) -> List[dict]:
+    """The n rows with the largest target_dollar_risk ({id, symbol, target_dollar_risk, status, classification}), to
+    spot rows of another size that dominate the USDT totals (issue #312; history is never rewritten)."""
+    sized = [r for r in rows if isinstance(r, dict) and _to_float(r.get("target_dollar_risk")) is not None]
+    sized.sort(key=lambda r: -_to_float(r.get("target_dollar_risk")))
+    return [{"id": r.get("id"), "symbol": r.get("symbol"), "target_dollar_risk": _to_float(r.get("target_dollar_risk")),
+             "status": r.get("status"), "classification": r.get("classification")} for r in sized[:n]]
 
 def calculate_efficacy_metrics(rolling_window: int = ROLLING_WINDOW_SIZE) -> dict:
     """Calculates Filter Efficacy Ratio (FER) all-time, clean intraday (<=4h), and rolling window."""
@@ -796,7 +1085,7 @@ def calculate_efficacy_metrics(rolling_window: int = ROLLING_WINDOW_SIZE) -> dic
     intraday_records = [
         r for r in resolved
         if r.get("classification") in ["TRUE_NEGATIVE", "FALSE_NEGATIVE"]
-        and ((r.get("resolved_at_ts", 0) - (r.get("activated_at_ts") or r.get("registered_at_ts", 0))) <= MAX_INTRADAY_HOLD_SECONDS + 300)
+        and ((resolution_ts(r) - (r.get("activated_at_ts") or r.get("registered_at_ts", 0))) <= MAX_INTRADAY_HOLD_SECONDS + 300)
     ]
     i_tn = sum(1 for r in intraday_records if r.get("classification") == "TRUE_NEGATIVE")
     i_fn = sum(1 for r in intraday_records if r.get("classification") == "FALSE_NEGATIVE")
@@ -815,6 +1104,11 @@ def calculate_efficacy_metrics(rolling_window: int = ROLLING_WINDOW_SIZE) -> dic
     r_saved = sum(abs(r.get("simulated_pnl_usdt", 1.5)) for r in recent_slice if r.get("classification") == "TRUE_NEGATIVE")
     r_missed = sum(r.get("simulated_pnl_usdt", 0) for r in recent_slice if r.get("classification") == "FALSE_NEGATIVE")
     rolling_net_edge = r_saved - r_missed
+
+    # Issue #312: R totals (the USDT totals mix row sizes); rows without a risk are skipped and counted
+    saved_r, missed_r, r_skipped = _r_totals(resolved)
+    i_saved_r, i_missed_r, _ = _r_totals(intraday_records)
+    r_saved_r, r_missed_r, _ = _r_totals(recent_slice)
 
     # 4. Resolved rows by rejection gate (issue #251; rows without "gate" predate it: legacy vol_ratio category)
     gate_counts: Dict[str, int] = {}
@@ -845,6 +1139,13 @@ def calculate_efficacy_metrics(rolling_window: int = ROLLING_WINDOW_SIZE) -> dic
         "rolling_capital_saved_usdt": round(r_saved, 2),
         "rolling_missed_alpha_usdt": round(r_missed, 2),
         "rolling_net_edge_usdt": round(rolling_net_edge, 2),
+        "capital_saved_r": round(saved_r, 2),
+        "missed_alpha_r": round(missed_r, 2),
+        "net_filter_edge_r": round(saved_r - missed_r, 2),
+        "intraday_net_edge_r": round(i_saved_r - i_missed_r, 2),
+        "rolling_net_edge_r": round(r_saved_r - r_missed_r, 2),
+        "r_rows_skipped": r_skipped,
+        "largest_risk_rows": largest_risk_rows(resolved + active),
         "gate_counts": gate_counts,
         "gate_source_counts": gate_source_counts,
         "active_trades": active,
@@ -866,20 +1167,22 @@ def print_shadow_dashboard():
     print(f"  • Capital Saved (SL Avoided): +${m['capital_saved_usdt']} USDT")
     print(f"  • Missed Alpha (TP Missed):   -${m['missed_alpha_usdt']} USDT")
     net_str = f"+${m['net_filter_edge_usdt']}" if m['net_filter_edge_usdt'] >= 0 else f"-${abs(m['net_filter_edge_usdt'])}"
-    print(f"  • Net Filter Advantage:   {net_str} USDT")
+    print(f"  • Net Filter Advantage:   {net_str} USDT (mixed row sizes, see R)")
+    print(f"  • In R (unit risk):       Saved +{m['capital_saved_r']}R | Missed -{m['missed_alpha_r']}R | "
+          f"Net {m['net_filter_edge_r']:+}R (rows without risk skipped: {m['r_rows_skipped']})")
     print("-" * 80)
     print(f"⚡ INTRADAY CLEAN HORIZON (<= 4.0 Hours Holding):")
     i_color = "🟢" if m["intraday_fer_pct"] >= 70 else ("🟡" if m["intraday_fer_pct"] >= 50 else "🔴")
     print(f"  • Intraday Conclusive:    {m['intraday_conclusive_count']} setups")
     print(f"  • Intraday Clean FER:     {i_color} {m['intraday_fer_pct']}%")
     i_net_str = f"+${m['intraday_net_edge_usdt']}" if m['intraday_net_edge_usdt'] >= 0 else f"-${abs(m['intraday_net_edge_usdt'])}"
-    print(f"  • Intraday Clean Edge:    {i_net_str} USDT (Saved: +${m['intraday_capital_saved_usdt']} | Missed: -${m['intraday_missed_alpha_usdt']})")
+    print(f"  • Intraday Clean Edge:    {i_net_str} USDT (Saved: +${m['intraday_capital_saved_usdt']} | Missed: -${m['intraday_missed_alpha_usdt']}) | {m['intraday_net_edge_r']:+}R")
     print("-" * 80)
     print(f"🔄 ROLLING WINDOW (Last {m['rolling_window_size']} Setups):")
     r_color = "🟢" if m["rolling_fer_pct"] >= 70 else ("🟡" if m["rolling_fer_pct"] >= 50 else "🔴")
     print(f"  • Rolling FER:            {r_color} {m['rolling_fer_pct']}%")
     r_net_str = f"+${m['rolling_net_edge_usdt']}" if m['rolling_net_edge_usdt'] >= 0 else f"-${abs(m['rolling_net_edge_usdt'])}"
-    print(f"  • Rolling Net Edge:       {r_net_str} USDT")
+    print(f"  • Rolling Net Edge:       {r_net_str} USDT | {m['rolling_net_edge_r']:+}R")
     print("-" * 80)
 
     if m["active_trades"]:
@@ -933,7 +1236,10 @@ def main():
     if args.audit or not (args.register_from_eval or args.loop or args.json):
         if not args.register_from_eval:   # already read by register_from_evaluation; --json keeps stdout JSON
             _register_gate_denials_and_print(sys.stderr if args.json else None)
-        res = audit_shadow_trades()
+        res = audit_shadow_trades()  # issue #312: unbounded (whole backlog); the guardian runs the bounded one
+        if isinstance(res, dict) and res.get("skipped") == "lock_held":
+            print(LOCK_HELD_LINE, file=sys.stderr if args.json else sys.stdout)
+            return
         if not args.json:
             print_shadow_dashboard()
         else:
@@ -950,8 +1256,10 @@ def main():
             try:
                 # 1. Check for newly rejected evaluations (deduped_window printed too, issue #290)
                 _register_and_print()
-                # 2. Audit active trades
-                audit_shadow_trades()
+                # 2. Audit active trades (skipped with one line while another audit holds the lock, issue #312)
+                res = audit_shadow_trades()
+                if isinstance(res, dict) and res.get("skipped") == "lock_held":
+                    print(LOCK_HELD_LINE)
                 # 3. Print report
                 print_shadow_dashboard()
             except Exception as e:

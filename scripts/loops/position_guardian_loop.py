@@ -54,6 +54,9 @@ Per cycle:
      is resolved once per env per cycle (a config error becomes an excursion_warnings entry
      "klines_host_fallback: <msg>"); EXCURSION_FAIL_REPORT_AFTER (10) consecutive tracker failures of a position
      file one MEDIUM/P2 report (never in --dry-run).
+     After step 5 (positions read), issue #312: a bounded shadow-desk audit (shadow_tracker.audit_shadow_trades,
+     SHADOW_AUDIT_BUDGET_SECONDS 5 s, SHADOW_AUDIT_MAX_ROWS rows, at most every SHADOW_AUDIT_MIN_INTERVAL_S), only
+     with the real logs/ dir and never in --dry-run; report-only and fail-open (never an error, no cycle_ok effect).
   6. State is written atomically to logs/guardian_state.json and every action is appended to
      logs/guardian_actions.jsonl.
 
@@ -243,6 +246,9 @@ STOP_UNKNOWN_ESCALATE_AFTER = 3  # consecutive UNKNOWN stop reads before heal_un
 EXCURSION_PASS_BUDGET_SECONDS = 5  # issue #192: checked before each klines read, so the real bound is ~budget + one 2 s
 # klines timeout (~7 s), far inside the liveness rule; total time of the excursion pass; later positions are skipped
 EXCURSION_FAIL_REPORT_AFTER = 10  # issue #192: consecutive tracker failures of one position before one report
+SHADOW_AUDIT_BUDGET_SECONDS = 5  # issue #312: bounded shadow audit per cycle (klines reads capped by the deadline)
+SHADOW_AUDIT_MAX_ROWS = 25       # issue #312: rows per bounded shadow audit
+SHADOW_AUDIT_MIN_INTERVAL_S = 120  # issue #312: at most one shadow audit per 120 s (logs/shadow_state.json)
 POSITION_CLOSED_DEDUPE_LINES = 500  # issue #192: guardian_actions.jsonl tail checked before a position_closed
 _UNRESOLVED = object()  # persist(): owner not resolved by the caller
 
@@ -835,6 +841,27 @@ class GuardianCycle:
             self.action(u["symbol"], "unknown_resting_entry", False, dict(u, message=msg))
             self.error(u["symbol"], "pending_unknown_entry", msg)
 
+    def _shadow_audit(self):
+        """Issue #312, report-only: bounded shadow_tracker.audit_shadow_trades (SHADOW_AUDIT_BUDGET_SECONDS,
+        SHADOW_AUDIT_MAX_ROWS, at most every SHADOW_AUDIT_MIN_INTERVAL_S). Runs only when this cycle's log_dir is the
+        shadow tracker's logs dir (where its files live) and never in --dry-run. Fail-open: any error is one stderr
+        line, never an error of the cycle."""
+        if self.dry_run:
+            return
+        try:
+            import shadow_tracker
+            here = os.path.realpath(self.log_dir)
+            if (here != os.path.realpath(shadow_tracker.LOGS_DIR)
+                    or here != os.path.realpath(os.path.dirname(shadow_tracker.SHADOW_TRADES_FILE))):
+                return
+            shadow_tracker.audit_shadow_trades(budget_s=SHADOW_AUDIT_BUDGET_SECONDS, max_rows=SHADOW_AUDIT_MAX_ROWS,
+                                               min_interval_s=SHADOW_AUDIT_MIN_INTERVAL_S)
+        except Exception as e:
+            try:
+                print(f"guardian: shadow audit skipped ({type(e).__name__}: {e})", file=sys.stderr)
+            except Exception:
+                pass
+
     # -- cycle -------------------------------------------------------------
     def run(self):
         # Issue #192: the klines host is resolved once per env for this cycle only (other callers are unaffected).
@@ -889,6 +916,7 @@ class GuardianCycle:
             except Exception as e:
                 self._excursion_failed(view, e)
         self._check_unknown_entries()
+        self._shadow_audit()
         return self.finish()
 
     def finish(self):
