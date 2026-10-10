@@ -129,7 +129,8 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    scripts/execute_futures_trade.py; logs/primed_brief.json and logs/primed_brief_scores.json (evaluator brief and
    its radar scores) <- scripts/prime_evaluator_brief.py; logs/gate_denials.jsonl (delta-gate denials of approved
    candidates for the shadow desk, see 11) <- this hook itself (issue #261); logs/trading_lease.json (single trading
-   writer, see 12) <- this hook and scripts/hooks/post_trade_sync.py (issue #280). File tools targeting them are denied: relative, absolute and Windows paths, NTFS aliases
+   writer, see 12) <- this hook and scripts/hooks/post_trade_sync.py (issue #280). File tools targeting them (and the
+   lease's .lock sidecar, issue #287) are denied: relative, absolute and Windows paths, NTFS aliases
    (trailing dot/space, ::$DATA streams) and targets whose os.path.realpath / samefile is a protected file
    (symlinked directory, hard link).
    Shell commands. The program of a sub-command is found past VAR=value / VAR+=value assignments, shell keywords
@@ -343,8 +344,9 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    logs/trading_lease.json {session_id, runtime, acquired_at, heartbeat_at, env} names the one session (agy
    conversationId / Claude Code session_id) that may open PROD positions. evaluate_trade_opening checks it read-only
    after the PROD bypass denial and, once every gate passed, claims or refreshes it atomically under its lock (bounded
-   wait, a lock not acquired denies): no lease or a stale one (heartbeat older than LEASE_STALE_SECONDS) -> this
-   session claims it; held by this session -> heartbeat refreshed (idempotent across wsl / PowerShell re-evaluations);
+   wait, a lock not acquired denies): no lease or a stale one (heartbeat older than LEASE_STALE_SECONDS or more than
+   LEASE_FUTURE_SKEW_SECONDS in the future) -> this session claims it; held by this session -> heartbeat refreshed
+   (one claim per hook evaluation: the wsl / PowerShell re-evaluations reuse it, issue #287);
    held by another session and fresh -> denied naming the holder; any lease (stale included) with an unknown caller ->
    denied (no lease and an unknown caller -> allowed, never claimed); unreadable / malformed -> denied. A denial writes
    nothing.
@@ -844,8 +846,11 @@ GROUND_TRUTH_FILES = {
 GROUND_TRUTH_BASENAMES = {path.rsplit("/", 1)[-1].lower(): path for path in GROUND_TRUTH_FILES}
 GROUND_TRUTH_RE = re.compile("|".join(re.escape(n) for n in GROUND_TRUTH_BASENAMES), re.IGNORECASE)
 GROUND_TRUTH_TARGET_RE = re.compile(
-    r"(?:^|/)logs/(" + "|".join(re.escape(n) for n in GROUND_TRUTH_BASENAMES) + r")$", re.IGNORECASE
+    r"(?:^|/)logs/(" + "|".join(re.escape(n) for n in GROUND_TRUTH_BASENAMES) + r")(\.lock)?$", re.IGNORECASE
 )
+# Ground-truth files whose utils.file_lock sidecar (<file>.lock) a file tool may not write either (issue #287: deleting
+# or replacing the lease lock would weaken its mutual exclusion); the shell-side match already covers it
+GROUND_TRUTH_LOCK_SIDECARS = {"logs/trading_lease.json"}
 SHELL_GLOB_RE = re.compile(r"[*?\[{]")
 # Windows drive (C:\x, C:/x), UNC (\\server\share) and drive-mount (/mnt/c/x, Git Bash /c/x) path forms
 WINDOWS_FORM_PATH_RE = re.compile(r"^(?:[A-Za-z]:(?:/|$)|//[^/]|/mnt/[A-Za-z](?:/|$)|/[A-Za-z]/)")
@@ -5887,14 +5892,24 @@ def _strip_windows_aliases(path: str) -> str:
     return drive + "/".join(parts)
 
 
+def _ground_truth_target_key(path: str) -> Optional[str]:
+    """GROUND_TRUTH_FILES key when a path ends with logs/<protected name> (or the lock sidecar of one listed in
+    GROUND_TRUTH_LOCK_SIDECARS), else None."""
+    m = GROUND_TRUTH_TARGET_RE.search(path) if path else None
+    if not m:
+        return None
+    key = GROUND_TRUTH_BASENAMES[m.group(1).lower()]
+    return key if not m.group(2) or key in GROUND_TRUTH_LOCK_SIDECARS else None
+
+
 def _ground_truth_file_target(target: str, abs_norm: str, rel: str) -> Optional[str]:
-    """GROUND_TRUTH_FILES key when a file-tool target ends with logs/<protected name>, else None."""
+    """GROUND_TRUTH_FILES key when a file-tool target ends with logs/<protected name> (or a protected lock sidecar),
+    else None."""
     raw = re.sub(r"^file:/*", "/", (target or "").strip(), flags=re.IGNORECASE)
     for candidate in (rel, abs_norm, raw):
-        path = _shell_path(_strip_windows_aliases(candidate or ""))
-        m = GROUND_TRUTH_TARGET_RE.search(path) if path else None
-        if m:
-            return GROUND_TRUTH_BASENAMES[m.group(1).lower()]
+        key = _ground_truth_target_key(_shell_path(_strip_windows_aliases(candidate or "")))
+        if key:
+            return key
     return None
 
 
@@ -5930,8 +5945,7 @@ def _ground_truth_alias_target(target: str, base_dir: str) -> Optional[str]:
                 return key
         except (OSError, ValueError):
             continue
-    m = GROUND_TRUTH_TARGET_RE.search(_shell_path(_strip_windows_aliases(real)))
-    return GROUND_TRUTH_BASENAMES[m.group(1).lower()] if m else None
+    return _ground_truth_target_key(_shell_path(_strip_windows_aliases(real)))
 
 
 def _git_exec_config_file_target(target: str, abs_norm: str, rel: str, base_dir: str) -> bool:
@@ -6235,14 +6249,22 @@ def _trading_lease_denial(base_dir: str, conversation_id: Optional[str], runtime
     claim=False: read-only check (utils.trading_lease.check_opening); claim=True: the atomic check-and-set under the
     lease lock (claim_or_refresh: no lease or a stale one -> this session claims it; held by this session -> heartbeat
     refreshed; an unknown caller never claims). Another session's fresh lease, a lease with an unknown caller, an
-    unreadable / malformed lease, a lock not acquired, a missing module or any error -> denied (fail closed)."""
+    unreadable / malformed lease, a lock not acquired, a missing module or any error -> denied (fail closed).
+    Issue #287: a claim allowed for a session is memoised in the audit scope, so the outer line, the wsl re-parse and
+    the PowerShell whole of one hook evaluation take the lock once (a denial is never memoised)."""
     if tl is None:
         return ("🚨 FAIL-CLOSED (Trading Lease): the lease module (scripts/utils/trading_lease.py) is unavailable. "
                 "PROD opening blocked.")
+    memo = _AUDIT["memo"] if claim and conversation_id and _AUDIT["active"] else None
+    memo_key = ("trading_lease_claim", base_dir, conversation_id)
+    if memo is not None and memo.get(memo_key):
+        return None
     try:
         result = (tl.claim_or_refresh(base_dir, conversation_id, runtime, now_ts) if claim
                   else tl.check_opening(base_dir, conversation_id, now_ts))
         if result.get("allow"):
+            if memo is not None:
+                memo[memo_key] = True
             return None
         return "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Trading Lease): " + tl.denial_reason(result, now_ts)
     except Exception as e:

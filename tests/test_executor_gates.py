@@ -295,7 +295,9 @@ class TestExecutorDossierIntegration(_TempWorkspace):
     """execute_complete_trade must reject before ANY Binance write when the dossier gate fails."""
 
     def _run(self, **kw):
+        # Issue #287: _workspace_dir too, so the PROD trading lease cross-check reads the temp workspace, never logs/
         with patch("execute_futures_trade.find_workspace_root", return_value=self.root), \
+             patch("execute_futures_trade._workspace_dir", return_value=self.root), \
              patch("execute_futures_trade.load_env", return_value={"LIVE_TRADING_ARMED": "true"}), \
              patch("execute_futures_trade.send_signed_request") as mock_send, \
              patch("execute_futures_trade.setup_margin_and_leverage") as mock_setup, \

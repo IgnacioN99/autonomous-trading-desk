@@ -7,8 +7,11 @@ One agent session at a time may open PROD positions: the PreToolUse hook (script
 the lease at an allowed opening and refreshes it on the holder's next ones; the PostToolUse hook
 (scripts/hooks/post_trade_sync.py) refreshes it after the holder's brief / record commands and commits a takeover the
 user approved (`python3 scripts/trading_lease.py --take`, force-asked by the PreToolUse hook). Those two hooks are the
-file's only writers. A lease whose heartbeat is older than LEASE_STALE_SECONDS holds nothing: the next opener claims
-it. Risk-reducing paths and TESTNET never read it.
+file's only writers. A lease whose heartbeat is older than LEASE_STALE_SECONDS, or more than LEASE_FUTURE_SKEW_SECONDS
+in the future, holds nothing: the next opener claims it. Risk-reducing paths and TESTNET never read it. The lease is
+per workspace: the main checkout and a worktree with its own logs/ never see each other's lease. A caller without a
+session id is allowed while there is no lease and never claims (agy / other runtimes may not supply one); the dossier
+provenance and the executor cross-check still bind its opening (issue #287).
 
 Fail closed: an unreadable or malformed file is an error (the PROD callers deny) and every write holds the sidecar
 lock (utils.file_lock) for at most LOCK_WAIT_S; a lock not acquired raises LeaseError and nothing is written.
@@ -31,6 +34,8 @@ except ImportError:  # pragma: no cover - imported as scripts.utils.trading_leas
 LEASE_REL_PATH = ("logs", "trading_lease.json")
 # Stale after this long without a heartbeat (dossier TTL 1200 s plus a user-confirmation wait); not a profile key
 LEASE_STALE_SECONDS = 1800
+# A heartbeat further in the future than this (clock skew, a forged date) is stale too, never live forever (#287)
+LEASE_FUTURE_SKEW_SECONDS = 300
 # Shorter than file_lock's 2 s: the PreToolUse hook has a 10 s budget
 LOCK_WAIT_S = 1.5
 SESSION_ABBREV_CHARS = 8
@@ -78,7 +83,9 @@ def load(base_dir: str) -> Optional[Dict[str, Any]]:
 
 
 def is_stale(record: Dict[str, Any], now: float, ttl: int = LEASE_STALE_SECONDS) -> bool:
-    return now - float(record["heartbeat_at"]) > ttl
+    """Heartbeat older than ttl, or more than LEASE_FUTURE_SKEW_SECONDS in the future."""
+    heartbeat = float(record["heartbeat_at"])
+    return now - heartbeat > ttl or heartbeat - now > LEASE_FUTURE_SKEW_SECONDS
 
 
 def abbreviate(session: Any) -> str:
