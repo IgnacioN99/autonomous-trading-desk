@@ -31,10 +31,10 @@ NOW_S = int(time.time())
 T0 = (NOW_S - 2 * 86400) * 1000  # entry fills two days ago (ms)
 
 
-def fill(fid, order_id, side, price, qty, t_ms, pnl=0.0, comm=0.0, asset="USDT", symbol="BTCUSDT"):
+def fill(fid, order_id, side, price, qty, t_ms, pnl=0.0, comm=0.0, asset="USDT", symbol="BTCUSDT", maker=False):
     return {"id": fid, "orderId": order_id, "symbol": symbol, "side": side, "price": str(price), "qty": str(qty),
             "quoteQty": str(price * qty), "realizedPnl": str(pnl), "commission": str(comm), "commissionAsset": asset,
-            "positionSide": "BOTH", "maker": False, "time": int(t_ms)}
+            "positionSide": "BOTH", "maker": maker, "time": int(t_ms)}
 
 
 class FakeFills:

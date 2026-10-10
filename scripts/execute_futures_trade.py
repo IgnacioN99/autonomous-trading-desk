@@ -186,7 +186,8 @@ except Exception:  # pragma: no cover - exercised only on broken installs
 # GATE 2 (YOLO loss cap) and GATE 3 (friction floor) limits, shared with the YOLO scanner and the screening
 # pipeline (scripts/utils/gate_limits.py, issue #64).
 from utils.gate_limits import (MIN_RR_TP2_CROSSED, MIN_TP1_DISTANCE, PENDING_DRIFT_CAP_TOLERANCE,
-                               RISK_CLAMP_HAIRCUT, YOLO_MAX_LOSS_MARGIN_FRACTION, YOLO_MIN_LOSS_CAP_USDT)
+                               RISK_CLAMP_HAIRCUT, TAKER_FEE_RATE, YOLO_MAX_LOSS_MARGIN_FRACTION,
+                               YOLO_MIN_LOSS_CAP_USDT, expected_fee_r)
 # Portfolio delta classification shared with sync_session_state.py; PROD gates apply it to the live exchange view.
 from utils.portfolio_exposure import (compute_exposure, book_exposure, project_order, resting_opening_legs,
                                       unrealized_pnl_total, LONG_HEAVY, SHORT_HEAVY)
@@ -1587,6 +1588,9 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
     10000 fallback. `exchange_ticks` ({symbol: tickSize}, issue #160) caps the registry tick_size used to match
     quantity-less resting orders to their records (record_price_tolerances); when given, records on symbols it does not
     know match exactly (strict_ticks, issue #189).
+    Gate 3B (issue #268, PROD only): with a profile `max_fee_r` set (null = OFF, the default), rejects when
+    utils.gate_limits.expected_fee_r of the stop distance from the effective entry (taker entry + taker SL) exceeds
+    it, when it cannot be computed, or when `max_fee_r` is present but invalid. Risk-reducing paths never call this.
     """
     ref = entry_price if entry_price else cur_price
     target_env = resolve_env(target_env)
@@ -1778,6 +1782,24 @@ def check_mechanical_gates(direction, cur_price, sl_price, tp1_price, total_qty,
         profit_pct_tp1 = ((tp1_price - ref) / ref) if is_long else ((ref - tp1_price) / ref)
         if profit_pct_tp1 < MIN_TP1_DISTANCE:
             return False, f"MECHANICAL HARD GATE REJECTION: Distance to TP1 ({profit_pct_tp1*100:.2f}%) below {MIN_TP1_DISTANCE*100:.2f}% friction floor or on the wrong side of entry (entry ref {ref}). Taker commissions erode statistical edge."
+
+    # --- GATE 3B: Fee-in-R Gate (issue #268; PROD only, OFF while the profile's max_fee_r is null) ---
+    if not is_testnet:
+        fee_cfg = up.get_max_fee_r(prof)
+        if fee_cfg["error"]:
+            return False, (f"MECHANICAL HARD GATE REJECTION: FAIL-CLOSED — invalid profile fee-in-R threshold "
+                           f"({fee_cfg['error']}). Fix config/user_profile.json (null turns the gate off).")
+        max_fee_r = fee_cfg["max_fee_r"]
+        if max_fee_r is not None:
+            stop_pct = abs(ref - sl_price) / ref * 100 if ref and ref > 0 and sl_price else None
+            fee_r = expected_fee_r(stop_pct)
+            if fee_r is None:
+                return False, (f"MECHANICAL HARD GATE REJECTION: FAIL-CLOSED — cannot compute the expected fee in R "
+                               f"(entry ref {ref}, SL {sl_price}). Order blocked.")
+            if fee_r > max_fee_r:
+                return False, (f"MECHANICAL HARD GATE REJECTION: Expected fee {fee_r:.4f}R (taker entry + taker SL, "
+                               f"{TAKER_FEE_RATE*100:.2f}% each) exceeds the profile max_fee_r {max_fee_r:g}R at a "
+                               f"{stop_pct:.2f}% stop distance (entry ref {ref}, SL {sl_price}).")
 
     return True, None
 

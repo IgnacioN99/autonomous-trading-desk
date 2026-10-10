@@ -361,7 +361,7 @@ class TestYoloLevelsFromTrigger(unittest.TestCase):
         self.assertEqual(cand.rr_tp2, bys.TP2_R)
         self.assertEqual(set(sp.YoloCandidate.model_fields),
                          {"symbol", "direction", "trigger", "sl", "tp1", "tp2", "risk_pct", "rr_tp2", "leverage",
-                          "margin_usdt", "rsi", "vol_ratio", "lower_wick"})
+                          "margin_usdt", "rsi", "vol_ratio", "lower_wick", "expected_fee_r"})  # #268: fee_r
 
     def test_trigger_premium_below_rr_floors_is_dropped(self):
         """Levels set from the current price but entered at a higher trigger: TP1 < 1.8R or TP2 < 3:1 -> dropped."""
