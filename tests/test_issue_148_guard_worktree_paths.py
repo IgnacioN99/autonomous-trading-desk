@@ -2,6 +2,7 @@
 """
 test_issue_148_guard_worktree_paths.py - Issue #148: file-tool writes inside a linked git worktree of the same
 repository (a sibling <repo>-wt-issue-<N>) were judged as outside scripts/ and tests/ and got a false force_ask.
+Issue #307: such a registered issue worktree is now allowed (except WORKTREE_GUARD_DEFINING, force_ask).
 
 Hermetic: fake repositories and worktrees are built in temporary directories (no git binary, no network, no
 writes to the real logs/).
@@ -66,13 +67,15 @@ class _Base(unittest.TestCase):
 
 class TestLinkedWorktreeFileWrites(_Base):
     def test_worktree_tests_and_scripts_are_in_scope(self):
+        # #307: a registered issue worktree (sibling trading-wt-issue-<N>) is allowed
         for rel in ("tests/test_x.py", "scripts/x.py", "scripts/utils/y.py"):
             with self.subTest(rel=rel):
-                self.assertEqual(self.decision(os.path.join(self.wt, *rel.split("/"))), "ask")
+                self.assertEqual(self.decision(os.path.join(self.wt, *rel.split("/"))), "allow")
 
-    def test_worktree_root_file_still_force_ask(self):
-        self.assertEqual(self.decision(os.path.join(self.wt, "x.py")), "force_ask")
-        self.assertEqual(self.decision(os.path.join(self.wt, "docs", "x.py")), "force_ask")
+    def test_worktree_root_file_allowed(self):
+        # #307: the content checks are skipped for allowed worktree paths (they were force_ask before)
+        self.assertEqual(self.decision(os.path.join(self.wt, "x.py")), "allow")
+        self.assertEqual(self.decision(os.path.join(self.wt, "docs", "x.py")), "allow")
 
     def test_forged_git_file_without_back_pointer_force_ask(self):
         forged = os.path.join(self.tmp, "forged")
@@ -99,9 +102,10 @@ class TestLinkedWorktreeFileWrites(_Base):
     def test_plain_directory_without_git_force_ask(self):
         self.assertEqual(self.decision(os.path.join(self.tmp, "plain", "tests", "t.py")), "force_ask")
 
-    def test_order_endpoint_content_force_ask_in_worktree(self):
-        self.assertEqual(self.decision(os.path.join(self.wt, "tests", "t.py"), ENDPOINT), "force_ask")
-        self.assertEqual(self.decision(os.path.join(self.wt, "scripts", "x.py"), ENDPOINT), "force_ask")
+    def test_order_endpoint_content_allowed_in_worktree(self):
+        # #307: executor tests legitimately name /fapi/v1/order; main keeps the force_ask (regressions below)
+        self.assertEqual(self.decision(os.path.join(self.wt, "tests", "t.py"), ENDPOINT), "allow")
+        self.assertEqual(self.decision(os.path.join(self.wt, "scripts", "x.py"), ENDPOINT), "allow")
 
     def test_main_checkout_regressions(self):
         self.assertEqual(self.decision(os.path.join(self.repo, "tests", "t.py")), "ask")
@@ -117,9 +121,10 @@ class TestLinkedWorktreeFileWrites(_Base):
         self.assertEqual(self.decision(os.path.join(self.wt, "tests", "t.py"), base_dir=self.wt), "ask")
         self.assertEqual(self.decision(os.path.join(self.wt, "x.py"), base_dir=self.wt), "force_ask")
 
-    def test_worktree_harness_copy_keeps_plain_ask(self):
+    def test_worktree_guard_copy_force_asks(self):
+        # #307: the guard-defining files keep an explicit confirmation in the worktree too
         target = os.path.join(self.wt, "scripts", "hooks", "pre_trade_guard.py")
-        self.assertEqual(self.decision(target, "x = 1\n"), "ask")
+        self.assertEqual(self.decision(target, "x = 1\n"), "force_ask")
 
 
 class TestLinkedWorktreeRelHelper(_Base):

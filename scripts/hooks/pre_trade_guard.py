@@ -57,7 +57,8 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    --shell-type login (it sources ~/.profile; standard / none are fine) and no wsl.exe -d /
    --distribution other than WSL_DISTRO_NAME (case-insensitive; unset: any -d asks), only RISK_ENV_ASSIGNMENTS
    (BINANCE_API_ENV, BINANCE_AUTH_MODE, PYTHONUNBUFFERED, PYTHONDONTWRITEBYTECODE, PYTHONIOENCODING,
-   MSYS_NO_PATHCONV) and RISK_PYTHON_OPTIONS (-u, -B, -X utf8) before the script, no env -S, and no token of the
+   MSYS_NO_PATHCONV) and RISK_PYTHON_OPTIONS (-u, -B, -X utf8) before the script, an interpreter named bare
+   (python3, never /usr/bin/python3 or <wt>/bin/python3; issue #307), no env -S, and no token of the
    risk-reducing sub-command holding ; | & $ < > ` or a line break (redirects included): otherwise "ask", never a
    denial. A gated trade opening on the same line as a risk-reducing sub-command that may not be auto-allowed asks.
    Paths compare lexically (_lexical_host_path, backslashes read as '/'): C:/x, c:/x and /mnt/c/x are one
@@ -115,9 +116,20 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    git config / hook files (GIT_EXEC_CONFIG_PATH_RE, see 8). File-tool content with trading primitives outside
    scripts/ and tests/ requires force_ask; scripts/ and tests/ of a linked git worktree of the same repository
    (its .git file and <common git dir>/worktrees/<name>/gitdir point at each other; issue #148) count as inside.
-   Inside a linked worktree, HARNESS_FILES / HARNESS_DIRS do not apply, so <wt>/scripts/hooks/* gets a plain ask
-   (worktree copies are not live hooks; they reach main only via PR review and CI; if a session is launched from
-   a worktree, that worktree becomes base_dir and harness checks apply again).
+   Issue #307: a file-tool write whose os.path.realpath lies in a registered issue worktree (a linked worktree of
+   this repository that is a sibling of the main checkout named <main>-wt-issue-<N>, no .git component, judged only
+   when base_dir is the main checkout and the path is lexically outside it) is allowed, content checks skipped
+   (worktree copies are not live; they reach main only via PR review and CI), except WORKTREE_GUARD_DEFINING (the
+   hooks, settings, hooks.json, the modules the hook imports or that decide for it (user_profile.py, file_lock.py),
+   the review / merge machinery): force_ask. Deny rules
+   run first; anything else (unregistered or foreign worktrees, .claude/worktrees, hard-linked targets, errors)
+   keeps the rules above, and a path lexically outside main whose realpath is a main harness file is force_ask.
+   A trade opening is judged by the gates as before, but an allow becomes an ask unless the executor it runs is
+   the sanctioned file from every possible working directory of the line (cd / pushd tracked, nested shells, env
+   -C / sudo -D / wsl.exe --cd, CDPATH; never a linked worktree copy) and its prefix passes the risk-reducing
+   prefix rules (4: bare interpreter name, RISK_ENV_ASSIGNMENTS only, RISK_PYTHON_OPTIONS, RISK_WRAPPERS), so no
+   agent-written code (PYTHONPATH / sitecustomize, <wt>/bin/python3) loads into it. If a session is launched
+   from a worktree, that worktree becomes base_dir and the harness checks apply to it.
 8. GROUND TRUTH PROTECTION (GROUND_TRUTH_FILES):
    Runtime state that gates PROD orders has exactly one sanctioned writer, which writes it from Python:
    logs/session_state.json <- scripts/sync_session_state.py; logs/guardian_state.json (guardian liveness
@@ -330,7 +342,9 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
 10. PASS-THROUGH:
    Tool calls unrelated to trading return "ask" so the runtime's normal permission policy applies.
    "allow" is reserved for calls that passed every trading gate or are purely risk-reducing (4), written as one
-   flat single-line command; anything the analysis cannot vouch for is downgraded to "ask".
+   flat single-line command, and for file-tool writes inside a registered issue worktree outside
+   WORKTREE_GUARD_DEFINING (7, issue #307; every path argument of the call must qualify); anything the analysis
+   cannot vouch for is downgraded to "ask". A linked worktree copy of a risk-reducing script is never sanctioned.
 11. HEARTBEAT:
    Every invocation refreshes logs/hook_heartbeat.json (best effort, never alters the decision). The file is
    ground truth (8) written only by this hook from Python: an agent command that merely names it outside a
@@ -2628,9 +2642,10 @@ def _windows_side_cwd(cwd: str) -> bool:
 
 
 def _sanctioned_script(script: str, cwd: str, base_dir: str, in_wsl: bool,
-                       windows_cwd: Optional[bool] = None, keys=None, allow_worktree: bool = True) -> Optional[str]:
+                       windows_cwd: Optional[bool] = None, keys=None, allow_worktree: bool = False) -> Optional[str]:
     """RISK_REDUCING_SCRIPTS key (or one of keys) of a script operand, compared lexically (no filesystem check) with
-    the sanctioned repo paths under base_dir (and, when allow_worktree, of a linked worktree). A relative operand is
+    the sanctioned repo paths under base_dir (and, when allow_worktree, of a linked worktree; off by default since
+    issue #307: worktree copies are edited without a prompt, so running one is unreviewed code). A relative operand is
     joined with the cwd (else base_dir). Inside wsl.exe the Linux
     path must be relative or absolute POSIX (/mnt/<drive>/... mapping to base_dir, or base_dir itself when the hook
     runs inside WSL); a Windows spelling or a backslash there names another file for Linux: None. windows_cwd (default
@@ -5459,6 +5474,9 @@ def _risk_prefix_blocker(tokens: List[str]) -> Optional[str]:
             tokens = linux
             continue
         if PYTHON_PROGRAM_RE.match(prog):
+            if "/" in tokens[idx] or "\\" in tokens[idx]:
+                # Issue #307: an interpreter named by a path may be a file the agent wrote (<wt>/bin/python3)
+                return f"it runs the interpreter by a path ({tokens[idx]}), not by its bare name"
             _toks, script_at, _ = _executed_script_at(tokens)
             options = tokens[idx + 1:script_at] if script_at > idx else tokens[idx + 1:]
             i = 0
@@ -5505,6 +5523,55 @@ def _is_trade_engine_invocation(tokens: List[str], text: str) -> bool:
             or prog in INSPECTION_PROGRAMS):
         return False
     return True
+
+
+def _track_chdir(tokens: List[str], cwds: List[str], unknown: bool) -> Tuple[List[str], bool]:
+    """Issue #307: the possible working directories after a CHDIR_PROGRAMS sub-command: a plain cd / pushd is tracked
+    by _apply_cd; one with an env assignment or wrapper (CDPATH=<dir> cd x: bash honours the temporary CDPATH) and
+    every other directory change (popd, Set-Location ...) make the directory unknown."""
+    idx, info = _command_start(tokens)
+    if _program(tokens) in ("cd", "pushd") and not info["assigns"] and not info["wrappers"]:
+        return _apply_cd(tokens, cwds, unknown)
+    return cwds, True
+
+
+def _prefix_changes_directory(tokens: List[str]) -> bool:
+    """True when a wrapper at any level _executed_script_at crosses changes the working directory (env -C, sudo -D,
+    wsl.exe --cd, also inside wsl -e); too deep a nesting counts as a change."""
+    for _ in range(NESTED_DEPTH_LIMIT + 2):
+        idx, info = _command_start(tokens)
+        if info["chdirs"]:
+            return True
+        if idx >= len(tokens):
+            return False
+        if re.sub(r"\.exe$", "", os.path.basename(tokens[idx]).lower()) != "wsl":
+            return False
+        if _wsl_cd(tokens[idx + 1:]) is not None:
+            return True
+        linux = _wsl_command(tokens[idx + 1:])
+        if not linux:
+            return False
+        tokens = linux
+    return True
+
+
+def _opening_cwd_drift(script: str, outer: List[str], inner: List[str], unwrapped: List[List[str]],
+                       cwds: List[str], cwd_unknown: bool, base_dir: str, in_wsl: bool) -> bool:
+    """Issue #307: True when a trade opening whose executor operand is the sanctioned path from the hook's cwd may
+    still run another file: the line changed directory before it (cd / pushd tracked as a union of possible
+    working directories, from each of which the operand must still be the sanctioned script; an unknown directory,
+    popd or Set-Location never is), a nested shell changes it (bash -c 'cd x && ...'), or a wrapper does (env -C,
+    sudo -D, wsl.exe --cd)."""
+    for sub in unwrapped:  # the nested shell's own sub-commands before the opening
+        if sub is inner:
+            break
+        if _program(sub) in CHDIR_PROGRAMS:
+            cwds, cwd_unknown = _track_chdir(sub, cwds, cwd_unknown)
+        if "CDPATH" in " ".join(sub):  # CDPATH=x; export CDPATH=x: later cds resolve elsewhere
+            cwd_unknown = True
+    if cwd_unknown or _prefix_changes_directory(outer) or _prefix_changes_directory(inner):
+        return True
+    return any(not _sanctioned_script(script, c, base_dir, in_wsl, _windows_side_cwd(c)) for c in cwds[1:])
 
 
 def _analyze_run_command(command_line: str, cwd: str, base_dir: str, shell: str = "bash") -> Dict[str, Any]:
@@ -5587,6 +5654,7 @@ def _analyze_run_command(command_line: str, cwd: str, base_dir: str, shell: str 
         result["deny"] = ground_truth_denial(protected)
         return result
 
+    line_cwds, line_cwd_unknown = [cwd or base_dir], False  # issue #307: possible cwds of a trade opening
     for tokens in subcommands:
         text = " ".join(tokens)
         prog = _program(tokens)
@@ -5594,6 +5662,9 @@ def _analyze_run_command(command_line: str, cwd: str, base_dir: str, shell: str 
             # The sanctioned scripts are matched against the hook's cwd: a line that changes directory never
             # auto-allows a risk-reducing call (one flat command per call)
             result["risk_blocker"] = result["risk_blocker"] or "it changes the working directory"
+            line_cwds, line_cwd_unknown = _track_chdir(tokens, line_cwds, line_cwd_unknown)
+        if "CDPATH" in text:  # CDPATH=x; export CDPATH=x: later cds resolve elsewhere (issue #307)
+            line_cwd_unknown = True
 
         # 5. Harness files require explicit confirmation
         if any(rx.search(text) and _subcommand_writes_path(tokens, text, rx, inline)
@@ -5686,6 +5757,16 @@ def _analyze_run_command(command_line: str, cwd: str, base_dir: str, shell: str 
                     # unknown flag, a nested shell): normal permission policy (ask), never auto-allowed
                     result["all_safe"] = False
                 else:
+                    # Issue #307: the gates still judge the opening, but only the sanctioned executor file may open
+                    # without a prompt (worktree copies are edited without one): otherwise an allow becomes an ask
+                    # (also code loaded into the executor's process: PYTHONPATH, an interpreter named by a path,
+                    # interpreter options, wrappers: the same prefix rules as a risk-reducing auto-allow)
+                    if not sanctioned or _opening_cwd_drift(script_path, tokens, eng_tokens, unwrapped_list, line_cwds,
+                                                            line_cwd_unknown, base_dir or find_workspace_root(),
+                                                            in_wsl) \
+                            or _risk_prefix_blocker(tokens) or _risk_prefix_blocker(eng_tokens):
+                        result["all_safe"] = False
+                        result["unsanctioned_opening"] = script_path or eng_text
                     result["trading"].append(eng_text)
                     result["trading_tokens"].append(eng_tokens)
             continue
@@ -5887,6 +5968,97 @@ def _linked_worktree_rel(abs_path: str, base_dir: str) -> str:
     return "" if rel == "." or rel == ".." or rel.startswith("../") else rel
 
 
+# Issue #307: the brake and the review path: changing them stays under the owner's eyes. Inside a registered issue
+# worktree every other file-tool write is allowed; these (worktree-relative, case-folded; a trailing '/' is a
+# directory) keep an explicit confirmation (force_ask), so no Edit allow rule in a settings file lets them through.
+WORKTREE_GUARD_DEFINING = (
+    "scripts/hooks/", ".claude/settings.json", ".claude/settings.local.json", ".claude/settings.local.json.example",
+    ".agents/hooks.json", "scripts/utils/dossier_provenance.py", "scripts/utils/trading_lease.py",
+    "scripts/utils/env_resolver.py", "scripts/utils/score_calibration.py", "scripts/utils/calibration_fallback.py",
+    "scripts/utils/atomic_writer.py", "scripts/utils/file_lock.py", "scripts/user_profile.py", "scripts/ci/",
+    ".github/workflows/", "scripts/dev/issue_workspace.py", "scripts/dev/sync_claude_assets.py",
+    ".agents/skills/pr-review/", ".agents/skills/issue-orchestrator/", ".claude/skills/pr-review/",
+    ".claude/skills/issue-orchestrator/",
+)
+# Tool arguments that name the file a write tool writes (normalize_tool_call reads the first one present)
+FILE_WRITE_PATH_ARG_KEYS = {"targetfile", "absolutepath", "file_path", "notebook_path", "path"}
+
+
+def _issue_worktree_rel(target: str, base_dir: str) -> str:
+    """Path of a file-tool target relative to a registered issue worktree, or '' (today's rules then decide).
+    Registered: base_dir is the main checkout (a real .git directory: a session launched from a worktree keeps
+    today's rules), the target's os.path.realpath lies in a linked worktree of this repository (_linked_worktree_rel)
+    whose root is a sibling of base_dir named <basename of base_dir>-wt-issue-<N> (case-folded), and no component of
+    the path is .git. Any error: ''."""
+    try:
+        base_git = os.path.join(base_dir, ".git")
+        if os.path.islink(base_git) or not os.path.isdir(base_git):
+            return ""
+        real = os.path.realpath(_host_path(target, base_dir)).replace("\\", "/")
+        rel = _linked_worktree_rel(real, base_dir)
+        if not rel or not real.endswith("/" + rel):
+            return ""
+        root = real[:-(len(rel) + 1)]
+        main = os.path.realpath(base_dir).replace("\\", "/")
+        if posixpath.dirname(root).casefold() != posixpath.dirname(main).casefold():
+            return ""
+        if not re.fullmatch(re.escape(posixpath.basename(main).casefold()) + r"-wt-issue-[0-9]+",
+                            posixpath.basename(root).casefold()):
+            return ""
+        if any(comp.casefold() == ".git" for comp in _strip_windows_aliases(rel).split("/")):
+            return ""
+        return rel
+    except Exception:
+        return ""
+
+
+def _worktree_guard_defining(wt_rel: str) -> bool:
+    """True when a worktree-relative path is one of WORKTREE_GUARD_DEFINING (NTFS aliases stripped too)."""
+    for path in {wt_rel.casefold(), _strip_windows_aliases(wt_rel).casefold()}:
+        for entry in WORKTREE_GUARD_DEFINING:
+            if path == entry.rstrip("/") or (entry.endswith("/") and path.startswith(entry)):
+                return True
+    return False
+
+
+def _outside_main_file_write(target: str, content: str, base_dir: str) -> Optional[Tuple[str, str]]:
+    """Issue #307: decision for a file-tool target lexically outside the main checkout, classified by its real
+    location, or None (today's rules decide). A path whose os.path.realpath is a harness file of the main checkout
+    asks (force_ask); inside a registered issue worktree (_issue_worktree_rel) WORKTREE_GUARD_DEFINING asks and
+    everything else is allowed, provided every path argument of the tool call (content: its JSON arguments) is
+    allowed as well and an existing target is not hard-linked (st_nlink > 1). Any error: None."""
+    try:
+        _, real_rel = _normalize_target(os.path.realpath(_host_path(target, base_dir)), os.path.realpath(base_dir))
+        real_rel_l = real_rel.lower()
+        if real_rel_l in HARNESS_FILES or any(real_rel_l.startswith(d) for d in HARNESS_DIRS):
+            return "force_ask", (f"'{target}' resolves to '{real_rel}', a trading harness file / gate module (hooks / "
+                                 "dossier provenance / evaluator / executor gates). Explicit confirmation required.")
+        wt_rel = _issue_worktree_rel(target, base_dir)
+        if not wt_rel:
+            return None
+        if _worktree_guard_defining(wt_rel):
+            return "force_ask", (f"'{wt_rel}' in an issue worktree defines the guard or the review path "
+                                 "(WORKTREE_GUARD_DEFINING). Explicit confirmation required.")
+        try:
+            args = json.loads(content) if content else {}
+        except ValueError:
+            args = {}
+        for key, value in (args.items() if isinstance(args, dict) else ()):
+            if not isinstance(key, str) or key.lower() not in FILE_WRITE_PATH_ARG_KEYS:
+                continue
+            value = _decode_value(value)
+            if value is None or value == "" or value == target:
+                continue
+            if not isinstance(value, str) or evaluate_file_write(value, "", base_dir)[0] != "allow":
+                return None
+        host = _host_path(target, base_dir)
+        if os.path.lexists(host) and os.stat(host).st_nlink > 1:
+            return None  # a hard link may be a protected file elsewhere (realpath cannot tell; stat errors: None)
+        return "allow", f"'{wt_rel}' is inside a registered issue worktree (not live; reaches main only via PR review)."
+    except Exception:
+        return None
+
+
 def _strip_windows_aliases(path: str) -> str:
     """NTFS aliases of the same file: trailing dots/spaces of each component and alternate data streams
     (guardian_state.json. / guardian_state.json::$DATA / name:stream). The drive letter is kept."""
@@ -5994,6 +6166,11 @@ def evaluate_file_write(target: str, content: str, base_dir: str) -> Tuple[str, 
     if _git_exec_config_file_target(target, abs_norm, rel, base_dir):
         return "force_ask", (f"'{rel or abs_norm}' is a git config / hook file: a later git command runs what it "
                              "configures (core.fsmonitor, hooks, aliases). Explicit confirmation required.")
+    if not rel:
+        # Issue #307: outside the main checkout by its real location (registered issue worktrees are allowed)
+        decided = _outside_main_file_write(target, content, base_dir)
+        if decided:
+            return decided
     if content and WRITE_ENDPOINT_PRIMITIVES_RE.search(content):
         return "force_ask", f"'{rel or abs_norm}' contains order-placing primitives. Explicit confirmation required."
     if content and not (rel_l.startswith("scripts/") or rel_l.startswith("tests/")) and SCRIPT_TRADING_PRIMITIVES_RE.search(content):
@@ -6635,7 +6812,12 @@ def _evaluate_shell_command(command_line: str, cwd: str, base_dir: str, conversa
         if decision == "allow" and (not analysis["all_safe"]
                                     or analysis["risk_reducing"] and analysis["risk_blocker"]):
             decision = "force_ask" if analysis["force_ask"] else "ask"
-            reason = reason + " Compound command contains other sub-commands; user confirmation required."
+            if analysis.get("unsanctioned_opening"):
+                reason = reason + (f" The executor '{analysis['unsanctioned_opening']}' is not provably the sanctioned "
+                                   "repository script (another path, a linked worktree copy or a changed working "
+                                   "directory); user confirmation required.")
+            else:
+                reason = reason + " Compound command contains other sub-commands; user confirmation required."
         return decision, reason
 
     if analysis["force_ask"]:

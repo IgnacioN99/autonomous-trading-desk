@@ -315,7 +315,11 @@ class TestShellWrappedConfirmation(t49.PowerShellHarness):
 
     def test_confirmed_inside_bash_c_string_allowed(self):
         direct, via_wsl = self.forms(f"cd /mnt/c/repo && {self.TRADE} --confirmed")
-        self.assertBothShells(direct, "allow")
+        # Issue #307: the nested cd leaves the workspace, so the relative executor is another file: the gates still
+        # pass (no confirmation denial) but the opening is not auto-allowed; cd into the workspace keeps the allow
+        self.assertBothShells(direct, "passthrough")
+        self.assertNotIn(YOLO_GATE, self.bash(direct)["__stderr__"])
+        self.assertBothShells(self.forms(f"cd {self.root} && {self.TRADE} --confirmed")[0], "allow")
         # Issue #97: from the Bash tool the joined wsl arguments are judged again as the Linux default shell re-parses
         # them (conservative model: plain join, quotes dropped): `bash -lc cd /mnt/c/repo && <TRADE> --confirmed`.
         # The trade is still confirmed (never a confirmation denial), but the line now has another non-benign

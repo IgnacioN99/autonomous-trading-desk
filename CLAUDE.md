@@ -68,7 +68,10 @@ signs its heartbeat (HMAC); `issue_workspace.py check-guard` verifies that signe
 `logs/issue_routing.jsonl`) and `issue_workspace.py cleanup`. Model and effort are routed per call by the skill's
 route table (quick/build/deep via the Agent tool's `model`/`effort`); frontmatter `opus` is the fallback and agy
 stays on opus. The three agents never use the internet; on Windows run the flow from WSL (the fixer's guard fails
-closed without `python3`).
+closed without `python3`). `pre_trade_guard.py` returns `allow` for file-tool edits inside a registered issue
+worktree (`<repo>-wt-issue-<N>`), except its `WORKTREE_GUARD_DEFINING` files (hooks, settings, the modules the hook
+imports or that decide for it, the review path), which ask. That `allow` is the mechanism expected to remove Claude
+Code's own prompt; the owner confirms it after merge, otherwise local settings rules are the next step.
 
 ## Windows
 

@@ -2781,11 +2781,16 @@ class TestUnifiedBatchIssues(TestRiskAutoAllowResiduals):
         with open(os.path.join(wt_root, ".git"), "w") as f:
             f.write(f"gitdir: {os.path.join(git_dir, 'worktrees', 'wt1')}\n")
 
-        # Script inside linked worktree has parity with canonical route
+        # Issue #307 (replaces #154's parity): worktree copies are edited without a prompt, so running one is
+        # unreviewed code: a plain ask like any unsanctioned script; the main checkout's executor keeps its auto-allow
         wt_script = os.path.join(wt_root, "scripts", "execute_futures_trade.py")
         c_wt = f"python3 {wt_script} --close-position --symbol BTCUSDT"
         res_wt = self.agy(self.cmd(c_wt))
-        self.assertEqual(res_wt.get("decision"), "allow")
+        self.assertEqual(res_wt.get("decision"), "ask")
+        self.assertIn("is not the sanctioned repository script", res_wt.get("reason", ""))
+        self.assertIsNone(pre_trade_guard._sanctioned_script(wt_script, self.root, self.root, False))
+        self.assertEqual(self.agy(self.cmd(f"python3 {self.E} --close-position --symbol BTCUSDT")).get("decision"),
+                         "allow")
 
 
 class TestReadOnlyAnalysisScripts(GuardHarness):
