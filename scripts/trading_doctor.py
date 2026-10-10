@@ -669,6 +669,23 @@ def fee_status_line(target_env: str, mcp: bool = False) -> str:
     return "; ".join(parts) + " (informational; the BNB discount is the owner's choice)."
 
 
+def pr_hook_detect_error_line(logs_dir: str, now: float = None) -> str:
+    """Issue #257: informational [PR-HOOK] text, the number of `detect_error` events (commands the PR review hook
+    could not scan, so it did not arm the review) in pr_hook_events.jsonl over the last 24 h. Unreadable lines skip."""
+    cutoff, count = (now or time.time()) - 24 * 3600, 0
+    try:
+        with open(os.path.join(logs_dir, "pr_hook_events.jsonl"), "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    event = json.loads(line)
+                    count += event.get("event") == "detect_error" and float(event.get("timestamp")) >= cutoff
+                except (ValueError, TypeError, AttributeError):
+                    continue
+    except FileNotFoundError:
+        pass
+    return f"{count} PR review hook detect_error event(s) in the last 24h (those commands did not arm the review)."
+
+
 def run_doctor(target_env: str = None, auto_heal: bool = False) -> int:
     target_env = resolve_env(target_env)
     start_time = time.time()
@@ -979,6 +996,13 @@ def run_doctor(target_env: str = None, auto_heal: bool = False) -> int:
     except Exception as e:
         lease_msg = f"Trading lease status unavailable ({type(e).__name__})."
     print(f"ℹ️  [LEASE] {lease_msg}")
+
+    # 5c'''. PR review hook scan failures (issue #257; informational only, never a warning or a failure)
+    try:
+        pr_hook_msg = pr_hook_detect_error_line(sss.LOGS_DIR)
+    except Exception as e:
+        pr_hook_msg = f"PR review hook events unreadable ({type(e).__name__})."
+    print(f"ℹ️  [PR-HOOK] {pr_hook_msg}")
 
     # 5c'. Score calibration store freshness (WARN only, never critical; issue #207)
     try:
