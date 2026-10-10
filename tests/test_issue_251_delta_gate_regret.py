@@ -271,9 +271,12 @@ class TestIdempotency(TrackerBase):
         self.assertEqual(st.audit_shadow_trades()["newly_resolved"], 1)
         self.assertEqual(st.load_jsonl(st.SHADOW_TRADES_FILE), [])
         self.assertEqual(st.register_from_evaluation(), 0)  # resolved row still blocks a re-registration
-        # a new dossier for the same candidate registers again, even within the 3600 s window
+        # issue #262: a new dossier for the same candidate (symbol, direction, gate) within the 3600 s window is
+        # deduped and counted (it registered again before #262); after the window it registers (test_issue_262)
         self.dossier([{"symbol": "FETUSDT", "direction": "LONG", "gate": "DELTA_GATE"}], sha="b" * 64)
-        self.assertEqual(st.register_from_evaluation(), 1)
+        stats = {}
+        self.assertEqual(st.register_from_evaluation(stats), 0)
+        self.assertEqual(stats, {"deduped_window": 1})
 
     def test_rows_without_hash_keep_symbol_dedupe(self):
         self.brief([opp("FETUSDT")])
@@ -443,10 +446,12 @@ class TestReplay(unittest.TestCase):
                                             "notional_derived": True}])
         # (b) fraction 0.5: ZRO at 50 vs SHORT 20 is still LONG_HEAVY -> nothing placed
         self.assertEqual((p["resting_fraction"]["total_r"], p["resting_fraction"]["placed"]), (0.5, 0))
-        # (c) swap: F (95) beats ZRO (80) by >= 10 -> ZRO cancelled (its +0.5R gone), F placed (+1.8R)
+        # (c) swap: F (95) beats ZRO (80) by >= 10, but F (100) on the book without ZRO (SHORT 20) would tip it
+        # LONG_HEAVY again: the re-checked delta gate denies it (issue #262; before, ZRO was cancelled and F placed
+        # at +1.8R), so nothing is cancelled or placed
         c = p["swap"]
-        self.assertEqual((c["total_r"], c["placed"], c["swapped"]), (1.8, 1, 1))
-        self.assertEqual([x["id"] for x in c["placements"]], ["f"])
+        self.assertEqual((c["total_r"], c["placed"], c["swapped"], c["swap_blocked"]), (0.5, 0, 0, 1))
+        self.assertEqual(c["placements"], [])
         # exposure: current book stays LONG_HEAVY at both events
         e = p["current"]["exposure"]
         self.assertEqual((e["points"], e["heavy_share"], e["max_abs_delta_ratio"]), (2, 1.0, 0.666667))
@@ -465,8 +470,9 @@ class TestReplay(unittest.TestCase):
         short = {"symbol": "OPUSDT", "direction": "SHORT", "kind": "position", "score": None, "entry_id": "p1",
                  "notional": 20.0, "since_ts": 5000}
         rows = [
+            # notional 20 (was 100 before #262): the swap's delta re-check (LONG 20 vs SHORT 20) allows it
             resolved_row("f", "d1", pnl=2.7, score=95, blockers=[zro_resting], book=[zro_resting, short],
-                         notional_usdt=100.0),
+                         notional_usdt=20.0),
             resolved_row("g", "d2", "TRUE_NEGATIVE", pnl=-1.5, score=70, blockers=[zro_position],
                          book=[zro_position, short], registered_at_ts=20000, resolved_at_ts=22000),
         ]
