@@ -44,6 +44,9 @@ from typing import Dict, Any, List, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from utils.atomic_writer import atomic_write_json, atomic_append_jsonl
+# Shared with shadow_analytics.py (issue #290), re-exported here: st.GATE_ENUM, st.row_gate, ... keep working
+from utils.shadow_common import (  # noqa: F401
+    GATE_ENUM, GATE_FALLBACK, POST_APPROVAL_GATE, BLOCKER_GATES, DEDUPE_WINDOW_SECONDS, row_gate)
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOGS_DIR = os.path.join(BASE_DIR, "logs")
@@ -56,17 +59,10 @@ SESSION_STATE_FILE = os.path.join(LOGS_DIR, "session_state.json")
 TRADES_AUDIT_FILE = os.path.join(LOGS_DIR, "trades_audit.jsonl")
 GATE_DENIALS_FILE = os.path.join(LOGS_DIR, "gate_denials.jsonl")
 
-# Typed rejection reasons of the dossier's rejected_candidates (issue #251). K5 squeeze risk only caps a tier.
-# DELTA_GATE_POST_APPROVAL (issue #261) is assigned by the hook's denial log, never by the evaluator.
-GATE_ENUM = ("DELTA_GATE", "MACRO_SHORT", "DUPLICATE_RESTING", "DRY_VOLUME", "FRICTION", "CATALYST_DOWNGRADE",
-             "UNREADABLE_BOOK", "DAILY_LOSS_GATE", "OTHER", "DELTA_GATE_POST_APPROVAL")
-GATE_FALLBACK = "OTHER"
-POST_APPROVAL_GATE = "DELTA_GATE_POST_APPROVAL"
-BLOCKER_GATES = ("DELTA_GATE", "DUPLICATE_RESTING", POST_APPROVAL_GATE)
+# GATE_ENUM, GATE_FALLBACK, POST_APPROVAL_GATE, BLOCKER_GATES, DEDUPE_WINDOW_SECONDS: utils/shadow_common.py
 GATE_DETAIL_MAX_CHARS = 300
 GATE_DENIAL_MAX_AGE_SECONDS = 86400  # older events would expire at once in the kline audit (24 h)
 GATE_DENIAL_TAIL_LINES = 500
-DEDUPE_WINDOW_SECONDS = 3600  # one row per (symbol, direction, gate) within this window, across dossiers (#262)
 
 # Intraday Desk Constraints & Statistical Hygiene
 MAX_TRIGGER_WAIT_SECONDS = 5400    # 90 min max to breach trigger (matches limit cancellation rule)
@@ -724,16 +720,6 @@ def audit_shadow_trades() -> dict:
         "total_resolved": len(load_jsonl(SHADOW_RESOLVED_FILE))
     }
 
-def row_gate(row: dict) -> tuple:
-    """(gate, gate_source) of a shadow row; a row written before issue #251 maps its vol_ratio category
-    (DRY_VOLUME_FAKE_TIER_S -> DRY_VOLUME, anything else -> OTHER) with source "legacy_category"."""
-    gate = row.get("gate")
-    if isinstance(gate, str) and gate:
-        return gate, str(row.get("gate_source") or "unknown")
-    return ("DRY_VOLUME" if row.get("rejection_category") == "DRY_VOLUME_FAKE_TIER_S" else GATE_FALLBACK,
-            "legacy_category")
-
-
 def calculate_efficacy_metrics(rolling_window: int = ROLLING_WINDOW_SIZE) -> dict:
     """Calculates Filter Efficacy Ratio (FER) all-time, clean intraday (<=4h), and rolling window."""
     resolved = load_jsonl(SHADOW_RESOLVED_FILE)
@@ -859,6 +845,15 @@ def print_shadow_dashboard():
             print(f"  • {r['symbol']} ({r['direction']}): {tag} | Outcome: {r['outcome']} | PnL: ${r['simulated_pnl_usdt']} USDT | Reason: {r['rejection_reason']}")
     print("=" * 80)
 
+def _register_and_print() -> int:
+    """register_from_evaluation with its deduped_window counter printed (--register-from-eval and --loop)."""
+    stats = {"deduped_window": 0}
+    count = register_from_evaluation(stats)
+    print(f"📥 Registered {count} candidate(s) into shadow ledger (deduped_window {stats['deduped_window']}: "
+          f"same symbol/direction/gate within {DEDUPE_WINDOW_SECONDS} s).")
+    return count
+
+
 def main():
     parser = argparse.ArgumentParser(description="Counterfactual Shadow Tracker")
     parser.add_argument("--register-from-eval", action="store_true", help="Auto-register rejected candidates from latest brief/dossier")
@@ -869,10 +864,7 @@ def main():
     args = parser.parse_args()
 
     if args.register_from_eval:
-        stats = {"deduped_window": 0}
-        count = register_from_evaluation(stats)
-        print(f"📥 Registered {count} candidate(s) into shadow ledger (deduped_window {stats['deduped_window']}: "
-              f"same symbol/direction/gate within {DEDUPE_WINDOW_SECONDS} s).")
+        _register_and_print()
 
     if args.audit or not (args.register_from_eval or args.loop or args.json):
         res = audit_shadow_trades()
@@ -890,8 +882,8 @@ def main():
         print(f"🚀 Starting Shadow Tracker Loop (interval: {args.interval}s)...")
         while True:
             try:
-                # 1. Check for newly rejected evaluations
-                register_from_evaluation()
+                # 1. Check for newly rejected evaluations (deduped_window printed too, issue #290)
+                _register_and_print()
                 # 2. Audit active trades
                 audit_shadow_trades()
                 # 3. Print report

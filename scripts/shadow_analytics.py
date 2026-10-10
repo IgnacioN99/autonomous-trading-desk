@@ -26,7 +26,9 @@ Delta-gate opportunity cost (issue #251; report-only, read-only: it never writes
      Total R, max drawdown in R (blocker R dated at its trade_outcomes exit, else at its first event,
      blocker_time_approx) and a net-delta exposure summary per policy. Unknown blocker R counts 0R in the
      headline; when any is unknown a sensitivity block gives every policy's total R at -1R / 0R / +1.8R and the
-     imputations that change the policy ranking.
+     imputations that change the policy ranking (a 0R tie that splits names the tied policies, issue #290).
+  A PROMOTION GUARD line (issue #290, advisory text only, nothing reads it) says whether a proposal to relax the
+  delta gate would even be admissible, else which conditions fail (promotion_guard).
   DELTA_GATE_POST_APPROVAL (issue #261): the hook's denials of dossier-approved candidates, registered by
   shadow_tracker from logs/gate_denials.jsonl; in both 4 and 5 (each denial its own replay event) with a caveat:
   their book is the cached session state at denial time (source session_state_cache), and denials by the
@@ -47,7 +49,7 @@ from typing import List, Dict, Any, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from utils.portfolio_exposure import LONG_HEAVY, SHORT_HEAVY, book_exposure, project_order
-from shadow_tracker import DEDUPE_WINDOW_SECONDS, row_gate
+from utils.shadow_common import DEDUPE_WINDOW_SECONDS, row_gate  # not shadow_tracker: no import coupling (#290)
 
 RESOLVED_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "logs", "shadow_resolved.jsonl"))
 TRADES_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "logs", "shadow_trades.jsonl"))
@@ -541,7 +543,8 @@ def replay_policies(resolved: List[Dict[str, Any]], index: Dict[str, Any],
     their exit (trade_outcomes exit_ts) else at their first event (blocker_time_approx); unknown blocker R counts
     0 R in the headline, and when any is unknown "sensitivity" holds every policy's total R with it at each
     SENSITIVITY_R, the ranking (best first) under each, the imputations that reverse a strict 0R order
-    (ranking_changes) and those whose ranking differs only by ties (ranking_ties) (else None).
+    (ranking_changes) and those whose ranking differs only by ties (ranking_ties), with tie_splits: per
+    imputation, the policy pairs tied at 0R that split strictly there (issue #290) (else None).
     Exposure = the full-weight book after each event's decisions."""
     out = _replay(resolved, index, resting_age_min, resting_weight, swap_margin, 0.0)
     out["sensitivity"] = None
@@ -552,15 +555,18 @@ def replay_policies(resolved: List[Dict[str, Any]], index: Dict[str, Any],
             totals[_r_label(v)] = {name: m["total_r"] for name, m in res["policies"].items()}
         ranking = {label: sorted(t, key=lambda n: (-t[n], REPLAY_POLICIES.index(n))) for label, t in totals.items()}
         base = totals["0R"]
-        changes, ties = [], []
+        changes, ties, splits = [], [], {}
         for label, t in totals.items():
             if ranking[label] == ranking["0R"]:
                 continue
             # a real change reverses a strict order; otherwise only ties (broken by REPLAY_POLICIES order) differ
             reversed_ = any(base[x] > base[y] and t[y] > t[x] for x in t for y in t)
             (changes if reversed_ else ties).append(label)
+            if not reversed_:
+                splits[label] = [[x, y] for i, x in enumerate(REPLAY_POLICIES) for y in REPLAY_POLICIES[i + 1:]
+                                 if base[x] == base[y] and t[x] != t[y]]
         out["sensitivity"] = {"unknown_blockers": out["blocker_r_unknown"], "total_r": totals, "ranking": ranking,
-                              "ranking_changes": changes, "ranking_ties": ties}
+                              "ranking_changes": changes, "ranking_ties": ties, "tie_splits": splits}
     return out
 
 
@@ -780,16 +786,60 @@ def format_delta_gate_report(regret: Dict[str, Any], replay: Dict[str, Any]) -> 
             lines.append(f"    unknown = {label:<6}" + " | ".join(f"{n} {totals[n]:+.3f}" for n in totals) + tag)
         order = " > ".join(sens["ranking"]["0R"])
         ties = sens.get("ranking_ties") or []
-        for labels, verb in ((sens["ranking_changes"], "CHANGES at"), (ties, "differs only by a tie at")):
+        splits = sens.get("tie_splits") or {}
+        generic_ties = [label for label in ties if not splits.get(label)]
+        for labels, verb in ((sens["ranking_changes"], "CHANGES at"), (generic_ties, "differs only by a tie at")):
             if labels:
                 lines.append(f"  Policy ranking at 0R ({order}) {verb} "
                              + ", ".join(f"{label} ({' > '.join(sens['ranking'][label])})" for label in labels) + ".")
+        for label in ties:
+            if splits.get(label):
+                pairs = ", ".join(f"{x} = {y}" for x, y in splits[label])
+                lines.append(f"  Policy ranking at 0R ({order}) differs at {label} "
+                             f"({' > '.join(sens['ranking'][label])}): policies tied at 0R split there: {pairs}.")
         if not sens["ranking_changes"] and not ties:
             lines.append(f"  Policy ranking unchanged at every imputation: {order}.")
     if replay["insufficient_sample"]:
         lines.append(f"  insufficient_sample: {replay['n_events']} event(s) < {replay['min_sample']}: no ranking.")
+    guard = promotion_guard(regret, replay)
+    if guard is not None:
+        if guard["admissible"]:
+            lines.append("  PROMOTION GUARD (advisory, nothing reads it): a proposal to relax the delta gate would be "
+                         "admissible for review (sample, clusters, sign, blocker R and swap checks pass); promotion "
+                         "still needs a reviewed PR and the owner's decision.")
+        else:
+            lines.append("  PROMOTION GUARD (advisory, nothing reads it): a proposal to relax the delta gate is NOT "
+                         "admissible: " + "; ".join(guard["failing"]) + ".")
     lines.append("=" * 80)
     return "\n".join(lines)
+
+
+def promotion_guard(regret: Dict[str, Any], replay: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Whether a proposal to relax the delta gate would even be admissible (issue #290; advisory text only, no code
+    path consumes it): {"admissible", "failing"} where failing lists the conditions that do not hold: the
+    conservative regret and the replay not insufficient_sample, regret n_clusters >= MIN_SAMPLE, no sign change of
+    the mean regret under the unknown-blocker imputations (sign_changes), no blocker of unknown R in the replay
+    (blocker_r_unknown) and no swap placed without the delta re-check (swap_unchecked). None without data (no
+    regret row and no replay event)."""
+    if not regret["counts"]["rows"] and not replay["n_events"]:
+        return None
+    cons = regret["conservative"]
+    min_sample = regret.get("min_sample", MIN_SAMPLE)
+    failing = []
+    if cons["insufficient_sample"]:
+        failing.append(f"insufficient_sample (regret n={cons['n']} < {min_sample})")
+    if replay["insufficient_sample"]:
+        failing.append(f"insufficient_sample (replay events {replay['n_events']} < {replay['min_sample']})")
+    if cons["n_clusters"] < min_sample:
+        failing.append(f"n_clusters {cons['n_clusters']} < {min_sample}")
+    if (regret.get("sensitivity") or {}).get("sign_changes"):
+        failing.append("sign_changes true (the mean regret's sign depends on the imputed blocker R)")
+    if replay["blocker_r_unknown"]:
+        failing.append(f"blocker_r_unknown {replay['blocker_r_unknown']}")
+    unchecked = (replay["policies"].get("swap") or {}).get("swap_unchecked", 0)
+    if unchecked:
+        failing.append(f"swap: swap_unchecked {unchecked} (placed without the delta re-check; must fail closed)")
+    return {"admissible": not failing, "failing": failing}
 
 
 def format_terminal_report(calibration: Dict[str, Any], leakage: List[Dict[str, Any]], dodges: List[Dict[str, Any]], hygiene: Optional[Dict[str, Any]] = None) -> str:

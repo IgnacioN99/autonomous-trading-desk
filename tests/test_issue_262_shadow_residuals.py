@@ -442,16 +442,31 @@ class TestSingleSources(unittest.TestCase):
             return f.read()
 
     def test_row_gate_defined_once(self):
+        """Issue #290: one definition, in utils/shadow_common.py (re-exported by shadow_tracker)."""
         self.assertIs(sa.row_gate, st.row_gate)
         self.assertNotIn("def row_gate", self.read("scripts", "shadow_analytics.py"))
-        self.assertEqual(self.read("scripts", "shadow_tracker.py").count("def row_gate"), 1)
+        self.assertNotIn("def row_gate", self.read("scripts", "shadow_tracker.py"))
+        self.assertEqual(self.read("scripts", "utils", "shadow_common.py").count("def row_gate"), 1)
+
+    @staticmethod
+    def between(text, start, end, source):
+        """text between start and the next end; an AssertionError naming the missing phrase when the wording of
+        source drifted (issue #290: not an IndexError)."""
+        if start not in text:
+            raise AssertionError(f"{source}: phrase {start!r} not found (wording changed? update this test)")
+        rest = text.split(start, 1)[1]
+        if end not in rest:
+            raise AssertionError(f"{source}: phrase {end!r} not found after {start!r} (wording changed? update "
+                                 f"this test)")
+        return rest.split(end, 1)[0]
 
     def test_gate_enum_matches_prompt_docs_and_tracker(self):
         prompt = self.read(".agents", "agents", "isolated_market_evaluator", "agent.md")
-        sentence = prompt.split("`gate`: the first failing check, one of")[1].split("K5 squeeze risk")[0]
+        sentence = self.between(prompt, "`gate`: the first failing check, one of", "K5 squeeze risk",
+                                "isolated_market_evaluator/agent.md")
         prompt_enum = re.findall(r'`"([A-Z_]+)"`', sentence)
         docs = self.read("docs", "agent_prompt_engineering_guide.md")
-        clause = docs.split("`gate` from a fixed enum:")[1].split(";")[0]
+        clause = self.between(docs, "`gate` from a fixed enum:", ";", "docs/agent_prompt_engineering_guide.md")
         docs_enum = re.findall(r"`([A-Z_]+)`", clause)
         evaluator_enum = [g for g in st.GATE_ENUM if g != st.POST_APPROVAL_GATE]
         self.assertEqual(len(prompt_enum), len(set(prompt_enum)))
