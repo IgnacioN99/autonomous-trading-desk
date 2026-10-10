@@ -17,6 +17,7 @@ Default Parameters:
 - leverage_yolo: 15 (Barbell YOLO slot; sub-accounts are auto-clamped to 5x by the executor on -4421)
 - leverage_ceiling: 15 (absolute desk ceiling enforced by the execution engine and the pre-trade guard;
   raise it here, never above MAX_LEVERAGE_CEILING)
+- max_fee_r: null (fee-in-R executor gate, issue #268; OFF by default, the owner sets the threshold in R)
 """
 
 import os
@@ -61,7 +62,11 @@ DEFAULT_PROFILE = {
     # expired) is covered by the user's earlier "yes" (utils/recheck_bounds.py). Validated by get_recheck_bounds.
     "recheck_max_drift_r": 0.25,
     "recheck_max_age_seconds": 1800,
-    "yolo_slot_enabled": False,       # Barbell memecoin moonshot slot (10x-15x, $10 margin or 0.5% equity)
+    # Issue #268: fee-in-R gate (executor, PROD openings only): reject when the expected taker entry + taker SL fee
+    # (utils/gate_limits.expected_fee_r) exceeds this many R. null = OFF (the default: the owner chooses a value).
+    # Validated by get_max_fee_r: a present but invalid value rejects PROD openings (never silently OFF).
+    "max_fee_r": None,
+    "yolo_slot_enabled": False,      # Barbell memecoin moonshot slot (10x-15x, $10 margin or 0.5% equity)
     "yolo_equity_pct": 0.005,          # 0.5% default margin for YOLO moonshots (e.g. $50 on $10k)
     "overnight_mode": "ZERO_OVERNIGHT_RISK", # ZERO_OVERNIGHT_RISK | CLOSE_ALL_AT_MARKET | SWING_STRUCTURAL_STOP
     "leverage_standard": 3,
@@ -279,6 +284,20 @@ def get_recheck_bounds(profile: Optional[Dict[str, Any]] = None) -> Dict[str, An
     low, high = RECHECK_MAX_AGE_RANGE_S
     age = int(raw) if _is_number(raw) and low <= raw <= high else DEFAULT_PROFILE["recheck_max_age_seconds"]
     return {"recheck_max_drift_r": drift, "recheck_max_age_seconds": age}
+
+
+def get_max_fee_r(profile: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Fee-in-R gate threshold (issue #268) from the profile: {"max_fee_r": float | None, "error": str | None}.
+    Absent or null = OFF ({"max_fee_r": None, "error": None}); a positive finite number = the threshold; any other
+    present value (bool, string, zero, negative, NaN, inf) = {"max_fee_r": None, "error": <why>}, so an invalid value
+    never silently disables an enabled protection (the executor rejects PROD openings on it). Never raises."""
+    prof = profile if isinstance(profile, dict) else {}
+    raw = prof.get("max_fee_r")
+    if raw is None:
+        return {"max_fee_r": None, "error": None}
+    if _is_number(raw) and raw > 0:
+        return {"max_fee_r": float(raw), "error": None}
+    return {"max_fee_r": None, "error": f"max_fee_r must be null or a positive finite number; got {raw!r}"[:120]}
 
 
 def validate_leverage_setting(name: str, value: int, ceiling: int) -> Optional[str]:

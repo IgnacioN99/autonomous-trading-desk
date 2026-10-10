@@ -13,6 +13,7 @@
   "yolo_max_daily_losses": 1,
   "recheck_max_drift_r": 0.25,
   "recheck_max_age_seconds": 1800,
+  "max_fee_r": null,
   "yolo_slot_enabled": false,
   "yolo_equity_pct": 0.005,
   "overnight_mode": "ZERO_OVERNIGHT_RISK",

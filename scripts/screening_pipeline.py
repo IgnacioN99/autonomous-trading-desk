@@ -29,7 +29,7 @@ import sync_session_state as sss
 import fetch_newsletters as fn
 import broad_yolo_scanner as bys
 from utils.env_resolver import resolve_env
-from utils.gate_limits import MIN_TP1_DISTANCE, YOLO_MAX_LOSS_MARGIN_FRACTION
+from utils.gate_limits import MIN_TP1_DISTANCE, YOLO_MAX_LOSS_MARGIN_FRACTION, expected_fee_r
 from utils import yolo_scan_health
 from utils import rate_limit_guard
 from utils import squeeze_filter as sqf
@@ -125,6 +125,8 @@ class CandidateSetup(BaseModel):
     # Issue #207: radar score formula version (sidecar / audit only) and the fundingInfo-fallback SHORT flag
     score_schema_version: Optional[int] = None
     funding_interval_unknown: bool = False
+    # Issue #268: plan-time fee estimate in R (taker entry + taker SL) from risk_pct; the brief shows it as fee_r
+    expected_fee_r: Optional[float] = None
 
 class StatArbPair(BaseModel):
     pair: str
@@ -169,6 +171,7 @@ class YoloCandidate(BaseModel):
     rsi: float
     vol_ratio: float
     lower_wick: float
+    expected_fee_r: Optional[float] = None  # issue #268: taker entry + taker SL fee in R from risk_pct (brief: fee_r)
 
 class YoloSlot(BaseModel):
     status: Literal["ACTIVE", "INACTIVE", "DISABLED", "UNAVAILABLE"]
@@ -300,6 +303,12 @@ def apply_alt_short_macro_gate(rows: List[dict], macro: MacroContext) -> Tuple[L
         kept.append(row)
     return kept, rejected
 
+def _fee_r(risk_pct) -> Optional[float]:
+    """Issue #268: expected taker entry + taker SL fee in R of a candidate's risk_pct, rounded to 3 decimals (brief
+    bytes); None when it cannot be computed."""
+    fee = expected_fee_r(risk_pct)
+    return round(fee, 3) if fee is not None else None
+
 def enrich_and_size_candidate(c: dict, target_env: Optional[str] = None) -> Optional[CandidateSetup]:
     """Calculates volatility parity sizing and encapsulates into Pydantic model."""
     try:
@@ -345,6 +354,7 @@ def enrich_and_size_candidate(c: dict, target_env: Optional[str] = None) -> Opti
 
         micro = c.get("micro") or {}
         tape = me.get_live_aggtrades_tape(sym) or {}
+        risk_pct = round(abs(sizing_entry - sl) / sizing_entry * 100, 2)
 
         return CandidateSetup(
             symbol=sym,
@@ -357,7 +367,7 @@ def enrich_and_size_candidate(c: dict, target_env: Optional[str] = None) -> Opti
             tp1_price=tp1,
             tp2_price=tp2,
             rr_ratio=rr_ratio,
-            risk_pct=round(abs(sizing_entry - sl) / sizing_entry * 100, 2),
+            risk_pct=risk_pct,
             sizing_entry_price=sizing_entry,
             rsi_15m=float(c.get("rsi_15m", 50)),
             vol_ratio=float(c.get("vol_ratio", 1.0)),
@@ -391,6 +401,7 @@ def enrich_and_size_candidate(c: dict, target_env: Optional[str] = None) -> Opti
             score_schema_version=(c.get("score_schema_version") if isinstance(c.get("score_schema_version"), int)
                                   and not isinstance(c.get("score_schema_version"), bool) else None),
             funding_interval_unknown=c.get("funding_interval_unknown") is True,
+            expected_fee_r=_fee_r(risk_pct),
         )
     except Exception as e:
         sym = c.get("symbol") if isinstance(c, dict) else None
@@ -516,6 +527,7 @@ def _to_yolo_candidate(raw: dict) -> Optional[YoloCandidate]:
     trigger, sl, tp1, tp2 = _sig(trigger), _sig(sl), _sig(tp1), _sig(tp2)
     risk = trigger - sl
     rr_tp2 = (tp2 - trigger) / risk
+    risk_pct = round(risk / trigger * 100, 2)
     return YoloCandidate(
         symbol=symbol,
         direction="LONG",
@@ -523,13 +535,14 @@ def _to_yolo_candidate(raw: dict) -> Optional[YoloCandidate]:
         sl=sl,
         tp1=tp1,
         tp2=tp2,
-        risk_pct=round(risk / trigger * 100, 2),
+        risk_pct=risk_pct,
         rr_tp2=round(rr_tp2, 2),
         leverage=leverage,
         margin_usdt=round(margin, 2),
         rsi=_sig(rsi),
         vol_ratio=_sig(vol_ratio),
         lower_wick=_sig(lower_wick),
+        expected_fee_r=_fee_r(risk_pct),
     )
 
 def build_yolo_slot(scan: dict) -> Tuple[str, YoloSlot]:

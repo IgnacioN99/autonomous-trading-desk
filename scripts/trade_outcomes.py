@@ -49,6 +49,12 @@ orders without the algo id, so stops are matched by price).
   fills were identified). mfe_r / mae_r / mfe_ts from 1m klines after the fill minute whose bar closed by the exit
   (no print after the exit) plus the leg prices; giveback_r = mfe_r - realized_r_gross. entry_ts, exit_ts, mfe_ts and
   leg times are in ms.
+  Fees (issue #268): each leg keeps the fill's "maker" flag; fees_r = (matched entry fills' commission + the legs'
+  commission) / (risk x filled_qty), the denominator of realized_r_net, null exactly when realized_r_net is (any
+  commission asset other than USDT, e.g. a BNB fee discount: no conversion); entry_liquidity / exit_liquidity =
+  "maker" (every entry fill / exit leg maker), "taker" (none), "mixed", or null without fills or a maker flag;
+  stop_distance_pct = initial_risk / audit entry_price x 100. no_entry_fill and fills_unavailable rows carry these
+  four as null; rows written before them simply lack the keys (readers use .get).
 summarize_closed_today (used by sync_session_state.py): the same matching on the day's fills already fetched (no
 request, no klines): per-trade closed / wins / losses / scratches (|R| < 0.05) and R sums; an entry before the day
 counts with partial_history (today's legs, audit entry). closed_trades_today (issue #207) is the same matching as a
@@ -467,6 +473,19 @@ def score_fields(rec):
     return {k: rec.get(k) for k in SCORE_FIELDS}
 
 
+# Issue #268: fee fields of a row without fills (no_entry_fill, fills_unavailable)
+NULL_FEE_FIELDS = {"fees_r": None, "entry_liquidity": None, "exit_liquidity": None, "stop_distance_pct": None}
+
+
+def _liquidity(flags):
+    """"maker" when every fill's maker flag is true, "taker" when every one is false, else "mixed"; None without
+    fills or when a flag is missing or not a boolean (issue #268)."""
+    flags = list(flags)
+    if not flags or any(not isinstance(m, bool) for m in flags):
+        return None
+    return "maker" if all(flags) else "taker" if not any(flags) else "mixed"
+
+
 def resolve_trade(rec, fills, consumed, trail_stops, next_start_ms, env, klines=True, foreign_entry_ids=(),
                   match=None, tick=None):
     """Outcome dict of one audit entry. consumed: {fill id: qty already assigned to earlier trades} (updated).
@@ -500,7 +519,8 @@ def resolve_trade(rec, fills, consumed, trail_stops, next_start_ms, env, klines=
            "is_yolo": _record_is_yolo(rec), **score_fields(rec)}
     if match["match"] == "no_entry_fill":
         out.update(status="no_entry_fill", filled_qty=None, legs=[], exit_ts=None, realized_r_gross=None,
-                   realized_r_net=None, entry_commission_included=False, tp1_filled=False, exit_reason=None)
+                   realized_r_net=None, entry_commission_included=False, tp1_filled=False, exit_reason=None,
+                   **NULL_FEE_FIELDS)
         return out
     if match["match"] == "partial_history":
         out["partial_history"] = True
@@ -531,11 +551,11 @@ def resolve_trade(rec, fills, consumed, trail_stops, next_start_ms, env, klines=
                      "price": _num(f.get("price"), 0.0), "time": t, "order_id": f.get("orderId"),
                      "realized_pnl": _num(f.get("realizedPnl"), 0.0) * share,
                      "commission": _num(f.get("commission"), 0.0) * share,
-                     "commission_asset": f.get("commissionAsset")})
+                     "commission_asset": f.get("commissionAsset"), "maker": f.get("maker")})
 
     closed = remaining <= filled_qty * QTY_TOLERANCE
     sign = 1.0 if direction == "LONG" else -1.0
-    gross = net = None
+    gross = net = fees_r = None
     if risk and legs:
         gross = round(sum(l["qty"] * sign * (l["price"] - basis) for l in legs) / (risk * filled_qty), 4)
         assets = {str(l["commission_asset"] or "").upper() for l in legs}
@@ -544,10 +564,15 @@ def resolve_trade(rec, fills, consumed, trail_stops, next_start_ms, env, klines=
             pnl = sum(l["realized_pnl"] - l["commission"] for l in legs)
             pnl -= sum(_num(f.get("commission"), 0.0) for f in entry_fills)
             net = round(pnl / (risk * filled_qty), 4)
+            fees = sum(l["commission"] for l in legs) + sum(_num(f.get("commission"), 0.0) for f in entry_fills)
+            fees_r = round(fees / (risk * filled_qty), 4)
     out.update(status="closed" if closed else "open", legs=legs, exit_ts=legs[-1]["time"] if closed else None,
                realized_r_gross=gross, realized_r_net=net, entry_commission_included=bool(entry_fills),
                tp1_filled=any(l["reason"] == "TP1" for l in legs),
-               exit_reason=legs[-1]["reason"] if closed else None)
+               exit_reason=legs[-1]["reason"] if closed else None, fees_r=fees_r,
+               entry_liquidity=_liquidity(f.get("maker") for f in entry_fills),
+               exit_liquidity=_liquidity(l["maker"] for l in legs),
+               stop_distance_pct=round(risk / entry * 100, 4) if risk and entry else None)
     if klines and closed and risk:
         try:
             mfe_r, mae_r, mfe_ts = kline_excursion(symbol, direction, basis, risk, entry_ms, out["exit_ts"], legs, env)
@@ -604,7 +629,7 @@ def build_outcomes(env, since_ts, symbol=None, klines=True, now_ms=None):
                                "entry_ts": int(_num(r.get("timestamp")) * 1000), "audit_ts": _num(r.get("timestamp")),
                                "entry_price": _num(r.get("entry_price")),
                                "sl_price": _num(r.get("sl_price")), "total_qty": _num(r.get("total_qty")),
-                               "is_yolo": _record_is_yolo(r), **score_fields(r),
+                               "is_yolo": _record_is_yolo(r), **score_fields(r), **NULL_FEE_FIELDS,
                                "status": "fills_unavailable", "error": err})
             continue
         readable += 1

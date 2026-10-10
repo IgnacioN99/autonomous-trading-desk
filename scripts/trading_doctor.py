@@ -15,6 +15,9 @@ Verifies:
 7. Barbell YOLO scan health (logs/yolo_scan_health.json; WARN only, when yolo_slot_enabled)
 8. Position guardian loop liveness (check_guardian_alive; WARN only, with the install_guardian_service.py hint)
 9. Python dependencies of the scanners (numpy, pydantic, statsmodels; WARN only)
+10. [FEES] (issue #268, informational only, read-only): KEYS mode reads GET /fapi/v1/commissionRate (BTCUSDT maker /
+   taker rate) and GET /fapi/v1/feeBurn (BNB fee discount ON / OFF); MCP mode prints "unavailable". A failed read is
+   printed as unavailable; it never adds a warning or a critical failure, so it never changes the exit code.
 User profile: not onboarded = critical; PROD also fails when config/user_profile.json is missing or unreadable
 (a fallback example/default profile, issue #180).
 
@@ -615,6 +618,57 @@ def calibration_store_warning(base_dir: str, target_env: str, now: float = None)
     return f"logs/score_calibration.json is missing while PROD closed trades exist: {hint}." if closed else None
 
 
+FEE_RATE_SYMBOL = "BTCUSDT"  # the commission rate is read for one symbol (the account's tier applies to all)
+
+
+def _fee_reply_text(res) -> str:
+    return str(res)[:120]
+
+
+def _commission_pct(res, key):
+    """res[key] (a commission rate fraction, e.g. "0.000500") in percent, None when missing or not a number."""
+    raw = res.get(key) if isinstance(res, dict) else None
+    if isinstance(raw, bool):
+        return None
+    try:
+        value = float(raw) * 100
+    except (TypeError, ValueError):
+        return None
+    return value if value == value and abs(value) != float("inf") else None
+
+
+def fee_status_line(target_env: str, mcp: bool = False) -> str:
+    """Issue #268: informational [FEES] text, read-only. KEYS mode: the commission rate on FEE_RATE_SYMBOL (signed
+    GET /fapi/v1/commissionRate: makerCommissionRate / takerCommissionRate) and the futures BNB fee discount (signed
+    GET /fapi/v1/feeBurn: feeBurn true = ON). MCP mode: unavailable (no gateway mapping). A failed or non-dict reply
+    or a missing field reads as unavailable. Never raises and never affects the exit code; enabling the BNB discount
+    is the owner's decision."""
+    if mcp:
+        return "Fee tier and BNB fee discount unavailable in MCP mode."
+    parts = []
+    try:
+        rate = eft.send_signed_request("GET", "/fapi/v1/commissionRate", {"symbol": FEE_RATE_SYMBOL},
+                                       target_env=target_env)
+    except Exception as e:
+        rate = f"{type(e).__name__}"
+    maker, taker = _commission_pct(rate, "makerCommissionRate"), _commission_pct(rate, "takerCommissionRate")
+    if maker is None and taker is None:
+        parts.append(f"commission rate unavailable ({_fee_reply_text(rate)})")
+    else:
+        maker_txt, taker_txt = (("n/a" if v is None else f"{v:.4f}%") for v in (maker, taker))
+        parts.append(f"{FEE_RATE_SYMBOL} commission maker {maker_txt} / taker {taker_txt}")
+    try:
+        burn = eft.send_signed_request("GET", "/fapi/v1/feeBurn", target_env=target_env)
+    except Exception as e:
+        burn = f"{type(e).__name__}"
+    flag = burn.get("feeBurn") if isinstance(burn, dict) else None
+    if isinstance(flag, bool):
+        parts.append(f"BNB fee discount {'ON' if flag else 'OFF'}")
+    else:
+        parts.append(f"BNB fee discount status unavailable ({_fee_reply_text(burn)})")
+    return "; ".join(parts) + " (informational; the BNB discount is the owner's choice)."
+
+
 def run_doctor(target_env: str = None, auto_heal: bool = False) -> int:
     target_env = resolve_env(target_env)
     start_time = time.time()
@@ -935,6 +989,13 @@ def run_doctor(target_env: str = None, auto_heal: bool = False) -> int:
     else:
         ok_items.append(msg)
         print(f"✅ [DEPENDENCIES] {msg}")
+
+    # 5e. Fee tier and BNB fee discount (issue #268; informational only: never a warning, never critical)
+    try:
+        fee_msg = fee_status_line(target_env, mcp=api_key == "MCP_OAUTH_ACTIVE")
+    except Exception as e:
+        fee_msg = f"Fee status check failed ({type(e).__name__})."
+    print(f"ℹ️  [FEES] {fee_msg}")
 
     # 6. Shadow Desk Counterfactual Audit
     try:

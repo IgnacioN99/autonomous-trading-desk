@@ -28,6 +28,14 @@ open / fills_unavailable rows and rows without realized R are excluded and count
    (never instructions: any change needs the user's explicit decision). The profit-factor note needs net R on every
    resolved row (no gross fallback).
 6. Shadow desk counterfactual metrics (best effort; an error is reported, never raised).
+7. Fees (issue #268, new top-level keys over the resolved trades): "fees" (total / mean fees_r, rows with and
+   without it: older rows and non-USDT commissions such as a BNB discount have none), "fees_by_stop_bucket" (stop
+   distance <1.5, 1.5-2, 2-3, 3-4, >=4 % of the entry; stop_distance_pct, else initial_risk / entry_price),
+   "gross_vs_net" (both expectancies over the same rows: those with gross and net R), "direction_split" (LONG vs
+   SHORT: n, win rate, expectancy, mean gross / net R, total R) and "fee_threshold_backtest" (report only, no
+   recommendation: per max_fee_r candidate 0.03-0.10, n / net expectancy / total net R of the trades the executor's
+   fee-in-R gate would keep vs reject, utils.gate_limits.expected_fee_r of the stop distance; n < 10 flagged
+   insufficient_n). The calibration store is unaffected (it keeps its own fields only).
 "source" reports the file's age and the env / since stamped in its rows; the human output warns when it is older
 than 24 h or its env differs from --env.
 
@@ -52,6 +60,7 @@ from utils.env_resolver import resolve_env
 from utils.lessons import read_active_lessons  # shared active-lesson reader (issue #187)
 from utils.position_timing import norm_env
 from utils import score_calibration as scal
+from utils import gate_limits as gl
 
 MIN_SAMPLE = 20
 STALE_SECONDS = 24 * 3600
@@ -196,6 +205,101 @@ def _usdt(rows):
         if net is not None:
             net = None if None in parts else net + parts[0] * parts[1] * parts[2]
     return (round(gross, 2) if gross is not None else None), (round(net, 2) if net is not None else None)
+
+
+# Issue #268: fees in R. Stop-distance buckets in percent of the entry, (label, low inclusive, high exclusive).
+STOP_BUCKETS = (("<1.5", None, 1.5), ("1.5-2", 1.5, 2.0), ("2-3", 2.0, 3.0), ("3-4", 3.0, 4.0), (">=4", 4.0, None))
+FEE_BACKTEST_THRESHOLDS = (0.03, 0.04, 0.05, 0.06, 0.08, 0.10)
+FEE_BACKTEST_MIN_N = 10
+FEES_NOTE = ("Data note: fees_r and realized_r_net are null when any commission is not paid in USDT (e.g. a BNB fee "
+             "discount); BNB commissions are not converted at the fill price.")
+FEE_BACKTEST_NOTE = ("Back-test of the executor fee-in-R gate (profile max_fee_r) over these closed trades: a trade is "
+                     "rejected when its expected fee (taker entry + taker SL) exceeds the threshold. Report only: it "
+                     "recommends no threshold.")
+
+
+def _stop_distance_pct(row):
+    """The row's stop_distance_pct, else initial_risk / entry_price x 100 (rows written before issue #268); None."""
+    pct = _num(row.get("stop_distance_pct"))
+    if pct is not None and pct > 0:
+        return pct
+    risk, entry = _num(row.get("initial_risk")), _num(row.get("entry_price"))
+    return risk / entry * 100 if risk is not None and entry is not None and risk > 0 and entry > 0 else None
+
+
+def _total(values):
+    values = [v for v in values if v is not None]
+    return round(sum(values), 4) if values else None
+
+
+def _fees_block(rows):
+    """Total / mean fee R over the rows with fees_r; rows without it (older rows, non-USDT commission) counted."""
+    known = [f for f in (_num(r.get("fees_r")) for r in rows) if f is not None]
+    return {"total_fees_r": _total(known), "mean_fees_r": _mean(known), "n_with_fees_r": len(known),
+            "fees_r_unavailable": len(rows) - len(known), "note": FEES_NOTE}
+
+
+def _fees_by_stop_bucket(rows):
+    """Fee R per stop-distance bucket (STOP_BUCKETS); rows without a stop distance counted apart."""
+    groups = {label: [] for label, _lo, _hi in STOP_BUCKETS}
+    unavailable = 0
+    for row in rows:
+        pct = _stop_distance_pct(row)
+        if pct is None:
+            unavailable += 1
+            continue
+        label = next(label for label, lo, hi in STOP_BUCKETS
+                     if (lo is None or pct >= lo) and (hi is None or pct < hi))
+        groups[label].append(_num(row.get("fees_r")))
+    buckets = [{"bucket": label, "n": len(fees), "n_with_fees_r": sum(f is not None for f in fees),
+                "total_fees_r": _total(fees), "mean_fees_r": _mean(fees)} for label, fees in groups.items()]
+    return {"unit": "percent of entry", "buckets": buckets, "stop_distance_unavailable": unavailable}
+
+
+def _gross_vs_net(rows):
+    """Gross and net expectancy over the SAME rows: those with both realized_r_gross and realized_r_net."""
+    pairs = [(g, n) for g, n in ((_num(r.get("realized_r_gross")), _num(r.get("realized_r_net"))) for r in rows)
+             if g is not None and n is not None]
+    return {"n": len(pairs), "rows_without_both": len(rows) - len(pairs),
+            "expectancy_r_gross": _mean(g for g, _n in pairs), "expectancy_r_net": _mean(n for _g, n in pairs),
+            "total_r_gross": _total(g for g, _n in pairs), "total_r_net": _total(n for _g, n in pairs)}
+
+
+def _direction_split(rows, r_values):
+    """LONG vs SHORT: n, win rate and expectancy on the R basis (_r_stats), mean gross / net R, total R."""
+    out = {}
+    for d in ("LONG", "SHORT"):
+        sel = [(row, r) for row, r in zip(rows, r_values) if str(row.get("direction") or "").upper() == d]
+        stats = _r_stats([r for _row, r in sel])
+        out[d] = {"n": stats["n"], "win_rate_pct": stats["win_rate_pct"], "expectancy_r": stats["expectancy_r"],
+                  "expectancy_r_gross": _mean(_num(row.get("realized_r_gross")) for row, _r in sel),
+                  "expectancy_r_net": _mean(_num(row.get("realized_r_net")) for row, _r in sel),
+                  "total_r": _total(r for _row, r in sel)}
+    return out
+
+
+def _fee_threshold_backtest(rows):
+    """Issue #268 (report only): for each FEE_BACKTEST_THRESHOLDS value, n / net expectancy / total net R of the rows
+    the fee-in-R gate would keep (expected_fee_r <= threshold, as the gate) vs reject. Rows without a stop distance
+    or without net R are counted, not used; a side with n < FEE_BACKTEST_MIN_N is flagged insufficient_n."""
+    usable, no_stop, no_net = [], 0, 0
+    for row in rows:
+        pct, net = _stop_distance_pct(row), _num(row.get("realized_r_net"))
+        if pct is None:
+            no_stop += 1
+        elif net is None:
+            no_net += 1
+        else:
+            usable.append((gl.expected_fee_r(pct), net))
+
+    def side(values):
+        return {"n": len(values), "expectancy_r_net": _mean(values), "total_r_net": _total(values),
+                "insufficient_n": len(values) < FEE_BACKTEST_MIN_N}
+
+    return {"note": FEE_BACKTEST_NOTE, "fee_model": "taker entry + taker SL", "n": len(usable),
+            "rows_without_stop_distance": no_stop, "rows_without_net_r": no_net,
+            "thresholds": [{"max_fee_r": t, "kept": side([n for f, n in usable if f <= t]),
+                            "rejected": side([n for f, n in usable if f > t])} for t in FEE_BACKTEST_THRESHOLDS]}
 
 
 def _source_info(path, rows, env, now):
@@ -379,6 +483,11 @@ def generate_scorecard(env, outcomes_path=None, now=None, write_calibration=Fals
         "performance": performance,
         "tiers_breakdown": {t: {k: v for k, v in _r_stats(vals).items() if k in ("n", "win_rate_pct", "expectancy_r")}
                             for t, vals in by_tier.items()},
+        "fees": _fees_block(resolved),
+        "fees_by_stop_bucket": _fees_by_stop_bucket(resolved),
+        "gross_vs_net": _gross_vs_net(resolved),
+        "direction_split": _direction_split(resolved, r_values),
+        "fee_threshold_backtest": _fee_threshold_backtest(resolved),
         "score_calibration": _calibration_block(store, min_trades, written, min_lcb_r),
         "insights": {"env_agnostic": True, "loss_cause_clusters": cause_clusters},
         "recommendations": _recommendations(n, stats["expectancy_r"], stats["profit_factor_r"], cause_clusters,
@@ -390,6 +499,40 @@ def generate_scorecard(env, outcomes_path=None, now=None, write_calibration=Fals
 
 def _fmt(value, spec, none="n/a"):
     return none if value is None else format(value, spec)
+
+
+def _fee_report_lines(sc: dict) -> list:
+    """Issue #268 report sections: fees in R, gross vs net, LONG / SHORT, the fee-in-R gate back-test."""
+    fees, buckets, gvn = sc.get("fees") or {}, sc.get("fees_by_stop_bucket") or {}, sc.get("gross_vs_net") or {}
+    lines = ["💸 FEES IN R (measured from fills):",
+             f"  • Total: {_fmt(fees.get('total_fees_r'), '.4f')}R | Mean per trade: "
+             f"{_fmt(fees.get('mean_fees_r'), '.4f')}R | rows with fees_r: {fees.get('n_with_fees_r', 0)} | "
+             f"without: {fees.get('fees_r_unavailable', 0)}",
+             f"  • Same {gvn.get('n', 0)} trades: expectancy gross {_fmt(gvn.get('expectancy_r_gross'), '+.4f')}R | "
+             f"net {_fmt(gvn.get('expectancy_r_net'), '+.4f')}R (rows without both: {gvn.get('rows_without_both', 0)})"]
+    for b in buckets.get("buckets") or []:
+        lines.append(f"  • Stop {b['bucket']}%: n={b['n']} | mean fee {_fmt(b['mean_fees_r'], '.4f')}R | total "
+                     f"{_fmt(b['total_fees_r'], '.4f')}R")
+    lines.append(f"  stop distance unavailable: {buckets.get('stop_distance_unavailable', 0)} | {fees.get('note', FEES_NOTE)}")
+    lines.append("-" * 70)
+    lines.append("↔️  BY DIRECTION:")
+    for d, s in (sc.get("direction_split") or {}).items():
+        lines.append(f"  - {d}: {s['n']} trades | Win Rate: {_fmt(s['win_rate_pct'], '.1f')}% | Expectancy: "
+                     f"{_fmt(s['expectancy_r'], '+.4f')}R (gross {_fmt(s['expectancy_r_gross'], '+.4f')}R / net "
+                     f"{_fmt(s['expectancy_r_net'], '+.4f')}R) | Total: {_fmt(s['total_r'], '+.4f')}R")
+    lines.append("-" * 70)
+    bt = sc.get("fee_threshold_backtest") or {}
+    lines.append(f"🧪 FEE-IN-R GATE BACK-TEST (n={bt.get('n', 0)}; without stop distance "
+                 f"{bt.get('rows_without_stop_distance', 0)}, without net R {bt.get('rows_without_net_r', 0)}):")
+    lines.append(f"  {bt.get('note', FEE_BACKTEST_NOTE)}")
+    for t in bt.get("thresholds") or []:
+        k, r = t["kept"], t["rejected"]
+        lines.append(f"  - max_fee_r {t['max_fee_r']:.2f}: kept n={k['n']} exp {_fmt(k['expectancy_r_net'], '+.4f')}R "
+                     f"total {_fmt(k['total_r_net'], '+.4f')}R{' (insufficient_n)' if k['insufficient_n'] else ''} | "
+                     f"rejected n={r['n']} exp {_fmt(r['expectancy_r_net'], '+.4f')}R total "
+                     f"{_fmt(r['total_r_net'], '+.4f')}R{' (insufficient_n)' if r['insufficient_n'] else ''}")
+    lines.append("-" * 70)
+    return lines
 
 
 def format_scorecard_report(sc: dict) -> str:
@@ -418,6 +561,7 @@ def format_scorecard_report(sc: dict) -> str:
         lines.append(f"  - {tier}: {stats['n']} trades | Win Rate: {_fmt(stats['win_rate_pct'], '.1f')}% | "
                      f"Expectancy: {_fmt(stats['expectancy_r'], '+.4f')}R")
     lines.append("-" * 70)
+    lines.extend(_fee_report_lines(sc))
     cal = sc.get("score_calibration")
     if cal:
         lines.append("🎯 CALIBRATION BY SCORE BUCKET (dossier score; heuristic, not a probability; PROD):")

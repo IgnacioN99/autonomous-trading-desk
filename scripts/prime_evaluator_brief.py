@@ -394,7 +394,8 @@ def build_risk_profile(target_env: str, profile: Optional[dict] = None, equity: 
 def build_yolo_slot_brief(screening: dict) -> dict:
     """Brief `yolo_slot` object: {status, summary, candidates} from the structured screening field (issue #52).
     Falls back to the legacy `yolo_slot_status` string (INACTIVE, no candidates) when the field is missing.
-    Candidates are forwarded only when the slot is ACTIVE."""
+    Candidates are forwarded only when the slot is ACTIVE, with the same key mapping as the standard rows
+    (_brief_opportunity: expected_fee_r as fee_r, dropped when null; issue #268)."""
     summary = str(screening.get("yolo_slot_status") or "INACTIVE: Preserving capital.")
     slot = screening.get("yolo_slot")
     if not isinstance(slot, dict) or not slot.get("status"):
@@ -402,7 +403,7 @@ def build_yolo_slot_brief(screening: dict) -> dict:
     status = str(slot["status"]).upper()
     candidates = slot.get("candidates") if status == "ACTIVE" else None
     return {"status": status, "summary": summary,
-            "candidates": [c for c in (candidates or []) if isinstance(c, dict)]}
+            "candidates": [_brief_opportunity(c) for c in (candidates or []) if isinstance(c, dict)]}
 
 
 def _write_json(path: str, data: dict, indent: Optional[int] = 2, separators: Optional[tuple] = None) -> None:
@@ -618,14 +619,18 @@ _SIDECAR_ONLY_KEYS = ("score_components", "tier_s_eligible", "alt_short_climax_o
 
 # Issue #206 flags reach the brief only when set (token budget): these values are dropped from a row.
 _DROP_WHEN_UNSET = {"squeeze_risk": False, "squeeze_reasons": [], "long_crowding_risk": False,
-                    "macro_short_check": None, "funding_rate_pct": None, "funding_interval_unknown": False}
+                    "macro_short_check": None, "funding_rate_pct": None, "funding_interval_unknown": False,
+                    "fee_r": None}
 # The 8h-normalized funding and the interval add nothing for an 8h symbol (normalized == raw)
 _FUNDING_8H_KEYS = ("funding_rate_8h_pct", "funding_interval_h")
+# Issue #268: the candidate's expected_fee_r (taker entry + taker SL fee in R, a plan-time estimate) under a short key
+_BRIEF_KEY_RENAMES = {"expected_fee_r": "fee_r"}
 
 
 def _brief_opportunity(o: Any) -> Any:
     if not isinstance(o, dict):
         return o
+    o = {_BRIEF_KEY_RENAMES.get(k, k): v for k, v in o.items()}
     out = {k: v for k, v in o.items() if k not in _SIDECAR_ONLY_KEYS
            and not (k in _DROP_WHEN_UNSET and v == _DROP_WHEN_UNSET[k] and type(v) is type(_DROP_WHEN_UNSET[k]))}
     if out.get("funding_interval_h") in (None, 8):
