@@ -439,7 +439,9 @@ class TestRadarObservability(unittest.TestCase):
         self.assertIn("LBADUSDT, SBADUSDT", err.getvalue())
 
     def test_text_report_trigger_spacing(self):
+        # Issue #298: the public payload row (radar_tier, not tier), as build_scan_payload emits it
         cand = dict(_broad(tac.radar_long_klines()), roe_est_pct=1.0, micro=None)
+        cand["radar_tier"] = cand.pop("tier")
         payload = {"interval": "15m", "env": "prod", "qualified_count": 1, "leverage_standard": 3,
                    "candidates": [cand]}
         out = io.StringIO()

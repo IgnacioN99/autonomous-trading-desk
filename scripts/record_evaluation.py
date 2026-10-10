@@ -28,6 +28,9 @@ Dossiers typed by hand are NOT accepted in PROD.
 Issue #298: the summary prints the brief's generated_at, the evaluation time and the validity as UTC date-times, and
 per approved candidate an advisory `Delta (est.)` line plus the approved set's ratio (utils/delta_fit.py, cached book
 and brief risk_profile only; UNKNOWN when unverifiable; nothing stored, no exchange call; Gate 1 decides).
+It also attaches each approved candidate's signal candle (signal_candle_open_ts, signal_interval) from the brief's
+own sidecar (logs/primed_brief_scores.json, same generated_at_ts) and prints it, and logs the scan's radar / brief /
+dossier Tier S counts (`Radar vs brief Tier S`, history field tier_s_divergence).
 
 Legacy manual paths (TESTNET only, stored as schema_version 1 / source "manual_testnet"):
   python3 scripts/record_evaluation.py --env testnet --symbols TIAUSDT,SAGAUSDT --directions LONG,SHORT
@@ -143,6 +146,56 @@ def build_radar_snapshots(record: dict, base_dir: Optional[str] = None) -> Optio
     return out
 
 
+def brief_sidecar(record: dict, base_dir: Optional[str] = None) -> Optional[dict]:
+    """Issue #298: logs/primed_brief_scores.json when it belongs to the brief this dossier was evaluated on (its
+    generated_at_ts equals the dossier's brief_generated_at_ts, the replaced-brief guard) and to the same
+    environment; None otherwise (missing, unreadable, another brief or environment). Never raises."""
+    try:
+        raw = (record.get("raw_payload") or {}).get("brief_generated_at_ts")
+        with open(os.path.join(base_dir or BASE_DIR, "logs", "primed_brief_scores.json"), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if raw is None or isinstance(raw, bool) or int(data["generated_at_ts"]) != int(raw):
+            return None
+        env = str(data.get("env") or "").lower()
+        if env and record.get("target_env") and env != str(record["target_env"]).lower():
+            return None
+        return data if isinstance(data.get("rows"), list) else None
+    except Exception:
+        return None
+
+
+def attach_signal_candles(record: dict, sidecar: Optional[dict]) -> None:
+    """Issue #298 item 2: sets signal_candle_open_ts (seconds) and signal_interval on each approved candidate from the
+    sidecar row of the same symbol and direction (brief_sidecar: only the dossier's own brief); omitted otherwise,
+    never guessed (values the evaluator itself emitted are removed: the recorder is their only source). Stored with
+    the record outside the provenance sha256; recheck_brief.bound_signal_fields binds them to the verified
+    brief_generated_at_ts before a re-check uses them."""
+    rows = [r for r in (sidecar or {}).get("rows") or [] if isinstance(r, dict)]
+    for c in record.get("approved_candidates") or []:
+        if not isinstance(c, dict):
+            continue
+        c.pop("signal_candle_open_ts", None)
+        c.pop("signal_interval", None)
+        row = next((r for r in rows if str(r.get("symbol") or "").upper() == str(c.get("symbol") or "").upper()
+                    and str(r.get("direction") or "").upper() == str(c.get("direction") or "").upper()), None)
+        ts, interval = (row or {}).get("signal_candle_open_ts"), (row or {}).get("signal_interval")
+        if isinstance(ts, int) and not isinstance(ts, bool) and ts > 0 and isinstance(interval, str) and interval:
+            c["signal_candle_open_ts"], c["signal_interval"] = ts, interval
+
+
+def _tier_s_divergence(record: dict, sidecar: Optional[dict]) -> Optional[dict]:
+    """Issue #298 item 5 (#90 baseline): the sidecar's {radar_tier_s, brief_tier_s} plus the dossier's own Tier S
+    count (dossier_tier_s); None when the sidecar has no usable counts."""
+    counts = (sidecar or {}).get("tier_s_divergence")
+    if not isinstance(counts, dict) or not all(isinstance(counts.get(k), int) and not isinstance(counts.get(k), bool)
+                                               for k in ("radar_tier_s", "brief_tier_s")):
+        return None
+    from utils.recheck_bounds import normalize_tier
+    dossier = sum(1 for c in record.get("approved_candidates") or []
+                  if isinstance(c, dict) and normalize_tier(c.get("tier")) == "S")
+    return {"radar_tier_s": counts["radar_tier_s"], "brief_tier_s": counts["brief_tier_s"], "dossier_tier_s": dossier}
+
+
 def attach_recheck(record: dict, base_dir: Optional[str] = None, now_ts: Optional[int] = None) -> Optional[str]:
     """Issue #267: when the brief (logs/primed_brief.json) is a `--recheck` brief and this dossier was evaluated on
     it, stores the brief's `recheck_of` (old dossier sha256 and its verified plan) and the deterministic bounds
@@ -185,8 +238,10 @@ def attach_recheck(record: dict, base_dir: Optional[str] = None, now_ts: Optiona
         except Exception:
             profile = {}
         bounds = up.get_recheck_bounds(profile)
+        # Issue #298: the brief's recheck block adds the setup_status check (found, or a fully passed carry)
         verdict = rb.evaluate_recheck_bounds(recheck_of, record, int(now_ts if now_ts is not None else time.time()),
-                                             bounds["recheck_max_drift_r"], bounds["recheck_max_age_seconds"])
+                                             bounds["recheck_max_drift_r"], bounds["recheck_max_age_seconds"],
+                                             recheck=brief.get("recheck"))
         record["recheck_bounds"] = dict(verdict, bounds=bounds)
     except Exception as e:  # never blocks recording; an unknown verdict asks the user again
         record["recheck_bounds"] = {"within_bounds": False, "checks": [],
@@ -266,12 +321,23 @@ def _recheck_candidate_fields(recheck_of) -> dict:
     return {"recheck_symbol": sym, "recheck_direction": dirn} if sym and dirn else {}
 
 
+def _signal_candles(record: dict) -> dict:
+    """Issue #298: {"SYMBOL|DIRECTION": {signal_candle_open_ts, signal_interval}} of the approved candidates that
+    carry them (the history row's copy, read by a re-check of an earlier scan of the session)."""
+    return {f"{c.get('symbol')}|{c.get('direction')}": {k: c[k] for k in ("signal_candle_open_ts", "signal_interval")}
+            for c in record.get("approved_candidates") or []
+            if isinstance(c, dict) and c.get("signal_candle_open_ts") is not None and c.get("signal_interval")}
+
+
 def _persist(record: dict, base_dir: Optional[str] = None, shadow: bool = True,
-             superseded: Optional[list] = None) -> str:
+             superseded: Optional[list] = None, report: Optional[dict] = None) -> str:
     """Issue #270: writes the record to its session's file (dossier_<parent_conversation_id>.json, when the
     session is known) and, as a full copy, to latest_dossier.json (the newest scan overall). Returns the latter.
     Issue #298: `superseded` (a list, when given) receives _superseded_approvals of the session's previous record;
-    the history row then carries `superseded_symbols` ("SYMBOL:DIRECTION", only when non-empty)."""
+    the history row then carries `superseded_symbols` ("SYMBOL:DIRECTION", only when non-empty). The approved
+    candidates get their signal candle from the brief's sidecar (attach_signal_candles), copied to the history row as
+    `signal_candles`; the row also gets `tier_s_divergence` (radar / brief / dossier Tier S counts) when the sidecar
+    has them. `report` (a dict, when given) receives {"tier_s_divergence": ...} for the summary."""
     base, dossier_file, history_file = _paths(base_dir)
     try:
         snapshots = build_radar_snapshots(record, base)
@@ -279,6 +345,15 @@ def _persist(record: dict, base_dir: Optional[str] = None, shadow: bool = True,
         snapshots = None
     if snapshots is not None:
         record["radar_snapshots"] = snapshots
+    sidecar = brief_sidecar(record, base)
+    try:
+        attach_signal_candles(record, sidecar)
+        divergence = _tier_s_divergence(record, sidecar)
+    except Exception:  # audit metadata only: never blocks recording the verdict
+        divergence = None
+    if report is not None:
+        report["tier_s_divergence"] = divergence
+    signals = _signal_candles(record)
     session_file = dp.session_dossier_path(base, record.get("parent_conversation_id"))
     dropped = _superseded_approvals(session_file, record, int(record.get("recorded_at_ts") or time.time()))
     if superseded is not None:
@@ -311,6 +386,9 @@ def _persist(record: dict, base_dir: Optional[str] = None, shadow: bool = True,
         **_recheck_candidate_fields(record.get("recheck_of")),
         # Issue #298: optional, only when the previous scan of the session had unexpired approvals this one dropped
         **({"superseded_symbols": [f"{s['symbol']}:{s['direction']}" for s in dropped]} if dropped else {}),
+        # Issue #298: optional, the approved candidates' signal candles and the radar / brief / dossier Tier S counts
+        **({"signal_candles": signals} if signals else {}),
+        **({"tier_s_divergence": divergence} if divergence else {}),
     })
     if shadow:
         _register_shadow()
@@ -363,9 +441,17 @@ def _delta_preview(record: dict, base: str, now_ts: int, cands: list) -> tuple:
         return [[unknown] for _ in cands], f"Delta (est.) of the approved set: UNKNOWN (preview failed: {type(e).__name__})"
 
 
+def _signal_line(cand: dict) -> str:
+    """Issue #298: 'Signal candle: <UTC open> (<interval>)', or 'unknown' when the recorder could not attach it."""
+    try:
+        return f"Signal candle: {_fmt_utc(cand['signal_candle_open_ts'])} ({cand['signal_interval']})"
+    except Exception:
+        return "Signal candle: unknown (no sidecar row of this brief)"
+
+
 def _print_summary(record: dict, dossier_file: str, base: str, now_ts: int,
                    recheck_not_linked: bool = False, superseded: Optional[list] = None,
-                   brief_replaced: bool = False) -> None:
+                   brief_replaced: bool = False, tier_s_divergence: Optional[dict] = None) -> None:
     status = record.get("status")
     cands = record.get("approved_candidates") or []
     valid_until = int(record.get("valid_until_ts") or 0)
@@ -401,9 +487,13 @@ def _print_summary(record: dict, dossier_file: str, base: str, now_ts: int,
             print(f"     - {c['symbol']} {direction} | {flag}" + (f" | {' '.join(extras)}" if extras else ""))
             for line in lines:  # issue #298 item 4: advisory, read before asking the user
                 print(f"       {line}")
+            print(f"       {_signal_line(c)}")  # issue #298 item 7: the candle that produced the setup
         print(f"   {delta_summary}")
     else:
         print("   No trade authorized by this dossier.")
+    if tier_s_divergence:  # issue #298 item 5: the raw radar tier is not a tier (#90 baseline)
+        print(f"   Radar vs brief Tier S: {tier_s_divergence['radar_tier_s']} vs {tier_s_divergence['brief_tier_s']} "
+              f"(dossier {tier_s_divergence['dossier_tier_s']}; radar_tier is pre-gate, only the dossier tier counts)")
     if record.get("summary"):
         print(f"   Summary: {record['summary']}")
     if superseded:  # issue #298: a newer scan never silently cancels the session's pending approvals
@@ -540,10 +630,12 @@ def _record_extracted(
     if replaced_warning:
         print(f"⚠️ BRIEF REPLACED: {replaced_warning}", file=sys.stderr)
     superseded: list = []
-    dossier_file = _persist(record, base, shadow=shadow, superseded=superseded)
+    report: dict = {}
+    dossier_file = _persist(record, base, shadow=shadow, superseded=superseded, report=report)
     if verbose:
         _print_summary(record, dossier_file, base, now_ts, recheck_not_linked=bool(recheck_warning),
-                       superseded=superseded, brief_replaced=bool(replaced_warning))
+                       superseded=superseded, brief_replaced=bool(replaced_warning),
+                       tier_s_divergence=report.get("tier_s_divergence"))
     return record
 
 
@@ -591,8 +683,10 @@ def record_evaluation_dossier(
         "raw_payload": raw_payload or {},
     }
     superseded: list = []
-    dossier_file = _persist(record, base, shadow=shadow, superseded=superseded)
-    _print_summary(record, dossier_file, base, now_ts, superseded=superseded)
+    report: dict = {}
+    dossier_file = _persist(record, base, shadow=shadow, superseded=superseded, report=report)
+    _print_summary(record, dossier_file, base, now_ts, superseded=superseded,
+                   tier_s_divergence=report.get("tier_s_divergence"))
     return record
 
 

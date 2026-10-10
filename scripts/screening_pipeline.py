@@ -33,6 +33,7 @@ from utils.gate_limits import MIN_TP1_DISTANCE, YOLO_MAX_LOSS_MARGIN_FRACTION, e
 from utils import yolo_scan_health
 from utils import rate_limit_guard
 from utils import squeeze_filter as sqf
+from utils.recheck_brief import RECHECK_PLAN_ENV
 
 # Barbell YOLO slot (issue #52): the memecoin scanner runs concurrently under a hard time budget so it can
 # never block or break the standard scan (prime_evaluator_brief.py gives the whole pipeline 60 s).
@@ -127,6 +128,10 @@ class CandidateSetup(BaseModel):
     funding_interval_unknown: bool = False
     # Issue #268: plan-time fee estimate in R (taker entry + taker SL) from risk_pct; the brief shows it as fee_r
     expected_fee_r: Optional[float] = None
+    # Issue #298: the radar's signal candle (open time in SECONDS, from wick_candle_open_time ms) and its interval;
+    # sidecar only (prime_evaluator_brief._SIDECAR_ONLY_KEYS), attached to the dossier by record_evaluation.py
+    signal_candle_open_ts: Optional[int] = None
+    signal_interval: Optional[str] = None
 
 class StatArbPair(BaseModel):
     pair: str
@@ -200,6 +205,9 @@ class MarketScreeningPayload(BaseModel):
     funding_info_warning: Optional[str] = None
     # Issue #267: single-symbol re-check ({symbol, direction, setup_status, cause}); None on a full scan
     recheck: Optional[dict] = None
+    # Issue #298 item 5 (#90 baseline): {"radar_tier_s": N, "brief_tier_s": M} of a full scan (radar Tier S rows before
+    # the macro gate and the slices vs Tier S rows in top_candidates); the brief writer copies it to the sidecar only
+    tier_s_divergence: Optional[dict] = None
 
 # ==========================================
 # 2. DETERMINISTIC EXECUTION PIPELINE
@@ -309,6 +317,12 @@ def _fee_r(risk_pct) -> Optional[float]:
     fee = expected_fee_r(risk_pct)
     return round(fee, 3) if fee is not None else None
 
+def _signal_open_ts(open_time_ms) -> Optional[int]:
+    """Issue #298: the radar's wick_candle_open_time (ms) in seconds; None when missing or not an integer."""
+    if isinstance(open_time_ms, bool) or not isinstance(open_time_ms, int) or open_time_ms <= 0:
+        return None
+    return open_time_ms // 1000
+
 def enrich_and_size_candidate(c: dict, target_env: Optional[str] = None) -> Optional[CandidateSetup]:
     """Calculates volatility parity sizing and encapsulates into Pydantic model."""
     try:
@@ -402,6 +416,8 @@ def enrich_and_size_candidate(c: dict, target_env: Optional[str] = None) -> Opti
                                   and not isinstance(c.get("score_schema_version"), bool) else None),
             funding_interval_unknown=c.get("funding_interval_unknown") is True,
             expected_fee_r=_fee_r(risk_pct),
+            signal_candle_open_ts=_signal_open_ts(c.get("wick_candle_open_time")),
+            signal_interval=str(c["interval"]) if c.get("interval") else None,
         )
     except Exception as e:
         sym = c.get("symbol") if isinstance(c, dict) else None
@@ -591,22 +607,162 @@ def execute_screening_pipeline(top_pairs_count: int = 80, target_env: Optional[s
 
 RECHECK_YOLO_STATUS = "UNAVAILABLE: YOLO scan not run by a single-symbol re-check. YOLO slot kept empty."
 
-def execute_symbol_recheck(symbol: str, direction: str, target_env: Optional[str] = None) -> MarketScreeningPayload:
+# Issue #298 item 2: signal carry of a re-check whose live signal is gone (signal_carried_check)
+CARRY_INTERVAL = "15m"
+CARRY_INTERVAL_S = 900
+CARRY_KLINES_MAX = 1500  # Binance klines limit
+CARRY_VOL_BARS = 20  # bars before the signal candle in the radar's volume average (analyze_single_symbol)
+_CARRY_EPS = 1e-9
+
+def _plan_num(value) -> Optional[float]:
+    """A finite positive float (booleans are not numbers), else None."""
+    if isinstance(value, bool):
+        return None
+    value = _optional_float(value)
+    return value if value is not None and value > 0 else None
+
+def _carry_qualifies(plan, now_ts: int) -> bool:
+    """A plan qualifies for a signal carry only with an integer signal_candle_open_ts, signal_interval 15m, valid
+    bounds and an original evaluation at most recheck_max_age_seconds old."""
+    if not isinstance(plan, dict):
+        return False
+    open_ts = plan.get("signal_candle_open_ts")
+    if isinstance(open_ts, bool) or not isinstance(open_ts, int) or open_ts <= 0:
+        return False
+    if plan.get("signal_interval") != CARRY_INTERVAL or _plan_num(plan.get("recheck_max_drift_r")) is None:
+        return False
+    max_age, evaluated = _plan_num(plan.get("recheck_max_age_seconds")), plan.get("evaluated_ts")
+    if max_age is None or isinstance(evaluated, bool) or not isinstance(evaluated, int):
+        return False
+    return 0 <= now_ts - evaluated <= max_age
+
+def _signal_vol_ratio(klines: list, idx: int) -> Optional[float]:
+    """Volume of the signal candle over the mean of the CARRY_VOL_BARS bars before it (the radar's formula, base
+    volume k[5], unrounded); None with fewer bars or unusable volumes."""
+    if idx < CARRY_VOL_BARS:
+        return None
+    try:
+        avg = sum(float(k[5]) for k in klines[idx - CARRY_VOL_BARS:idx]) / CARRY_VOL_BARS
+        ratio = float(klines[idx][5]) / avg if avg > 0 else None
+    except (TypeError, ValueError, IndexError):
+        return None
+    return ratio if ratio is not None and math.isfinite(ratio) else None
+
+def signal_carried_check(symbol: str, direction: str, plan, macro, now_ts: Optional[int] = None
+                         ) -> Tuple[Optional[dict], List[dict]]:
+    """Issue #298 item 2: when the radar no longer produces the setup, checks the ORIGINAL plan's signal candle and
+    levels against live data. Returns (None, []) when the plan does not qualify (_carry_qualifies: today's no_setup),
+    else ({"ok", "signal_candle_open_ts", "signal_interval", "checks": [{check, value, limit, ok[, reason]}]},
+    macro-rejected shorts). Checks: the signal candle is in the live 15m klines and closed (select_wick_kline); no bar
+    after it touched the plan SL; the live price is past the plan entry by at most recheck_max_drift_r R; R:R to TP2
+    >= 3:1 from the entry the executor would use at the live price (the trigger, or the live price once crossed;
+    recheck_bounds._rr_tp2); the alt-short macro gate re-run on the live BTC macro with the signal candle's own climax
+    flag. `ok` only when every check passed; a missing or unverifiable input fails its check (fail closed).
+    RateLimitedError propagates (the re-check reports unavailable)."""
+    from utils import recheck_bounds as rb
+    now_ts = int(now_ts if now_ts is not None else time.time())
+    if not _carry_qualifies(plan, now_ts):
+        return None, []
+    checks: List[dict] = []
+    rejected: List[dict] = []
+
+    def check(name: str, value, limit, ok: bool, reason: str = "") -> None:
+        checks.append({"check": name, "value": value, "limit": limit, "ok": bool(ok),
+                       **({"reason": reason} if not ok and reason else {})})
+
+    is_long = direction == "LONG"
+    open_ts = plan["signal_candle_open_ts"]
+    max_drift = _plan_num(plan.get("recheck_max_drift_r"))
+    entry, sl, tp2 = _plan_num(plan.get("entry")), _plan_num(plan.get("stop_loss")), _plan_num(plan.get("tp2"))
+    klines, idx, fetch_error = None, None, None
+    try:
+        bars = max(0, (now_ts - open_ts) // CARRY_INTERVAL_S) + 1
+        klines = bmr.fetch_klines(symbol, interval=CARRY_INTERVAL,
+                                  limit=min(CARRY_KLINES_MAX, bars + CARRY_VOL_BARS + 3))
+    except rate_limit_guard.RateLimitedError:
+        raise
+    except Exception as e:
+        fetch_error = type(e).__name__
+    if isinstance(klines, list) and len(klines) >= 2:
+        kline, mismatch = me.select_wick_kline(klines, open_ts * 1000)
+        if not mismatch:
+            idx = next(i for i, k in enumerate(klines) if k is kline)
+    closed = idx is not None and idx < len(klines) - 1
+    candle_utc = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(open_ts))
+    check("signal_candle", candle_utc, f"closed {CARRY_INTERVAL} candle in the live klines", closed,
+          f"live klines unavailable ({fetch_error})" if fetch_error
+          else "signal candle not found in the live klines" if idx is None else "signal candle still forming")
+
+    extreme = None
+    if closed and sl is not None:
+        try:
+            after = klines[idx + 1:]
+            extreme = min(float(k[3]) for k in after) if is_long else max(float(k[2]) for k in after)
+        except (TypeError, ValueError, IndexError):
+            extreme = None
+    sl_ok = extreme is not None and math.isfinite(extreme) and (extreme > sl if is_long else extreme < sl)
+    check("sl_untouched", extreme, f"{'>' if is_long else '<'} {sl}", sl_ok,
+          "SL level or the bars since the signal candle unreadable" if extreme is None
+          else "a bar since the signal candle closed touched the plan SL")
+
+    live = None
+    try:
+        ticker = me.fetch_json(f"{me.BASE_FAPI}/fapi/v1/ticker/price?symbol={symbol}")
+        live = _plan_num(ticker.get("price")) if isinstance(ticker, dict) else None
+    except rate_limit_guard.RateLimitedError:
+        raise
+    except Exception:
+        live = None
+    check("live_price", live, "> 0", live is not None, "no live price")
+
+    risk = abs(entry - sl) if entry is not None and sl is not None else 0.0
+    crossed = (((live - entry) if is_long else (entry - live)) / risk) if risk > 0 and live is not None else None
+    check("trigger_crossed_r", round(crossed, 4) if crossed is not None else None, f"<= {max_drift}R past the entry",
+          crossed is not None and crossed <= max_drift + _CARRY_EPS,
+          "trigger crossed beyond the re-check drift bound" if crossed is not None
+          else "not measurable (missing level, zero R or no live price)")
+
+    effective = ((max(entry, live) if is_long else min(entry, live))
+                 if entry is not None and live is not None else None)
+    rr = rb._rr_tp2(direction, effective, sl, tp2) if None not in (effective, sl, tp2) else None
+    check("rr_tp2", round(rr, 3) if rr is not None else None,
+          f">= {rb.MIN_RR_TP2} from the entry at the live price", rr is not None and rr >= rb.MIN_RR_TP2 - _CARRY_EPS,
+          "R:R to TP2 below 3:1 at the live price (or levels on the wrong side)")
+
+    if direction == "SHORT" and symbol != sqf.BTC_SYMBOL:
+        ratio = _signal_vol_ratio(klines, idx) if closed else None
+        kept, rejected = apply_alt_short_macro_gate(
+            [{"symbol": symbol, "direction": "SHORT", "vol_ratio": round(ratio, 2) if ratio is not None else None,
+              "alt_short_climax_ok": ratio is not None and ratio >= sqf.ALT_SHORT_CLIMAX_VOL}], macro)
+        check("alt_short_macro", kept[0]["macro_short_check"] if kept else (rejected[0]["reason"] if rejected else None),
+              "btc_rejection or climax>=2.5x on the signal candle (live BTC macro)", bool(kept),
+              "the alt-short macro gate rejects it now")
+    else:
+        check("alt_short_macro", "not applicable", "alt SHORT only", True)
+    return ({"ok": all(c["ok"] for c in checks), "signal_candle_open_ts": open_ts, "signal_interval": CARRY_INTERVAL,
+             "checks": checks}, rejected)
+
+def execute_symbol_recheck(symbol: str, direction: str, target_env: Optional[str] = None,
+                           plan: Optional[dict] = None) -> MarketScreeningPayload:
     """Issue #267: the live setup of one symbol and direction through the standard scan's own steps (radar row ->
     fundingInfo -> microstructure enrichment -> confidence / risk ceiling filter -> alt-short macro gate -> sizing),
     with no YOLO, stat-arb, funding or news scan. Same rate-limit guard as execute_screening_pipeline. The payload's
     `recheck` says why there is no candidate: setup_status "found", "no_setup" (the radar no longer produces it)
-    or "unavailable" (market data unavailable: rate-limit ban or a failed step)."""
+    or "unavailable" (market data unavailable: rate-limit ban or a failed step).
+    Issue #298: `plan` (the original confirmed plan, recheck_brief.carry_plan) lets a vanished signal be carried:
+    setup_status "signal_carried" only when every signal_carried_check passed (no candidate row: the evaluator reuses
+    the original plan); a failed carry stays "no_setup". Either way `recheck.carried` lists the checks."""
     with rate_limit_guard.scan_session():
-        return _run_symbol_recheck(str(symbol).strip().upper(), str(direction).strip().upper(), target_env)
+        return _run_symbol_recheck(str(symbol).strip().upper(), str(direction).strip().upper(), target_env, plan)
 
-def _run_symbol_recheck(symbol: str, direction: str, target_env: Optional[str]) -> MarketScreeningPayload:
+def _run_symbol_recheck(symbol: str, direction: str, target_env: Optional[str],
+                        plan: Optional[dict] = None) -> MarketScreeningPayload:
     global _last_yolo_future
     _last_yolo_future = None  # no YOLO scan in a re-check: the CLI exit never waits for one
     t0 = time.time()
     target_env = resolve_env(target_env)
     macro_data, candidate, rejected, warning = None, None, [], None
-    status, cause = "no_setup", None
+    status, cause, carried = "no_setup", None, None
     rate_limited = False
     try:
         rate_limit_guard.raise_if_banned()  # a ban persisted by an earlier run: no Binance call in this run
@@ -615,6 +771,14 @@ def _run_symbol_recheck(symbol: str, direction: str, target_env: Optional[str]) 
         if row is None:
             cause = (f"radar: no setup for {symbol} (no LONG/SHORT score >= 45, or its {bmr.DEFAULT_INTERVAL} klines "
                      "are unreadable or the wick candle has zero range)")
+            # Issue #298: the original signal candle and live levels (the macro gate runs with no radar row)
+            carried, rejected = signal_carried_check(symbol, direction, plan, macro_data)
+            if carried is not None and carried["ok"]:
+                status, cause = "signal_carried", (f"radar: no live setup for {symbol}; the original "
+                                                   f"{CARRY_INTERVAL} signal candle and the live levels hold")
+            elif carried is not None:
+                cause += "; signal not carried (failed: " + ", ".join(
+                    c["check"] for c in carried["checks"] if not c["ok"]) + ")"
         elif row.get("direction") != direction:
             cause = f"radar: {symbol} now scores {row.get('direction')}, not {direction}"
         else:
@@ -637,12 +801,12 @@ def _run_symbol_recheck(symbol: str, direction: str, target_env: Optional[str]) 
     except rate_limit_guard.RateLimitedError:
         rate_limited = True
     except Exception as e:  # any other failed step: the setup cannot be judged (fail closed)
-        status, cause, candidate = "unavailable", f"re-check failed ({type(e).__name__})", None
+        status, cause, candidate, carried = "unavailable", f"re-check failed ({type(e).__name__})", None, None
         print(f"Symbol re-check of {symbol} failed: {type(e).__name__}: {e}", file=sys.stderr)
     market_data_status = None
     if rate_limited or rate_limit_guard.is_banned():  # same fail-closed rule as the full scan
         market_data_status = rate_limit_guard.unavailable_text()
-        status, cause, candidate, rejected = "unavailable", market_data_status, None, []
+        status, cause, candidate, rejected, carried = "unavailable", market_data_status, None, [], None
         if rate_limited or macro_data is None:
             macro_data = _rate_limited_macro(market_data_status)
     if macro_data is None:
@@ -662,8 +826,13 @@ def _run_symbol_recheck(symbol: str, direction: str, target_env: Optional[str]) 
         run_id=os.environ.get(yolo_scan_health.RUN_ID_ENV) or None,
         macro_rejected_shorts=rejected,
         funding_info_warning=warning,
-        recheck={"symbol": symbol, "direction": direction, "setup_status": status, "cause": cause},
+        recheck=dict({"symbol": symbol, "direction": direction, "setup_status": status, "cause": cause},
+                     **({"carried": carried} if carried is not None else {})),
     )
+
+def _is_tier_s(tier_code, tier) -> bool:
+    """Issue #298: a Tier S row by its tier code, else by its label (the pipeline's own sort test)."""
+    return tier_code == "S" if tier_code else str(tier or "").startswith("Tier S")
 
 def _run_screening_pipeline(top_pairs_count: int, target_env: Optional[str],
                             include_yolo: bool) -> MarketScreeningPayload:
@@ -695,6 +864,7 @@ def _run_screening_pipeline(top_pairs_count: int, target_env: Optional[str],
     # If a non-YOLO task raises after the scan started, stop the scan from issuing further requests.
     standard_scan_done = False
     rate_limited = False
+    tier_s_divergence: Optional[dict] = None
     macro_rejected_shorts: List[dict] = []
     funding_status: dict = {}  # filled by the radar: fundingInfo fallback warning (issue #206)
     try:
@@ -751,6 +921,10 @@ def _run_screening_pipeline(top_pairs_count: int, target_env: Optional[str],
             parsed_candidates.sort(key=lambda x: (x.tier.startswith("Tier S"), x.confidence), reverse=True)
 
         top_candidates = parsed_candidates[:6]
+        # Issue #298 item 5 (#90 baseline): radar Tier S rows before the macro gate and the slices vs the brief's
+        tier_s_divergence = {"radar_tier_s": sum(1 for r in raw_candidates if isinstance(r, dict)
+                                                 and _is_tier_s(r.get("tier_code"), r.get("tier"))),
+                             "brief_tier_s": sum(1 for c in top_candidates if _is_tier_s(c.tier_code, c.tier))}
 
         # Actionable or cointegrated Stat-Arb pairs
         stat_arb_list: List[StatArbPair] = []
@@ -818,6 +992,7 @@ def _run_screening_pipeline(top_pairs_count: int, target_env: Optional[str],
     if rate_limited or rate_limit_guard.is_banned():
         market_data_status = rate_limit_guard.unavailable_text()
         top_candidates, stat_arb_list, raw_funding, macro_rejected_shorts = [], [], None, []
+        tier_s_divergence = None
         if yolo_slot.status in ("ACTIVE", "INACTIVE"):  # no YOLO candidate either; DISABLED is kept as is
             yolo_status, yolo_slot = _yolo_unavailable(YOLO_RATE_LIMITED_REASON)
     if include_yolo:
@@ -843,6 +1018,7 @@ def _run_screening_pipeline(top_pairs_count: int, target_env: Optional[str],
         run_id=run_id,
         macro_rejected_shorts=macro_rejected_shorts,
         funding_info_warning=funding_status.get("warning"),
+        tier_s_divergence=tier_s_divergence,
     )
 
 def _exit_without_waiting_for_yolo(code: int) -> None:
@@ -889,12 +1065,20 @@ def main(argv: Optional[list] = None) -> int:
             print("error: --recheck expects SYMBOL:DIRECTION (e.g. ETHFIUSDT:LONG)", file=sys.stderr)
             return 2
         recheck = parts
+        # Issue #298: the original plan for a signal carry, from recheck_brief.fetch_recheck_payload (unreadable = none)
+        try:
+            plan = json.loads(os.environ.get(RECHECK_PLAN_ENV) or "null")
+        except ValueError:
+            plan = None
+        if isinstance(plan, dict):
+            recheck.append(plan)
 
     real_stdout = sys.stdout
     try:
         # Keep stdout pure JSON with --json: library diagnostics go to stderr.
         with contextlib.redirect_stdout(sys.stderr if args.json else real_stdout):
-            payload = (execute_symbol_recheck(recheck[0], recheck[1], target_env=env) if recheck
+            payload = (execute_symbol_recheck(recheck[0], recheck[1], target_env=env,
+                                              **({"plan": recheck[2]} if len(recheck) > 2 else {})) if recheck
                        else execute_screening_pipeline(target_env=env))
     except Exception as e:
         if args.json:
