@@ -39,6 +39,19 @@ def _make_repo(root: str, name: str = "trading") -> str:
     return repo
 
 
+def _guard_check_block(skill: str) -> str:
+    """The issue-orchestrator skill's "Guard check" bullet with its indented sub-bullets (#256 split it)."""
+    lines = skill.splitlines()
+    start = next(i for i, line in enumerate(lines) if "**Guard check.**" in line)
+    indent = len(lines[start]) - len(lines[start].lstrip())
+    block = [lines[start]]
+    for line in lines[start + 1:]:
+        if not line.strip() or len(line) - len(line.lstrip()) <= indent:
+            break
+        block.append(line)
+    return "\n".join(block)
+
+
 FAKE_HOME = "/nonexistent-issue-fixer-test-home"  # never under the temp dir, never read
 
 # {wt} = the linked issue worktree, {main} = the main checkout (where the running hooks live)
@@ -691,10 +704,10 @@ class TestIssueFixerGuard(unittest.TestCase):
             ("Grep", {"pattern": ".", "path": self.tmp}),
             ("Glob", {"pattern": "*.md", "path": "/"}),
             ("Grep", {"pattern": ".", "path": f"{self.main}/scripts/.."}),
-            # #250: a Grep glob that can match <N>.key is denied whatever the path; braces do not parse
-            ("Grep", {"pattern": ".", "path": self.wt, "glob": "*"}),
-            ("Grep", {"pattern": ".", "path": self.wt, "glob": "**/*.key"}),
-            ("Grep", {"pattern": ".", "path": self.wt, "glob": "*.{py,md}"}),
+            # #256: a Grep glob that can match <N>.key is denied outside a linked worktree; braces do not parse
+            ("Grep", {"pattern": ".", "path": "/etc", "glob": "*"}),
+            ("Grep", {"pattern": ".", "path": "/etc", "glob": "**/*.key"}),
+            ("Grep", {"pattern": ".", "path": "/etc", "glob": "*.{py,md}"}),
         ]
         for tool, tool_input in denied:
             with self.subTest(tool=tool, tool_input=tool_input):
@@ -716,6 +729,11 @@ class TestIssueFixerGuard(unittest.TestCase):
             ("Grep", {"pattern": "x", "path": self.wt2, "glob": "*.md"}),
             ("Glob", {"pattern": "*", "path": self.wt}),
             ("Grep", {"pattern": "x", "path": self.wt}),
+            # #256: inside a linked worktree (which cannot hold the keys) any Grep glob passes; these three rows
+            # were denied by #250 whatever the root
+            ("Grep", {"pattern": ".", "path": self.wt, "glob": "*"}),
+            ("Grep", {"pattern": ".", "path": self.wt, "glob": "**/*.key"}),
+            ("Grep", {"pattern": ".", "path": self.wt, "glob": "*.{py,md}"}),
         ]
         for tool, tool_input in allowed:
             with self.subTest(tool=tool, tool_input=tool_input):
@@ -731,7 +749,7 @@ class TestIssueFixerGuard(unittest.TestCase):
                 ("Read", {"file_path": f"{self.main}/logs/ISSUE_WORK_KEYS/8.key"}),
                 ("Grep", {"pattern": ".", "path": f"{self.main}/Logs/Issue_Work_Keys"}),
                 ("Glob", {"pattern": "LOGS/Issue_Work_Keys/*"}),
-                ("Grep", {"pattern": ".", "path": self.wt, "glob": "*.KEY"})):
+                ("Grep", {"pattern": ".", "path": "/etc", "glob": "*.KEY"})):
             with self.subTest(tool=tool, tool_input=tool_input):
                 payload = {"tool_name": tool, "tool_input": tool_input, "cwd": self.main}
                 self.assertIn("heartbeat keys", guard.evaluate_payload(payload, self.conf))
@@ -814,11 +832,23 @@ class TestIssueFixerGuard(unittest.TestCase):
             ("Grep", {"pattern": "x", "path": f"{self.wt}/scripts"}),
             ("Glob", {"pattern": "**/*.py", "path": self.wt}),
             ("Grep", {"pattern": "x", "path": self.main}),  # holds the keys: denied without git
+            # #256: also with the session's cwd inside the worktree, and with any glob
+            ("Grep", {"pattern": "x", "path": self.wt}),
+            ("Grep", {"pattern": "x", "path": self.wt, "glob": "*"}),
+            ("Glob", {"pattern": "*", "path": self.wt}),
+            ("Glob", {"pattern": f"{self.wt}/scripts/*"}),
         ]
         with mock.patch.object(guard.subprocess, "run", side_effect=spy):
-            for tool, tool_input in ordinary:
-                with self.subTest(tool=tool, tool_input=tool_input):
-                    self.run_hook({"tool_name": tool, "tool_input": tool_input, "cwd": self.main})
+            for cwd in (self.main, self.wt):
+                for tool, tool_input in ordinary:
+                    with self.subTest(cwd=cwd, tool=tool, tool_input=tool_input):
+                        self.run_hook({"tool_name": tool, "tool_input": tool_input, "cwd": cwd})
+                        self.assertEqual(calls, [])
+            # No path: the session's directory, the worktree
+            for tool_input in ({"pattern": "x"}, {"pattern": "x", "glob": "*.{py,md}"}):
+                with self.subTest(tool_input=tool_input):
+                    payload = {"tool_name": "Grep", "tool_input": tool_input, "cwd": f"{self.wt}/scripts"}
+                    self.assertEqual(self.run_hook(payload), (0, ""))
                     self.assertEqual(calls, [])
             # A root outside any linked worktree needs the main checkout; so do Bash and the edit tools
             self.assertEqual(self.run_hook({"tool_name": "Grep", "tool_input": {"pattern": ".", "path": self.tmp},
@@ -840,6 +870,106 @@ class TestIssueFixerGuard(unittest.TestCase):
                 code, err = self.run_hook(payload, project_dir=plain)
                 self.assertEqual(code, 2)
                 self.assertIn("cannot resolve the repository", err)
+
+    # ----- #256: Grep globs inside the worktree, submodules, Glob patterns that leave their root -----
+    def _evaluate_read(self, tool, tool_input, cwd):
+        payload = {"tool_name": tool, "tool_input": tool_input, "cwd": cwd}
+        reason = guard.evaluate_payload(payload, self.conf)
+        self.assertEqual(self.run_hook(payload)[0], 2 if reason else 0)
+        return reason
+
+    def test_grep_globs_inside_the_worktree_pass(self):
+        keys = os.path.dirname(self._key(8))
+        outside = tempfile.mkdtemp()  # not a worktree, not an ancestor of the keys
+        self.addCleanup(os.rmdir, outside)
+        globs = ("*", "**/*", "scripts/**", "*.{py,md}", "**/*.key")
+        for cwd in (self.main, self.wt):
+            for root in (self.wt, f"{self.wt}/scripts"):
+                for glob in globs:
+                    with self.subTest(cwd=cwd, root=root, glob=glob):
+                        self.assertEqual(self._evaluate_read("Grep", {"pattern": "x", "path": root, "glob": glob},
+                                                             cwd), "")
+            # The keys directory, under it or an ancestor: denied whatever the glob
+            for root in (keys, f"{keys}/8.key", f"{keys}/sub", self.main, f"{self.main}/logs", self.tmp):
+                for glob in ("*", "*.py"):
+                    with self.subTest(cwd=cwd, root=root, glob=glob):
+                        self.assertIn("heartbeat keys", self._evaluate_read(
+                            "Grep", {"pattern": "x", "path": root, "glob": glob}, cwd))
+            # Outside any linked worktree a glob that can match <N>.key is denied; a narrow one passes
+            for glob in globs:
+                with self.subTest(cwd=cwd, root=outside, glob=glob):
+                    self.assertIn("heartbeat keys", self._evaluate_read(
+                        "Grep", {"pattern": "x", "path": outside, "glob": glob}, cwd))
+            self.assertEqual(self._evaluate_read("Grep", {"pattern": "x", "path": outside, "glob": "*.py"}, cwd), "")
+
+    def test_submodule_git_file_is_not_a_linked_worktree(self):
+        sup = tempfile.mkdtemp()
+        self.addCleanup(subprocess.run, ["rm", "-rf", sup], check=False)
+        os.makedirs(os.path.join(sup, ".git", "modules", "sub"))
+        os.makedirs(os.path.join(sup, "sub", "src"))
+        Path(sup, "sub", ".git").write_text("gitdir: ../.git/modules/sub\n")
+        os.makedirs(os.path.join(sup, "odd"))
+        Path(sup, "odd", ".git").write_text("not a pointer\n")
+        for path in (os.path.join(sup, "sub"), os.path.join(sup, "sub", "src"), os.path.join(sup, "odd"), sup):
+            with self.subTest(path=path):
+                self.assertFalse(guard._in_linked_worktree(path))
+                self.assertEqual(guard._linked_worktree_top(path), "")
+        for path in (self.wt, os.path.join(self.wt, "scripts")):
+            with self.subTest(path=path):
+                self.assertTrue(guard._in_linked_worktree(path))
+                self.assertEqual(guard._linked_worktree_top(path), os.path.realpath(self.wt))
+        self.assertEqual(guard._linked_worktree_top(self.main), "")
+        # A submodule root gets no fast path: git runs, and a glob that can match <N>.key is denied there
+        real_run = subprocess.run
+        calls = []
+
+        def spy(cmd, *args, **kwargs):
+            if cmd and cmd[0] == "git":
+                calls.append(cmd)
+            return real_run(cmd, *args, **kwargs)
+
+        sub = os.path.join(sup, "sub")
+        with mock.patch.object(guard.subprocess, "run", side_effect=spy):
+            code, err = self.run_hook({"tool_name": "Grep", "tool_input": {"pattern": "x", "path": sub, "glob": "*"},
+                                       "cwd": self.main})
+        self.assertEqual(code, 2)
+        self.assertIn("heartbeat keys", err)
+        self.assertTrue(calls)
+
+    def test_glob_pattern_that_leaves_its_root_is_denied(self):
+        self._key(8)
+        for cwd in (self.main, self.wt):
+            for tool_input in ({"pattern": "../trading/logs/*/*.key", "path": self.wt},
+                               {"pattern": "**/../../trading/logs/*/*", "path": self.wt},
+                               {"pattern": "scripts/../../trading/logs/*/8.key", "path": self.wt},
+                               {"pattern": "..\\trading\\logs\\*\\*.key", "path": self.wt},
+                               {"pattern": "{scripts,/etc}/*", "path": self.wt},
+                               # brace expansion runs before the path split: `..` or `/` inside a group
+                               {"pattern": "{.,..}/trading/logs/*/*.key", "path": self.wt},
+                               {"pattern": "{..,x}/trading/logs/*/*.key", "path": self.wt},
+                               {"pattern": "{.,x}{.,y}/trading/logs/*/*.key", "path": self.wt},
+                               {"pattern": "{x,{y,..}}/trading/logs/*/*", "path": self.wt},
+                               {"pattern": "{a,{b,/etc}}/*", "path": self.wt},
+                               {"pattern": "{/etc,x}/*", "path": self.wt},
+                               {"pattern": "{a,b}" * 7 + "/*", "path": self.wt},  # past the expansion limit
+                               # an absolute pattern ignores `path`: rooted at its directory before the wildcard
+                               {"pattern": f"{self.main}/logs/*/8.key", "path": self.wt},
+                               {"pattern": f"{self.tmp}/*/logs/*/*.key", "path": self.wt}):
+                with self.subTest(cwd=cwd, tool_input=tool_input):
+                    self.assertIn("heartbeat keys", self._evaluate_read("Glob", tool_input, cwd))
+            for tool_input in ({"pattern": "**/*.py", "path": self.wt},
+                               {"pattern": "scripts/**", "path": self.wt},
+                               {"pattern": "notes..md", "path": self.wt},
+                               {"pattern": "*.{py,md}", "path": self.wt},
+                               {"pattern": "test_{a,b}.py", "path": self.wt},
+                               {"pattern": "*{.py,.md}", "path": self.wt},
+                               {"pattern": "a{1..3}.py", "path": self.wt},
+                               {"pattern": "{scripts,tests}/**/*.py", "path": self.wt},
+                               {"pattern": f"{self.wt}/{{scripts,tests}}/*.py"},
+                               {"pattern": f"{self.wt}/scripts/*.py"},
+                               {"pattern": f"{self.wt}/**/*.py", "path": self.main}):
+                with self.subTest(cwd=cwd, tool_input=tool_input):
+                    self.assertEqual(self._evaluate_read("Glob", tool_input, cwd), "")
 
     # ----- #250: check-guard keeps the claim history in marker_session_id_null -----
     def test_check_guard_reports_whether_the_marker_was_claimed(self):
@@ -1564,7 +1694,7 @@ class TestGeneratorWriteAgents(unittest.TestCase):
                      "--force", "confirm no other session works in that worktree"):
             self.assertIn(text, recovery)
         # #230: under agy the user confirms an unguarded fixer before it is launched; a failed claim is reported
-        guard_check = next(line for line in skill.splitlines() if "**Guard check.**" in line)
+        guard_check = _guard_check_block(skill)
         for text in ("Under agy no guard runs: before launching `issue_fixer`", "ask whether to proceed",
                      "launch it only after an explicit yes", "`binding_claim: failed`", "`signed`, `sig_ok`"):
             self.assertIn(text, guard_check)
@@ -1597,7 +1727,7 @@ class TestGeneratorWriteAgents(unittest.TestCase):
             for gone in ("only those are scrubbed", "GEMINI_API_KEY", "`BINANCE_*`"):
                 self.assertNotIn(gone, step_7a)
             # A read-only fixer round leaves no heartbeat
-            guard_check = next(line for line in skill.splitlines() if "**Guard check.**" in line)
+            guard_check = _guard_check_block(skill)
             self.assertIn("A fixer round with no Edit/Write/Bash call leaves no heartbeat (reads write none), so "
                           "`check-guard` exits 2.", guard_check)
         # The checklist heading convention in the guide's section 4.4
@@ -1609,6 +1739,44 @@ class TestGeneratorWriteAgents(unittest.TestCase):
         # The documented check_env allowlist matches the code
         self.assertEqual(iw.CHECK_ENV_NAMES, {"PATH", "LANG", "TZ", "TERM", "TMPDIR"})
         self.assertEqual(iw.CHECK_ENV_PREFIXES, ("LC_", "PYTHON"))
+
+    def test_issue_256_prompt_and_skill_followups(self):
+        def text(*parts):
+            return REPO_ROOT.joinpath(*parts).read_text(encoding="utf-8")
+
+        # The fixer's grep_search bullet: any glob inside the worktree, the key glob rule only outside it
+        for fixer in (text(".agents", "agents", "issue_fixer", "agent.md"), text(".claude", "agents", "issue_fixer.md")):
+            operational = fixer.split("<operational_environment>", 1)[1].split("</operational_environment>", 1)[0]
+            bullet = next(ln for ln in operational.splitlines() if "every grep_search and list_dir call" in ln)
+            self.assertIn("inside WORKTREE any grep_search glob works (`*`, braces)", bullet)
+            self.assertIn("outside it a glob that could match `<N>.key` is denied", bullet)
+            self.assertIn("a list_dir pattern may not contain `..`", bullet)
+            self.assertNotIn("is denied anywhere", bullet)
+        for skill in (text(".agents", "skills", "issue-orchestrator", "SKILL.md"),
+                      text(".claude", "skills", "issue-orchestrator", "SKILL.md")):
+            block = _guard_check_block(skill)
+            lead, subs = block.split("\n")[0], block.split("\n")[1:]
+            # Split into sub-bullets
+            self.assertGreaterEqual(len(subs), 5)
+            self.assertTrue(all(ln.lstrip().startswith("- ") for ln in subs))
+            self.assertLess(len(lead), 400)
+            # How to read marker_session_id_null
+            marker = next(ln for ln in subs if "`marker_session_id_null`" in ln)
+            for item in ("`true` = the binding marker is not claimed yet", "`false` = the marker is bound to a session",
+                         "`null` = no readable marker (a legacy worktree)"):
+                self.assertIn(item, marker)
+            # Exit 2 and a read-only round: stop and ask the user, never a retry
+            self.assertIn("stop and ask the user before any audit", block)
+            self.assertIn("Exit 2 is never a retry trigger", block)
+            self.assertIn("Treat such a read-only round like any exit 2: stop and ask the user.", block)
+        # The guard docstring records the hardlink limit
+        self.assertIn("A hardlink to a key file inside the worktree is not covered", " ".join(guard.__doc__.split()))
+        # check_env documents why the network variables are dropped
+        for name in ("SSL_CERT_FILE", "HTTP_PROXY", "HTTPS_PROXY", "hermetic"):
+            self.assertIn(name, iw.check_env.__doc__)
+        # No over-wide line in the issue_workspace docstring
+        self.assertEqual([ln for ln in iw.__doc__.splitlines() if len(ln) > 120], [])
+        self.assertNotIn("SSL_CERT_FILE", iw.CHECK_ENV_NAMES)
 
     def test_auditor_axioms_match_the_trading_risk_reviewer(self):
         """#231: every axiom token the auditor pins also appears in the trading_risk_reviewer source."""

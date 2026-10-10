@@ -17,10 +17,14 @@ this guard included, live).
     names are compared case-folded (`LOGS/`, `.GIT/` and `.CLAUDE/` are the same directories on DrvFs).
   * Read / Grep / Glob: allowed, except the heartbeat keys in <main checkout>/logs/issue_work_keys/ (compared
     case-folded, plus st_dev / st_ino for other names of that directory): a path with an `issue_work_keys`
-    component, a Grep `glob` or Glob `pattern` naming it, a Grep `glob` that can match `<N>.key` (unparseable
-    globs such as braces count as a match), and any Grep or Glob rooted at that directory, under it or at an
-    ancestor of it (the main checkout included), with or without a glob. Git runs only for the rules that need
-    the main checkout (check_read_tool). Reads neither claim nor write the heartbeat.
+    component, a Grep `glob` or Glob `pattern` naming it, a Glob `pattern` that can leave its root (a `..`
+    component or an absolute alternative in any brace expansion; an absolute pattern is rooted at its directory
+    part before the first wildcard), any Grep or Glob rooted at that directory, under it or at an ancestor of it
+    (the main checkout included), with or without a glob, and, for a Grep rooted outside a linked worktree, a
+    `glob` that can match `<N>.key` (unparseable globs such as braces count as a match). Inside a linked
+    worktree (a `.git` file pointing into `.git/worktrees/`, never a submodule) any Grep glob passes. Git runs
+    only for the rules that need the main checkout (check_read_tool). Reads neither claim nor write the
+    heartbeat.
   * Bash:
       - a command containing a carriage return is denied (send LF line endings): bash reads `\\r` as a word
         character, so `cd x<CR>` would name another directory than the one the guard sees;
@@ -67,7 +71,10 @@ this guard included, live).
 Limits: tests the fixer writes are code and run with the test runner; the auditor and the PR reviewers review that
 code before merge. The guard prevents direct misuse; it is not a sandbox. The signature detects a stale, missing
 or unsigned heartbeat and casual forgery, not a determined one: if the frontmatter hook does not load at all, the
-fixer is unguarded and could read the key and sign a heartbeat itself.
+fixer is unguarded and could read the key and sign a heartbeat itself. A hardlink to a key file inside the
+worktree is not covered (it shares no name or directory with the keys); the fixer has no tool that creates one
+(`ln` is denied, the edit tools write regular files, and Bash cannot name the main checkout, so `cp -l` cannot
+reach a key).
 
 Contract (Claude Code hooks): hook JSON on stdin; exit 0 allows, exit 2 denies (reason on stderr). Malformed input
 or an unresolvable repository is denied (fail closed); a read that needs no main-checkout rule never resolves it.
@@ -219,6 +226,9 @@ PROTECTED_WORK_FILES = {f"{WORK_DIR}/{BINDING_FILE}", f"{WORK_DIR}/{HEARTBEAT_FI
 KEYS_DIR = "logs/issue_work_keys"
 KEYS_DIR_NAME = "issue_work_keys"
 KEY_FILE_CHARS = set("0123456789.key")  # every character of a key file name, <N>.key
+# Glob patterns: an innermost `{...}` group, and the most brace expansions checked before denying
+_BRACE_GROUP_RE = re.compile(r"\{([^{}]*)\}")
+BRACE_EXPANSION_LIMIT = 64
 # Fields covered by the heartbeat HMAC; issue_workspace.py check-guard recomputes it over the same fields
 SIGNED_FIELDS = ("ts", "worktree", "issue", "decision", "session_id", "binding_claim")
 CR_MESSAGE = "carriage return in command; send LF line endings"
@@ -266,6 +276,11 @@ class Confinement:
             raise Denied("cannot list the repository worktrees")
         self._set(main_root, [ln[len("worktree "):] for ln in listing.stdout.splitlines()
                               if ln.startswith("worktree ")])
+
+    @property
+    def project_dir(self) -> str:
+        """The directory the confinement was built from ('' when built from an explicit main root)."""
+        return self._project_dir
 
     @property
     def main_root(self) -> str:
@@ -1312,46 +1327,123 @@ def _holds_keys(root: str) -> bool:
     return os.path.isdir(os.path.join(root, KEYS_DIR)) or os.path.isdir(os.path.join(root, KEYS_DIR_NAME))
 
 
-def _in_linked_worktree(root: str) -> bool:
-    """True when the nearest `.git` at or above root is a `gitdir:` file: root is inside a linked worktree (or a
-    submodule). git never creates a worktree around an existing directory, so it cannot hold the main checkout."""
+def _linked_worktree_top(root: str) -> str:
+    """The top directory of the linked worktree that holds root, or '' when there is none. The nearest `.git` at or
+    above root must be a file whose `gitdir:` line (resolved against that file's directory) ends in
+    `.git/worktrees/<name>`: a submodule's `.git/modules/...` pointer, a `.git` directory, an unreadable or
+    malformed file all answer ''. git never creates a worktree around an existing directory, so it cannot hold the
+    main checkout."""
     current = root
     while True:
         dot_git = os.path.join(current, ".git")
         if os.path.lexists(dot_git):
             if not os.path.isfile(dot_git):
-                return False
+                return ""
             try:
                 with open(dot_git, encoding="utf-8") as f:
-                    return f.read(8) == "gitdir: "
+                    line = f.read(4096).split("\n", 1)[0].rstrip("\r")
             except (OSError, ValueError):
-                return False
+                return ""
+            if not line.startswith("gitdir: "):
+                return ""
+            gitdir = line[len("gitdir: "):].strip()
+            if not gitdir:
+                return ""
+            parts = _folded(os.path.join(current, gitdir)).split(os.sep)
+            return current if len(parts) >= 3 and parts[-3:-1] == [".git", "worktrees"] else ""
         parent = os.path.dirname(current)
         if parent == current:
-            return False
+            return ""
         current = parent
+
+
+def _in_linked_worktree(root: str) -> bool:
+    """True when root is inside a linked worktree (never a submodule): see _linked_worktree_top."""
+    return bool(_linked_worktree_top(root))
+
+
+def _brace_expansions(pattern: str, limit: int = BRACE_EXPANSION_LIMIT):
+    """Every brace expansion of a Glob pattern (`{a,b}` alternatives, nested and adjacent groups included), or
+    None past `limit` expansions. A group without a comma (`{x}`, the range `{1..3}`) stays literal: its braces are
+    replaced by control characters, so its text never forms a component of its own."""
+    todo, done = [pattern], []
+    while todo:
+        p, alt = todo.pop(), None
+        while True:
+            groups = list(_BRACE_GROUP_RE.finditer(p))
+            alt = next((g for g in groups if "," in g.group(1)), None)
+            if alt or not groups:
+                break
+            p = p[:groups[0].start()] + "\x00" + groups[0].group(1) + "\x01" + p[groups[0].end():]
+        if alt is None:
+            done.append(p)
+        else:
+            todo.extend(p[:alt.start()] + a + p[alt.end():] for a in alt.group(1).split(","))
+        if len(todo) + len(done) > limit:
+            return None
+    return done
+
+
+def _glob_leaves_root(pattern: str) -> bool:
+    """True when a Glob `pattern` can list names outside its root: a brace expansion with a `..` component
+    (`../trading/logs/*/*.key`, `{.,..}/x`, `{.,x}{.,y}/x`, whatever its position: `**/..` may climb above the
+    root), a relative pattern with an absolute expansion (`{x,/abs}/*`), or more than BRACE_EXPANSION_LIMIT
+    expansions (fail closed). An ordinary pattern, braces included (`*.{py,md}`, `a{1..3}.py`), never does."""
+    expansions = _brace_expansions(pattern.replace("\\", "/"))
+    if expansions is None:
+        return True
+    absolute = os.path.isabs(pattern)
+    return any(".." in e.split("/") or (not absolute and e.startswith("/")) for e in expansions)
+
+
+def _glob_literal_dir(pattern: str) -> str:
+    """The directory part of a Glob pattern before its first wildcard component (`*`, `?`, `[` or `{`)."""
+    first = min((i for i in (pattern.find(c) for c in "*?[{") if i >= 0), default=len(pattern))
+    return pattern[:pattern.rfind("/", 0, first) + 1] or "/"
+
+
+def _fast_read_root(root: str, cwd: str, project_dir: str) -> bool:
+    """True when a Grep / Glob root is inside a linked worktree that cannot hold the heartbeat keys, decided without
+    git. The session's cwd and the project directory (the confinement's anchor, whose main checkout holds the
+    keys) must either lie outside root or inside the same linked worktree: a main checkout nested under root has a
+    `.git` directory, so it never shares root's worktree top and the lookup falls back to git."""
+    top = _linked_worktree_top(root)
+    if not top:
+        return False
+    for anchor in (cwd, project_dir):
+        if isinstance(anchor, str) and os.path.isabs(anchor):
+            real = os.path.realpath(anchor)
+            if Confinement._under_folded(real, root) and _linked_worktree_top(real) != top:
+                return False
+    return True
 
 
 def check_read_tool(tool: str, tool_input: dict, conf: Confinement, cwd) -> None:
     """Read / Grep / Glob may read anything except the heartbeat keys under <main checkout>/logs/issue_work_keys/
     (compared case-folded, plus st_dev / st_ino for other names of that directory):
       * any tool: a target with an `issue_work_keys` component, or a Grep `glob` / Glob `pattern` naming it;
-      * Grep: a `glob` that can match `<N>.key` or the directory's name (_glob_can_match_key), whatever the path;
+      * Glob: a `pattern` that can leave its root (_glob_leaves_root: a `..` component or an absolute alternative
+        in any brace expansion); an absolute pattern is rooted at its directory part before the first wildcard;
       * Grep / Glob: a root that is the keys directory, under it or an ancestor of it (the main checkout, its
-        logs/, every directory above), with or without a glob: never rely on .gitignore.
+        logs/, every directory above), with or without a glob: never rely on .gitignore;
+      * Grep rooted outside a linked worktree: a `glob` that can match `<N>.key` or the directory's name
+        (_glob_can_match_key). Inside a linked worktree (which cannot hold the keys) any glob passes: a Grep glob
+        only filters the files under its root.
     Git runs only when the rule needs the main checkout: a Read never (unless its relative path has no absolute
-    cwd), a Grep / Glob only when its root is not inside a linked worktree, is an ancestor of the session's cwd or
-    the call has no absolute cwd; a failed lookup denies."""
+    cwd), a Grep / Glob only when the call has no absolute cwd or _fast_read_root cannot place its root in a
+    linked worktree without git; a failed lookup denies."""
     target = tool_input.get("file_path") if tool == "Read" else tool_input.get("path")
     pattern = tool_input.get("glob") if tool == "Grep" else tool_input.get("pattern") if tool == "Glob" else None
     off_limits = f"the heartbeat keys ({KEYS_DIR}/ of the main checkout) are off limits"
     if isinstance(pattern, str) and KEYS_DIR_NAME in pattern.casefold():
         raise Denied(f"{pattern}: {off_limits}")
-    if tool == "Grep" and isinstance(pattern, str) and pattern and _glob_can_match_key(pattern):
-        raise Denied(f"Grep glob {pattern!r} can match the heartbeat keys ({KEYS_DIR}/<N>.key; a glob filter "
-                     "overrides .gitignore): use a narrower glob such as '*.py'")
+    if tool == "Glob" and isinstance(pattern, str) and _glob_leaves_root(pattern):
+        raise Denied(f"Glob pattern {pattern!r} can leave its root and list the heartbeat keys ({KEYS_DIR}/): "
+                     "drop `..` and pass the directory as `path`")
     has_cwd = isinstance(cwd, str) and os.path.isabs(cwd)
     rel = target if isinstance(target, str) else ""
+    if tool == "Glob" and isinstance(pattern, str) and os.path.isabs(pattern):
+        rel = target = _glob_literal_dir(pattern)  # an absolute pattern ignores `path`
     if os.path.isabs(rel):
         root = os.path.realpath(rel)
     else:
@@ -1363,7 +1455,7 @@ def check_read_tool(tool: str, tool_input: dict, conf: Confinement, cwd) -> None
     holds = f"{tool} over {root}, which holds the heartbeat keys ({KEYS_DIR}/): pass a path inside the issue worktree"
     if _holds_keys(root):
         raise Denied(holds)
-    if has_cwd and _in_linked_worktree(root) and not Confinement._under_folded(cwd, root):
+    if has_cwd and _fast_read_root(root, cwd, conf.project_dir):
         return
     keys = os.path.join(conf.main_root, KEYS_DIR)
     if Confinement._under_folded(root, keys):
@@ -1373,6 +1465,10 @@ def check_read_tool(tool: str, tool_input: dict, conf: Confinement, cwd) -> None
         above.append(os.path.dirname(above[-1]))
     if Confinement._under_folded(keys, root) or any(_same_file(root, a) for a in above):
         raise Denied(holds)
+    if tool == "Grep" and isinstance(pattern, str) and pattern and _glob_can_match_key(pattern):
+        raise Denied(f"Grep glob {pattern!r} can match the heartbeat keys ({KEYS_DIR}/<N>.key; a glob filter "
+                     "overrides .gitignore) outside the issue worktree: pass a path inside it or use a narrower "
+                     "glob such as '*.py'")
 
 
 def evaluate_payload(payload: dict, conf: Confinement) -> str:
