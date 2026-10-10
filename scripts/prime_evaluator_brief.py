@@ -19,7 +19,9 @@ Usage:
     --json        print the brief as JSON instead of Markdown
     --out [PATH]  also write the JSON brief to PATH (default: logs/primed_brief.json)
     --recheck     brief with only the live setup of one approved candidate of the latest dossier (issue #267,
-                  utils/recheck_brief.py); exit 2 when there is no verified approval of it to re-check
+                  utils/recheck_brief.py); issue #298: under Claude Code (CLAUDE_CODE_SESSION_ID) also of any
+                  provenance-verified scan of this session within recheck_max_age_seconds; exit 2 when there is no
+                  verified approval of it to re-check
 """
 
 import argparse
@@ -883,7 +885,8 @@ def main(argv: Optional[list] = None) -> int:
                         help="Also write the JSON brief to PATH (logs/primed_brief.json is always written)")
     parser.add_argument("--recheck", default=None, metavar="SYMBOL:DIRECTION",
                         help="Re-check one approved candidate of the latest dossier (e.g. after it expired) with its "
-                             "live setup only (issue #267)")
+                             "live setup only (issue #267); under Claude Code also of an earlier scan of this "
+                             "session within recheck_max_age_seconds (issue #298)")
     args = parser.parse_args(argv)
 
     try:
@@ -901,6 +904,8 @@ def main(argv: Optional[list] = None) -> int:
         except recheck_brief.RecheckError as e:
             print(f"Re-check refused: {e}", file=sys.stderr)
             return 2
+        for note in recheck.get("notes") or []:  # issue #298: on stderr with --json, so the JSON stays parseable
+            print(note, file=sys.stderr if args.json else sys.stdout)
     brief = assemble_primed_brief(target_env=env, out_path=args.out, recheck=recheck)
     if args.json:
         print(json.dumps(brief, indent=2, ensure_ascii=False))
