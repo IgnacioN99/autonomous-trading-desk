@@ -20,7 +20,9 @@ Failed commands change nothing. Events are logged to logs/pr_hook_events.jsonl.
 
 Directory: a bare `gh pr create` / `git push` resolves its branch from the payload cwd (agy Cwd, Claude Code
 cwd), followed through `cd`/`chdir`/`pushd`/`Set-Location`/`sl`/`Push-Location` (`-Path`/`-LiteralPath`)
-and `git -C`; `popd`/`Pop-Location` return to the payload cwd. Whether that cwd follows the Bash tool's
+and `git -C`; `pushd`/`Push-Location` push onto a directory stack that `popd`/`Pop-Location` pop (an empty
+stack returns to the payload cwd). Another PowerShell parameter (`-StackName`) or a stack rotation (`pushd +1`)
+keeps the current directory. Whether that cwd follows the Bash tool's
 persistent directory cannot be confirmed here, so `gh pr create --head <branch>` is the checkout-independent
 form. Paths are POSIX (Linux, macOS, WSL): a backslash is a shell escape, Windows `C:\\dir` paths are
 not supported.
@@ -53,8 +55,10 @@ except Exception as _import_error:  # pragma: no cover - the hook must still ans
 REVIEW_FLOW_MARKERS = ("run_pr_audit", "triage_pr", "assemble_review", "verify_review", "pr_review_state")
 PROTECTED_BRANCHES = ("main", "master")
 
-# `<<WORD`, `<<-WORD`, `<<'WORD'`, `<< "WORD"`, `<<\WORD` (never the `<<<` here-string)
-_HEREDOC_RE = re.compile(r"(?<!<)<<(?!<)([-~]?)[ \t]*\\?(['\"]?)([A-Za-z0-9_][A-Za-z0-9_.-]*)\2")
+# `<<WORD`, `<<-WORD`, `<<'WORD'`, `<< "WORD"`, `<<\WORD`, `<<$WORD` / `<<${WORD}` (bash does not expand the
+# delimiter: the terminator line is the literal `$WORD`); never the `<<<` here-string
+_HEREDOC_RE = re.compile(
+    r"(?<!<)<<(?!<)([-~]?)[ \t]*\\?(['\"]?)(\$\{[A-Za-z0-9_]+\}|\$?[A-Za-z0-9_][A-Za-z0-9_.-]*)\2")
 _OPERATOR_CHARS = "();<>|&"
 _ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 _RESERVED_WORDS = {"!", "{", "do", "then", "else", "elif", "if", "while", "until"}
@@ -103,6 +107,21 @@ def _arithmetic_end(text: str, i: int) -> int:
             depth -= 1
             if depth == 0:
                 return i + 1
+        i += 1
+    raise ValueError("No closing arithmetic expression")
+
+
+def _arithmetic_command_end(text: str, i: int) -> int | None:
+    """Index after the `))` of a `((` command whose expression starts at `i`; None when the `)` closing the
+    inner `(` is not directly followed by `)`: bash then parses nested subshells, `((cd x); git push)`."""
+    depth = 2
+    while i < len(text):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 1:
+                return i + 2 if text.startswith(")", i + 1) else None
         i += 1
     raise ValueError("No closing arithmetic expression")
 
@@ -169,9 +188,9 @@ def _tokenize(text: str) -> list[tuple[str, str]]:
     """Shell tokens: ("word", value without quotes) or ("op", run of ();<>|& characters; ";" for a newline).
 
     Quoted or escaped characters never form an operator. A `<<WORD` outside quotes and arithmetic
-    (`$((...))`, `((...))`, kept inside one word) hides the heredoc body that follows the end of its line.
-    `#` starts a comment up to the end of the line, also inside a word (as posix shlex does).
-    Raises ValueError on an unclosed quote, substitution or arithmetic expression."""
+    (`$((...))`, `((...))` also right after `;`/`(`/`&`/`|`, kept inside one word) hides the heredoc body that
+    follows the end of its line. `#` at the start of a word starts a comment up to the end of the line (`$#`,
+    `fix/#12` are words). Raises ValueError on an unclosed quote, substitution or arithmetic expression."""
     tokens, heredocs, word, quoted = [], [], [], False
     i, n = 0, len(text)
 
@@ -205,11 +224,11 @@ def _tokenize(text: str) -> list[tuple[str, str]]:
             end = _arithmetic_end(text, i + 3)
             word.append(text[i:end])
             i = end
-        elif text.startswith("((", i) and not word and not quoted:  # arithmetic command
-            end = _arithmetic_end(text, i + 2)
+        elif text.startswith("((", i) and not word and not quoted and \
+                (end := _arithmetic_command_end(text, i + 2)) is not None:  # arithmetic command
             word.append(text[i:end])
             i = end
-        elif c == "#":
+        elif c == "#" and not word and not quoted:
             end = text.find("\n", i)
             i = n if end < 0 else end
         elif c in " \t\r":
@@ -223,6 +242,8 @@ def _tokenize(text: str) -> list[tuple[str, str]]:
             end_word()
             end = i
             while end < n and text[end] in _OPERATOR_CHARS:
+                if end > i and text[end - 1] in ";&|(" and text.startswith("((", end):
+                    break  # `x;((1<<3))`: an arithmetic command starts after the separator
                 end += 1
             if text[i:end].endswith("<<") and (match := _HEREDOC_RE.match(text, end - 2)):
                 heredocs.append((match.group(3), match.group(1)))
@@ -305,11 +326,17 @@ def _change_dir(current: str, target: str, start: str) -> str:
     return os.path.normpath(os.path.join(current, target))
 
 
-def _chdir_target(args: list[str]) -> str:
-    """Directory argument of cd/pushd/Set-Location: `-Path`/`-LiteralPath <dir>`, else the first positional."""
+def _chdir_target(args: list[str]) -> str | None:
+    """Directory argument of cd/pushd/Set-Location: `-Path`/`-LiteralPath <dir>`, else the first positional.
+
+    None (keep the current directory) for a stack rotation (`pushd +1`, `pushd -1`) or another PowerShell
+    parameter (`-StackName foo`: its value is no directory); single-letter flags (`cd -P`) are skipped."""
     for i, arg in enumerate(args):
         if arg.lower() in _PATH_PARAMETERS:
             return args[i + 1] if i + 1 < len(args) else ""
+    for arg in args:
+        if re.fullmatch(r"[+-][0-9]+", arg) or (arg.startswith("-") and not arg.startswith("--") and len(arg) > 2):
+            return None
     targets = [a for a in args if not (a.startswith("-") and a != "-")]
     return targets[0] if targets else ""
 
@@ -330,7 +357,9 @@ def _push_branch(args: list[str]) -> str | None:
         elif arg == "--delete":
             delete = True
         elif not arg.startswith("--"):
-            delete = delete or "d" in arg[1:].split("o", 1)[0]  # `-fd`; after `o` comes a push option value
+            flags, has_o, value = arg[1:].partition("o")  # `-fd`; after `o` comes a push option value
+            delete = delete or "d" in flags
+            skip = bool(has_o) and not value  # `-fo ci.skip`: the value is the next argument
     if delete:
         return None
     if len(positionals) < 2:
@@ -360,16 +389,23 @@ def _pr_head(args: list[str]) -> str:
     return "" if _is_expansion(head) else head.split(":", 1)[-1]
 
 
-def _scan_words(words: list[str], start: str, cwd: str, triggers: list, depth: int) -> str:
-    """Records the push/PR-creation of one sub-command; returns the tracked directory after it."""
+def _scan_words(words: list[str], start: str, cwd: str, triggers: list, depth: int, stack: list) -> str:
+    """Records the push/PR-creation of one sub-command; returns the tracked directory after it.
+
+    `stack` is the shell's directory stack (pushd pushes, popd pops; empty -> start dir)."""
     words = _command_words(words)
     if not words:
         return cwd
     program, args = _program_name(words[0]), words[1:]
     if program in _CHDIR_PROGRAMS:
-        return _change_dir(cwd, _chdir_target(args), start)
+        target = _chdir_target(args)
+        if target is None:
+            return cwd
+        if program in ("pushd", "push-location"):
+            stack.append(cwd)
+        return _change_dir(cwd, target, start)
     if program in _POPDIR_PROGRAMS:
-        return start
+        return stack.pop() if stack else start
     if program in _SHELLS and depth < _MAX_UNWRAP_DEPTH:
         for i, arg in enumerate(args):
             if arg.startswith("--"):
@@ -388,7 +424,7 @@ def _scan_words(words: list[str], start: str, cwd: str, triggers: list, depth: i
                 i += 1
                 break
             i += 2 if args[i] in ("-d", "--distribution", "-u", "--user", "--cd") else 1
-        _scan_words(args[i:], start, cwd, triggers, depth + 1)
+        _scan_words(args[i:], start, cwd, triggers, depth + 1, [])
         return cwd
     if program == "git":
         directory, i = cwd, 0
@@ -409,8 +445,9 @@ def _scan_words(words: list[str], start: str, cwd: str, triggers: list, depth: i
 
 
 def _scan_text(text: str, start: str, cwd: str, triggers: list, depth: int = 0) -> str:
+    stack: list[str] = []  # each (inline) shell has its own directory stack
     for words in _split_subcommands(text):
-        cwd = _scan_words(words, start, cwd, triggers, depth)
+        cwd = _scan_words(words, start, cwd, triggers, depth, stack)
     return cwd
 
 
