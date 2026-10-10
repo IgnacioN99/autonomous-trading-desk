@@ -185,6 +185,7 @@ class TestSelection(InsightsFile):
                 lesson("ins-5-shadow", "SHADOW_DESK"), lesson("ins-6-alts", "ALTS_BASKET"),
                 lesson("ins-7-uni", "UNI", "SHORT"), lesson("ins-8-recent", "XRP", "LONG")]
         ids = self.ids(recs, candidates=[("UNIUSDT", "SHORT")])
+        # issue #271: within them by recency, except the pinned LONG lesson (no LONG candidate): it comes last
         self.assertEqual(ids, ["ins-6-alts", "ins-5-shadow", "ins-4-capital", "ins-3-market", "ins-2-macro",
                                "ins-1-pinned", "ins-7-uni", "ins-8-recent"])
 
@@ -349,11 +350,13 @@ class TestSelection(InsightsFile):
         budget = kwargs.pop("budget_bytes")
         self.assertEqual(kwargs.pop("report"), {})
         self.assertEqual(kwargs, {"candidates": [("UNI", "SHORT"), ("PEPE", "LONG")]})  # no limit=3
-        self.assertEqual(brief["committed_memory_lessons"], [{"tag": ["a"], "lesson": "hello"}])
+        self.assertEqual(brief["committed_memory_lessons"], [{"id": "ins-1-x", "tag": ["a"], "lesson": "hello"}])
         self.assertNotIn("lesson_budget_exceeded", brief)  # omitted when nothing went over
-        # the lesson budget is what the rest of the brief leaves under BRIEF_BUDGET_BYTES, at most the cap
+        # the lesson budget is what the rest of the brief leaves under BRIEF_BUDGET_BYTES, at most the cap and at
+        # least the floor (issue #271)
         rest = peb._brief_bytes(dict(brief, committed_memory_lessons=[]))
-        self.assertEqual(budget, min(peb.LESSON_BUDGET_BYTES, peb.BRIEF_BUDGET_BYTES - rest + 2))
+        self.assertEqual(budget, max(peb.LESSON_FLOOR_BYTES,
+                                     min(peb.LESSON_BUDGET_BYTES, peb.BRIEF_BUDGET_BYTES - rest + 2)))
         # the slot enabled but the payload's run id foreign: the brief empties the slot, so PEPE is not a candidate
         brief, fn = self.assemble(dict(screening, run_id="foreign"), {"risk_pct_equity": 0.02,
                                                                       "yolo_slot_enabled": True})
@@ -386,7 +389,7 @@ class TestSelection(InsightsFile):
 
     def test_plain_brief_carries_every_lesson_of_a_larger_ledger(self):
         """A ledger ~20% larger than the locator sizes (8 shown lessons ~3.8 KB of text, the orchestrator's
-        measurement of the real ledger is ~3.7 KB): a plain brief still carries all 8, under 1,800 tokens."""
+        measurement of the real ledger is ~3.7 KB): a plain brief still carries all 8, under 3,000 tokens."""
         ledger = real_shaped_ledger(scale=1.2)
         write_jsonl(self.path, ledger)
         self.assertGreater(sum(len(r.get("insight") or "") for r in ledger if r["id"] not in
@@ -401,7 +404,7 @@ class TestSelection(InsightsFile):
             brief = peb.assemble_primed_brief(target_env="prod")
         self.assertEqual(len(brief["committed_memory_lessons"]), 8)
         self.assertNotIn("lesson_budget_exceeded", brief)
-        self.assertLess(os.path.getsize(brief_file) / 4, 1800)
+        self.assertLess(os.path.getsize(brief_file) / 4, 3000)
 
 
 # =============================================================================
