@@ -39,6 +39,7 @@ for _p in (SCRIPTS_DIR, HOOKS_DIR, TESTS_DIR):
         sys.path.insert(0, _p)
 
 import execute_futures_trade as eft  # noqa: E402
+import post_trade_sync  # noqa: E402
 import pre_trade_guard  # noqa: E402
 import prime_evaluator_brief as peb  # noqa: E402
 import record_evaluation as rec  # noqa: E402
@@ -47,6 +48,7 @@ import sync_session_state as sss  # noqa: E402
 from utils import dossier_provenance as dp  # noqa: E402
 from utils import recheck_brief as rb  # noqa: E402
 from utils import score_calibration as scal  # noqa: E402
+from utils import trading_lease  # noqa: E402
 import test_guard_bypasses as tgb  # noqa: E402  (module import: its tests are not collected twice)
 import test_issue_101_exchange_anchored_gates as t101  # noqa: E402
 import test_pending_entries as tpe  # noqa: E402
@@ -184,7 +186,23 @@ class TestHookReadsTheCallingSessionsDossier(SessionDossierHarness):
     def test_session_a_still_trades_after_session_b_recorded_a_scan(self):
         self.record_two_sessions()
         self.assertAllowed(self.deploy(SESSION_A, "BTCUSDT", "SHORT"))   # the bug: B's scan replaced A's approval
+        # Issue #280: A's allowed opening claimed the trading lease, so B is denied until it takes it over
+        self.assertDeniedWith(self.deploy(SESSION_B, "ETHUSDT", "LONG"), "trading lease is held by session 5e55105e")
+        with patch("post_trade_sync.find_workspace_root", return_value=self.root):
+            post_trade_sync.handle_post_trade_sync({
+                "session_id": SESSION_B, "hook_event_name": "PostToolUse", "tool_name": "Bash",
+                "tool_input": {"command": "python3 scripts/trading_lease.py --take"}, "tool_response": {}})
         self.assertAllowed(self.deploy(SESSION_B, "ETHUSDT", "LONG"))
+
+    def test_session_b_trades_once_the_lease_of_a_is_stale(self):
+        self.record_two_sessions()
+        self.assertAllowed(self.deploy(SESSION_A, "BTCUSDT", "SHORT"))
+        lease = self.load(trading_lease.lease_path(self.root))
+        lease["heartbeat_at"] -= trading_lease.LEASE_STALE_SECONDS + 1
+        with open(trading_lease.lease_path(self.root), "w", encoding="utf-8") as f:
+            json.dump(lease, f)
+        self.assertAllowed(self.deploy(SESSION_B, "ETHUSDT", "LONG"))
+        self.assertEqual(self.load(trading_lease.lease_path(self.root))["session_id"], SESSION_B)
 
     def test_another_sessions_dossier_never_authorises_a_trade(self):
         self.record_two_sessions()

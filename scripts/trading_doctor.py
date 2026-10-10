@@ -972,6 +972,14 @@ def run_doctor(target_env: str = None, auto_heal: bool = False) -> int:
         ok_items.append(msg)
         print(f"✅ [GUARDIAN] {msg}")
 
+    # 5c''. Trading lease holder (issue #280; informational only, never a warning or a failure)
+    try:
+        from utils import trading_lease as tl
+        lease_msg = tl.status_line(os.path.dirname(sss.LOGS_DIR))
+    except Exception as e:
+        lease_msg = f"Trading lease status unavailable ({type(e).__name__})."
+    print(f"ℹ️  [LEASE] {lease_msg}")
+
     # 5c'. Score calibration store freshness (WARN only, never critical; issue #207)
     try:
         calib_msg = calibration_store_warning(os.path.dirname(sss.LOGS_DIR), target_env)

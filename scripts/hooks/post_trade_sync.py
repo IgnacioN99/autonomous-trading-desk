@@ -20,6 +20,12 @@ Recognized tool calls (Antigravity and Claude Code payloads):
         in the gateway meta-tool 'tool_execute', placeMultipleOrders and newAlgoOrder.
     The retired crypto_radar MCP server is denied by pre_trade_guard and never triggers a sync.
 
+Trading lease (issue #280; logs/trading_lease.json, written only by this hook and pre_trade_guard.py): after a
+successful run_command / Bash / PowerShell call from a known session (agy conversationId / Claude Code session_id),
+`scripts/trading_lease.py --take` (force-asked by pre_trade_guard, so it ran with the user's approval) hands the
+lease to that session, and prime_evaluator_brief.py / record_evaluation.py refresh its heartbeat when that session
+holds it (never acquire). A failed call, an unknown session or an explicit non-PROD --env changes nothing.
+
 Contract:
   Input (stdin): JSON with step metadata.
   Output (stdout): {} — always, with exit code 0. Total runtime is bounded well below the
@@ -30,6 +36,7 @@ import os
 import re
 import sys
 import json
+import time
 import threading
 import subprocess
 
@@ -55,6 +62,11 @@ EXECUTOR_NON_OPENING_FLAGS = {
 }
 EXECUTOR_READ_ONLY_FLAGS = {"--positions"}
 GUARDIAN_NO_WRITE_FLAGS = {"--dry-run", "--dry_run"}
+# Issue #280: trading lease refresh (the holder's brief / record) and approved takeover (trading_lease.py --take)
+PRIME_BRIEF_RE = re.compile(r"\bprime_evaluator_brief(?:\.py)?\b")
+RECORD_EVALUATION_RE = re.compile(r"\brecord_evaluation(?:\.py)?\b")
+TRADING_LEASE_SCRIPT = "trading_lease.py"
+TRADING_LEASE_TAKE_FLAG = "--take"
 INSPECTION_PROGRAMS = {
     "git", "gh", "grep", "rg", "cat", "ls", "find", "diff", "echo", "printf", "head", "tail", "less", "wc",
     "stat", "file", "jq", "sort", "uniq", "awk", "sed", "cp", "mv", "rm", "mkdir", "chmod", "pytest",
@@ -252,12 +264,93 @@ def classify_command(command_line: str, shell: str = "bash"):
     return order_placed, is_opening
 
 
+def session_of(payload: dict):
+    """(session, runtime) of the caller, resolved like pre_trade_guard.evaluate_payload: agy conversationId, else the
+    Claude Code session_id (payload without toolCall); (None, runtime) when unknown."""
+    runtime = "agy" if "toolCall" in payload else "claude"
+    session = payload.get("conversationId") if isinstance(payload.get("conversationId"), str) else None
+    if session is None and "toolCall" not in payload and isinstance(payload.get("session_id"), str):
+        session = payload["session_id"]
+    return (session or None), runtime
+
+
+def tool_failed(payload: dict) -> bool:
+    """True when the payload reports a failed or interrupted tool call (same checks as post_pr_review_hook.py)."""
+    if payload.get("error"):
+        return True
+    if payload.get("hook_event_name") == "PostToolUseFailure":
+        return True
+    response = payload.get("tool_response")
+    if isinstance(response, dict):
+        if response.get("is_error") or response.get("interrupted"):
+            return True
+        for key in ("exit_code", "exitCode", "returncode"):
+            code = response.get(key)
+            if isinstance(code, int) and code != 0:
+                return True
+    return False
+
+
+def classify_lease_command(command_line: str, shell: str = "bash") -> str:
+    """Trading lease action of a shell command (issue #280), per sub-command that runs the script (inspection
+    programs that merely name it are ignored): "take" (scripts/trading_lease.py with the exact --take flag), "refresh"
+    (prime_evaluator_brief.py or record_evaluation.py, except --help) or "" (nothing). An explicit --env testnet means
+    nothing: TESTNET never uses the lease."""
+    m = re.search(r"--env(?:\s+|=)(['\"]?)([A-Za-z0-9_-]+)\1", command_line or "", re.IGNORECASE)
+    if m and m.group(2).lower() not in ("prod", "production", "mainnet"):
+        return ""
+    action = ""
+    inspection = INSPECTION_PROGRAMS | (PS_INSPECTION_PROGRAMS if shell == "powershell" else set())
+    for tokens in _split_subcommands(command_line or ""):
+        if not tokens or _program(tokens) in inspection or set(tokens) & HELP_FLAGS:
+            continue
+        # --take after the script, as pre_trade_guard.TRADING_LEASE_TAKE_RE force-asks it (never a wider set)
+        script_at = [i for i, t in enumerate(tokens) if t.replace("\\", "/").rsplit("/", 1)[-1] == TRADING_LEASE_SCRIPT]
+        if script_at and TRADING_LEASE_TAKE_FLAG in tokens[script_at[0] + 1:]:
+            return "take"
+        text = " ".join(tokens)
+        if PRIME_BRIEF_RE.search(text) or RECORD_EVALUATION_RE.search(text):
+            action = "refresh"
+    return action
+
+
+def handle_trading_lease(payload: dict, call: dict) -> str:
+    """Issue #280 (PostToolUse, after the command ran): commits an approved takeover (the PreToolUse guard force-asks
+    `scripts/trading_lease.py --take`) to the calling session, or refreshes the lease's heartbeat when the caller
+    holds it and ran a brief / record command (never acquires). Nothing on a failed tool call, an unknown session or
+    another command. Returns the action taken ("take", "refresh" or ""); errors go to stderr, never raised (the sync
+    and the orphan audit always run)."""
+    try:
+        if call.get("kind") != "run_command" or tool_failed(payload):
+            return ""
+        session, runtime = session_of(payload)
+        if not session:
+            return ""
+        action = classify_lease_command(call.get("command") or "", call.get("shell", "bash"))
+        if not action:
+            return ""
+        base_dir = find_workspace_root()
+        scripts_dir = os.path.join(base_dir, "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        from utils import trading_lease as tl
+        if action == "take":
+            tl.take(base_dir, session, runtime, time.time())
+            sys.stderr.write(f"[POST-TRADE-SYNC] Trading lease taken over by session {tl.abbreviate(session)}.\n")
+            return "take"
+        return "refresh" if tl.refresh_if_holder(base_dir, session, time.time()) else ""
+    except Exception as e:
+        sys.stderr.write(f"[POST-TRADE-SYNC LEASE ERROR] {type(e).__name__}: {e}\n")
+        return ""
+
+
 def handle_post_trade_sync(payload: dict) -> dict:
     """
     Inspects toolCall payload and executes necessary sync / audit operations.
     Returns status dict for observability and testing.
     """
     call = _normalize(payload if isinstance(payload, dict) else {})
+    lease_action = handle_trading_lease(payload if isinstance(payload, dict) else {}, call)
     command_line = call["command"] or ""
     mcp_args = call["args"] if isinstance(call["args"], dict) else {}
 
@@ -283,7 +376,8 @@ def handle_post_trade_sync(payload: dict) -> dict:
         "is_opening": is_opening,
         "sync_attempted": False,
         "sync_rc": None,
-        "audit_healed": False
+        "audit_healed": False,
+        "lease_action": lease_action,
     }
 
     if not order_placed:

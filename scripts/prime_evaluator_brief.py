@@ -865,6 +865,15 @@ def main(argv: Optional[list] = None) -> int:
         print(format_markdown_brief(brief))
         if recheck:
             print(recheck_brief.recheck_summary(brief))
+    # Issue #280: who may open PROD positions (stdout only, never in the JSON brief: byte budget; with --json on
+    # stderr so the JSON output stays parseable)
+    if env == "prod":
+        try:
+            from utils import trading_lease
+            lease_line = trading_lease.status_line(BASE_DIR)
+        except Exception as e:
+            lease_line = f"Trading lease status unavailable ({type(e).__name__})."
+        print(lease_line, file=sys.stderr if args.json else sys.stdout)
     if brief.get("dropped_lessons") or brief.get("lesson_budget_exceeded"):  # issue #271: the exit line
         print(f"Brief lessons: {len(brief.get('committed_memory_lessons') or [])} shown, "
               f"{len(brief.get('dropped_lessons') or [])} dropped for the budget"
