@@ -476,7 +476,8 @@ class TestReporterOpenIssueLookup(_BacklogCase):
         self.posts.append(payload)
         number = len(self.posts)
         self.open_issues.append({"number": number, "url": f"https://github.com/owner/repo/issues/{number}",
-                                 "body": payload["body"]})
+                                 "body": payload["body"],
+                                 "labels": [{"name": label} for label in payload["labels"]]})  # as GitHub lists it
         return fake_response({"number": number, "html_url": f"https://github.com/owner/repo/issues/{number}",
                               "labels": [{"name": label} for label in payload["labels"]]})
 
@@ -582,7 +583,7 @@ class TestFingerprintFileConcurrency(_BacklogCase):
 # The gh stub of test_report_issue plus `gh issue list`: an open issue carrying STUB_OPEN_ISSUE_FP, else exit 1
 GH_STUB_WITH_LIST = GH_STUB.replace("\nexit 1\n", "\n" + r"""if [ "$1" = "issue" ] && [ "$2" = "list" ]; then
   if [ -n "$STUB_OPEN_ISSUE_FP" ]; then
-    printf '[{"number": 5, "url": "https://github.com/owner/repo/issues/5", "body": "| **Fingerprint ID** | `%s` |"}]' "$STUB_OPEN_ISSUE_FP"
+    printf '[{"number": 5, "url": "https://github.com/owner/repo/issues/5", "body": "| **Fingerprint ID** | `%s` |", "labels": [{"name": "severity:%s"}]}]' "$STUB_OPEN_ISSUE_FP" "${STUB_OPEN_ISSUE_SEVERITY:-high}"
     exit 0
   fi
   exit 1
