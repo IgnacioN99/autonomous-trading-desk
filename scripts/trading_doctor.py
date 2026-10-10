@@ -18,6 +18,9 @@ Verifies:
 10. [FEES] (issue #268, informational only, read-only): KEYS mode reads GET /fapi/v1/commissionRate (BTCUSDT maker /
    taker rate) and GET /fapi/v1/feeBurn (BNB fee discount ON / OFF); MCP mode prints "unavailable". A failed read is
    printed as unavailable; it never adds a warning or a critical failure, so it never changes the exit code.
+11. [PREARM] / [FILL-STOP] (issue #273, informational only, read-only, last 24 h of logs/guardian_actions.jsonl): the
+   resting-entry pre-arms rejected with -4509 (and how many were LIMIT entries) and the max / median fill-to-stop
+   seconds of stops placed at fill by the guardian ([FILL-STOP] only when there is at least one).
 User profile: not onboarded = critical; PROD also fails when config/user_profile.json is missing or unreadable
 (a fallback example/default profile, issue #180).
 
@@ -38,6 +41,7 @@ import hashlib
 
 import re
 import shlex
+import statistics
 import shutil
 import subprocess
 import tempfile
@@ -686,6 +690,75 @@ def pr_hook_detect_error_line(logs_dir: str, now: float = None) -> str:
     return f"{count} PR review hook detect_error event(s) in the last 24h (those commands did not arm the review)."
 
 
+PREARM_STATS_WINDOW_S = 24 * 3600
+
+
+def _finite(value):
+    """float(value) when it is a finite number (not a bool), else None."""
+    if isinstance(value, bool):
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if out == out and abs(out) != float("inf") else None
+
+
+def prearm_fill_stop_lines(base_dir: str, target_env: str, now: float = None) -> list:
+    """Issue #273: informational [PREARM] / [FILL-STOP] lines from logs/guardian_actions.jsonl, read-only, for
+    target_env and the last PREARM_STATS_WINDOW_S. [PREARM]: "prearm_rejected" events with code -4509 (written by
+    the executor) and how many of them were LIMIT entries. [FILL-STOP]: max / median fill_to_stop_s of successful,
+    non-dry-run pending_protect_sl actions (only when n > 0). Unreadable files and malformed lines are ignored. Returns
+    [(tag, message)]; never raises on file contents and never affects the exit code."""
+    now = time.time() if now is None else now
+    env = pt.norm_env(target_env)
+    envs = {}
+    rejected = limit = 0
+    latencies, from_exchange = [], 0
+    try:
+        f = open(os.path.join(base_dir, "logs", "guardian_actions.jsonl"), "r", encoding="utf-8", errors="replace")
+    except OSError:
+        f = None
+    if f is not None:
+        with f:
+            for line in f:
+                if "prearm_rejected" not in line and "pending_protect_sl" not in line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                raw_env = str(rec.get("env") or "")
+                if raw_env not in envs:
+                    envs[raw_env] = pt.norm_env(raw_env)
+                if envs[raw_env] != env:
+                    continue
+                if rec.get("event") == "prearm_rejected":
+                    ts = _finite(rec.get("ts"))
+                    if ts is None or now - ts > PREARM_STATS_WINDOW_S or _finite(rec.get("code")) != -4509:
+                        continue
+                    rejected += 1
+                    limit += str(rec.get("entry_type") or "").upper() == "LIMIT"
+                elif rec.get("type") == "pending_protect_sl" and rec.get("success") is True and not rec.get("dry_run"):
+                    ts = _finite(rec.get("timestamp"))
+                    detail = rec.get("detail") if isinstance(rec.get("detail"), dict) else {}
+                    latency = _finite(detail.get("fill_to_stop_s"))
+                    if ts is None or now - ts > PREARM_STATS_WINDOW_S or latency is None or latency < 0:
+                        continue
+                    latencies.append(latency)
+                    from_exchange += detail.get("fill_ts_source") == "position_update"
+    lines = [("PREARM", f"{rejected} pre-arm(s) rejected with -4509 in the last 24 h ({limit} on LIMIT entries); "
+                        "the guardian places those stops at fill (informational).")]
+    if latencies:
+        lines.append(("FILL-STOP", f"Fill-to-stop in the last 24 h: max {max(latencies):.1f} s, median "
+                                   f"{statistics.median(latencies):.1f} s (n={len(latencies)}, {from_exchange} from the "
+                                   "exchange fill time); accepted window about 60-120 s, bounded by the guardian "
+                                   "interval (informational)."))
+    return lines
+
+
 def run_doctor(target_env: str = None, auto_heal: bool = False) -> int:
     target_env = resolve_env(target_env)
     start_time = time.time()
@@ -1028,6 +1101,14 @@ def run_doctor(target_env: str = None, auto_heal: bool = False) -> int:
     except Exception as e:
         fee_msg = f"Fee status check failed ({type(e).__name__})."
     print(f"ℹ️  [FEES] {fee_msg}")
+
+    # 5f. Pre-arm -4509 rejections and fill-to-stop latency (issue #273; informational only)
+    try:
+        prearm_lines = prearm_fill_stop_lines(os.path.dirname(sss.LOGS_DIR), target_env)
+    except Exception as e:
+        prearm_lines = [("PREARM", f"Pre-arm / fill-to-stop stats unavailable ({type(e).__name__}).")]
+    for tag, msg in prearm_lines:
+        print(f"ℹ️  [{tag}] {msg}")
 
     # 6. Shadow Desk Counterfactual Audit
     try:

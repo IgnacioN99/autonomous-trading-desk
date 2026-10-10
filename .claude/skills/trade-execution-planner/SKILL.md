@@ -73,7 +73,10 @@ Follow these steps in order. Skipping one is a hard failure: the PreToolUse hook
    - `python3 scripts/execute_futures_trade.py --audit-orphans`, `--auto-heal`
    - `python3 scripts/execute_futures_trade.py --protect-pending` (places the planned SL/TPs of filled resting entries from `logs/pending_entries.json`, cancels expired ones; the guardian runs it every cycle)
    - Resting entries (untriggered `STOP_MARKET`, `LIMIT`):
-     - KEYS: a resting `LIMIT` gets its SL pre-armed when it is not crossed; the guardian verifies it at fill and is the fallback. `STOP_MARKET` entries (`skipped:no_position`) and MCP: no pre-armed SL (the guardian places it at fill). A rejected (except -2021 / -4509, logged only) or unverified pre-arm is reported (`prearm_anomaly`); the entry is kept.
+     - Stop Loss pre-arm:
+       - KEYS `LIMIT`: the SL is pre-armed when it is not crossed; the guardian verifies it at fill and is the fallback. A rejected (except -2021 / -4509, logged only; -4509 is counted in the doctor's `[PREARM]` line) or unverified pre-arm is reported (`prearm_anomaly`); the entry is kept.
+       - KEYS `STOP_MARKET`: never pre-armed (`skipped:no_position`); the guardian places the planned SL at fill. Accepted no-stop window after the fill: about 60-120 s (up to one guardian `--interval`, at most 120 s; doctor `[FILL-STOP]` line).
+       - MCP: never pre-armed (`skipped:mcp`); the guardian places the SL at fill, same window.
      - PROD: they require a running guardian loop (`python3 scripts/loops/position_guardian_loop.py --interval 60 --env <env>`; `--interval` <= 120 s, not `--once` or `--dry-run`; a cron or scheduled `--once` run does not satisfy this, it is not a live guardian) and no open position on the symbol. While a symbol has a pending entry, every new entry on it is rejected.
    - **Invariant:** in PROD, if the guardian is not live (`[GUARDIAN]` line of `python3 scripts/trading_doctor.py`, or `python3 scripts/install_guardian_service.py --status`), do NOT plan a `STOP_MARKET` / `LIMIT` entry: offer a MARKET entry or get the guardian running first (`python3 scripts/install_guardian_service.py --install --env <env>`).
    - While resting entries are pending, tell the user not to log off or close the guardian console.

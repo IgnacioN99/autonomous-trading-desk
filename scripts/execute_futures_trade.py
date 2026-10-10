@@ -95,7 +95,9 @@ JSON schemas (stable; extra keys may be added, existing keys are never renamed):
       (issue #118 loss cap; issue #126 total_qty: a record whose total_qty is below margin_usdt x leverage / price
       x 0.98 minus one stepSize is untrusted, pending_record_mismatch; issue #156: 3 consecutive deferred runs of a
       record (check_deferrals) file a HIGH issue, issue #180: the first for a filled record deferred on a non-user
-      profile (loss_cap_profile); pending_tp_placed detail has fill_quality_flags)
+      profile (loss_cap_profile); pending_tp_placed detail has fill_quality_flags; issue #273: a verified
+      pending_protect_sl of mode "place" (stop not a verified pre-arm) has fill_ts, fill_ts_source, fill_detected_ts,
+      stop_placed_ts, fill_to_stop_s)
   trade deployment: {"success": bool, "symbol", "direction", "leverage", "entry_price", "total_qty",
       "sl_price", "tp1_price", "tp2_price", ..., "error"?: str, "hard_gate_rejection"?: bool}
       Resting entries (untriggered STOP_MARKET via the algo order API, resting LIMIT) return
@@ -106,7 +108,8 @@ JSON schemas (stable; extra keys may be added, existing keys are never renamed):
       "skipped:crossed", "prearm_algo_id"); the guardian verifies it at fill and is the fallback; it is cancelled (by
       algo id) when the entry ends without a position. Issue #232: a STOP_MARKET entry is never pre-armed
       (skipped:no_position; the guardian places its SL at fill).
-      Issue #157: a rejected (except -2021 and -4509, logged only) or unverified pre-arm adds "prearm_anomaly":
+      Issue #157: a rejected (except -2021 and -4509, logged only; issue #273: a -4509 is also a "prearm_rejected"
+      event in logs/guardian_actions.jsonl) or unverified pre-arm of a resting LIMIT adds "prearm_anomaly":
       {"status", "message"} and files a MEDIUM issue (the entry is kept). Issue #232: an API rejection also adds
       "prearm_reject_msg" (the Binance msg, <= 200 chars; in the registry record, the message and the issue context).
       A MARKET entry's SL is verified by its own algo id only (an id-less
@@ -2483,7 +2486,8 @@ def prearm_resting_entry_stop(symbol, exit_side, sl_price, ref_price, target_env
         CONTRACT_PRICE): below it for a SELL stop (LONG), above it for a BUY stop (SHORT).
     Never blocks the entry. Returns the v2 registry fields: {"prearm_status": "placed" | "rejected:<code-or-text>" |
     "skipped:mcp" | "skipped:no_position" | "skipped:crossed"}, plus prearm_reject_msg (issue #232: the Binance msg
-    of an API rejection, <= 200 chars, absent when there is none; a -4509 is also logged, issue #232), plus
+    of an API rejection, <= 200 chars, absent when there is none; a -4509 is also logged, issue #232, and appended
+    to logs/guardian_actions.jsonl as a "prearm_rejected" event, issue #273, _log_prearm_rejected), plus
     prearm_algo_id / prearm_price (the listed trigger once verified, else the requested sl_price) when an algo id was
     returned (cancelled with the entry) and sl_close_position: True / sl_qty: None once verified on
     /fapi/v1/openAlgoOrders (wait_for_stop_confirmation: by algo id, falling back to a trigger match within one tick;
@@ -2520,6 +2524,7 @@ def _prearm_resting_entry_stop(symbol, exit_side, sl_price, ref_price, target_en
             # Issue #232: expected on a flat symbol, not an anomaly (no issue filed); logged for the rate.
             logger.warning(f"{symbol} pre-arm rejected:-4509 (not reported; the guardian places the SL at fill): "
                            f"{reject_msg or 'no Binance message'}")
+            _log_prearm_rejected(symbol, exit_side, target_env, entry_type, -4509, reject_msg)
         return rejected
     fields = {'prearm_algo_id': placed_id, 'prearm_price': sl_price}
     verified, info = wait_for_stop_confirmation(symbol, exit_side, sl_price, algo_id=placed_id, tick_size=tick_size,
@@ -2529,6 +2534,22 @@ def _prearm_resting_entry_stop(symbol, exit_side, sl_price, ref_price, target_en
     # Issue #157: the trigger as listed (tick-rounded by place_algo_stop_loss), else the requested price.
     fields['prearm_price'] = _trigger_price(info) if isinstance(info, dict) and _trigger_price(info) > 0 else sl_price
     return dict(fields, prearm_status='placed', sl_close_position=True, sl_qty=None)
+
+
+def _log_prearm_rejected(symbol, exit_side, target_env, entry_type, code, reject_msg):
+    """Issue #273: appends one {"event": "prearm_rejected", "ts", "env", "symbol", "direction", "entry_type", "code",
+    "msg"} line to logs/guardian_actions.jsonl (the doctor's [PREARM] -4509 count). No "type" key: the readers of
+    guardian actions skip it. Best effort: never raises, never changes the pre-arm result."""
+    try:
+        from utils.atomic_writer import atomic_append_jsonl
+        log_dir = os.path.join(_workspace_dir(), 'logs')
+        os.makedirs(log_dir, exist_ok=True)
+        atomic_append_jsonl(os.path.join(log_dir, 'guardian_actions.jsonl'), {
+            'event': 'prearm_rejected', 'ts': int(time.time()), 'env': resolve_env(target_env),
+            'symbol': str(symbol).upper(), 'direction': 'LONG' if str(exit_side).upper() == 'SELL' else 'SHORT',
+            'entry_type': str(entry_type).upper() if entry_type else None, 'code': code, 'msg': reject_msg})
+    except Exception as e:
+        logger.warning(f"{symbol} prearm_rejected event not logged: {type(e).__name__}: {e}")
 
 
 def _prearm_note(prearm, sl_price):
@@ -2646,6 +2667,24 @@ def _ensure_entry_stop(symbol, exit_side, sl_price, prearm_algo_id=None, quantit
     verified, info = wait_for_stop_confirmation(symbol, exit_side, sl_price, algo_id=placed_id, tick_size=tick_size,
                                                 target_env=target_env)
     return {"verified": verified, "source": "placed" if verified else None, "placement": placement, "info": info}
+
+
+def _fill_to_stop_fields(position, detected_ts, stop_ts, placed_at_ts=None):
+    """Issue #273 (observability only): timing fields of a pending_protect_sl action whose stop was verified at fill:
+    fill_ts = the positionRisk row's updateTime (fill_ts_source "position_update") when it is a positive time not
+    after the detection and not before the entry's placed_at_ts (5 s of clock drift allowed each way; an older one is
+    a position change before this entry), else the detection time ("detected": measures placement only),
+    fill_detected_ts, stop_placed_ts (s, after the verification) and fill_to_stop_s = stop_placed_ts - fill_ts
+    (>= 0). Never raises ({} on error)."""
+    try:
+        update_s = _to_float((position or {}).get('updateTime')) / 1000.0
+        floor = max(_to_float(placed_at_ts) - 5, 0.0)
+        fill_ts, source = ((update_s, 'position_update') if 0 < update_s <= detected_ts + 5 and update_s >= floor
+                           else (detected_ts, 'detected'))
+        return {"fill_ts": round(fill_ts, 3), "fill_ts_source": source, "fill_detected_ts": round(detected_ts, 3),
+                "stop_placed_ts": round(stop_ts, 3), "fill_to_stop_s": round(max(0.0, stop_ts - fill_ts), 3)}
+    except Exception:
+        return {}
 
 
 def _stop_covers_position(order, qty, rec=None):
@@ -3618,6 +3657,7 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out, run_ctx=None
         if (amt > 0) if is_long else (amt < 0):
             position = p
             break
+    fill_detected_ts = time.time()   # issue #273: when this run saw the position (fill-to-stop latency)
 
     # The entry (or a position) is visible again: clear a previous "missing" mark.
     if rec.get('missing_since_ts') is not None and (entry_open or position is not None):
@@ -3942,6 +3982,7 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out, run_ctx=None
     elif mode:
         cancelled_old = []
         stop_source = None
+        timing = {}   # issue #273: fill-to-stop latency of a stop placed (or found) at fill, mode 'place' only
         if mode == 'place':
             # Issue #36: a pre-armed stop that is still verified is kept; otherwise (consumed) the planned SL is placed.
             ensured = _ensure_entry_stop(sym, exit_side, target_p, prearm_algo_id=rec.get('prearm_algo_id'),
@@ -3950,6 +3991,8 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out, run_ctx=None
             new_stop = stop_summary(ensured["info"]) if verified else None
             if stop_source == "kept":
                 kept_trigger = (new_stop or {}).get('trigger_price')
+            if verified and stop_source != "prearm":   # a verified pre-arm protected the fill: no window
+                timing = _fill_to_stop_fields(position, fill_detected_ts, time.time(), rec.get('placed_at_ts'))
         else:
             rep = replace_protective_stop(sym, exit_side, target_p, qty_str, old_stops, target_env=target_env, tick_size=tick)
             placement, verified, new_stop = rep.get('placement'), bool(rep.get('success')), rep.get('new_stop')
@@ -3959,7 +4002,7 @@ def _protect_pending_entry(key, rec, target_env, dry_run, now, out, run_ctx=None
         act("pending_protect_sl", verified, mode=mode, sl_price=target_p, planned_sl_price=sl_p, quantity=qty,
             verified=verified, new_stop=new_stop, cancelled_old_stop_ids=cancelled_old, placement=placement,
             coverage_unknown=(mode == 'resize' and bool(mcp) and not covered), stop_source=stop_source,
-            **({"kept_trigger_price": kept_trigger} if stop_source == "kept" else {}))
+            **({"kept_trigger_price": kept_trigger} if stop_source == "kept" else {}), **timing)
         if not verified and mode in ('place', 'replace') and _is_immediate_trigger(placement):
             return crossed_close("sl_rejected_would_immediately_trigger", placement)
         if not verified and mode != 'place':
@@ -4599,7 +4642,8 @@ def _execute_complete_trade_pass(
                 order_id = _order_id(cond_order) if isinstance(cond_order, dict) and not _is_api_error(cond_order) else None
                 if order_id:
                     # Issue #232: not pre-armed (skipped:no_position, Binance rejects a closePosition stop on a flat
-                    # symbol with -4509); the guardian places the planned SL at fill.
+                    # symbol with -4509); the guardian places the planned SL at fill. Issue #273: no pre-arm, so no
+                    # prearm_anomaly report here (only the LIMIT branch can have one).
                     prearm = prearm_resting_entry_stop(symbol, exit_side, sl_p, cur_price, target_env=target_env,
                                                        tick_size=filters.get('tickSize'), entry_type='STOP_MARKET')
                     key, rec, failure = register_or_cancel('STOP_MARKET', order_id, trigger_p, prearm)
@@ -4627,11 +4671,6 @@ def _execute_complete_trade_pass(
                     }
                     if prearm.get('prearm_reject_msg'):
                         result["prearm_reject_msg"] = prearm['prearm_reject_msg']   # issue #232
-                    # Issue #157: a rejected / unverified pre-arm is reported (the entry is kept).
-                    anomaly = _prearm_anomaly(prearm)
-                    if anomaly:
-                        result["prearm_anomaly"] = anomaly
-                        _report_prearm_anomaly(symbol, target_env, 'STOP_MARKET', order_id, anomaly)
                     return result
                 elif _is_immediate_trigger(cond_order):
                     # Issue #263: -2021 = the trigger was reached after the price read above; no entry order exists.
@@ -4703,7 +4742,7 @@ def _execute_complete_trade_pass(
         # Issue #36: a resting (NEW) LIMIT gets its SL pre-armed after the entry; a PARTIALLY_FILLED one is protected
         # below from executedQty (_ensure_entry_stop).
         prearm = (prearm_resting_entry_stop(symbol, exit_side, sl_p, cur_price, target_env=target_env,
-                                            tick_size=filters.get('tickSize'))
+                                            tick_size=filters.get('tickSize'), entry_type='LIMIT')
                   if entry_status == 'NEW' else None)
         key, rec, failure = register_or_cancel('LIMIT', entry_order.get('orderId'), lim_p, prearm)
         if failure:
