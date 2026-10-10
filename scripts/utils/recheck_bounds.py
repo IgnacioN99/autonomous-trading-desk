@@ -6,9 +6,13 @@ After a dossier expired while the user was confirming a candidate, `prime_evalua
 that one candidate. The user's earlier "yes" covers the new plan only when every check holds:
 - the new dossier is APPROVED and approves the same symbol and direction (never a YOLO entry);
 - the tier is the same or higher (S > A+ > A; a downgrade fails);
-- trigger (entry), stop loss and TP2 each drifted at most `max_drift_r` R of the ORIGINAL plan
+- trigger (entry), stop loss, TP1 and TP2 each drifted at most `max_drift_r` R of the ORIGINAL plan
   (|new - old| / |old entry - old stop loss|);
+- the new stop distance |entry - stop loss| is within [1 - max_drift_r, 1 + max_drift_r] R of the original one
+  (issue #279: entry and SL moving in opposite directions cannot widen or tighten the stop beyond the bound);
 - the new plan's R:R to TP2 is >= 3:1 (levels on the correct side of the entry);
+- the new TP1 is at least the executor's friction floor (gate_limits.MIN_TP1_DISTANCE) from the entry, on the
+  profit side (issue #279: an earlier signal; the executor still enforces it);
 - at most `max_age_s` seconds passed since the original dossier was evaluated (`evaluated_ts`, the verifiable
   proxy for the user's "yes", which is not persisted).
 Anything missing, malformed or ambiguous fails (the user is asked again). The verdict is advisory: printed and
@@ -18,9 +22,11 @@ logged by record_evaluation.py; the hook and the executor gates are unchanged.
 import math
 from typing import Any, Dict, List, Optional
 
+from utils.gate_limits import MIN_TP1_DISTANCE
+
 TIER_RANK = {"S": 3, "A+": 2, "A": 1}
 MIN_RR_TP2 = 3.0
-DRIFT_FIELDS = (("entry", "trigger"), ("stop_loss", "stop loss"), ("tp2", "TP2"))
+DRIFT_FIELDS = (("entry", "trigger"), ("stop_loss", "stop loss"), ("tp1", "TP1"), ("tp2", "TP2"))
 _EPS = 1e-9
 
 
@@ -63,7 +69,7 @@ def _find(record: dict, symbol: str, direction: str) -> Optional[dict]:
 
 def evaluate_recheck_bounds(old: dict, new_record: dict, now_ts: int, max_drift_r: float,
                             max_age_s: int) -> Dict[str, Any]:
-    """Compares the old confirmed plan (`recheck_of` snapshot: symbol, direction, tier, entry, stop_loss, tp2,
+    """Compares the old confirmed plan (`recheck_of` snapshot: symbol, direction, tier, entry, stop_loss, tp1, tp2,
     evaluated_ts) with the newly recorded dossier. Returns {"within_bounds": bool, "checks": [{"check", "value",
     "limit", "ok"}], "reasons": [str]}; within_bounds is True only when every check passed."""
     checks: List[dict] = []
@@ -105,10 +111,23 @@ def evaluate_recheck_bounds(old: dict, new_record: dict, now_ts: int, max_drift_
             check(f"drift_{key}", round(drift, 4), max_drift_r, drift <= max_drift_r + _EPS,
                   f"{label} moved {drift:.2f}R (> {max_drift_r}R of the original plan)")
         entry, sl, tp2 = _num(new.get("entry")), _num(new.get("stop_loss")), _num(new.get("tp2"))
+        stop_r = abs(entry - sl) / old_r if old_r > 0 and entry is not None and sl is not None else None
+        stop_limit = f"{max(0.0, 1 - max_drift_r):g}R-{1 + max_drift_r:g}R"
+        check("stop_distance", f"new {stop_r:.2f}R vs old 1.00R" if stop_r is not None else None, stop_limit,
+              stop_r is not None and abs(stop_r - 1) <= max_drift_r + _EPS,
+              f"stop distance is {stop_r:.2f}R of the original plan (outside {stop_limit})" if stop_r is not None
+              else "stop distance not measurable (missing level or zero original R)")
         rr = _rr_tp2(direction, entry, sl, tp2) if None not in (entry, sl, tp2) else None
         check("rr_tp2", round(rr, 3) if rr is not None else None, MIN_RR_TP2,
               rr is not None and rr >= MIN_RR_TP2 - _EPS,
               "new R:R to TP2 below 3:1 (or levels on the wrong side of the entry)")
+        tp1 = _num(new.get("tp1"))
+        # Same signed distance as the executor's friction gate: a TP1 on the wrong side is negative
+        tp1_frac = (((tp1 - entry) if direction == "LONG" else (entry - tp1)) / entry
+                    if tp1 is not None and entry is not None else None)
+        check("tp1_friction", f"{tp1_frac * 100:.2f}%" if tp1_frac is not None else None,
+              f">= {MIN_TP1_DISTANCE * 100:.2f}%", tp1_frac is not None and tp1_frac >= MIN_TP1_DISTANCE,
+              "new TP1 is closer to the entry than the executor's friction floor (or missing / on the wrong side)")
     try:
         age = int(now_ts) - int(old.get("evaluated_ts"))
     except (TypeError, ValueError):

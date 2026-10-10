@@ -48,6 +48,9 @@ REVIEWERS = {
             r"^scripts/trading_scorecard\.py$",
             r"^scripts/utils/score_calibration\.py$",
             r"^scripts/utils/trade_excursion\.py$",
+            # PROD trading lease: single writer for opening orders (issue #280 / #287)
+            r"^scripts/utils/trading_lease\.py$",
+            r"^scripts/trading_lease\.py$",
         ],
     },
     "binance_microstructure": {
@@ -86,6 +89,9 @@ REVIEWERS = {
             r"^scripts/trading_scorecard\.py$",
             r"^scripts/utils/score_calibration\.py$",
             r"^scripts/utils/atomic_writer\.py$",
+            # Trading lease: hook-written ground truth and its takeover CLI (issue #280 / #287)
+            r"^scripts/utils/trading_lease\.py$",
+            r"^scripts/trading_lease\.py$",
         ],
     },
     "prompt_engineering": {

@@ -32,7 +32,10 @@ Delta-gate opportunity cost (issue #251; report-only, read-only: it never writes
   DELTA_GATE_POST_APPROVAL (issue #261): the hook's denials of dossier-approved candidates, registered by
   shadow_tracker from logs/gate_denials.jsonl; in both 4 and 5 (each denial its own replay event) with a caveat:
   their book is the cached session state at denial time (source session_state_cache), and denials by the
-  executor's own live Gate 1 are not recorded.
+  executor's own live Gate 1 are not recorded. Issue #275: their notional is the hook's (equity x profile risk,
+  equity_source session_state or primed_brief) when it could derive it, else derived at the default
+  target_dollar_risk (rows without an equity source, counted notional_derived_default); a row with a
+  truncated book, or a snapshot error and an empty book, is not replayed (skipped no_book).
 
 Usage:
   python3 scripts/shadow_analytics.py [--json] [--resting-age-min 30] [--resting-weight 0.5] [--swap-margin 10]
@@ -49,7 +52,8 @@ from typing import List, Dict, Any, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from utils.portfolio_exposure import LONG_HEAVY, SHORT_HEAVY, book_exposure, project_order
-from utils.shadow_common import DEDUPE_WINDOW_SECONDS, row_gate  # not shadow_tracker: no import coupling (#290)
+from utils.shadow_common import (  # not shadow_tracker: no import coupling (#290)
+    DEDUPE_WINDOW_SECONDS, POST_APPROVAL_GATE, row_gate)
 
 RESOLVED_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "logs", "shadow_resolved.jsonl"))
 TRADES_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "logs", "shadow_trades.jsonl"))
@@ -482,7 +486,8 @@ def _r_label(value: float) -> str:
 
 def candidate_notional(row: Dict[str, Any]) -> tuple:
     """(notional, derived): the row's notional_usdt when positive, else target_dollar_risk / |trigger - sl| x
-    trigger (derived True); (None, False) when neither is available."""
+    trigger (derived True); (None, False) when neither is available. "derived" is the replay's own derivation: a hook
+    row's notional_derived flag (issue #275: estimated by the hook from equity x profile risk) is a separate field."""
     n = _num(row.get("notional_usdt"))
     if n is not None and n > 0:
         return n, False
@@ -576,10 +581,12 @@ def _replay(resolved: List[Dict[str, Any]], index: Dict[str, Any], resting_age_m
     rows = [r for r in resolved if row_gate(r)[0] in REPLAY_GATES]
     skipped = {"no_book": 0, "no_shadow_r": 0, "notional_missing": 0}
     events: Dict[Any, Dict[str, Any]] = {}
-    notional_derived = 0
+    notional_derived = notional_derived_default = 0
     for r in rows:
-        if not isinstance(r.get("book"), list) or r.get("book_truncated"):
-            # issue #261: a hook event whose book did not fit its 4 KB line has no usable (complete) book
+        if (not isinstance(r.get("book"), list) or r.get("book_truncated")
+                or (r.get("blockers_error") and not r["book"])):
+            # issue #261: a hook event whose book did not fit its 4 KB line (or skipped an oversized registry) has
+            # no usable (complete) book; issue #275: nor has a snapshot that failed with an empty book
             skipped["no_book"] += 1
             continue
         if shadow_r(r) is None:
@@ -590,6 +597,10 @@ def _replay(resolved: List[Dict[str, Any]], index: Dict[str, Any], resting_age_m
             skipped["notional_missing"] += 1
             continue
         notional_derived += int(derived)
+        # issue #275: a hook row without an equity source (no hook notional / risk) is sized at the default
+        # target_dollar_risk
+        notional_derived_default += int(derived and row_gate(r)[0] == POST_APPROVAL_GATE
+                                        and not r.get("equity_source"))
         # A hook denial (later, cache book) is its own event, apart from its dossier's DELTA_GATE rows
         key = (r.get("dossier_sha256") or r.get("id"), row_gate(r)[0])
         ev = events.setdefault(key, {"ts": _num(r.get("registered_at_ts")) or 0.0, "book": r["book"], "rows": []})
@@ -703,7 +714,8 @@ def _replay(resolved: List[Dict[str, Any]], index: Dict[str, Any], resting_age_m
             "insufficient_sample": len(ordered) < MIN_SAMPLE, "min_sample": MIN_SAMPLE,
             "params": {"resting_age_min": resting_age_min, "resting_weight": resting_weight,
                        "swap_margin": swap_margin},
-            "skipped": skipped, "notional_derived": notional_derived, "book_notional_missing": book_notional_missing,
+            "skipped": skipped, "notional_derived": notional_derived,
+            "notional_derived_default": notional_derived_default, "book_notional_missing": book_notional_missing,
             "blockers": len(blocker_r), "blocker_r_unknown": sum(1 for r in blocker_r.values() if r is None),
             "blocker_time_approx": blocker_time_approx, "unknown_blocker_r": unknown_r,
             "policies": policies,
@@ -758,8 +770,11 @@ def format_delta_gate_report(regret: Dict[str, Any], replay: Dict[str, Any]) -> 
     lines += ["", "🔁 APPLICATION E: DELTA GATE POLICY REPLAY (report only)", "-" * 80]
     lines += [f"  ! {w}" for w in replay["warnings"]]
     p = replay["params"]
-    lines.append(f"  events {replay['n_events']} (rows {replay['n_rows']}) | skipped {replay['skipped']} | notional "
-                 f"derived {replay['notional_derived']} | blocker R unknown {replay['blocker_r_unknown']}/"
+    lines.append(f"  events {replay['n_events']} (rows {replay['n_rows']}) | skipped {replay['skipped']} (no_book: no "
+                 f"snapshot, a truncated hook book or a snapshot error with an empty book) | notional derived "
+                 f"{replay['notional_derived']} (hook rows without an equity source, at the default risk: "
+                 f"notional_derived_default "
+                 f"{replay.get('notional_derived_default', 0)}) | blocker R unknown {replay['blocker_r_unknown']}/"
                  f"{replay['blockers']} | blocker_time_approx {replay.get('blocker_time_approx', 0)} | "
                  f"N={p['resting_age_min']:g} min, weight={p['resting_weight']:g}, swap X={p['swap_margin']:g}")
     sens = replay.get("sensitivity")

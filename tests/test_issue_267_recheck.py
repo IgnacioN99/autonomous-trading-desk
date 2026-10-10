@@ -101,12 +101,13 @@ class TestRecheckBounds(unittest.TestCase):
 
     def old(self, **kw):
         return dict({"sha256": "a" * 64, "symbol": SYMBOL, "direction": DIRECTION, "tier": "S", "entry": 1.0,
-                     "stop_loss": 0.97, "tp2": 1.15, "evaluated_ts": self.NOW - 1500}, **kw)  # 5R
+                     "stop_loss": 0.97, "tp1": 1.054, "tp2": 1.15, "evaluated_ts": self.NOW - 1500}, **kw)  # 5R
 
     @staticmethod
     def new(status="APPROVED", **kw):
+        # Issue #279: TP1 is part of the verdict (drift and friction floor), so the fixtures carry it
         cand = dict({"symbol": SYMBOL, "direction": DIRECTION, "tier": "S", "entry": 1.0, "stop_loss": 0.97,
-                     "tp2": 1.15, "is_yolo": False}, **kw)
+                     "tp1": 1.054, "tp2": 1.15, "is_yolo": False}, **kw)
         return {"status": status, "approved_candidates": [cand] if status == "APPROVED" else []}
 
     def verdict(self, old=None, new=None, drift=0.25, age=1800):
@@ -121,16 +122,18 @@ class TestRecheckBounds(unittest.TestCase):
         self.assertEqual(v["reasons"], [])
         self.assertEqual({c["check"] for c in v["checks"]},
                          {"status", "symbol_direction", "not_yolo", "tier", "drift_entry", "drift_stop_loss",
-                          "drift_tp2", "rr_tp2", "age_s"})
+                          "drift_tp1", "drift_tp2", "stop_distance", "rr_tp2", "tp1_friction", "age_s"})
 
     def test_drift_in_r_per_field_at_and_over_the_limit(self):
-        for key, base in (("entry", 1.0), ("stop_loss", 0.97), ("tp2", 1.15)):
+        for key, base in (("entry", 1.0), ("stop_loss", 0.97), ("tp1", 1.054), ("tp2", 1.15)):
             with self.subTest(field=key):
                 at = self.verdict(new=self.new(**{key: base + 0.0075}))  # exactly 0.25R
                 self.assertTrue(at["within_bounds"], at)
                 over = self.verdict(new=self.new(**{key: base + 0.0078}))  # 0.26R
                 self.assertFalse(over["within_bounds"])
-                self.assertEqual(self.failed(over), {f"drift_{key}"})
+                # Issue #279: moving the entry or the SL alone also changes the stop distance by 0.26R
+                self.assertEqual(self.failed(over), {f"drift_{key}"} | (
+                    {"stop_distance"} if key in ("entry", "stop_loss") else set()))
                 down = self.verdict(new=self.new(**{key: base - 0.0078}))  # drift is absolute
                 self.assertIn(f"drift_{key}", self.failed(down))
         wide = self.verdict(new=self.new(entry=1.0078), drift=0.5)  # the profile bound is used
@@ -168,9 +171,10 @@ class TestRecheckBounds(unittest.TestCase):
         self.assertIn("not_yolo", self.failed(self.verdict(new=self.new(is_yolo=True))))
 
     def test_short_and_malformed_levels(self):
-        old = self.old(direction="SHORT", entry=1.0, stop_loss=1.03, tp2=0.88)
+        old = self.old(direction="SHORT", entry=1.0, stop_loss=1.03, tp1=0.946, tp2=0.88)
         new = {"status": "APPROVED", "approved_candidates": [{"symbol": SYMBOL, "direction": "SHORT", "tier": "S",
-                                                             "entry": 0.999, "stop_loss": 1.03, "tp2": 0.88}]}
+                                                             "entry": 0.999, "stop_loss": 1.03, "tp1": 0.946,
+                                                             "tp2": 0.88}]}
         self.assertTrue(rb.evaluate_recheck_bounds(old, new, self.NOW, 0.25, 1800)["within_bounds"])
         for bad in ("x", None, True, float("nan"), 0, -1):
             with self.subTest(bad=bad):
@@ -199,11 +203,12 @@ class TestRecheckProfile(unittest.TestCase):
             self.assertEqual(example[key], up.DEFAULT_PROFILE[key], key)
 
     def test_valid_and_invalid_values(self):
-        self.assertEqual(up.get_recheck_bounds({"recheck_max_drift_r": 2, "recheck_max_age_seconds": 7200}),
-                         {"recheck_max_drift_r": 2.0, "recheck_max_age_seconds": 7200})
+        # Issue #279: the valid range is (0, 0.5]
+        self.assertEqual(up.get_recheck_bounds({"recheck_max_drift_r": 0.5, "recheck_max_age_seconds": 7200}),
+                         {"recheck_max_drift_r": 0.5, "recheck_max_age_seconds": 7200})
         self.assertEqual(up.get_recheck_bounds({"recheck_max_drift_r": 0.1, "recheck_max_age_seconds": 300.0}),
                          {"recheck_max_drift_r": 0.1, "recheck_max_age_seconds": 300})
-        for bad in (0, -0.1, 2.01, "0.3", None, True, float("nan"), float("inf")):
+        for bad in (0, -0.1, 0.51, 1.0, 2, 2.01, "0.3", None, True, float("nan"), float("inf")):
             self.assertEqual(up.get_recheck_bounds({"recheck_max_drift_r": bad})["recheck_max_drift_r"], 0.25, bad)
         for bad in (299, 7201, "900", None, True, float("nan"), -1):
             self.assertEqual(up.get_recheck_bounds({"recheck_max_age_seconds": bad})["recheck_max_age_seconds"],
@@ -580,8 +585,9 @@ class TestRecheckBrief(_RecheckWorkspace):
         self.assertEqual(run.call_args[1]["env"][rcb.RUN_ID_ENV], "rid")
         self.assertEqual(run.call_args[1]["timeout"], 60)
         self.assertEqual(payload["recheck"]["setup_status"], "found")
-        with patch("subprocess.run", side_effect=OSError("x")):
-            self.assertEqual(rcb.fetch_recheck_payload(SYMBOL, DIRECTION, "prod", "rid", self.workspace), {})
+        with patch("subprocess.run", side_effect=OSError("x")):  # issue #279: the failure class is kept
+            self.assertEqual(rcb.fetch_recheck_payload(SYMBOL, DIRECTION, "prod", "rid", self.workspace),
+                             {"recheck_failure": "OSError"})
 
 
 class TestRecorderRecheckLink(_RecheckWorkspace):
@@ -651,9 +657,10 @@ class TestRecorderRecheckLink(_RecheckWorkspace):
     def test_profile_bounds_are_used(self):
         os.makedirs(os.path.join(self.workspace, "config"), exist_ok=True)
         with open(os.path.join(self.workspace, "config", "user_profile.json"), "w", encoding="utf-8") as f:
-            json.dump({"recheck_max_drift_r": 1.0}, f)
+            json.dump({"recheck_max_drift_r": 0.5}, f)  # issue #279: the profile maximum
         _, brief = self.recheck()
-        record, out, _ = self.record_new(self.new_payload(brief, entry=1.02, stop_loss=0.99, tp2=1.14), brief)
+        # 0.4R on trigger, SL and TP2 (out of the default 0.25R), the stop distance unchanged
+        record, out, _ = self.record_new(self.new_payload(brief, entry=1.012, stop_loss=0.982, tp2=1.132), brief)
         self.assertTrue(record["recheck_bounds"]["within_bounds"], record["recheck_bounds"])
         self.assertIn("WITHIN BOUNDS", out)
 
@@ -680,19 +687,22 @@ class TestRecorderRecheckLink(_RecheckWorkspace):
         self.assertIn("OUT OF BOUNDS", out)
 
     def test_fails_soft_without_a_linked_recheck_brief(self):
-        # No brief at all
+        # No brief at all: recorded, never linked; issue #279: an explicit no-verdict line instead of silence
         record, out, err = self.record_new(self.new_payload({"generated_at_ts": self.now}), {"generated_at_ts":
                                                                                             self.now - 2})
         self.assertNotIn("recheck_of", record)
-        self.assertNotIn("Re-check", out)
+        self.assertNotIn("Re-check of dossier", out)
+        self.assertIn("Re-check: NOT LINKED (no verdict)", out)
+        self.assertIn("RE-CHECK NOT LINKED", err)
         self.assertNotIn("recheck_of", self.history()[-1])
         # A normal brief (no recheck_of)
         with open(self.brief_path, "w", encoding="utf-8") as f:
             json.dump({"generated_at_ts": self.now, "target_env": "PROD"}, f)
-        record, _, err = self.record_new(self.new_payload({"generated_at_ts": self.now}), {"generated_at_ts":
-                                                                                          self.now - 2})
+        record, out, err = self.record_new(self.new_payload({"generated_at_ts": self.now}), {"generated_at_ts":
+                                                                                            self.now - 2})
         self.assertNotIn("recheck_of", record)
         self.assertEqual(err, "")
+        self.assertNotIn("Re-check", out)
         # A re-check brief this dossier was not evaluated on
         _, brief = self.recheck()
         payload = dict(self.new_payload(brief), brief_generated_at_ts=int(brief["generated_at_ts"]) - 500)
@@ -700,22 +710,25 @@ class TestRecorderRecheckLink(_RecheckWorkspace):
         self.assertNotIn("recheck_of", record)
         self.assertIn("RE-CHECK NOT LINKED", err)
         self.assertNotIn("WITHIN BOUNDS", out)
+        self.assertIn("Re-check: NOT LINKED (no verdict)", out)
 
-    def test_link_window_without_brief_generated_at_ts(self):
+    def test_no_link_without_brief_generated_at_ts(self):
+        """Issue #279: the 600 s window fallback is gone; a re-check dossier without brief_generated_at_ts is never
+        linked, however close to the brief it was emitted."""
         _, brief = self.recheck()
         payload = self.new_payload(brief)
         payload.pop("brief_generated_at_ts")
-        record, _, _ = self.record_new(payload, brief)
-        self.assertIn("recheck_of", record)
-        record, _, err = self.record_new(payload, brief, conv="bbbbbbbb-1111-4222-8333-444455556666",
-                                         ts=int(brief["generated_at_ts"]) + rec.BRIEF_LINK_WINDOW_S + 5)
-        self.assertNotIn("recheck_of", record)
-        self.assertIn("RE-CHECK NOT LINKED", err)
-        # A brief written after the dossier was emitted did not feed it
-        record, _, err = self.record_new(payload, brief, conv="cccccccc-1111-4222-8333-444455556666",
-                                         ts=int(brief["generated_at_ts"]) - 1)
-        self.assertNotIn("recheck_of", record)
-        self.assertIn("RE-CHECK NOT LINKED", err)
+        for conv, ts in (("bbbbbbbb-1111-4222-8333-444455556666", int(brief["generated_at_ts"]) + 2),
+                         ("cccccccc-1111-4222-8333-444455556666", int(brief["generated_at_ts"]) + 605),
+                         ("dddddddd-1111-4222-8333-444455556666", int(brief["generated_at_ts"]) - 1)):
+            with self.subTest(ts=ts):
+                record, out, err = self.record_new(payload, brief, conv=conv, ts=ts)
+                self.assertNotIn("recheck_of", record)
+                self.assertNotIn("recheck_bounds", record)
+                self.assertIn("RE-CHECK NOT LINKED", err)
+                self.assertIn("Re-check: NOT LINKED (no verdict)", out)
+                self.assertNotIn("WITHIN BOUNDS", out)
+                self.assertNotIn("recheck_of", self.history()[-1])
 
 
 # =============================================================================

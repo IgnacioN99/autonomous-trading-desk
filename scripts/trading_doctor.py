@@ -188,6 +188,7 @@ def read_hook_heartbeat(base_dir: str, now_ts: float = None) -> dict:
         "tool": hb.get("tool"),
         "decision": hb.get("decision"),
         "last_seen_utc": hb.get("last_seen_utc"),
+        "gate_denial_recorder_errors": hb.get("gate_denial_recorder_errors"),
     }
 
 
@@ -343,6 +344,12 @@ def check_pretool_hook(base_dir: str = None, run_selftest: bool = True, timeout_
         report["info"].append(
             f"Hook heartbeat {hb['age_s']}s ago (hook={hb.get('hook')}, mode={hb.get('mode')}, tool={hb.get('tool')}, decision={hb.get('decision')})."
         )
+    recorder_errors = hb.get("gate_denial_recorder_errors")
+    if hb.get("present") and isinstance(recorder_errors, int) and not isinstance(recorder_errors, bool) \
+            and recorder_errors > 0:
+        # issue #275: informational only (lost logs/gate_denials.jsonl events of the shadow desk, never a gate)
+        report["info"].append(f"Gate-denial recorder errors: {recorder_errors} delta-gate denial event(s) not "
+                              "recorded in logs/gate_denials.jsonl (hook heartbeat counter; shadow desk only).")
 
     # Claude Code runtime, independent of the agy checks below (and of their early returns)
     claude_critical, claude_info = check_claude_hook_matcher(base_dir)
