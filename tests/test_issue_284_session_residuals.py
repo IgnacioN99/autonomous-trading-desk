@@ -329,9 +329,10 @@ class TestReporterBoundsAndSeverity(_BacklogCase):
                 self.assertEqual(self.posts, [])
                 self.assertEqual((self.entry()["issue_number"], self.entry()["count"]), (5, 2))
 
-    def test_open_issue_without_a_severity_label_still_deduplicates(self):
+    def test_open_issue_without_a_severity_label_deduplicates_medium_only(self):
+        # Issue #309: an unlabelled open issue no longer swallows a CRITICAL / HIGH report (see its own tests)
         self.open_with("agent-failure")
-        self.assertTrue(self.report("CRITICAL")["deduplicated"])
+        self.assertTrue(self.report("MEDIUM")["deduplicated"])
         self.assertEqual(self.posts, [])
         self.assertTrue(report_agent_issue.severity_outranks("CRITICAL", "HIGH"))
         for new, existing in (("HIGH", "HIGH"), ("LOW", "MEDIUM"), ("CRITICAL", None), (None, "LOW"), ("x", "LOW")):
@@ -419,11 +420,8 @@ class TestReporterBoundsAndSeverity(_BacklogCase):
         self.assertEqual(report_agent_issue.find_open_issue(self.fp, "owner/repo")["number"], 5)
 
 
-# The gh stub of #270 plus the open issue's labels (STUB_OPEN_ISSUE_SEVERITY)
-GH_STUB_WITH_LABELS = GH_STUB_WITH_LIST.replace(
-    '"body": "| **Fingerprint ID** | `%s` |"}]\' "$STUB_OPEN_ISSUE_FP"',
-    '"body": "| **Fingerprint ID** | `%s` |", "labels": [{"name": "severity:%s"}]}]\' "$STUB_OPEN_ISSUE_FP" '
-    '"${STUB_OPEN_ISSUE_SEVERITY:-high}"')
+# The gh stub of #270 (issue #309: it carries the open issue's severity label, STUB_OPEN_ISSUE_SEVERITY)
+GH_STUB_WITH_LABELS = GH_STUB_WITH_LIST
 
 
 @unittest.skipUnless(shutil.which("bash") and os.name != "nt", "requires a POSIX bash")
@@ -432,7 +430,7 @@ class TestReportIssueShHit(unittest.TestCase):
     TITLE, ERROR = "executor: SL unverified", "boom"
 
     def setUp(self):
-        self.assertNotEqual(GH_STUB_WITH_LABELS, GH_STUB_WITH_LIST)
+        self.assertIn("STUB_OPEN_ISSUE_SEVERITY", GH_STUB_WITH_LABELS)
         self.stub_dir = tempfile.mkdtemp()
         self.logs_dir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.stub_dir, True)
