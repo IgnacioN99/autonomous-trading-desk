@@ -425,7 +425,7 @@ class TestTrackerIntake(t251.TrackerBase):
         self.assertEqual(klines.call_args[0][1], (ev["ts"] - 300) * 1000)
 
     def test_idempotent(self):
-        ev = self.event()
+        ev = self.event(ts=int(time.time()) - 5000)   # > 3600 s before the c-sha event below (issue #262 window)
         self.write_events([ev, ev])   # the hook may append the same denial twice
         self.assertEqual(st.register_from_gate_denials(), 1)
         self.assertEqual(st.register_from_gate_denials(), 0)
@@ -480,7 +480,8 @@ class TestTrackerIntake(t251.TrackerBase):
         self.assertEqual(reg.call_count, st.GATE_DENIAL_TAIL_LINES)
 
     def test_runs_from_register_from_evaluation_without_opportunities(self):
-        self.write_events([self.event()])
+        # > 3600 s before the c-sha event below (issue #262 window dedupe)
+        self.write_events([self.event(ts=int(time.time()) - 5000)])
         self.assertEqual(st.register_from_evaluation(), 1)      # no brief file at all
         self.write_events([self.event(sha="c" * 64)])
         self.brief([])                                           # brief without filtered_opportunities
@@ -571,7 +572,8 @@ class TestAnalytics(unittest.TestCase):
         index = sa.build_blocker_index([], [], [])
         alone = sa.replay_policies([hook_row], index, swap_margin=10)
         self.assertEqual((alone["n_events"], alone["n_rows"]), (1, 1))
-        self.assertEqual(alone["policies"]["swap"]["placed"], 1)
+        # issue #262: the swap is evaluated (F outscores ZRO) and re-checked: F (100) would tip the book again
+        self.assertEqual((alone["policies"]["swap"]["placed"], alone["policies"]["swap"]["swap_blocked"]), (0, 1))
         self.assertIn(sa.HOOK_DENIAL_NOTE, alone["warnings"])
         # the same dossier's DELTA_GATE row (earlier snapshot) stays a separate event
         dossier_row = t251.resolved_row("a", "d1", "TRUE_NEGATIVE", pnl=-1.5, score=85, blockers=[zro],
@@ -590,8 +592,9 @@ class TestAnalytics(unittest.TestCase):
         res = sa.replay_policies(rows, t251.TestReplay().index(), resting_age_min=30, resting_weight=0.5,
                                  swap_margin=10)
         self.assertEqual((res["n_events"], res["n_rows"]), (2, 3))
+        # swap 0.5 (was 1.8 before #262): the swap's delta re-check denies F (see test_policy_totals)
         self.assertEqual({k: v["total_r"] for k, v in res["policies"].items()},
-                         {"current": 0.5, "resting_after_n_min": -0.5, "resting_fraction": 0.5, "swap": 1.8})
+                         {"current": 0.5, "resting_after_n_min": -0.5, "resting_fraction": 0.5, "swap": 0.5})
 
 
 if __name__ == "__main__":

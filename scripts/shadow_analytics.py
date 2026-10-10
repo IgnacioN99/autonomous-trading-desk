@@ -15,11 +15,18 @@ Delta-gate opportunity cost (issue #251; report-only, read-only: it never writes
      symbol + entry_id), else realized_r_net (NET) of its logs/trade_outcomes.jsonl row (KEYS mode only), joined by
      symbol + audit_ts (the blocker's, or the logs/trades_audit.jsonl record whose entry_order_id is its entry_id);
      anything else is blocker_unresolved (excluded, counted). Mean with a seeded cluster bootstrap CI (clusters =
-     dossier_sha256), by gate, score-delta bucket (blocked score - blocker score) and blocker kind; n, n_clusters and
-     insufficient_sample (n < MIN_SAMPLE) always printed, no conclusion below the minimum.
+     row_clusters: rows linked by dossier_sha256 or by the same symbol + direction within 3600 s, issue #262), by
+     gate, score-delta bucket (blocked score - blocker score) and blocker kind; n, n_clusters and
+     insufficient_sample (n < MIN_SAMPLE) always printed, no conclusion below the minimum. With unresolved blockers
+     (always in MCP mode) a sensitivity block imputes their R at -1R / 0R / +1.8R and says whether the sign changes.
   5. Policy replay of the DELTA_GATE rows' book snapshots: current rule, resting entries counted only after N
-     minutes or at a fraction weight, and swap (a candidate outscoring the weakest same-direction resting blocker by
-     >= X points cancels it and is placed). Total R, max drawdown in R and a net-delta exposure summary per policy.
+     minutes or at a fraction weight (candidate at full weight: printed WARNING), and swap (a candidate outscoring
+     the weakest same-direction resting blocker by >= X points cancels it and is placed, only if the delta gate
+     re-checked on the book without it allows the candidate: else swap_blocked; unverifiable: swap_unchecked).
+     Total R, max drawdown in R (blocker R dated at its trade_outcomes exit, else at its first event,
+     blocker_time_approx) and a net-delta exposure summary per policy. Unknown blocker R counts 0R in the
+     headline; when any is unknown a sensitivity block gives every policy's total R at -1R / 0R / +1.8R and the
+     imputations that change the policy ranking.
   DELTA_GATE_POST_APPROVAL (issue #261): the hook's denials of dossier-approved candidates, registered by
   shadow_tracker from logs/gate_denials.jsonl; in both 4 and 5 (each denial its own replay event) with a caveat:
   their book is the cached session state at denial time (source session_state_cache), and denials by the
@@ -40,6 +47,7 @@ from typing import List, Dict, Any, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from utils.portfolio_exposure import LONG_HEAVY, SHORT_HEAVY, book_exposure, project_order
+from shadow_tracker import DEDUPE_WINDOW_SECONDS, row_gate
 
 RESOLVED_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "logs", "shadow_resolved.jsonl"))
 TRADES_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "logs", "shadow_trades.jsonl"))
@@ -71,9 +79,18 @@ RANKING_NOTE = ("Ranking caveat: policies are counterfactuals replayed on a mode
                 "5m bars); promoting one to the live gate requires a reviewed PR and the owner's decision.")
 REPLAY_MODEL_NOTE = ("Replay model: the book is each dossier's registration snapshot; counterfactual placements stay in "
                      "the book until their shadow row resolved; the candidate's own notional is projected at full "
-                     "weight (Gate 1 new-order rule) even where resting entries are discounted, so the resting "
-                     "policies place conservatively; a swap does not re-check the delta gate; blockers with an "
-                     "unknown realized R count 0 R in every policy (blocker_r_unknown).")
+                     "weight (Gate 1 new-order rule) even where resting entries are discounted; a swap is made only "
+                     "when the delta gate re-checked on the book without the cancelled entry (full weight) allows the "
+                     "candidate, else nothing is cancelled or placed (swap_blocked; a book item without a notional "
+                     "cannot be re-checked: placed as before, swap_unchecked); a blocker's R is dated at its exit "
+                     "(trade_outcomes exit_ts), else at its first event (blocker_time_approx); blockers with an "
+                     "unknown realized R count 0 R in the headline totals (blocker_r_unknown; see the sensitivity).")
+RESTING_WEIGHT_WARNING = ("WARNING resting_after_n_min / resting_fraction: these are NOT faithful models of a rule that "
+                          "discounts resting entries; the candidate is projected at full weight while the book's "
+                          "resting entries are dropped or discounted, so their placed count and total R mix two "
+                          "weightings and understate what such a rule would place. Compare them only as rough bounds.")
+SENSITIVITY_R = (-1.0, 0.0, 1.8)  # R imputed to blockers with an unknown outcome (MCP mode: no trade_outcomes)
+CLUSTER_WINDOW_SECONDS = DEDUPE_WINDOW_SECONDS
 HOOK_DENIAL_NOTE = ("DELTA_GATE_POST_APPROVAL rows (issue #261) are the hook's denials of dossier-approved candidates: "
                     "their book is the cached logs/session_state.json at denial time (source session_state_cache, "
                     "possibly up to 300 s old), not the exchange; denials by the executor's own live Gate 1 are not "
@@ -224,14 +241,6 @@ def _num(value) -> Optional[float]:
     return f if math.isfinite(f) else None
 
 
-def row_gate(row: Dict[str, Any]) -> tuple:
-    """(gate, gate_source); same mapping as shadow_tracker.row_gate (rows before #251: legacy vol_ratio category)."""
-    gate = row.get("gate")
-    if isinstance(gate, str) and gate:
-        return gate, str(row.get("gate_source") or "unknown")
-    return ("DRY_VOLUME" if row.get("rejection_category") == "DRY_VOLUME_FAKE_TIER_S" else "OTHER"), "legacy_category"
-
-
 def shadow_r(row: Dict[str, Any]) -> Optional[float]:
     """Gross simulated R of a resolved shadow row: 0 when it never triggered (EXPIRED), else simulated_pnl_usdt /
     target_dollar_risk (None when either is missing or the risk is not positive)."""
@@ -279,13 +288,26 @@ def blocker_outcome(blocker: Dict[str, Any], index: Dict[str, Any]) -> tuple:
     resting = blocker.get("kind") == "resting"
     if resting and entry_id is not None and (sym, entry_id) in index["expired"]:
         return 0.0, "resting_expired_unfilled"
-    ts = _ts_key(blocker.get("audit_ts"))
-    if ts is None and entry_id is not None:
-        ts = index["audit_ts"].get((sym, entry_id))
-    row = index["outcomes"].get((sym, ts)) if ts is not None else None
+    row = _outcome_row(blocker, index)
     if row and row.get("status") == "closed" and _num(row.get("realized_r_net")) is not None:
         return _num(row.get("realized_r_net")), ("resting_filled" if resting else "position")
     return None, "unresolved"
+
+
+def _outcome_row(blocker: Dict[str, Any], index: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The blocker's trade_outcomes row, joined by symbol + audit_ts (its own, else via its entry_id), or None."""
+    sym = str(blocker.get("symbol") or "").upper()
+    ts = _ts_key(blocker.get("audit_ts"))
+    if ts is None and blocker.get("entry_id") is not None:
+        ts = index["audit_ts"].get((sym, str(blocker.get("entry_id"))))
+    return index["outcomes"].get((sym, ts)) if ts is not None else None
+
+
+def blocker_exit_ts(blocker: Dict[str, Any], index: Dict[str, Any]) -> Optional[float]:
+    """Close time in seconds of the blocker's closed trade_outcomes row (exit_ts is in ms), else None (issue #262)."""
+    row = _outcome_row(blocker, index)
+    exit_ms = _num(row.get("exit_ts")) if row and row.get("status") == "closed" else None
+    return exit_ms / 1000.0 if exit_ms is not None and exit_ms > 0 else None
 
 
 def score_delta_bucket(delta: Optional[float]) -> str:
@@ -300,15 +322,59 @@ def score_delta_bucket(delta: Optional[float]) -> str:
     return ">= 20"
 
 
-def regret_pairs(resolved: List[Dict[str, Any]], index: Dict[str, Any]) -> tuple:
-    """(pairs, counts): one pair per (resolved DELTA_GATE / DUPLICATE_RESTING row, blocker with a known outcome)."""
+def row_clusters(rows: List[Dict[str, Any]]) -> List[str]:
+    """Bootstrap cluster label per row (issue #262): connected components of the rows that share a dossier_sha256 or
+    have the same (symbol, direction) registered within CLUSTER_WINDOW_SECONDS of each other (chained in time order),
+    so one candidate re-rejected by several dossiers never counts as independent clusters. Unlike the registration
+    dedupe window (shadow_tracker, measured from the first row, no chaining) this chains: rows 0 s, 3000 s and 6000 s
+    apart are one cluster. Label: the smallest dossier_sha256 (else id) of the component."""
+    parent = list(range(len(rows)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    first_by_sha: Dict[str, int] = {}
+    by_candidate: Dict[tuple, List[tuple]] = {}
+    for i, r in enumerate(rows):
+        sha = r.get("dossier_sha256")
+        if isinstance(sha, str) and sha:
+            union(first_by_sha.setdefault(sha, i), i)
+        ts = _num(r.get("registered_at_ts"))
+        if ts is not None:
+            key = (str(r.get("symbol") or "").upper(), str(r.get("direction") or "").upper())
+            by_candidate.setdefault(key, []).append((ts, i))
+    for members in by_candidate.values():
+        members.sort()
+        for (t0, a), (t1, b) in zip(members, members[1:]):
+            if t1 - t0 < CLUSTER_WINDOW_SECONDS:
+                union(a, b)
+    labels: Dict[int, str] = {}
+    for i, r in enumerate(rows):
+        label = str(r.get("dossier_sha256") or r.get("id"))
+        root = find(i)
+        labels[root] = min(labels.get(root, label), label)
+    return [labels[find(i)] for i in range(len(rows))]
+
+
+def regret_pairs(resolved: List[Dict[str, Any]], index: Dict[str, Any],
+                 unresolved: Optional[List[Dict[str, Any]]] = None) -> tuple:
+    """(pairs, counts): one pair per (resolved DELTA_GATE / DUPLICATE_RESTING row, blocker with a known outcome);
+    cluster = row_clusters. unresolved (optional list): receives {"cluster", "shadow_r", "expired"} per blocker
+    without a known outcome (the sensitivity imputes its R)."""
     pairs = []
     counts = {"rows": 0, "no_shadow_r": 0, "no_blockers": 0, "blockers_error": 0, "expired_blocked_rows": 0,
               "blocker_unresolved": 0}
-    for r in resolved:
+    rows = [r for r in resolved if row_gate(r)[0] in REGRET_GATES]
+    for r, cluster in zip(rows, row_clusters(rows)):
         gate, _source = row_gate(r)
-        if gate not in REGRET_GATES:
-            continue
         counts["rows"] += 1
         sr = shadow_r(r)
         if sr is None:
@@ -328,10 +394,12 @@ def regret_pairs(resolved: List[Dict[str, Any]], index: Dict[str, Any]) -> tuple
             realized, kind = blocker_outcome(b, index)
             if realized is None:
                 counts["blocker_unresolved"] += 1
+                if unresolved is not None:
+                    unresolved.append({"cluster": cluster, "shadow_r": sr, "expired": expired})
                 continue
             b_score = _num(b.get("score"))
             delta = score - b_score if score is not None and b_score is not None else None
-            pairs.append({"cluster": r.get("dossier_sha256") or r.get("id"), "row_id": r.get("id"), "gate": gate,
+            pairs.append({"cluster": cluster, "row_id": r.get("id"), "gate": gate,
                           "symbol": r.get("symbol"), "direction": r.get("direction"),
                           "blocker_symbol": b.get("symbol"), "blocker_kind": kind, "shadow_r": round(sr, 6),
                           "blocker_r": round(realized, 6), "regret_r": round(sr - realized, 6),
@@ -374,12 +442,25 @@ def bootstrap_mean_ci(pairs: List[Dict[str, Any]], resamples: int = DEFAULT_RESA
 def regret_report(resolved: List[Dict[str, Any]], guardian_actions: List[Dict[str, Any]],
                   trade_outcomes: List[Dict[str, Any]], trades_audit: List[Dict[str, Any]],
                   resamples: int = DEFAULT_RESAMPLES, seed: int = DEFAULT_SEED) -> Dict[str, Any]:
-    """Regret of the delta gate (and duplicate-resting rule) in R; conservative definition first."""
-    pairs, counts = regret_pairs(resolved, build_blocker_index(guardian_actions, trade_outcomes, trades_audit))
+    """Regret of the delta gate (and duplicate-resting rule) in R; conservative definition first. The headline
+    excludes blockers without a known outcome; when there are any (always in MCP mode), "sensitivity" holds the
+    conservative statistics with their R imputed at each SENSITIVITY_R (issue #262), else None."""
+    unresolved: List[Dict[str, Any]] = []
+    pairs, counts = regret_pairs(resolved, build_blocker_index(guardian_actions, trade_outcomes, trades_audit),
+                                 unresolved)
 
     def split(field, labels):
         return {label: bootstrap_mean_ci([p for p in pairs if p[field] == label], resamples, seed)
                 for label in labels if any(p[field] == label for p in pairs)}
+
+    sensitivity = None
+    if unresolved:
+        stats = {_r_label(v): bootstrap_mean_ci(
+            pairs + [{"cluster": u["cluster"], "regret_r": round(u["shadow_r"] - v, 6)} for u in unresolved],
+            resamples, seed) for v in SENSITIVITY_R}
+        signs = {label: (s["mean_regret_r"] > 0) - (s["mean_regret_r"] < 0) for label, s in stats.items()}
+        sensitivity = {"unknown_blockers": len(unresolved), "by_imputed_r": stats,
+                       "sign_changes": len(set(signs.values())) > 1}
 
     return {
         "definition": "conservative",
@@ -388,9 +469,13 @@ def regret_report(resolved: List[Dict[str, Any]], guardian_actions: List[Dict[st
         "by_gate": split("gate", REGRET_GATES),
         "by_score_delta": split("score_delta_bucket", SCORE_DELTA_BUCKETS),
         "by_blocker_kind": split("blocker_kind", ("position", "resting_filled", "resting_expired_unfilled")),
-        "counts": counts, "min_sample": MIN_SAMPLE, "pairs": pairs,
+        "counts": counts, "min_sample": MIN_SAMPLE, "pairs": pairs, "sensitivity": sensitivity,
         "warnings": [CONSERVATIVE_NOTE, GROSS_NET_NOTE, SELECTION_BIAS_NOTE, HOOK_DENIAL_NOTE],
     }
+
+
+def _r_label(value: float) -> str:
+    return f"{value:+g}R" if value else "0R"
 
 
 def candidate_notional(row: Dict[str, Any]) -> tuple:
@@ -418,9 +503,16 @@ def _gate_allows(long_n: float, short_n: float, is_long: bool, notional: float) 
 def _item_key(item: Dict[str, Any]) -> tuple:
     """Trade identity of a book item / blocker: (symbol, direction, entry_id), without kind, so a resting entry and
     the position it filled into (same entry_id, execute_futures_trade -> active_positions.entry_order_id) are one
-    trade: its R counts once and a swap's cancellation drops both. Without an entry_id the kind stays in the key."""
+    trade: its R counts once and a swap's cancellation drops both. Without an entry_id the kind stays in the key
+    plus the item's own start time (since_ts, else audit_ts), so two trades of one symbol / direction at different
+    times never collapse into one (issue #262); with neither, the time cannot be checked and the item keeps the
+    collapsed pre-#262 key (one trade per symbol / direction / kind, never counted twice)."""
     sym, direction = str(item.get("symbol") or "").upper(), str(item.get("direction") or "").upper()
     if item.get("entry_id") is None:
+        for field in ("since_ts", "audit_ts"):
+            ts = _ts_key(item.get(field))
+            if ts is not None:
+                return (sym, direction, None, item.get("kind"), field, ts)
         return (sym, direction, None, item.get("kind"))
     return (sym, direction, str(item.get("entry_id")))
 
@@ -442,9 +534,39 @@ def replay_policies(resolved: List[Dict[str, Any]], index: Dict[str, Any],
     current (nothing placed), resting_after_n_min (a resting entry counts toward delta only once it is
     resting_age_min old; unknown age counts), resting_fraction (resting entries count at resting_weight) and swap (a
     candidate whose score beats the weakest scored same-direction resting blocker by >= swap_margin cancels it and is
-    placed). Candidates of one event are taken by score, highest first; a placement joins the book (as a resting
-    entry) until its shadow row resolved. Total R = placed candidates' shadow R + realized R of the events'
-    blockers not cancelled (unknown: 0 R, counted); exposure = the full-weight book after each event's decisions."""
+    placed, only if the delta gate re-checked on the book without that entry allows it, issue #262: else swap_blocked
+    and nothing changes; a book item without a notional: placed without re-check, swap_unchecked). Candidates of one
+    event are taken by score, highest first; a placement joins the book (as a resting entry) until its shadow row
+    resolved. Total R = placed candidates' shadow R + realized R of the events' blockers not cancelled, dated at
+    their exit (trade_outcomes exit_ts) else at their first event (blocker_time_approx); unknown blocker R counts
+    0 R in the headline, and when any is unknown "sensitivity" holds every policy's total R with it at each
+    SENSITIVITY_R, the ranking (best first) under each, the imputations that reverse a strict 0R order
+    (ranking_changes) and those whose ranking differs only by ties (ranking_ties) (else None).
+    Exposure = the full-weight book after each event's decisions."""
+    out = _replay(resolved, index, resting_age_min, resting_weight, swap_margin, 0.0)
+    out["sensitivity"] = None
+    if out["blocker_r_unknown"]:
+        totals = {}
+        for v in SENSITIVITY_R:
+            res = out if v == 0.0 else _replay(resolved, index, resting_age_min, resting_weight, swap_margin, v)
+            totals[_r_label(v)] = {name: m["total_r"] for name, m in res["policies"].items()}
+        ranking = {label: sorted(t, key=lambda n: (-t[n], REPLAY_POLICIES.index(n))) for label, t in totals.items()}
+        base = totals["0R"]
+        changes, ties = [], []
+        for label, t in totals.items():
+            if ranking[label] == ranking["0R"]:
+                continue
+            # a real change reverses a strict order; otherwise only ties (broken by REPLAY_POLICIES order) differ
+            reversed_ = any(base[x] > base[y] and t[y] > t[x] for x in t for y in t)
+            (changes if reversed_ else ties).append(label)
+        out["sensitivity"] = {"unknown_blockers": out["blocker_r_unknown"], "total_r": totals, "ranking": ranking,
+                              "ranking_changes": changes, "ranking_ties": ties}
+    return out
+
+
+def _replay(resolved: List[Dict[str, Any]], index: Dict[str, Any], resting_age_min: float, resting_weight: float,
+            swap_margin: float, unknown_r: float) -> Dict[str, Any]:
+    """replay_policies with blockers of unknown outcome counted at unknown_r."""
     rows = [r for r in resolved if row_gate(r)[0] in REPLAY_GATES]
     skipped = {"no_book": 0, "no_shadow_r": 0, "notional_missing": 0}
     events: Dict[Any, Dict[str, Any]] = {}
@@ -470,13 +592,19 @@ def replay_policies(resolved: List[Dict[str, Any]], index: Dict[str, Any],
     ordered = sorted(events.items(), key=lambda kv: (kv[1]["ts"], str(kv[0])))
 
     blocker_r: Dict[tuple, Optional[float]] = {}
-    blocker_first_ts: Dict[tuple, float] = {}
+    blocker_ts: Dict[tuple, float] = {}
+    blocker_time_approx = 0
     for _key, ev in ordered:
         for row in ev["rows"]:
             for b in row.get("blockers") or []:
-                if isinstance(b, dict) and _item_key(b) not in blocker_r:
-                    blocker_r[_item_key(b)] = blocker_outcome(b, index)[0]
-                    blocker_first_ts[_item_key(b)] = ev["ts"]
+                if not isinstance(b, dict) or _item_key(b) in blocker_r:
+                    continue
+                key = _item_key(b)
+                realized, kind = blocker_outcome(b, index)
+                blocker_r[key] = realized
+                exit_ts = blocker_exit_ts(b, index) if kind in ("position", "resting_filled") else None
+                blocker_time_approx += int(kind in ("position", "resting_filled") and exit_ts is None)
+                blocker_ts[key] = exit_ts if exit_ts is not None else ev["ts"]
     book_notional_missing = sum(1 for _k, ev in ordered for i in ev["book"]
                                 if isinstance(i, dict) and _num(i.get("notional")) is None)
 
@@ -505,7 +633,7 @@ def replay_policies(resolved: List[Dict[str, Any]], index: Dict[str, Any],
     for name in REPLAY_POLICIES:
         mode = modes[name]
         cancelled, placed, contributions, series, placements = set(), [], [], [], []
-        swapped = 0
+        swapped = swap_blocked = swap_unchecked = 0
         for _key, ev in ordered:
             ts = ev["ts"]
             items = [i for i in ev["book"] if isinstance(i, dict) and _item_key(i) not in cancelled]
@@ -524,10 +652,18 @@ def replay_policies(resolved: List[Dict[str, Any]], index: Dict[str, Any],
                     if score is not None and eligible:
                         weakest = min(eligible, key=lambda i: (_num(i.get("score")), str(i.get("entry_id"))))
                         if score - _num(weakest.get("score")) >= swap_margin:
-                            cancelled.add(_item_key(weakest))
-                            items = [i for i in items if _item_key(i) != _item_key(weakest)]
-                            swapped += 1
-                            place = True
+                            wkey = _item_key(weakest)
+                            rest = [i for i in items if _item_key(i) != wkey]
+                            if any(_num(i.get("notional")) is None for i in rest):
+                                swap_unchecked += 1   # no faithful projection: placed as before #262
+                                place = True
+                            else:
+                                place = _gate_allows(*sums(rest, ts, "current"), is_long, row["_notional"])
+                                swap_blocked += int(not place)
+                            if place:
+                                cancelled.add(wkey)
+                                items = rest
+                                swapped += 1
                 if place:
                     until = _num(row.get("resolved_at_ts")) or ts
                     p = {"kind": "resting", "symbol": row.get("symbol"), "direction": row.get("direction"),
@@ -543,12 +679,13 @@ def replay_policies(resolved: List[Dict[str, Any]], index: Dict[str, Any],
                            "delta_ratio": round(exp["delta_ratio"], 6), "delta_bias": exp["delta_bias"]})
         for key, r in blocker_r.items():
             if key not in cancelled:
-                contributions.append((blocker_first_ts[key], r or 0.0))
+                contributions.append((blocker_ts[key], unknown_r if r is None else r))
         abs_ratios = [abs(s["delta_ratio"]) for s in series]
         policies[name] = {
             "total_r": round(sum(r for _ts, r in contributions), 6),
             "max_drawdown_r": _max_drawdown(contributions),
-            "placed": len(placements), "swapped": swapped, "placements": placements,
+            "placed": len(placements), "swapped": swapped, "swap_blocked": swap_blocked,
+            "swap_unchecked": swap_unchecked, "placements": placements,
             "exposure": {"points": len(series),
                          "mean_abs_delta_ratio": round(sum(abs_ratios) / len(abs_ratios), 6) if abs_ratios else None,
                          "max_abs_delta_ratio": round(max(abs_ratios), 6) if abs_ratios else None,
@@ -562,9 +699,10 @@ def replay_policies(resolved: List[Dict[str, Any]], index: Dict[str, Any],
                        "swap_margin": swap_margin},
             "skipped": skipped, "notional_derived": notional_derived, "book_notional_missing": book_notional_missing,
             "blockers": len(blocker_r), "blocker_r_unknown": sum(1 for r in blocker_r.values() if r is None),
+            "blocker_time_approx": blocker_time_approx, "unknown_blocker_r": unknown_r,
             "policies": policies,
-            "warnings": [IN_SAMPLE_NOTE, RANKING_NOTE, SELECTION_BIAS_NOTE, REPLAY_MODEL_NOTE, GROSS_NET_NOTE,
-                         HOOK_DENIAL_NOTE]}
+            "warnings": [IN_SAMPLE_NOTE, RANKING_NOTE, SELECTION_BIAS_NOTE, REPLAY_MODEL_NOTE, RESTING_WEIGHT_WARNING,
+                         GROSS_NET_NOTE, HOOK_DENIAL_NOTE]}
 
 
 def _fmt_r(value) -> str:
@@ -593,6 +731,15 @@ def format_delta_gate_report(regret: Dict[str, Any], replay: Dict[str, Any]) -> 
     lines.append(f"  rows {c['rows']} | expired blocked rows {c['expired_blocked_rows']} (0 R) | blocker_unresolved "
                  f"{c['blocker_unresolved']} (excluded) | no shadow R {c['no_shadow_r']} | no blockers "
                  f"{c['no_blockers']} (snapshot errors {c['blockers_error']})")
+    sens = regret.get("sensitivity")
+    if sens:
+        lines.append(f"  Sensitivity (headline above excludes the {sens['unknown_blockers']} blocker(s) with unknown "
+                     f"R, e.g. MCP mode without trade_outcomes; here they are imputed):")
+        for label, s in sens["by_imputed_r"].items():
+            lines.append(_stat_line(f"unknown blocker R = {label}", s))
+        lines.append("  The sign of the mean regret " + ("CHANGES with the imputed blocker R: no conclusion on its sign."
+                                                         if sens["sign_changes"] else
+                                                         "is the same under every imputation."))
     cons = regret["conservative"]
     if cons["insufficient_sample"]:
         lines.append(f"  insufficient_sample: n={cons['n']} < {regret['min_sample']}: no conclusion.")
@@ -607,8 +754,12 @@ def format_delta_gate_report(regret: Dict[str, Any], replay: Dict[str, Any]) -> 
     p = replay["params"]
     lines.append(f"  events {replay['n_events']} (rows {replay['n_rows']}) | skipped {replay['skipped']} | notional "
                  f"derived {replay['notional_derived']} | blocker R unknown {replay['blocker_r_unknown']}/"
-                 f"{replay['blockers']} | N={p['resting_age_min']:g} min, weight={p['resting_weight']:g}, "
-                 f"swap X={p['swap_margin']:g}")
+                 f"{replay['blockers']} | blocker_time_approx {replay.get('blocker_time_approx', 0)} | "
+                 f"N={p['resting_age_min']:g} min, weight={p['resting_weight']:g}, swap X={p['swap_margin']:g}")
+    sens = replay.get("sensitivity")
+    if sens:
+        lines.append(f"  Headline total R counts the {sens['unknown_blockers']} blocker(s) with unknown R at 0R "
+                     f"(see the sensitivity below).")
     lines.append(f"  {'policy':<22}{'total R':>10}{'maxDD R':>10}{'placed':>8}{'swapped':>9}{'mean|dr|':>10}"
                  f"{'heavy %':>9}")
     for name, m in replay["policies"].items():
@@ -617,6 +768,24 @@ def format_delta_gate_report(regret: Dict[str, Any], replay: Dict[str, Any]) -> 
         heavy = "-" if e["heavy_share"] is None else f"{e['heavy_share'] * 100:.1f}"
         lines.append(f"  {name:<22}{m['total_r']:>+10.3f}{m['max_drawdown_r']:>10.3f}{m['placed']:>8}"
                      f"{m['swapped']:>9}{mean_dr:>10}{heavy:>9}")
+    swap = replay["policies"].get("swap")
+    if swap is not None:
+        lines.append(f"  swap re-check (delta gate on the book without the cancelled entry): swap_blocked "
+                     f"{swap.get('swap_blocked', 0)} | swap_unchecked {swap.get('swap_unchecked', 0)} (book item "
+                     f"without notional: placed without re-check)")
+    if sens:
+        lines.append(f"  Sensitivity, total R with unknown blocker R imputed ({sens['unknown_blockers']} blocker(s)):")
+        for label, totals in sens["total_r"].items():
+            tag = " (headline)" if label == "0R" else ""
+            lines.append(f"    unknown = {label:<6}" + " | ".join(f"{n} {totals[n]:+.3f}" for n in totals) + tag)
+        order = " > ".join(sens["ranking"]["0R"])
+        ties = sens.get("ranking_ties") or []
+        for labels, verb in ((sens["ranking_changes"], "CHANGES at"), (ties, "differs only by a tie at")):
+            if labels:
+                lines.append(f"  Policy ranking at 0R ({order}) {verb} "
+                             + ", ".join(f"{label} ({' > '.join(sens['ranking'][label])})" for label in labels) + ".")
+        if not sens["ranking_changes"] and not ties:
+            lines.append(f"  Policy ranking unchanged at every imputation: {order}.")
     if replay["insufficient_sample"]:
         lines.append(f"  insufficient_sample: {replay['n_events']} event(s) < {replay['min_sample']}: no ranking.")
     lines.append("=" * 80)
