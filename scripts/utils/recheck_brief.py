@@ -486,9 +486,18 @@ def prepare_recheck(spec: Any, target_env: str, base_dir: str, run_id: Optional[
 
 
 def recheck_summary(brief: dict) -> str:
-    """One Markdown line for the parent: the re-check result and the confirmed plan it re-checks."""
+    """One Markdown line for the parent: the re-check result and the confirmed plan it re-checks (issue #298: with
+    the plan's evaluated-at and valid-until times in UTC, `unknown` when absent)."""
     rc, old = brief.get("recheck") or {}, brief.get("recheck_of") or {}
+
+    def _utc(ts):
+        try:
+            return datetime.datetime.fromtimestamp(int(ts), datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        except (TypeError, ValueError, OverflowError, OSError):
+            return "unknown"
+
     return (f"**Re-check:** {rc.get('symbol')} {rc.get('direction')} -> `{rc.get('setup_status')}`"
             + (f" ({rc['cause']})" if rc.get("cause") else "")
             + f" | re-checks dossier sha256 {str(old.get('sha256'))[:16]}… (Tier {old.get('tier')}, entry "
-              f"{old.get('entry')}, SL {old.get('stop_loss')}, TP2 {old.get('tp2')})")
+              f"{old.get('entry')}, SL {old.get('stop_loss')}, TP2 {old.get('tp2')}; evaluated at "
+              f"{_utc(old.get('evaluated_ts'))}, valid until {_utc(old.get('valid_until_ts'))})")

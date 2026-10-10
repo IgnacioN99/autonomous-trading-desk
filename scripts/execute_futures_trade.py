@@ -125,7 +125,8 @@ JSON schemas (stable; extra keys may be added, existing keys are never renamed):
   trade deployment: {"success": bool, "symbol", "direction", "leverage", "entry_price", "total_qty",
       "sl_price", "tp1_price", "tp2_price", ..., "error"?: str, "hard_gate_rejection"?: bool}
       Resting entries (untriggered STOP_MARKET via the algo order API, resting LIMIT) return
-      "conditional_entry" / "pending_limit_entry": true and "pending_entry_key"; they are recorded in
+      "conditional_entry" / "pending_limit_entry": true, "pending_entry_key", "expires_at_ts" and (issue #298)
+      "placed_at_ts", "placed_at_utc", "expires_at_utc"; they are recorded in
       logs/pending_entries.json, require a live position guardian in PROD and count against max_open_positions.
       Issue #36: on KEYS the planned SL of a resting LIMIT is pre-armed as a closePosition stop when not crossed
       ("prearm_status": "placed" | "rejected:<code-or-text>" | "skipped:mcp" | "skipped:no_position" |
@@ -2469,6 +2470,18 @@ def register_resting_entry(kind, entry_id, symbol, direction, entry_side, exit_s
         record['daily_loss_gate'] = daily_loss_gate
     update_pending_entries(lambda entries: entries.__setitem__(key, record))
     return key, record
+
+
+def _placement_times(rec):
+    """Issue #298 item 7: placed_at_ts, placed_at_utc and expires_at_utc of a registry record for the result JSON of a
+    resting entry (a UTC text is None when its timestamp is missing or unparseable)."""
+    def utc(ts):
+        try:
+            return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(int(ts)))
+        except (TypeError, ValueError, OverflowError, OSError):
+            return None
+    return {"placed_at_ts": rec.get('placed_at_ts'), "placed_at_utc": utc(rec.get('placed_at_ts')),
+            "expires_at_utc": utc(rec.get('expires_at_ts'))}
 
 
 def _rejection_text(res):
@@ -4896,6 +4909,7 @@ def _execute_complete_trade_pass(
                         "quantity": total_qty,
                         "pending_entry_key": key,
                         "expires_at_ts": rec['expires_at_ts'],
+                        **_placement_times(rec),   # issue #298 item 7
                         "prearm_status": prearm['prearm_status'],
                         "prearm_algo_id": prearm.get('prearm_algo_id'),
                         "message": (f"Conditional STOP_MARKET entry placed at {trigger_p} (algo order {order_id}). "
@@ -4994,6 +5008,7 @@ def _execute_complete_trade_pass(
             "status": entry_status,
             "pending_entry_key": key,
             "expires_at_ts": rec['expires_at_ts'],
+            **_placement_times(rec),   # issue #298 item 7
             "message": (f"LIMIT order placed at {lim_p} (order ID: {entry_order.get('orderId')}). "
                         + (_prearm_note(prearm, sl_p) if prearm else "") +
                         "TP orders (and the SL when not pre-armed) deferred until fill "

@@ -25,6 +25,9 @@ dossier_provenance.check_precondition_checklist): an inconsistent APPROVED dossi
 and recorded with a warning in TESTNET; REJECTED/NEUTRAL dossiers are always recorded, with a warning.
 The PROD trade gate re-runs the same check on the transcript (dossier_provenance.rebuild_verified_record).
 Dossiers typed by hand are NOT accepted in PROD.
+Issue #298: the summary prints the brief's generated_at, the evaluation time and the validity as UTC date-times, and
+per approved candidate an advisory `Delta (est.)` line plus the approved set's ratio (utils/delta_fit.py, cached book
+and brief risk_profile only; UNKNOWN when unverifiable; nothing stored, no exchange call; Gate 1 decides).
 
 Legacy manual paths (TESTNET only, stored as schema_version 1 / source "manual_testnet"):
   python3 scripts/record_evaluation.py --env testnet --symbols TIAUSDT,SAGAUSDT --directions LONG,SHORT
@@ -324,6 +327,42 @@ def _recheck_deadline(record: dict) -> Optional[int]:
         return None
 
 
+def _delta_preview(record: dict, base: str, now_ts: int, cands: list) -> tuple:
+    """Issue #298 item 4: (per-candidate line lists, summary line) of the advisory post-trade delta preview
+    (utils/delta_fit.py) from the cached book (logs/session_state.json, logs/pending_entries.json) and the brief the
+    dossier was evaluated on. Reads files only: no network, no signed request, no write. Never raises: any failure
+    is UNKNOWN."""
+    try:
+        from utils import delta_fit as df
+        logs = os.path.join(base, "logs")
+        env = str(record.get("target_env") or "").lower()
+        if env == "testnet":  # the executor skips Gate 1 in TESTNET
+            return ([[f"Delta (est.): {df.TESTNET_NA}"] for _ in cands],
+                    f"Delta (est.) of the approved set: {df.TESTNET_NA}")
+
+        def _load(name):
+            try:
+                with open(os.path.join(logs, name), "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                return None
+
+        records, reg_err = df.load_registry_records(logs, env)
+        book, reason = df.book_from_state(_load("session_state.json"), records, reg_err, env, now_ts)
+        brief, raw = _load("primed_brief.json"), (record.get("raw_payload") or {}).get("brief_generated_at_ts")
+        rows = []
+        for c in cands:
+            c = c if isinstance(c, dict) else {}
+            notional, why = df.estimate_notional(c, brief, raw)
+            rows.append({"symbol": c.get("symbol"), "direction": c.get("direction"), "notional_estimate": notional,
+                         "reason": why})
+        result = df.evaluate(book, reason, rows)
+        return [df.format_candidate(r, env) for r in result["candidates"]], df.format_summary(result, len(rows))
+    except Exception as e:
+        unknown = f"Delta (est.): UNKNOWN (preview failed: {type(e).__name__})"
+        return [[unknown] for _ in cands], f"Delta (est.) of the approved set: UNKNOWN (preview failed: {type(e).__name__})"
+
+
 def _print_summary(record: dict, dossier_file: str, base: str, now_ts: int,
                    recheck_not_linked: bool = False, superseded: Optional[list] = None,
                    brief_replaced: bool = False) -> None:
@@ -333,11 +372,18 @@ def _print_summary(record: dict, dossier_file: str, base: str, now_ts: int,
     remaining = max(0, valid_until - now_ts)
     print(f"✅ EVALUATION DOSSIER RECORDED | env: {str(record.get('target_env', '')).upper()} | status: {status}")
     print(f"   Evaluator: {record.get('evaluator_agent')} | conversation: {record.get('conversation_id')}")
-    print(f"   Evaluated at: {record.get('timestamp_utc')} | Valid until: {_fmt_utc(valid_until, '%H:%M:%S UTC')} "
+    try:  # issue #298 item 7: the brief the dossier was evaluated on
+        brief_at = _fmt_utc((record.get("raw_payload") or {})["brief_generated_at_ts"])
+    except Exception:
+        brief_at = "unknown"
+    print(f"   Brief generated at: {brief_at}")
+    print(f"   Evaluated at: {record.get('timestamp_utc')} | Valid until: {_fmt_utc(valid_until)} "
           f"({remaining // 60}m {remaining % 60:02d}s left)")
     if status == "APPROVED" and cands:
         print(f"   Approved ({len(cands)}):")
-        for c in cands:
+        delta_lines, delta_summary = _delta_preview(record, base, now_ts, cands)
+        for i, c in enumerate(cands):
+            lines = delta_lines[i] if i < len(delta_lines) else ["Delta (est.): UNKNOWN (preview failed)"]
             direction = c.get("direction") or "UNKNOWN DIRECTION (will be rejected in PROD)"
             confirm = c.get("requires_user_confirmation")
             if confirm is None:
@@ -353,6 +399,9 @@ def _print_summary(record: dict, dossier_file: str, base: str, now_ts: int,
             if c.get("is_yolo"):
                 extras.append("YOLO")
             print(f"     - {c['symbol']} {direction} | {flag}" + (f" | {' '.join(extras)}" if extras else ""))
+            for line in lines:  # issue #298 item 4: advisory, read before asking the user
+                print(f"       {line}")
+        print(f"   {delta_summary}")
     else:
         print("   No trade authorized by this dossier.")
     if record.get("summary"):
