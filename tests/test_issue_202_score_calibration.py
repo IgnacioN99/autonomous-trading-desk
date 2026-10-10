@@ -1196,6 +1196,11 @@ class TestPromptAndDocs(unittest.TestCase):
         rejected = [l for l in text.splitlines() if '"gate": ' in l]
         self.assertEqual(text.count('"score": ') - sum(l.count('"score": ') for l in rejected), 6)
         self.assertEqual(sum(l.count('"score": null') for l in rejected), 7)
+        # issue #262: every gate line carries exactly one score and it is null, so a numeric score on a gate line
+        # fails here instead of escaping both counts above
+        self.assertEqual(len(rejected), 7)
+        for line in rejected:
+            self.assertEqual((line.count('"score": '), line.count('"score": null')), (1, 1), line)
         self.assertIn("RLCUSDT Tier A, confidence 64 = score 64", text)
         self.assertIn("NEARUSDT Tier A, confidence 72 = score 72", text)
         self.assertIn('"leverage": 5, "score": null, "is_yolo": true', text)

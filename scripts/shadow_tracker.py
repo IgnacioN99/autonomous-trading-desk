@@ -13,7 +13,8 @@ Rejection reason (issue #251): the dossier may carry `rejected_candidates: [{sym
 (gate in GATE_ENUM). A candidate with a typed entry gets gate_source "dossier"; without one the vol_ratio heuristic
 stays as a flagged fallback (gate_source "heuristic_vol_ratio"). Malformed entries are dropped or mapped to OTHER and
 flagged (normalize_rejected_candidates), never refused. Rows also carry score, dossier_sha256 (one registration per
-dossier_sha256 + symbol + direction, resolved rows included) and, for DELTA_GATE / DUPLICATE_RESTING, a best-effort
+dossier_sha256 + symbol + direction, resolved rows included, and, issue #262, one per symbol + direction + gate within
+DEDUPE_WINDOW_SECONDS across dossiers, counted as deduped_window) and, for DELTA_GATE / DUPLICATE_RESTING, a best-effort
 snapshot of the blocking positions / resting entries ("blockers") and of the whole book ("book") read from
 logs/pending_entries.json, logs/session_state.json and logs/trades_audit.jsonl. Report-only: nothing here gates an
 order. Regret and the policy replay are computed in scripts/shadow_analytics.py.
@@ -43,6 +44,9 @@ from typing import Dict, Any, List, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from utils.atomic_writer import atomic_write_json, atomic_append_jsonl
+# Shared with shadow_analytics.py (issue #290), re-exported here: st.GATE_ENUM, st.row_gate, ... keep working
+from utils.shadow_common import (  # noqa: F401
+    GATE_ENUM, GATE_FALLBACK, POST_APPROVAL_GATE, BLOCKER_GATES, DEDUPE_WINDOW_SECONDS, row_gate)
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOGS_DIR = os.path.join(BASE_DIR, "logs")
@@ -55,13 +59,7 @@ SESSION_STATE_FILE = os.path.join(LOGS_DIR, "session_state.json")
 TRADES_AUDIT_FILE = os.path.join(LOGS_DIR, "trades_audit.jsonl")
 GATE_DENIALS_FILE = os.path.join(LOGS_DIR, "gate_denials.jsonl")
 
-# Typed rejection reasons of the dossier's rejected_candidates (issue #251). K5 squeeze risk only caps a tier.
-# DELTA_GATE_POST_APPROVAL (issue #261) is assigned by the hook's denial log, never by the evaluator.
-GATE_ENUM = ("DELTA_GATE", "MACRO_SHORT", "DUPLICATE_RESTING", "DRY_VOLUME", "FRICTION", "CATALYST_DOWNGRADE",
-             "UNREADABLE_BOOK", "DAILY_LOSS_GATE", "OTHER", "DELTA_GATE_POST_APPROVAL")
-GATE_FALLBACK = "OTHER"
-POST_APPROVAL_GATE = "DELTA_GATE_POST_APPROVAL"
-BLOCKER_GATES = ("DELTA_GATE", "DUPLICATE_RESTING", POST_APPROVAL_GATE)
+# GATE_ENUM, GATE_FALLBACK, POST_APPROVAL_GATE, BLOCKER_GATES, DEDUPE_WINDOW_SECONDS: utils/shadow_common.py
 GATE_DETAIL_MAX_CHARS = 300
 GATE_DENIAL_MAX_AGE_SECONDS = 86400  # older events would expire at once in the kline audit (24 h)
 GATE_DENIAL_TAIL_LINES = 500
@@ -127,21 +125,40 @@ def register_shadow_trade(
     score: Optional[float] = None,
     dossier_sha256: Optional[str] = None,
     extra: Optional[dict] = None,
-    registered_at_ts: Optional[int] = None
+    registered_at_ts: Optional[int] = None,
+    stats: Optional[dict] = None,
+    dedupe_ref_ts: Optional[float] = None
 ) -> Optional[dict]:
     """Registers a rejected setup into shadow_trades.jsonl if not already active.
-    With dossier_sha256: at most one row per (dossier_sha256, symbol, direction), also after it resolved (issue #251);
-    without it: no second active/pending row for the symbol within 60 minutes. extra: additional row keys (blockers).
-    registered_at_ts: the rejection's own time when it is registered later (issue #261: the kline audit starts
-    there), else now."""
+    With dossier_sha256: at most one row per (dossier_sha256, symbol, direction), also after it resolved (issue #251),
+    and none when a row (pending or resolved, any dossier) with the same (symbol, direction, gate) was registered
+    within DEDUPE_WINDOW_SECONDS of this one (issue #262: a candidate re-rejected by every new dossier counts once;
+    counted in stats["deduped_window"] when stats is given; the window is measured from dedupe_ref_ts, the
+    rejection's own time such as the dossier's, so a rerun on the same dossier after the window stays deduped, else
+    from the registration time); without it: no second active/pending row for the symbol within 60 minutes. extra:
+    additional row keys (blockers). registered_at_ts: the rejection's own time when it is registered later (issue
+    #261: the kline audit starts there), else now."""
     os.makedirs(LOGS_DIR, exist_ok=True)
     existing = load_jsonl(SHADOW_TRADES_FILE)
 
     now_ts = int(registered_at_ts) if registered_at_ts else int(time.time())
     if dossier_sha256:
-        key = (dossier_sha256, symbol.upper().strip(), direction.upper().strip())
-        for t in existing + load_jsonl(SHADOW_RESOLVED_FILE):
+        sym, dir_ = symbol.upper().strip(), direction.upper().strip()
+        key = (dossier_sha256, sym, dir_)
+        rows = existing + load_jsonl(SHADOW_RESOLVED_FILE)
+        for t in rows:
             if (t.get("dossier_sha256"), t.get("symbol"), str(t.get("direction") or "").upper()) == key:
+                return None
+        row_gate_value = row_gate({"gate": gate, "rejection_category": rejection_category})[0]
+        ref_ts = _to_float(dedupe_ref_ts)
+        ref_ts = ref_ts if ref_ts is not None and ref_ts > 0 else now_ts
+        for t in rows:
+            if not isinstance(t, dict) or t.get("symbol") != sym or str(t.get("direction") or "").upper() != dir_:
+                continue
+            ts = _to_float(t.get("registered_at_ts"))
+            if row_gate(t)[0] == row_gate_value and ts is not None and abs(ref_ts - ts) < DEDUPE_WINDOW_SECONDS:
+                if stats is not None:
+                    stats["deduped_window"] = stats.get("deduped_window", 0) + 1
                 return None
     else:
         # Avoid duplicate active/pending trade for same symbol registered in last 60 minutes
@@ -354,7 +371,7 @@ def _trimmed_book(items: list) -> list:
             for i in items]
 
 
-def _register_gate_denial(ev, now_ts: int, seen: set) -> Optional[dict]:
+def _register_gate_denial(ev, now_ts: int, seen: set, stats: Optional[dict] = None) -> Optional[dict]:
     """One logs/gate_denials.jsonl event -> a DELTA_GATE_POST_APPROVAL shadow row (None when skipped)."""
     if not isinstance(ev, dict) or ev.get("gate") != POST_APPROVAL_GATE:
         return None
@@ -394,19 +411,19 @@ def _register_gate_denial(ev, now_ts: int, seen: set) -> Optional[dict]:
         current_price=entry, rejection_reason=f"[{POST_APPROVAL_GATE}] {detail}"[:GATE_DETAIL_MAX_CHARS],
         rejection_category=POST_APPROVAL_GATE, gate=POST_APPROVAL_GATE, gate_detail=detail[:GATE_DETAIL_MAX_CHARS],
         gate_source="hook_denial", score=_to_float(ev.get("score")), dossier_sha256=sha, extra=extra,
-        registered_at_ts=int(ts))
+        registered_at_ts=int(ts), stats=stats)
     if row and sha:
         seen.add((sha, sym, direction))
     return row
 
 
-def register_from_gate_denials(now_ts: Optional[int] = None) -> int:
+def register_from_gate_denials(now_ts: Optional[int] = None, stats: Optional[dict] = None) -> int:
     """Registers the hook's delta-gate denials of approved candidates (logs/gate_denials.jsonl, issue #261) as
     DELTA_GATE_POST_APPROVAL shadow rows: gate_source "hook_denial", blockers and book from the event's cached book
     (book_from_sources; position scores from trades_audit records not newer than the event), registered_at_ts = the
     denial time and trigger = current price = the dossier entry. Reads only the last GATE_DENIAL_TAIL_LINES lines and
     events of the last GATE_DENIAL_MAX_AGE_SECONDS; skips events without valid dossier prices. Idempotent through
-    register_shadow_trade's dedupe. A missing or garbled file registers nothing; never raises."""
+    register_shadow_trade's dedupe (stats: see there). A missing or garbled file registers nothing; never raises."""
     try:
         if not os.path.exists(GATE_DENIALS_FILE):
             return 0
@@ -421,16 +438,17 @@ def register_from_gate_denials(now_ts: Optional[int] = None) -> int:
     count = 0
     for line in lines:
         try:
-            if _register_gate_denial(json.loads(line), now, seen):
+            if _register_gate_denial(json.loads(line), now, seen, stats):
                 count += 1
         except Exception:
             continue
     return count
 
-def register_from_evaluation() -> int:
+def register_from_evaluation(stats: Optional[dict] = None) -> int:
     """Reads latest evaluation brief and dossier, auto-registering rejected setups, and first the hook's recent
-    delta-gate denials of approved candidates (register_from_gate_denials, issue #261; also without a brief)."""
-    registered_count = register_from_gate_denials()
+    delta-gate denials of approved candidates (register_from_gate_denials, issue #261; also without a brief).
+    stats: optional dict that receives the "deduped_window" count (issue #262, register_shadow_trade)."""
+    registered_count = register_from_gate_denials(stats=stats)
 
     # 1. Read candidates from primed brief
     brief_data = {}
@@ -466,6 +484,9 @@ def register_from_evaluation() -> int:
     for c in typed:
         typed_by_key.setdefault((c["symbol"], c["direction"]), c)
     target_env = raw_payload.get("target_env") or dossier_data.get("target_env")
+    # Issue #262: the dedupe window is measured from the dossier's own time, so a rerun on a deduped dossier stays
+    # deduped after the window (the row itself is still registered now)
+    dossier_ts = _to_float(dossier_data.get("timestamp_ts")) or _to_float(dossier_data.get("recorded_at_ts"))
     book = None
 
     for o in opps:
@@ -527,7 +548,9 @@ def register_from_evaluation() -> int:
                 gate_source=gate_source,
                 score=score,
                 dossier_sha256=dossier_sha256,
-                extra=extra
+                extra=extra,
+                stats=stats,
+                dedupe_ref_ts=dossier_ts
             )
             if res:
                 registered_count += 1
@@ -697,16 +720,6 @@ def audit_shadow_trades() -> dict:
         "total_resolved": len(load_jsonl(SHADOW_RESOLVED_FILE))
     }
 
-def row_gate(row: dict) -> tuple:
-    """(gate, gate_source) of a shadow row; a row written before issue #251 maps its vol_ratio category
-    (DRY_VOLUME_FAKE_TIER_S -> DRY_VOLUME, anything else -> OTHER) with source "legacy_category"."""
-    gate = row.get("gate")
-    if isinstance(gate, str) and gate:
-        return gate, str(row.get("gate_source") or "unknown")
-    return ("DRY_VOLUME" if row.get("rejection_category") == "DRY_VOLUME_FAKE_TIER_S" else GATE_FALLBACK,
-            "legacy_category")
-
-
 def calculate_efficacy_metrics(rolling_window: int = ROLLING_WINDOW_SIZE) -> dict:
     """Calculates Filter Efficacy Ratio (FER) all-time, clean intraday (<=4h), and rolling window."""
     resolved = load_jsonl(SHADOW_RESOLVED_FILE)
@@ -832,6 +845,15 @@ def print_shadow_dashboard():
             print(f"  • {r['symbol']} ({r['direction']}): {tag} | Outcome: {r['outcome']} | PnL: ${r['simulated_pnl_usdt']} USDT | Reason: {r['rejection_reason']}")
     print("=" * 80)
 
+def _register_and_print() -> int:
+    """register_from_evaluation with its deduped_window counter printed (--register-from-eval and --loop)."""
+    stats = {"deduped_window": 0}
+    count = register_from_evaluation(stats)
+    print(f"📥 Registered {count} candidate(s) into shadow ledger (deduped_window {stats['deduped_window']}: "
+          f"same symbol/direction/gate within {DEDUPE_WINDOW_SECONDS} s).")
+    return count
+
+
 def main():
     parser = argparse.ArgumentParser(description="Counterfactual Shadow Tracker")
     parser.add_argument("--register-from-eval", action="store_true", help="Auto-register rejected candidates from latest brief/dossier")
@@ -842,8 +864,7 @@ def main():
     args = parser.parse_args()
 
     if args.register_from_eval:
-        count = register_from_evaluation()
-        print(f"📥 Registered {count} candidate(s) into shadow ledger.")
+        _register_and_print()
 
     if args.audit or not (args.register_from_eval or args.loop or args.json):
         res = audit_shadow_trades()
@@ -861,8 +882,8 @@ def main():
         print(f"🚀 Starting Shadow Tracker Loop (interval: {args.interval}s)...")
         while True:
             try:
-                # 1. Check for newly rejected evaluations
-                register_from_evaluation()
+                # 1. Check for newly rejected evaluations (deduped_window printed too, issue #290)
+                _register_and_print()
                 # 2. Audit active trades
                 audit_shadow_trades()
                 # 3. Print report
