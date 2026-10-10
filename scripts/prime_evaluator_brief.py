@@ -636,7 +636,9 @@ def closed_today_data_quality(closed_today: Any) -> dict:
 # Audit-only fields (issue #202): kept out of the evaluator's brief (token budget) and written to the sidecar.
 # alt_short_climax_ok (issue #206) is a pipeline-only gate input: kept out of the brief, not written to the sidecar.
 # score_schema_version (issue #207): sidecar only (calibration input).
-_SIDECAR_ONLY_KEYS = ("score_components", "tier_s_eligible", "alt_short_climax_ok", "score_schema_version")
+# signal_candle_open_ts / signal_interval (issue #298): sidecar only, attached to the dossier by record_evaluation.py.
+_SIDECAR_ONLY_KEYS = ("score_components", "tier_s_eligible", "alt_short_climax_ok", "score_schema_version",
+                      "signal_candle_open_ts", "signal_interval")
 
 
 # Issue #206 flags reach the brief only when set (token budget): these values are dropped from a row.
@@ -759,7 +761,9 @@ def scores_sidecar_path() -> str:
 
 def _write_scores_sidecar(screening: Any, yolo_slot: dict, generated_at_ts: int, target_env: str) -> None:
     """Radar score, tier and components of every candidate in the brief (issue #202). Read only by
-    record_evaluation.py for the audit trail, never by the evaluator or a gate. Fail-open: the brief is unaffected."""
+    record_evaluation.py for the audit trail, never by the evaluator or a gate. Fail-open: the brief is unaffected.
+    Issue #298: each row's signal candle (signal_candle_open_ts in seconds, signal_interval) when known, and the
+    scan's `tier_s_divergence` ({radar_tier_s, brief_tier_s}) as a top-level key when the screening has one."""
     try:
         cands = list(screening.get("top_candidates") or []) if isinstance(screening, dict) else []
         cands += [dict(c, direction=c.get("direction") or "LONG") for c in (yolo_slot.get("candidates") or [])]
@@ -769,10 +773,16 @@ def _write_scores_sidecar(screening: Any, yolo_slot: dict, generated_at_ts: int,
                       "score_components": c.get("score_components"), "reasons": c.get("reasons")},
                      # issue #207: the radar score formula version, when the row carries one (calibration filter)
                      **({"score_schema_version": c["score_schema_version"]}
-                        if isinstance(c.get("score_schema_version"), int) else {}))
+                        if isinstance(c.get("score_schema_version"), int) else {}),
+                     # issue #298: the radar's signal candle, when the row carries one
+                     **({k: c[k] for k in ("signal_candle_open_ts", "signal_interval")}
+                        if isinstance(c.get("signal_candle_open_ts"), int) and c.get("signal_interval") else {}))
                 for c in cands if isinstance(c, dict) and c.get("symbol")]
-        _write_json(scores_sidecar_path(), {"generated_at_ts": generated_at_ts, "env": str(target_env).upper(),
-                                            "rows": rows})
+        divergence = screening.get("tier_s_divergence") if isinstance(screening, dict) else None
+        _write_json(scores_sidecar_path(), dict({"generated_at_ts": generated_at_ts, "env": str(target_env).upper(),
+                                                 "rows": rows},
+                                                **({"tier_s_divergence": divergence}
+                                                   if isinstance(divergence, dict) else {})))
     except Exception as e:
         print(f"Radar score sidecar not written ({type(e).__name__})", file=sys.stderr)
 

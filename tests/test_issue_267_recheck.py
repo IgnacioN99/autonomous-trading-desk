@@ -381,7 +381,8 @@ class _RecheckWorkspace(tdp.TranscriptFixture):
                 patch.object(peb, "get_latest_screening_payload") as full, \
                 patch.object(peb, "_record_pipeline_failure") as yolo_failure, \
                 patch.object(rcb, "fetch_recheck_payload",
-                             side_effect=lambda s, d, e, run_id, base: payload_fn(run_id)) as fetch, \
+                             # issue #298: `plan` (carry_plan) is passed only for a plan with a signal candle
+                             side_effect=lambda s, d, e, run_id, base, **kw: payload_fn(run_id)) as fetch, \
                 redirect_stdout(out), redirect_stderr(err):
             code = peb.main(["--env", "prod", "--json", "--recheck", spec])
         full.assert_not_called()  # never the full scan
@@ -436,7 +437,9 @@ class TestRecheckBrief(_RecheckWorkspace):
         self.assertEqual(brief["recheck_of"], {
             "sha256": old["provenance"]["sha256"], "symbol": SYMBOL, "direction": DIRECTION, "tier": "S",
             "score": 95, "entry": 1.0, "stop_loss": 0.97, "tp1": 1.054, "tp2": 1.12, "leverage": 3,
-            "evaluated_ts": old["timestamp_ts"], "valid_until_ts": old["valid_until_ts"]})
+            "evaluated_ts": old["timestamp_ts"], "valid_until_ts": old["valid_until_ts"],
+            # Issue #298: the original plan's signal candle (none recorded for this dossier)
+            "signal_candle_open_ts": None, "signal_interval": None})
         # Normal header and ground truth, minimal-but-present blocks
         for key in ("generated_at_ts", "max_age_seconds", "target_env", "market_data_status", "risk_profile",
                     "ground_truth_portfolio", "pending_entries", "macro_btc", "daily_loss_gate"):

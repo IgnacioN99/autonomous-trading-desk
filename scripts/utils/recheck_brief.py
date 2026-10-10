@@ -24,10 +24,16 @@ truth, macro BTC, risk profile, lessons) with only that candidate's LIVE setup, 
   original's sha256 and `recheck_symbol` / `recheck_direction` = the requested candidate refuses; a row without
   those fields (written before them) refuses every candidate of that original. A re-check dossier is never
   re-checkable itself. Only with CLAUDE_CODE_SESSION_ID; another session's scans are never read for approvals.
-- The brief carries `recheck` {symbol, direction, setup_status found|no_setup|unavailable, cause} and
+- The brief carries `recheck` {symbol, direction, setup_status found|no_setup|unavailable|signal_carried, cause} and
   `recheck_of` (sha256 and the verified old plan). The YOLO slot is not scanned (empty, never counted as a YOLO
   scan failure). record_evaluation.py links the new dossier to `recheck_of` and prints the bounds verdict
   (utils/recheck_bounds.py).
+- Issue #298 item 2: `recheck_of` also carries the plan's signal candle (signal_candle_open_ts in seconds,
+  signal_interval), read from the stored dossier candidate or the history row's `signal_candles` (both written by the
+  recorder, outside the hash) only when consistent with the verified brief_generated_at_ts (bound_signal_fields;
+  else None). With it, the screening re-check gets the plan (RECHECK_PLAN_ENV) and, when the radar no longer
+  produces the setup, checks the original signal candle and live levels: `signal_carried` (with `recheck.carried`)
+  only when every check passed, else `no_setup`.
 """
 
 import datetime
@@ -45,15 +51,20 @@ if SCRIPTS_DIR not in sys.path:
 
 from utils import dossier_provenance as dp  # noqa: E402  (stdlib only)
 from utils.yolo_scan_health import RUN_ID_ENV  # noqa: E402  (stdlib only)
+from utils.recheck_bounds import carried_ok  # noqa: E402  (stdlib only)
 
-SETUP_STATUSES = ("found", "no_setup", "unavailable")
+SETUP_STATUSES = ("found", "no_setup", "unavailable", "signal_carried")
 RECHECK_YOLO_SLOT = {"status": "UNAVAILABLE", "candidates": [],
                      "summary": "UNAVAILABLE: not scanned by a single-candidate re-check. YOLO slot kept empty."}
 PIPELINE_TIMEOUT_S = 60
 CAUSE_MAX_CHARS = 200
-SNAPSHOT_KEYS = ("tier", "score", "entry", "stop_loss", "tp1", "tp2", "leverage")
+# Issue #298: the signal candle travels from the recorder (outside the provenance hash), never from the evaluator
+SIGNAL_KEYS = ("signal_candle_open_ts", "signal_interval")
+SIGNAL_INTERVAL_S = {"5m": 300, "15m": 900, "1h": 3600}
+SNAPSHOT_KEYS = ("tier", "score", "entry", "stop_loss", "tp1", "tp2", "leverage") + SIGNAL_KEYS
 HISTORY_FILE = "evaluations_history.jsonl"  # next to latest_dossier.json (record_evaluation._paths)
 SESSION_ENV = "CLAUDE_CODE_SESSION_ID"  # issue #284: selects the caller's own dossier file (Claude Code)
+RECHECK_PLAN_ENV = "DESK_RECHECK_PLAN"  # issue #298: carry_plan JSON for screening_pipeline.py --recheck
 
 
 class RecheckError(Exception):
@@ -144,14 +155,57 @@ def _session_label(session: Any) -> str:
     return label or "unknown"
 
 
-def _recheck_max_age(base_dir: str) -> int:
-    """recheck_max_age_seconds of the profile (user_profile.get_recheck_bounds; an unreadable profile = defaults)."""
+def _recheck_bounds(base_dir: str) -> Dict[str, Any]:
+    """user_profile.get_recheck_bounds of the profile (an unreadable profile = defaults)."""
     import user_profile as up
     try:
         profile = up.load_user_profile(base_dir)
     except Exception:
         profile = {}
-    return int(up.get_recheck_bounds(profile)["recheck_max_age_seconds"])
+    return up.get_recheck_bounds(profile)
+
+
+def _recheck_max_age(base_dir: str) -> int:
+    """recheck_max_age_seconds of the profile (user_profile.get_recheck_bounds; an unreadable profile = defaults)."""
+    return int(_recheck_bounds(base_dir)["recheck_max_age_seconds"])
+
+
+def bound_signal_fields(source: Any, rebuilt: Any) -> Dict[str, Any]:
+    """Issue #298: {signal_candle_open_ts, signal_interval} of `source` (the stored dossier candidate or the history
+    row's entry, both written by the recorder outside the provenance sha256) only when consistent with the verified
+    `brief_generated_at_ts` of the evaluator's own payload in `rebuilt`: an open time aligned to the interval whose
+    candle closed before that brief was generated and at most two intervals earlier. Else {} (no carry, fail closed)."""
+    if not isinstance(source, dict) or not isinstance(rebuilt, dict):
+        return {}
+    ts, interval = source.get("signal_candle_open_ts"), source.get("signal_interval")
+    step = SIGNAL_INTERVAL_S.get(interval) if isinstance(interval, str) else None
+    brief_ts = (rebuilt.get("raw_payload") or {}).get("brief_generated_at_ts")
+    if isinstance(ts, bool) or not isinstance(ts, int) or step is None or ts % step or isinstance(brief_ts, bool):
+        return {}
+    try:
+        brief_ts = int(brief_ts)
+    except (TypeError, ValueError):
+        return {}
+    if not ts + step <= brief_ts < ts + 3 * step:
+        return {}
+    return {"signal_candle_open_ts": ts, "signal_interval": interval}
+
+
+def _stored_candidate(record: Any, symbol: str, direction: str) -> Optional[dict]:
+    """The stored record's approved candidate of symbol + direction (unverified: only its signal fields are read)."""
+    cands = record.get("approved_candidates") if isinstance(record, dict) else None
+    return next((c for c in cands or [] if isinstance(c, dict) and str(c.get("symbol") or "").upper() == symbol
+                 and str(c.get("direction") or "").upper() == direction), None)
+
+
+def carry_plan(recheck_of: Any, base_dir: str) -> Optional[Dict[str, Any]]:
+    """Issue #298: what screening_pipeline.signal_carried_check needs to carry a vanished signal (the plan's levels,
+    its signal candle, the original evaluation time and the profile's re-check bounds), or None when `recheck_of`
+    has no signal candle (the re-check then behaves as before)."""
+    if not isinstance(recheck_of, dict) or not all(recheck_of.get(k) is not None for k in SIGNAL_KEYS):
+        return None
+    return dict({k: recheck_of.get(k) for k in ("entry", "stop_loss", "tp1", "tp2", "evaluated_ts") + SIGNAL_KEYS},
+                **_recheck_bounds(base_dir))
 
 
 def _utc_ts(text: Any) -> Optional[int]:
@@ -222,9 +276,10 @@ def _plan_from_session_scans(session: str, no_approval: "_NoApproval", symbol: s
         ts = int(rebuilt.get("timestamp_ts") or 0)
         if now - ts > max_age:
             continue
+        signals = row.get("signal_candles") if isinstance(row.get("signal_candles"), dict) else {}
         try:
             found.append((ts, _plan_from_rebuilt(rebuilt, row.get("target_env"), symbol, direction, target_env,
-                                                 history)))
+                                                 history, signals.get(f"{symbol}|{direction}"))))
         except (_NoApproval, _WrongEnv):
             continue
         except RecheckError as e:  # the newest approval decides: a YOLO candidate or a chained re-check refuses
@@ -390,13 +445,15 @@ def _plan_from_file(path: str, symbol: str, direction: str, target_env: str,
     ok, reason, rebuilt = dp.rebuild_verified_record(record)
     if not ok or not isinstance(rebuilt, dict):
         raise RecheckError(f"the latest dossier is not provenance-verified ({reason}): run a full scan")
-    return _plan_from_rebuilt(rebuilt, record.get("target_env"), symbol, direction, target_env, history)
+    return _plan_from_rebuilt(rebuilt, record.get("target_env"), symbol, direction, target_env, history,
+                              _stored_candidate(record, symbol, direction))
 
 
 def _plan_from_rebuilt(rebuilt: dict, stored_env: Any, symbol: str, direction: str, target_env: str,
-                       history: Optional[List[str]] = None) -> Dict[str, Any]:
+                       history: Optional[List[str]] = None, signal_source: Any = None) -> Dict[str, Any]:
     """The checks of _plan_from_file after provenance verification, on a rebuilt record (`stored_env`: the stored
-    target_env, used when the evaluator's payload has none)."""
+    target_env, used when the evaluator's payload has none). Issue #298: the signal keys come only from
+    `signal_source` through bound_signal_fields (None otherwise), never from the evaluator's candidate."""
     prov = rebuilt.get("provenance") if isinstance(rebuilt.get("provenance"), dict) else {}
     if _history_is_recheck(history or [], prov.get("sha256")):
         raise _recheck_dossier_error(rebuilt, symbol, direction, history)
@@ -414,17 +471,24 @@ def _plan_from_rebuilt(rebuilt: dict, stored_env: Any, symbol: str, direction: s
     if cand.get("is_yolo") is True or str(cand.get("is_yolo")).strip().lower() in ("true", "1", "yes"):
         raise RecheckError(f"{symbol} is a YOLO (memecoin slot) candidate: --recheck does not support it, "
                            "it needs a full scan")
-    return dict({"sha256": prov.get("sha256"), "symbol": symbol, "direction": direction},
-                **{k: cand.get(k) for k in SNAPSHOT_KEYS},
+    plan = dict({"sha256": prov.get("sha256"), "symbol": symbol, "direction": direction},
+                **{k: None if k in SIGNAL_KEYS else cand.get(k) for k in SNAPSHOT_KEYS},
                 evaluated_ts=rebuilt.get("timestamp_ts"), valid_until_ts=rebuilt.get("valid_until_ts"))
+    plan.update(bound_signal_fields(signal_source, rebuilt))
+    return plan
 
 
-def fetch_recheck_payload(symbol: str, direction: str, target_env: str, run_id: str, base_dir: str) -> dict:
+def fetch_recheck_payload(symbol: str, direction: str, target_env: str, run_id: str, base_dir: str,
+                          plan: Optional[dict] = None) -> dict:
     """The live setup from `screening_pipeline.py --recheck SYMBOL:DIRECTION --json` (a subprocess, like the
     full scan). On any failure only {"recheck_failure": <class>} (issue #279: the exception class, `exit <code>`,
-    `empty output` or `not a JSON object`), which recheck_inputs turns into an `unavailable` cause."""
+    `empty output` or `not a JSON object`), which recheck_inputs turns into an `unavailable` cause. Issue #298:
+    `plan` (carry_plan) reaches the subprocess as RECHECK_PLAN_ENV JSON; an inherited value is never passed on."""
     script = os.path.join(base_dir, "scripts", "screening_pipeline.py")
     env = dict(os.environ, **{RUN_ID_ENV: run_id})
+    env.pop(RECHECK_PLAN_ENV, None)
+    if isinstance(plan, dict):
+        env[RECHECK_PLAN_ENV] = json.dumps(plan)
     try:
         res = subprocess.run([sys.executable, script, "--json", "--env", target_env, "--recheck",
                               f"{symbol}:{direction}"], capture_output=True, text=True,
@@ -442,7 +506,9 @@ def fetch_recheck_payload(symbol: str, direction: str, target_env: str, run_id: 
 def recheck_inputs(payload: Any, symbol: str, direction: str, run_id: str) -> Tuple[dict, dict]:
     """(screening payload for the brief, `recheck` block). The screening keeps at most the one candidate of
     symbol + direction, and only when the pipeline found it. A failed, foreign or inconsistent payload is
-    `unavailable` with no candidate (fail closed)."""
+    `unavailable` with no candidate (fail closed). Issue #298: `signal_carried` has no candidate row by design and
+    needs a carried block whose every check passed (else `no_setup`); the block's `carried` checks are kept on
+    `signal_carried` and `no_setup`."""
     block = {"symbol": symbol, "direction": direction, "setup_status": "unavailable", "cause": None}
     rc = payload.get("recheck") if isinstance(payload, dict) else None
     if not isinstance(rc, dict):
@@ -459,11 +525,16 @@ def recheck_inputs(payload: Any, symbol: str, direction: str, run_id: str) -> Tu
     cause = str(rc.get("cause"))[:CAUSE_MAX_CHARS] if rc.get("cause") else None
     cands = [c for c in payload.get("top_candidates") or [] if isinstance(c, dict)
              and str(c.get("symbol") or "").upper() == symbol and str(c.get("direction") or "").upper() == direction]
+    carried = rc.get("carried") if isinstance(rc.get("carried"), dict) else None
+    if status == "signal_carried" and not carried_ok(carried):
+        status, cause = "no_setup", "screening reported signal_carried without every carried check passing"
     if str(payload.get("market_data_status") or "").startswith("UNAVAILABLE"):
         status, cause = "unavailable", cause or str(payload["market_data_status"])[:CAUSE_MAX_CHARS]
     if status == "found" and not cands:
         status, cause = "unavailable", "screening reported a setup without its candidate row"
     block.update(setup_status=status, cause=cause)
+    if carried is not None and status in ("signal_carried", "no_setup"):
+        block["carried"] = carried
     screening = dict(payload, top_candidates=cands[:1] if status == "found" else [])
     screening.pop("recheck", None)
     return screening, block
@@ -479,7 +550,8 @@ def prepare_recheck(spec: Any, target_env: str, base_dir: str, run_id: Optional[
     if run_id is None:
         import uuid
         run_id = uuid.uuid4().hex
-    payload = fetch_recheck_payload(symbol, direction, target_env, run_id, base_dir)
+    plan = carry_plan(recheck_of, base_dir)  # issue #298: only a plan with a signal candle can be carried
+    payload = fetch_recheck_payload(symbol, direction, target_env, run_id, base_dir, **({"plan": plan} if plan else {}))
     screening, block = recheck_inputs(payload, symbol, direction, run_id)
     return {"screening": screening, "yolo_slot": dict(RECHECK_YOLO_SLOT),
             "blocks": {"recheck": block, "recheck_of": recheck_of}, "notes": notes}
@@ -500,4 +572,7 @@ def recheck_summary(brief: dict) -> str:
             + (f" ({rc['cause']})" if rc.get("cause") else "")
             + f" | re-checks dossier sha256 {str(old.get('sha256'))[:16]}… (Tier {old.get('tier')}, entry "
               f"{old.get('entry')}, SL {old.get('stop_loss')}, TP2 {old.get('tp2')}; evaluated at "
-              f"{_utc(old.get('evaluated_ts'))}, valid until {_utc(old.get('valid_until_ts'))})")
+              f"{_utc(old.get('evaluated_ts'))}, valid until {_utc(old.get('valid_until_ts'))}"
+            # issue #298: the signal candle of the original plan
+            + (f"; signal candle {_utc(old['signal_candle_open_ts'])} ({old.get('signal_interval')})"
+               if old.get("signal_candle_open_ts") is not None else "") + ")")

@@ -14,7 +14,9 @@ that one candidate. The user's earlier "yes" covers the new plan only when every
 - the new TP1 is at least the executor's friction floor (gate_limits.MIN_TP1_DISTANCE) from the entry, on the
   profit side (issue #279: an earlier signal; the executor still enforces it);
 - at most `max_age_s` seconds passed since the original dossier was evaluated (`evaluated_ts`, the verifiable
-  proxy for the user's "yes", which is not persisted).
+  proxy for the user's "yes", which is not persisted);
+- issue #298, when the brief's `recheck` block is given: its setup_status is `found`, or `signal_carried` with every
+  carried check passed (a re-approval of the original levels on a gone setup is never within bounds).
 Anything missing, malformed or ambiguous fails (the user is asked again). The verdict is advisory: printed and
 logged by record_evaluation.py; the hook and the executor gates are unchanged.
 """
@@ -67,11 +69,20 @@ def _find(record: dict, symbol: str, direction: str) -> Optional[dict]:
     return None
 
 
+def carried_ok(carried: Any) -> bool:
+    """Issue #298: a `recheck.carried` block whose `ok` is True and whose every check (at least one) passed."""
+    checks = carried.get("checks") if isinstance(carried, dict) else None
+    return (isinstance(carried, dict) and carried.get("ok") is True and isinstance(checks, list) and bool(checks)
+            and all(isinstance(c, dict) and c.get("ok") is True for c in checks))
+
+
 def evaluate_recheck_bounds(old: dict, new_record: dict, now_ts: int, max_drift_r: float,
-                            max_age_s: int) -> Dict[str, Any]:
+                            max_age_s: int, recheck: Any = None) -> Dict[str, Any]:
     """Compares the old confirmed plan (`recheck_of` snapshot: symbol, direction, tier, entry, stop_loss, tp1, tp2,
     evaluated_ts) with the newly recorded dossier. Returns {"within_bounds": bool, "checks": [{"check", "value",
-    "limit", "ok"}], "reasons": [str]}; within_bounds is True only when every check passed."""
+    "limit", "ok"}], "reasons": [str]}; within_bounds is True only when every check passed. Issue #298: with the
+    brief's `recheck` block (a dict), one more check `setup_status`: ok only for `found`, or `signal_carried` with
+    every carried check passed (an approval on a gone or failed-carry setup is out of bounds); no block, no check."""
     checks: List[dict] = []
 
     def check(name: str, value: Any, limit: Any, ok: bool, reason: str = "") -> bool:
@@ -86,6 +97,11 @@ def evaluate_recheck_bounds(old: dict, new_record: dict, now_ts: int, max_drift_
     status = str(new_record.get("status") or "").upper()
     check("status", status or None, "APPROVED", status == "APPROVED",
           f"the re-check dossier is {status or 'missing'}: no trade")
+    if isinstance(recheck, dict):
+        setup = recheck.get("setup_status")
+        check("setup_status", setup, "found or signal_carried (every carried check passed)",
+              setup == "found" or (setup == "signal_carried" and carried_ok(recheck.get("carried"))),
+              f"the re-check brief's setup is {setup or 'unknown'}: the live setup is gone or not carried")
     new = _find(new_record, symbol, direction) if status == "APPROVED" and symbol and direction else None
     approved = sorted(f"{c.get('symbol')} {c.get('direction')}" for c in new_record.get("approved_candidates") or []
                       if isinstance(c, dict))

@@ -9,6 +9,8 @@ Read-only: uses public Binance Futures market data and never places orders.
 Levels are measured from the trigger (the effective entry); `trigger_distance_pct` is signed (> 0: the trigger is
 beyond the price in the trade direction). The enrichment never lifts a row to Tier S without institutional volume
 or a >= 60% wick (`tier_s_eligible`). Rows above the risk_pct ceiling are dropped with a stderr count.
+Issue #298: the JSON / text output labels the tier `radar_tier` / `radar_tier_code`: pre-gate (before the macro gate
+and the brief's filters), never a tier for the user; the brief / dossier tier is the only tier.
 
 CLI:
     python3 scripts/broad_market_radar.py [--json] [--top N] [--interval 15m|5m|1h]
@@ -606,6 +608,9 @@ def build_scan_payload(candidates, env, interval, universe, top, latency_ms):
     out = []
     for c in selected:
         item = dict(c)
+        # Issue #298 item 5: the public payload labels the pre-gate radar tier `radar_tier` / `radar_tier_code` (never
+        # presented as a tier: the brief/dossier tier is the only one); internal rows keep `tier` for the pipeline
+        item["radar_tier"], item["radar_tier_code"] = item.pop("tier", None), item.pop("tier_code", None)
         item["micro"] = c.get("micro")
         item["roe_est_pct"] = round(c["risk_pct"] * c["rr"] * leverage, 1)
         out.append(item)
@@ -628,7 +633,8 @@ def print_text_report(payload):
           f"{payload['qualified_count']}\n")
     for c in payload["candidates"]:
         m = c.get('micro') or {}
-        print(f"• {c['tier']} | {c['symbol']} ({c['direction']}) -> score {c['confidence']} (heuristic, not a probability)")
+        print(f"• Radar {c['radar_tier']} (pre-gate) | {c['symbol']} ({c['direction']}) -> score {c['confidence']} "
+              "(heuristic, not a probability)")
         print(f"  Price: {c['price']} | Trigger (entry): {c['trigger']:.4f} | SL: {c['sl']:.4f} (-{c['risk_pct']}%) | "
               f"TP1: {c['tp1']:.4f} | TP2: {c['tp2']:.4f} | R:R {c['rr']}:1 | "
               f"ROE est ({payload['leverage_standard']}x): +{c['roe_est_pct']}%")

@@ -65,8 +65,8 @@ sorted by confidence. `--top 0` (default) returns all of them.
 {"status": "ok", "command": "scan", "env": "prod", "interval": "15m", "universe_size": 80,
  "leverage_standard": 3, "qualified_count": 4, "count": 1, "generated_at_utc": "2026-10-04T12:00:00Z",
  "latency_ms": 4200,
- "candidates": [{"symbol": "SOLUSDT", "direction": "LONG", "confidence": 85, "tier": "Tier S (...)",
-   "tier_code": "S", "interval": "15m", "price": 142.1, "trigger": 142.4, "trigger_distance_pct": 0.21,
+ "candidates": [{"symbol": "SOLUSDT", "direction": "LONG", "confidence": 85, "radar_tier": "Tier S (...)",
+   "radar_tier_code": "S", "interval": "15m", "price": 142.1, "trigger": 142.4, "trigger_distance_pct": 0.21,
    "sl": 139.4, "tp1": 147.8, "tp2": 154.4, "rr": 4.0, "risk_pct": 2.11, "rsi": 26.4, "rsi_15m": 26.4, "vol_ratio": 2.1,
    "lower_wick": 63.0, "upper_wick": 5.0, "reasons": ["..."], "roe_est_pct": 25.3,
    "funding_rate_pct": 0.01, "funding_rate_8h_pct": 0.01, "funding_interval_h": 8, "long_crowding_risk": false,
@@ -76,8 +76,10 @@ sorted by confidence. `--top 0` (default) returns all of them.
              "vwap_deviation_pct": -0.8, "cascade_risk": "BASELINE", "...": "..."}}]}
 ```
 
-- `tier_code`: `S` (≥ 80), `A+` (65-79), `A` (55-64). Tier S requires volume ≥ 1.4x or wick ≥ 60%
-  (`tier_s_eligible`), also after the microstructure bonus.
+- `radar_tier_code`: `S` (≥ 80), `A+` (65-79), `A` (55-64). Tier S requires volume ≥ 1.4x or wick ≥ 60%
+  (`tier_s_eligible`), also after the microstructure bonus. Pre-gate label (issue #298): before the macro gate and
+  the brief's filters, never present it as a tier; the brief/dossier tier is the only tier (the recorder prints
+  `Radar vs brief Tier S: N vs M`).
 - Squeeze filter (issue #206, `scripts/utils/squeeze_filter.py`): a SHORT with `micro.oi_z_score` ≥ 2.0, funding ≤
   -0.01% per 8h (`funding_rate_8h_pct`, normalized from the symbol's `funding_interval_h` in `/fapi/v1/fundingInfo`,
   8h when not listed or when the call fails), or without micro data, gets `squeeze_risk: true` + `squeeze_reasons`

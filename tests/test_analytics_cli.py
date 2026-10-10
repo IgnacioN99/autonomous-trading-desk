@@ -227,12 +227,15 @@ class TestBroadMarketRadarCli(_NoOrders):
         self.assertEqual(data["qualified_count"], 2)
         self.assertEqual(data["count"], 1)
         cand = data["candidates"][0]
-        for key in ("symbol", "direction", "confidence", "tier", "tier_code", "interval", "price", "trigger",
-                    "sl", "tp1", "tp2", "rr", "risk_pct", "rsi", "vol_ratio", "lower_wick", "upper_wick",
+        # Issue #298: the pre-gate radar tier is labelled radar_tier / radar_tier_code, never a bare tier
+        for key in ("symbol", "direction", "confidence", "radar_tier", "radar_tier_code", "interval", "price",
+                    "trigger", "sl", "tp1", "tp2", "rr", "risk_pct", "rsi", "vol_ratio", "lower_wick", "upper_wick",
                     "wick_candle_open_time", "reasons", "micro", "roe_est_pct"):
             self.assertIn(key, cand)
+        self.assertNotIn("tier", cand)
+        self.assertNotIn("tier_code", cand)
         self.assertEqual(cand["direction"], "LONG")
-        self.assertEqual(cand["tier_code"], "S")
+        self.assertEqual(cand["radar_tier_code"], "S")
         self.assertAlmostEqual(cand["roe_est_pct"], round(cand["risk_pct"] * cand["rr"] * 3, 1))
         # The interval is real: klines and microstructure both use it.
         kline_urls = [u for u in log if "/fapi/v1/klines" in u]
