@@ -88,9 +88,11 @@ def _register_shadow() -> None:
     """Enrolls unapproved/disqualified candidates into counterfactual shadow tracking (best effort)."""
     try:
         import shadow_tracker
-        shadow_count = shadow_tracker.register_from_evaluation()
-        if shadow_count > 0:
-            print(f"👻 SHADOW TRACKER: {shadow_count} candidate(s) enrolled into counterfactual efficacy auditing.")
+        stats = {"deduped_window": 0}
+        shadow_count = shadow_tracker.register_from_evaluation(stats)
+        if shadow_count > 0 or stats["deduped_window"]:
+            print(f"👻 SHADOW TRACKER: {shadow_count} candidate(s) enrolled into counterfactual efficacy auditing "
+                  f"(deduped_window {stats['deduped_window']}).")
     except Exception:
         pass
 

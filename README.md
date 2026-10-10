@@ -274,9 +274,10 @@ python3 scripts/loops/position_guardian_loop.py --once --dry-run --json   # repo
 python3 scripts/loops/position_guardian_loop.py --once --env prod         # one protective cycle
 python3 scripts/loops/position_guardian_loop.py --interval 60 --env prod  # long-running (default interval 60s)
 python3 scripts/trade_outcomes.py --since 2026-10-01 --json               # read-only: exits, realized R, fees_r, maker/taker, MFE per trade
-python3 scripts/trading_scorecard.py --env prod                           # offline: win rate / R / tiers, fees in R, LONG/SHORT, fee-gate back-test
+python3 scripts/trading_scorecard.py --env prod                           # offline: win rate / R / tiers, fees in R, LONG/SHORT, fee-gate back-test, immediate stop-outs (SL with MFE < 0.3R), MFE histogram
 #   (reads the outcomes file by default; naming that ground-truth file via --outcomes is denied by the hook on purpose)
 python3 scripts/exit_policy_sim.py --env prod --json                      # offline: replay exit policies on closed trades (public klines; stops fill at the stop, no gap slippage; capture uses MFE over the whole horizon, not comparable to trade_outcomes)
+python3 scripts/entry_policy_sim.py --env prod --exact-entry-only --json  # offline, counterfactual: replay closed trades and resolved shadow rows under alternative entries (closed-candle confirm, ATR buffer, pullback limit, kline order-flow veto) with the live exit; real and shadow reported apart, n >= 50 to decide (no live entry change)
 python3 scripts/shadow_analytics.py --json                                # offline, report only: delta-gate regret in R (gross shadow R vs net blocker R, cluster-bootstrap CI, clusters = dossier or same symbol/direction within 1 h; dossier DELTA_GATE rows and hook denials of approved candidates, DELTA_GATE_POST_APPROVAL) and policy replay (current / resting after N min or weighted / swap, re-checked against the delta gate: swap_blocked); with unknown blocker outcomes (MCP mode) both print a sensitivity block at -1R / 0R / +1.8R
 ```
 

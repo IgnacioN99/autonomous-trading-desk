@@ -2879,6 +2879,30 @@ class TestReadOnlyAnalysisScripts(GuardHarness):
                   f"python3 {self.TO} --json && cp /tmp/x logs/trade_outcomes.jsonl"):
             self.assertEqual(self.decisions(c), ("deny", "deny", "deny"), c)
 
+    def test_entry_policy_sim(self):
+        # Issue #269: the entry simulator is a read-only analysis script with its own output and read-only
+        # --outcomes / --shadow inputs inside logs/
+        ent = "scripts/entry_policy_sim.py"
+        for c in (f"python3 {ent} --exact-entry-only --json",
+                  f"python3 {ent} --env prod --shadow logs/shadow_resolved.jsonl --policies current,orderflow_veto "
+                  f"--horizon-hours 24 --taker-fee 0.0005 --maker-fee 0.0002 --trail-cadence 15m "
+                  f"--confirm-minutes 45 --pullback-minutes 20 --exact-entry-only --json "
+                  f"--out logs/entry_policy_sim.json",
+                  f"python3 {ent} --outcomes logs/old/outcomes.jsonl --json"):
+            self.assertEqual(self.decisions(c), ("allow", "allow", "allow"), c)
+        self.assertIn("read-only analysis script", self.agy(self.cmd(f"python3 {ent} --json")).get("reason", ""))
+        for c in (f"python3 {ent} --out logs/exit_policy_sim.json",  # another read-only script's output
+                  f"python3 {self.SIM} --out logs/entry_policy_sim.json",
+                  f"python3 {ent} --out logs/x.json", f"python3 {ent} --out /tmp/entry_policy_sim.json",
+                  f"python3 {ent} --shadow /tmp/forged.jsonl", f"python3 {ent} --shadow ../x.jsonl --json",
+                  f"python3 {ent} --json --unknown-flag", f"python3 {ent} --json && echo done"):
+            for label, decision in zip(("agy", "bash", "powershell"), self.decisions(c)):
+                self.assertEqual(decision, "ask", f"{label}: {c}")
+        # The ground-truth outcomes file through --outcomes, and another writer's file through --out, stay denied
+        for c in (f"python3 {ent} --outcomes logs/trade_outcomes.jsonl",
+                  f"python3 {ent} --out logs/score_calibration.json"):
+            self.assertEqual(self.decisions(c), ("deny", "deny", "deny"), c)
+
 
 if __name__ == "__main__":
     unittest.main()
