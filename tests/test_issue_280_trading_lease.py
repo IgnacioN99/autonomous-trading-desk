@@ -236,13 +236,15 @@ class LeaseHarness(SessionDossierHarness):
                    "tool_input": {"command": command}}
         return self.run_guard(payload)
 
-    def post(self, session, command, tool_response=None, **extra):
+    def post(self, session, command, tool_response=None, env="prod", **extra):
         payload = {"hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_input": {"command": command},
                    "tool_response": {"stdout": "", "stderr": ""} if tool_response is None else tool_response}
         if session is not None:
             payload["session_id"] = session
         payload.update(extra)
-        with patch.object(post_trade_sync, "find_workspace_root", return_value=self.root), \
+        # Issue #287: without --env the hook resolves the environment like the script (BINANCE_API_ENV here)
+        with patch.dict(os.environ, {"BINANCE_API_ENV": env}), \
+                patch.object(post_trade_sync, "find_workspace_root", return_value=self.root), \
                 patch.object(post_trade_sync.subprocess, "run") as run:
             res = post_trade_sync.handle_post_trade_sync(payload)
         return res, run
@@ -375,7 +377,7 @@ class TestHookLease(LeaseHarness):
         with patch("utils.trading_lease.claim_or_refresh", side_effect=counting):
             res = self.bash(SESSION_A, "wsl.exe -d Ubuntu -- " + self.opening())
             self.assertEqual(res["__exit_code__"], 0, res)
-            self.assertGreaterEqual(len(calls), 2)  # the outer line and the wsl re-parse both claim
+            self.assertEqual(len(calls), 1)  # issue #287: the outer line and the wsl re-parse share one claim
             res = self.run_guard({"session_id": SESSION_A, "hook_event_name": "PreToolUse", "cwd": self.root,
                                   "tool_name": "PowerShell", "tool_input": {"command": self.opening()}})
             self.assertEqual(res["__exit_code__"], 0, res)
@@ -514,7 +516,8 @@ class TestTakeover(LeaseHarness):
         self.assertEqual((self.lease()["session_id"], self.lease()["runtime"]), (SESSION_B, "claude"))
         # agy payload: conversationId and runtime agy
         payload = self.cmd(self.TAKE, conversationId=AGY_SESSION)
-        with patch.object(post_trade_sync, "find_workspace_root", return_value=self.root):
+        with patch.dict(os.environ, {"BINANCE_API_ENV": "prod"}), \
+                patch.object(post_trade_sync, "find_workspace_root", return_value=self.root):
             self.assertEqual(post_trade_sync.handle_post_trade_sync(payload)["lease_action"], "take")
         self.assertEqual((self.lease()["session_id"], self.lease()["runtime"]), (AGY_SESSION, "agy"))
 

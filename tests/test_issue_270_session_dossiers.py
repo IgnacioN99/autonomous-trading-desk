@@ -188,7 +188,9 @@ class TestHookReadsTheCallingSessionsDossier(SessionDossierHarness):
         self.assertAllowed(self.deploy(SESSION_A, "BTCUSDT", "SHORT"))   # the bug: B's scan replaced A's approval
         # Issue #280: A's allowed opening claimed the trading lease, so B is denied until it takes it over
         self.assertDeniedWith(self.deploy(SESSION_B, "ETHUSDT", "LONG"), "trading lease is held by session 5e55105e")
-        with patch("post_trade_sync.find_workspace_root", return_value=self.root):
+        # Issue #287: a takeover is committed only when the environment resolves to PROD (as the script resolves it)
+        with patch("post_trade_sync.find_workspace_root", return_value=self.root), \
+                patch.dict(os.environ, {"BINANCE_API_ENV": "prod"}):
             post_trade_sync.handle_post_trade_sync({
                 "session_id": SESSION_B, "hook_event_name": "PostToolUse", "tool_name": "Bash",
                 "tool_input": {"command": "python3 scripts/trading_lease.py --take"}, "tool_response": {}})

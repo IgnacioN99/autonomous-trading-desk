@@ -24,7 +24,8 @@ Trading lease (issue #280; logs/trading_lease.json, written only by this hook an
 successful run_command / Bash / PowerShell call from a known session (agy conversationId / Claude Code session_id),
 `scripts/trading_lease.py --take` (force-asked by pre_trade_guard, so it ran with the user's approval) hands the
 lease to that session, and prime_evaluator_brief.py / record_evaluation.py refresh its heartbeat when that session
-holds it (never acquire). A failed call, an unknown session or an explicit non-PROD --env changes nothing.
+holds it (never acquire). A failed call, an unknown session or a non-PROD environment changes nothing: the --env of
+the lease sub-command itself, else BINANCE_API_ENV / .env resolved like the script does (issue #287).
 
 Contract:
   Input (stdin): JSON with step metadata.
@@ -67,6 +68,14 @@ PRIME_BRIEF_RE = re.compile(r"\bprime_evaluator_brief(?:\.py)?\b")
 RECORD_EVALUATION_RE = re.compile(r"\brecord_evaluation(?:\.py)?\b")
 TRADING_LEASE_SCRIPT = "trading_lease.py"
 TRADING_LEASE_TAKE_FLAG = "--take"
+# Issue #287: the environment of a lease command comes from its own arguments (--env and the argparse abbreviations
+# the brief / recorder accept; trading_lease.py has none), else a BINANCE_API_ENV assignment (bash or PowerShell
+# $env:) in front of it, else the hook's own resolver; lease writes need PROD
+LEASE_ENV_FLAGS = {"--env", "--en", "--e"}
+LEASE_ENV_ASSIGNMENT_RE = re.compile(r"^(?:\$env:)?BINANCE_API_ENV=(.*)$", re.IGNORECASE)
+SHELL_ASSIGNMENT_RE = re.compile(r"^(?:\$env:)?[A-Za-z_][A-Za-z0-9_]*=", re.IGNORECASE)
+PROD_ENV_NAMES = ("prod", "production", "mainnet")
+EXIT_CODE_KEYS = ("exit_code", "exitCode", "returncode")
 INSPECTION_PROGRAMS = {
     "git", "gh", "grep", "rg", "cat", "ls", "find", "diff", "echo", "printf", "head", "tail", "less", "wc",
     "stat", "file", "jq", "sort", "uniq", "awk", "sed", "cp", "mv", "rm", "mkdir", "chmod", "pytest",
@@ -291,49 +300,98 @@ def tool_failed(payload: dict) -> bool:
     return False
 
 
-def classify_lease_command(command_line: str, shell: str = "bash") -> str:
-    """Trading lease action of a shell command (issue #280), per sub-command that runs the script (inspection
-    programs that merely name it are ignored): "take" (scripts/trading_lease.py with the exact --take flag), "refresh"
-    (prime_evaluator_brief.py or record_evaluation.py, except --help) or "" (nothing). An explicit --env testnet means
-    nothing: TESTNET never uses the lease."""
-    m = re.search(r"--env(?:\s+|=)(['\"]?)([A-Za-z0-9_-]+)\1", command_line or "", re.IGNORECASE)
-    if m and m.group(2).lower() not in ("prod", "production", "mainnet"):
-        return ""
-    action = ""
+def _lease_command_env(tokens, script_index: int, assigned):
+    """Environment a lease sub-command names (issue #287): its own last --env value (argparse keeps the last one; a
+    flag without a value gives ""), else the BINANCE_API_ENV assignment in front of the script or, failing that, the
+    latest one an earlier export / assignment statement set (`assigned`); None when it names none."""
+    env = None
+    for i in range(script_index + 1, len(tokens)):
+        flag, eq, value = tokens[i].partition("=")
+        if flag in LEASE_ENV_FLAGS:
+            env = value if eq else (tokens[i + 1] if i + 1 < len(tokens) else "")
+    if env is None:
+        env = assigned
+        for tok in tokens[:script_index]:
+            m = LEASE_ENV_ASSIGNMENT_RE.match(tok)
+            if m:
+                env = m.group(1)
+    return None if env is None else env.strip().strip("'\"")
+
+
+def lease_command(command_line: str, shell: str = "bash"):
+    """(action, env) of a shell command for the trading lease (issue #280), per sub-command that runs the script
+    (inspection programs that merely name it are ignored): action "take" (scripts/trading_lease.py with the exact
+    --take flag), "refresh" (prime_evaluator_brief.py or record_evaluation.py, except --help) or "" (nothing); env:
+    what that sub-command names (_lease_command_env), None when nothing. An --env elsewhere in the line never counts
+    (issue #287)."""
+    action, env, assigned = "", None, None
     inspection = INSPECTION_PROGRAMS | (PS_INSPECTION_PROGRAMS if shell == "powershell" else set())
     for tokens in _split_subcommands(command_line or ""):
-        if not tokens or _program(tokens) in inspection or set(tokens) & HELP_FLAGS:
+        if not tokens:
             continue
+        skipped = _program(tokens) in inspection or set(tokens) & HELP_FLAGS
         # --take after the script, as pre_trade_guard.TRADING_LEASE_TAKE_RE force-asks it (never a wider set)
         script_at = [i for i, t in enumerate(tokens) if t.replace("\\", "/").rsplit("/", 1)[-1] == TRADING_LEASE_SCRIPT]
-        if script_at and TRADING_LEASE_TAKE_FLAG in tokens[script_at[0] + 1:]:
-            return "take"
-        text = " ".join(tokens)
-        if PRIME_BRIEF_RE.search(text) or RECORD_EVALUATION_RE.search(text):
-            action = "refresh"
+        if not skipped and script_at and TRADING_LEASE_TAKE_FLAG in tokens[script_at[0] + 1:]:
+            return "take", _lease_command_env(tokens, script_at[0], assigned)
+        brief_at = [i for i, t in enumerate(tokens) if PRIME_BRIEF_RE.search(t) or RECORD_EVALUATION_RE.search(t)]
+        if not skipped and brief_at and not action:
+            action, env = "refresh", _lease_command_env(tokens, brief_at[0], assigned)
+        # `export X=v`, a bare `X=v` statement and PowerShell `$env:X=v` reach the later sub-commands; an inline prefix
+        # (`X=v cmd`, `env X=v cmd`) only scopes to its own command
+        if tokens[0].lower() == "export" or all(SHELL_ASSIGNMENT_RE.match(t) for t in tokens):
+            for tok in tokens:
+                m = LEASE_ENV_ASSIGNMENT_RE.match(tok)
+                if m:
+                    assigned = m.group(1)
+    return action, env
+
+
+def classify_lease_command(command_line: str, shell: str = "bash") -> str:
+    """Trading lease action of a shell command (lease_command): "take", "refresh" or "". An explicit non-PROD env of
+    the lease sub-command itself (--env testnet, BINANCE_API_ENV=testnet) means nothing: TESTNET never uses the
+    lease."""
+    action, env = lease_command(command_line, shell)
+    if env is not None and env.lower() not in PROD_ENV_NAMES:
+        return ""
     return action
+
+
+def exit_code_unknown(payload: dict) -> bool:
+    """True when the tool response carries an exit code that is not an integer (issue #287: a takeover is committed
+    only on a known exit 0 or, without any exit code, on a successful PostToolUse)."""
+    response = payload.get("tool_response")
+    if not isinstance(response, dict):
+        return False
+    return any(key in response and (not isinstance(response[key], int) or isinstance(response[key], bool))
+               for key in EXIT_CODE_KEYS)
 
 
 def handle_trading_lease(payload: dict, call: dict) -> str:
     """Issue #280 (PostToolUse, after the command ran): commits an approved takeover (the PreToolUse guard force-asks
     `scripts/trading_lease.py --take`) to the calling session, or refreshes the lease's heartbeat when the caller
-    holds it and ran a brief / record command (never acquires). Nothing on a failed tool call, an unknown session or
-    another command. Returns the action taken ("take", "refresh" or ""); errors go to stderr, never raised (the sync
-    and the orphan audit always run)."""
+    holds it and ran a brief / record command (never acquires). Nothing on a failed tool call, an unknown session,
+    another command, a takeover whose exit code is not an integer, or an environment that does not resolve to PROD the
+    way the script resolves it (its own --env, else BINANCE_API_ENV / .env; issue #287). Returns the action taken
+    ("take", "refresh" or ""); errors go to stderr, never raised (the sync and the orphan audit always run)."""
     try:
         if call.get("kind") != "run_command" or tool_failed(payload):
             return ""
         session, runtime = session_of(payload)
         if not session:
             return ""
-        action = classify_lease_command(call.get("command") or "", call.get("shell", "bash"))
-        if not action:
+        command, shell = call.get("command") or "", call.get("shell", "bash")
+        action = classify_lease_command(command, shell)
+        if not action or (action == "take" and exit_code_unknown(payload)):
             return ""
         base_dir = find_workspace_root()
         scripts_dir = os.path.join(base_dir, "scripts")
         if scripts_dir not in sys.path:
             sys.path.insert(0, scripts_dir)
         from utils import trading_lease as tl
+        from utils.env_resolver import resolve_env
+        if resolve_env(lease_command(command, shell)[1], base_dir=base_dir) != "prod":
+            return ""  # e.g. BINANCE_API_ENV=testnet without --env: --take exited 2, the brief was a TESTNET one
         if action == "take":
             tl.take(base_dir, session, runtime, time.time())
             sys.stderr.write(f"[POST-TRADE-SYNC] Trading lease taken over by session {tl.abbreviate(session)}.\n")
