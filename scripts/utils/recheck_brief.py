@@ -8,7 +8,8 @@ truth, macro BTC, risk profile, lessons) with only that candidate's LIVE setup, 
 - The old plan comes only from a dossier record re-verified against the evaluator transcript
   (dossier_provenance.rebuild_verified_record; its expiry is not checked): an APPROVED record approving that
   symbol and direction for the same environment. Issue #270: the brief CLI has no session, so exactly one such
-  record (by sha256) among latest_dossier.json and the per-session files must exist. Anything else (none, two
+  record (by sha256) among latest_dossier.json and the per-session files must exist (issue #284: under Claude Code,
+  CLAUDE_CODE_SESSION_ID selects the caller's own dossier_<session>.json when it exists). Anything else (none, two
   sessions' plans), a YOLO candidate (needs a full scan) or a dossier that is itself a re-check (carries
   `recheck_of`, or its evaluations_history.jsonl row does, issue #279: no chained re-checks) refuses the re-check
   (RecheckError: no brief is written).
@@ -39,6 +40,7 @@ PIPELINE_TIMEOUT_S = 60
 CAUSE_MAX_CHARS = 200
 SNAPSHOT_KEYS = ("tier", "score", "entry", "stop_loss", "tp1", "tp2", "leverage")
 HISTORY_FILE = "evaluations_history.jsonl"  # next to latest_dossier.json (record_evaluation._paths)
+SESSION_ENV = "CLAUDE_CODE_SESSION_ID"  # issue #284: selects the caller's own dossier file (Claude Code)
 
 
 class RecheckError(Exception):
@@ -61,19 +63,27 @@ def _norm_env(value: Any) -> str:
 def load_confirmed_plan(symbol: str, direction: str, target_env: str, base_dir: str,
                         session: Optional[str] = None) -> Dict[str, Any]:
     """`recheck_of` snapshot of the confirmed candidate (issue #270). With a known `session`: that session's own
-    dossier file (else latest_dossier.json). Without one (the brief CLI): every dossier file (latest_dossier.json and
-    the per-session files) is checked and exactly one distinct verified plan (by sha256) must qualify; two or more
-    refuse (ambiguous), none raises latest_dossier.json's own error. Issue #279: an unreadable evaluation history
-    refuses (the chain guard cannot read it)."""
+    dossier file (else latest_dossier.json). Without one (the brief CLI): the dossier_<session>.json named by
+    CLAUDE_CODE_SESSION_ID when it exists (issue #284: its own plan or error; the chain guard reads only that file),
+    else every dossier file (latest_dossier.json and the per-session files) is checked and exactly one distinct
+    verified plan (by sha256) must qualify; two or more refuse (ambiguous), none raises latest_dossier.json's own
+    error. Issue #279: an unreadable evaluation history refuses (the chain guard cannot read it)."""
     history = _history_lines(base_dir)
     if session:
         return _plan_from_file(dp.resolve_dossier_path(base_dir, session=session), symbol, direction, target_env,
                                history)
+    # Issue #284: the caller's own dossier_<session>.json (CLAUDE_CODE_SESSION_ID, sanitised; a selector only, never a
+    # security boundary: the plan is provenance-verified) decides alone when it exists, so another session's
+    # re-check never blocks it. No variable or no such file: every file, as before.
+    own = dp.session_dossier_path(base_dir, os.environ.get(SESSION_ENV))
+    if own and os.path.isfile(own):
+        return _plan_from_file(own, symbol, direction, target_env, history)
     latest = dp.default_dossier_path(base_dir)
     plans, latest_error = {}, None
     for path in dp.dossier_paths(base_dir):
-        if _is_recheck_of(path, symbol, direction, history):  # that plan was already re-checked: no chained re-checks
-            raise RecheckError("the latest dossier is already a re-check: ask the user again or run a full scan")
+        rechecked = _is_recheck_of(path, symbol, direction, history)
+        if rechecked is not None:  # that plan was already re-checked: no chained re-checks
+            raise _chain_refusal(rechecked)
         try:
             plan = _plan_from_file(path, symbol, direction, target_env, history)
         except RecheckError as e:
@@ -127,18 +137,30 @@ def _approves(record: dict, symbol: str, direction: str) -> bool:
                and str(c.get("direction") or "").upper() == direction for c in record.get("approved_candidates") or [])
 
 
-def _is_recheck_of(path: str, symbol: str, direction: str, history: List[str]) -> bool:
-    """True when the file holds a re-check dossier of symbol + direction: its stored `recheck_of` or, when that was
-    removed, the history row of its sha256 (issue #279)."""
+def _is_recheck_of(path: str, symbol: str, direction: str, history: List[str]) -> Optional[dict]:
+    """The file's record when it holds a re-check dossier of symbol + direction (its stored `recheck_of` or, when
+    that was removed, the history row of its sha256, issue #279), else None."""
     try:
         record = dp.load_dossier(path)
     except Exception:
-        return False
+        return None
     old = record.get("recheck_of")
     if isinstance(old, dict):
-        return str(old.get("symbol") or "").upper() == symbol and str(old.get("direction") or "").upper() == direction
+        same = (str(old.get("symbol") or "").upper() == symbol
+                and str(old.get("direction") or "").upper() == direction)
+        return record if same else None
     prov = record.get("provenance") if isinstance(record.get("provenance"), dict) else {}
-    return _approves(record, symbol, direction) and _history_is_recheck(history, prov.get("sha256"))
+    return record if _approves(record, symbol, direction) and _history_is_recheck(history, prov.get("sha256")) else None
+
+
+def _chain_refusal(record: Any) -> RecheckError:
+    """Issue #284: the chain refusal names the session (sanitised like its file name) of the dossier that is already
+    a re-check."""
+    session = record.get("parent_conversation_id") if isinstance(record, dict) else None
+    label = (dp.SESSION_ID_UNSAFE_RE.sub("_", session.strip())[:dp.SESSION_ID_MAX_CHARS]
+             if isinstance(session, str) else "")
+    return RecheckError(f"the dossier of session {label or 'unknown'} is already a re-check: ask the user again or "
+                        "run a full scan")
 
 
 def _plan_from_file(path: str, symbol: str, direction: str, target_env: str,
@@ -154,13 +176,13 @@ def _plan_from_file(path: str, symbol: str, direction: str, target_env: str,
         raise RecheckError(f"no readable evaluation dossier to re-check ({type(e).__name__}): run a full scan")
     # Drift and age are always measured against the ORIGINAL confirmed plan, never a previous re-check
     if "recheck_of" in record or "recheck_bounds" in record:
-        raise RecheckError("the latest dossier is already a re-check: ask the user again or run a full scan")
+        raise _chain_refusal(record)
     ok, reason, rebuilt = dp.rebuild_verified_record(record)
     if not ok or not isinstance(rebuilt, dict):
         raise RecheckError(f"the latest dossier is not provenance-verified ({reason}): run a full scan")
     prov = rebuilt.get("provenance") if isinstance(rebuilt.get("provenance"), dict) else {}
     if _history_is_recheck(history or [], prov.get("sha256")):
-        raise RecheckError("the latest dossier is already a re-check: ask the user again or run a full scan")
+        raise _chain_refusal(rebuilt)
     if rebuilt.get("status") != "APPROVED":
         raise RecheckError(f"the latest dossier is {rebuilt.get('status')}, not APPROVED: nothing to re-check")
     dossier_env = _norm_env((rebuilt.get("raw_payload") or {}).get("target_env") or record.get("target_env"))

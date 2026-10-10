@@ -519,9 +519,11 @@ class TestReporterOpenIssueLookup(_BacklogCase):
         self.assertEqual((entry["status"], entry["issue_number"], entry["count"]), ("PUBLISHED_GITHUB", 1, 2))
         args, kw = self.gh_calls[-1]
         self.assertEqual(args, ["gh", "issue", "list", "--repo", "owner/repo", "--state", "open", "--search",
-                                f"{fp} in:body", "--json", "number,url,body", "--limit", "10"])
-        self.assertEqual(kw["timeout"], report_agent_issue.DEDUPE_LOOKUP_TIMEOUT_S)
-        self.assertEqual(report_agent_issue.DEDUPE_LOOKUP_TIMEOUT_S, 5.0)
+                                f"{fp} in:body", "--json", "number,url,body,labels", "--limit", "10"])
+        # Issue #284: in-process callers get the shorter bound; the CLI keeps 5 s
+        self.assertEqual(kw["timeout"], report_agent_issue.INPROCESS_LOOKUP_TIMEOUT_S)
+        self.assertEqual((report_agent_issue.INPROCESS_LOOKUP_TIMEOUT_S, report_agent_issue.DEDUPE_LOOKUP_TIMEOUT_S),
+                         (3.0, 5.0))
         self.assertFalse(os.path.exists(self.backlog))
 
     def test_any_lookup_failure_creates_as_before(self):
@@ -634,8 +636,8 @@ class TestReportIssueShDedupe(unittest.TestCase):
         with open(os.path.join(self.stub_dir, "payload.json"), encoding="utf-8") as f:
             body = json.load(f)["body"]
         self.assertIn(f"| **Fingerprint ID** | `{self.fp}` |", body)
-        self.assertIn(f"issue list --repo owner/repo --state open --search {self.fp} in:body --json number,url,body "
-                      "--limit 10", self.calls())
+        self.assertIn(f"issue list --repo owner/repo --state open --search {self.fp} in:body --json "
+                      "number,url,body,labels --limit 10", self.calls())
 
     def test_open_issue_with_the_fingerprint_is_not_duplicated(self):
         res = self.run_script(STUB_OPEN_ISSUE_FP=self.fp)

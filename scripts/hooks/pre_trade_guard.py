@@ -636,7 +636,7 @@ SCRIPT_HEAD_BYTES = 4096
 # Desk shell scripts judged with relaxed rules (run-time values and unknown cwd only), pinned by the sha256 of their
 # bytes: an edited copy (or any other file under scripts/) is judged strictly. Update the pin with the script.
 DESK_SHELL_SCRIPTS = {
-    "scripts/report_issue.sh": "75af2e06899ddf54c570058dda7be8eae6fe1ffdfb208e921cc32ec68b5791e6",
+    "scripts/report_issue.sh": "59fdb9b984141e95b42c5964a9905c7c42c70126303e51035a1c3802fc6abb08",
 }
 # Fail-closed work budget of one hook evaluation (all nested lines, scripts and cwd candidates together)
 AUDIT_MAX_SUBCOMMANDS = 5000

@@ -31,6 +31,7 @@ not blocked). CLI exit code 1 when the state written is INVALID or the write fai
 import os
 import sys
 import json
+import re
 import time
 import datetime
 from typing import Dict, List, Any
@@ -205,15 +206,20 @@ def load_audit_metadata(target_env: str = None, records: List[dict] = None) -> D
     return meta
 
 ORIGIN_ID_CHARS = 8
+ORIGIN_ID_UNSAFE_RE = re.compile(r"[^A-Za-z0-9._-]")
 
 
 def origin_tag(meta) -> str:
     """Issue #270: short origin of a position or resting entry from its audit record / pending score_meta: the
     evaluator's session (dossier_session) and dossier sha256, 8 characters each ("session:1a2b3c4d dossier:9f8e7d6c",
-    only the known parts). "" when neither is known (unknown origin: the caller adds no tag)."""
+    only the known parts). "" when neither is known (unknown origin: the caller adds no tag). Issue #284: rendered
+    into the evaluator brief, so each id keeps only [A-Za-z0-9._-] (a part left empty is dropped)."""
     meta = meta if isinstance(meta, dict) else {}
-    parts = [f"{label}:{str(meta[key])[:ORIGIN_ID_CHARS]}" for label, key in
-             (("session", "dossier_session"), ("dossier", "dossier_sha256")) if meta.get(key)]
+    parts = []
+    for label, key in (("session", "dossier_session"), ("dossier", "dossier_sha256")):
+        value = ORIGIN_ID_UNSAFE_RE.sub("", str(meta[key]))[:ORIGIN_ID_CHARS] if meta.get(key) else ""
+        if value:
+            parts.append(f"{label}:{value}")
     return " ".join(parts)
 
 
