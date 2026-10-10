@@ -268,7 +268,7 @@ def get_daily_loss_limits(profile: Optional[Dict[str, Any]] = None) -> Dict[str,
     return out
 
 
-RECHECK_MAX_DRIFT_R_MAX = 2.0
+RECHECK_MAX_DRIFT_R_MAX = 0.5  # issue #279: above it the earlier "yes" no longer covers the new plan
 RECHECK_MAX_AGE_RANGE_S = (300, 7200)
 
 

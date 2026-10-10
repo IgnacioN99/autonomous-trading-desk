@@ -140,39 +140,38 @@ def build_radar_snapshots(record: dict, base_dir: Optional[str] = None) -> Optio
     return out
 
 
-BRIEF_LINK_WINDOW_S = 600  # the evaluator rejects briefs older than 10 min (prime_evaluator_brief.py)
-
-
 def attach_recheck(record: dict, base_dir: Optional[str] = None, now_ts: Optional[int] = None) -> Optional[str]:
     """Issue #267: when the brief (logs/primed_brief.json) is a `--recheck` brief and this dossier was evaluated on
     it, stores the brief's `recheck_of` (old dossier sha256 and its verified plan) and the deterministic bounds
     verdict (utils/recheck_bounds.py, profile bounds from user_profile.get_recheck_bounds) as `recheck_of` /
-    `recheck_bounds`, outside the provenance sha256 (like radar_snapshots). Linked when the dossier's
-    `brief_generated_at_ts` equals the brief's `generated_at_ts` or, without that field, when the brief precedes the
-    dossier by at most BRIEF_LINK_WINDOW_S. Fails soft: no brief, no recheck_of or no link -> nothing stored.
-    Returns a warning when the brief carries recheck_of but this dossier is not linked to it, else None."""
+    `recheck_bounds`, outside the provenance sha256 (like radar_snapshots). Linked only when the dossier's
+    `brief_generated_at_ts` equals the brief's `generated_at_ts` (issue #279: a dossier without that field is never
+    linked). Never blocks recording; nothing is stored without a link. Returns a warning (the caller prints
+    `Re-check: NOT LINKED (no verdict)`) when the brief is missing or unparseable, or is a re-check brief this
+    dossier is not linked to; None for a normal brief or a linked dossier."""
     path = os.path.join(base_dir or BASE_DIR, "logs", "primed_brief.json")
     try:
         with open(path, "r", encoding="utf-8") as f:
             brief = json.load(f)
-        recheck_of = brief.get("recheck_of")
-        generated_at = int(brief.get("generated_at_ts"))
-    except Exception:
-        return None
-    if not isinstance(recheck_of, dict):
+        if not isinstance(brief, dict):
+            raise ValueError("not a JSON object")
+    except Exception as e:
+        return (f"logs/primed_brief.json is missing or unreadable ({type(e).__name__}): no re-check verdict, ask "
+                "the user again before executing a re-checked plan")
+    recheck_of = brief.get("recheck_of")
+    if not isinstance(recheck_of, dict) and brief.get("recheck") is None:
         return None
     raw = (record.get("raw_payload") or {}).get("brief_generated_at_ts")
-    ts = int(record.get("timestamp_ts") or 0)
     try:
-        linked = int(raw) == generated_at if raw is not None else (
-            ts - BRIEF_LINK_WINDOW_S <= generated_at <= ts)
+        linked = (isinstance(recheck_of, dict) and raw is not None
+                  and int(raw) == int(brief.get("generated_at_ts")))
     except (TypeError, ValueError):
         linked = False
     if linked and str(brief.get("target_env") or "").lower() not in ("", str(record.get("target_env") or "").lower()):
         linked = False
     if not linked:
         return ("the brief is a --recheck brief but this dossier was not evaluated on it (brief_generated_at_ts "
-                "differs): not linked to the confirmed plan, ask the user again before executing")
+                "missing or different): not linked to the confirmed plan, ask the user again before executing")
     record["recheck_of"] = dict(recheck_of)
     try:
         from utils import recheck_bounds as rb
@@ -246,7 +245,18 @@ def _persist(record: dict, base_dir: Optional[str] = None, shadow: bool = True) 
     return dossier_file
 
 
-def _print_summary(record: dict, dossier_file: str, base: str, now_ts: int) -> None:
+def _recheck_deadline(record: dict) -> Optional[int]:
+    """Issue #279: the latest time the age bound still holds (the original plan's evaluated_ts +
+    recheck_max_age_seconds), or None when it cannot be read (the verdict is then already out of bounds)."""
+    bounds = (record.get("recheck_bounds") or {}).get("bounds") or {}
+    try:
+        return int((record.get("recheck_of") or {})["evaluated_ts"]) + int(bounds["recheck_max_age_seconds"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _print_summary(record: dict, dossier_file: str, base: str, now_ts: int,
+                   recheck_not_linked: bool = False) -> None:
     status = record.get("status")
     cands = record.get("approved_candidates") or []
     valid_until = int(record.get("valid_until_ts") or 0)
@@ -286,8 +296,14 @@ def _print_summary(record: dict, dossier_file: str, base: str, now_ts: int) -> N
               f"{lines[0]}")
         for line in lines[1:]:
             print(f"     {line}")
-        print(f"   Deadline: valid until {_fmt_utc(valid_until, '%H:%M:%S UTC')} ({remaining // 60}m "
-              f"{remaining % 60:02d}s left)")
+        age_until = _recheck_deadline(record)
+        deadline = min(valid_until, age_until) if age_until is not None else valid_until
+        left = max(0, deadline - now_ts)
+        age_text = _fmt_utc(age_until, '%H:%M:%S UTC') if age_until is not None else "unknown"
+        print(f"   Deadline: valid until {_fmt_utc(valid_until, '%H:%M:%S UTC')}, age bound until {age_text}: "
+              f"execute before {_fmt_utc(deadline, '%H:%M:%S UTC')} ({left // 60}m {left % 60:02d}s left)")
+    elif recheck_not_linked:  # issue #279: never a silent missing verdict
+        print("   Re-check: NOT LINKED (no verdict)")
     prov = record.get("provenance") or {}
     if prov.get("source") in dp.SUBAGENT_SOURCES:
         runtime = "Claude Code" if prov.get("source") == dp.CLAUDE_SOURCE else "agy"
@@ -395,7 +411,7 @@ def _record_extracted(
         print(f"⚠️ RE-CHECK NOT LINKED: {recheck_warning}", file=sys.stderr)
     dossier_file = _persist(record, base, shadow=shadow)
     if verbose:
-        _print_summary(record, dossier_file, base, now_ts)
+        _print_summary(record, dossier_file, base, now_ts, recheck_not_linked=bool(recheck_warning))
     return record
 
 
