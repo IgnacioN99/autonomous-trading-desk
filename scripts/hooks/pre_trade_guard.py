@@ -335,7 +335,8 @@ Hardened against fail-open behaviors and spoofing vulnerabilities:
    read-only program is denied like the other ground-truth files (report_issue.sh: pass such text through
    --context-file / --output-file). Likewise, after a Delta-Neutral denial (5) of a dossier-approved candidate the
    hook appends one line to logs/gate_denials.jsonl (issue #261: symbol, direction, dossier prices / score / sha,
-   cached delta and book; record-only, best effort, bounded size, never alters the decision); the shadow tracker
+   cached delta and book; record-only, best effort, bounded size and reads, never alters the decision; issue #275: a
+   failed recording increments gate_denial_recorder_errors in the heartbeat); the shadow tracker
    turns it into a DELTA_GATE_POST_APPROVAL shadow row. Executor-only denials are not recorded. The trading lease (12)
    is the one hook-written file that changes a decision: written only at an allowed PROD opening.
 12. TRADING LEASE (issue #280, scripts/utils/trading_lease.py; PROD openings only):
@@ -6047,33 +6048,132 @@ GATE_DENIAL_GATE = "DELTA_GATE_POST_APPROVAL"
 GATE_DENIAL_MAX_BYTES = 4096
 GATE_DENIAL_BOOK_MAX_ITEMS = 25
 GATE_DENIAL_DEDUPE_TAIL_BYTES = 16384
+GATE_DENIAL_DEDUPE_WINDOW_SECONDS = 3600  # issue #275: mirror of utils/shadow_common.DEDUPE_WINDOW_SECONDS
+GATE_DENIAL_REGISTRY_MAX_BYTES = 65536    # issue #275: a larger logs/pending_entries.json is left out of the book
+GATE_DENIAL_BRIEF_MAX_BYTES = 65536       # issue #275: equity fallback read of logs/primed_brief.json
+GATE_DENIAL_BRIEF_MAX_AGE_SECONDS = 6 * 3600
+HEARTBEAT_READ_MAX_BYTES = 4096
+_gate_denial_recorder_errors = 0          # failed recordings of this process, added to the heartbeat (issue #275)
+
+
+def _gate_denial_key(sha: Any, env: Any, symbol: Any, direction: Any, ts: Any) -> Optional[tuple]:
+    """Identity of a gate_denials event (mirror of utils/shadow_common.gate_event_key, issue #275): ("sha",
+    dossier_sha256, symbol, direction), else (an event without a sha: check_dossier adds none outside PROD)
+    ("window", env, symbol, direction, ts // GATE_DENIAL_DEDUPE_WINDOW_SECONDS); None when ts is not a number."""
+    if isinstance(sha, str) and sha:
+        return ("sha", sha, symbol, direction)
+    try:
+        return ("window", env, symbol, direction, int(float(ts)) // GATE_DENIAL_DEDUPE_WINDOW_SECONDS)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _gate_denial_positive(value: Any) -> Optional[float]:
+    """value as a finite positive float, else None (bools are not numbers here)."""
+    if isinstance(value, bool):
+        return None
+    try:
+        num = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return num if 0 < num < float("inf") else None
+
+
+def _gate_denial_env(value: Any) -> str:
+    env = str(value or "").strip().lower()
+    return "prod" if env == "mainnet" else env
+
+
+def _gate_denial_equity(state: dict, env: str, base_dir: str, now_ts: int) -> Tuple[Optional[float], Optional[str]]:
+    """(equity, equity_source) for the event sizing (issue #275), never raises: the cached session state's
+    operating_balance.total_wallet_balance_usdt ("session_state"; its target_env, when set, must be env), else
+    logs/primed_brief.json risk_profile.account_equity_usdt ("primed_brief"; bounded read of at most
+    GATE_DENIAL_BRIEF_MAX_BYTES, its target_env must be env and its generated_at_ts at most
+    GATE_DENIAL_BRIEF_MAX_AGE_SECONDS old); (None, None) when neither is usable."""
+    try:
+        balance = state.get("operating_balance")
+        state_env = _gate_denial_env(state.get("target_env"))
+        equity = _gate_denial_positive(balance.get("total_wallet_balance_usdt")) if isinstance(balance, dict) else None
+        if equity is not None and (not state_env or state_env == env):
+            return equity, "session_state"
+    except Exception:
+        pass
+    try:
+        path = os.path.join(base_dir, "logs", "primed_brief.json")
+        if not os.path.isfile(path) or os.path.getsize(path) > GATE_DENIAL_BRIEF_MAX_BYTES:
+            return None, None
+        with open(path, "rb") as f:
+            raw = f.read(GATE_DENIAL_BRIEF_MAX_BYTES + 1)
+        if len(raw) > GATE_DENIAL_BRIEF_MAX_BYTES:
+            return None, None
+        brief = json.loads(raw.decode("utf-8"))
+        generated = _gate_denial_positive(brief.get("generated_at_ts"))
+        profile = brief.get("risk_profile")
+        if (_gate_denial_env(brief.get("target_env")) != env or generated is None or not isinstance(profile, dict)
+                or not (now_ts - GATE_DENIAL_BRIEF_MAX_AGE_SECONDS <= generated <= now_ts + 300)):
+            return None, None
+        equity = _gate_denial_positive(profile.get("account_equity_usdt"))
+        return (equity, "primed_brief") if equity is not None else (None, None)
+    except Exception:
+        return None, None
+
+
+def _gate_denial_sizing(cand: dict, state: dict, env: str, user_prof: Any, base_dir: str, now_ts: int) -> dict:
+    """Issue #275: {"notional_usdt", "risk_usdt", "notional_derived": True, "equity_source"} of the denied candidate,
+    derived from the dossier entry / stop_loss, the equity of _gate_denial_equity (session state, else the primed
+    brief) and the profile's risk_pct_equity (fraction; above 0.05 read as a percentage, as the executor does):
+    risk_usdt = equity x risk, notional_usdt = risk_usdt / |entry - stop_loss| x entry. {} when any input is missing
+    or invalid (never guessed). Report-only (shadow desk): it feeds no gate. Never raises."""
+    try:
+        raw_risk = user_prof.get("risk_pct_equity") if isinstance(user_prof, dict) else None
+        risk_pct = _gate_denial_positive(raw_risk)
+        entry, stop = _gate_denial_positive(cand.get("entry")), _gate_denial_positive(cand.get("stop_loss"))
+        if risk_pct is None or entry is None or stop is None or entry == stop:
+            return {}
+        equity, source = _gate_denial_equity(state, env, base_dir, now_ts)
+        if equity is None:
+            return {}
+        risk = equity * (risk_pct if risk_pct <= 0.05 else risk_pct / 100.0)
+        return {"notional_usdt": round(risk / abs(entry - stop) * entry, 2), "risk_usdt": round(risk, 4),
+                "notional_derived": True, "equity_source": source}
+    except Exception:
+        return {}
 
 
 def _record_gate_denial(base_dir: str, env: str, now_ts: int, symbol: Optional[str], direction: Optional[str],
-                        cand: Optional[dict], state: dict, delta_bias: Any, age_seconds: Any) -> None:
+                        cand: Optional[dict], state: dict, delta_bias: Any, age_seconds: Any,
+                        user_prof: Optional[dict] = None) -> None:
     """Record-only (issue #261): append one JSON line to logs/gate_denials.jsonl for a Delta-Neutral denial of a
     dossier-approved candidate, after the decision is made. Never raises and never changes the decision: stdlib
     only, no network, no lock, no fsync, one write of at most GATE_DENIAL_MAX_BYTES (the book is dropped and
     flagged when it does not fit). Without a dossier candidate (cand None, TESTNET --bypass-eval-gate) nothing is
     written. Book: the cached session state's active_positions and the same-env logs/pending_entries.json records,
-    trimmed to the fields the tracker's book_from_sources reads (a registry read error goes to book_error). Skips an event whose (dossier_sha256, symbol,
-    direction) is already in the file's tail (best effort; the tracker's dedupe is authoritative)."""
+    trimmed to the fields the tracker's book_from_sources reads (a registry read error goes to book_error; a
+    registry above GATE_DENIAL_REGISTRY_MAX_BYTES is not read and flags book_truncated). Skips an event whose
+    identity (_gate_denial_key: dossier_sha256 + symbol + direction, else env + symbol + direction + time window) is
+    already in the file's last GATE_DENIAL_DEDUPE_TAIL_BYTES (best effort; the tracker's dedupe is authoritative).
+    Issue #275: notional_usdt / risk_usdt / notional_derived / equity_source from _gate_denial_sizing when
+    derivable (equity: session state, else a fresh same-env logs/primed_brief.json; bounded reads); a failed
+    recording (write error, size cap, exception) counts in _gate_denial_recorder_errors (heartbeat)."""
+    global _gate_denial_recorder_errors
     try:
         if not isinstance(cand, dict) or not symbol or not direction:
             return
         sha = cand.get("dossier_sha256") if isinstance(cand.get("dossier_sha256"), str) else None
         path = os.path.join(base_dir, *GATE_DENIALS_LOG.split("/"))
-        if sha and os.path.exists(path):
+        key = _gate_denial_key(sha, env, symbol, direction, now_ts)
+        if key is not None and os.path.isfile(path):
             with open(path, "rb") as f:
                 f.seek(max(0, os.path.getsize(path) - GATE_DENIAL_DEDUPE_TAIL_BYTES))
-                tail = f.read().decode("utf-8", "replace")
+                tail = f.read(GATE_DENIAL_DEDUPE_TAIL_BYTES).decode("utf-8", "replace")
             for line in tail.splitlines():
                 try:
                     prev = json.loads(line)
                 except ValueError:
                     continue
-                if (isinstance(prev, dict) and prev.get("dossier_sha256") == sha and prev.get("symbol") == symbol
-                        and prev.get("direction") == direction):
+                if isinstance(prev, dict) and _gate_denial_key(prev.get("dossier_sha256"), prev.get("env"),
+                                                               prev.get("symbol"), prev.get("direction"),
+                                                               prev.get("ts")) == key:
                     return
         portfolio = state.get("portfolio_exposure") if isinstance(state.get("portfolio_exposure"), dict) else {}
         book = []
@@ -6082,11 +6182,17 @@ def _record_gate_denial(base_dir: str, env: str, now_ts: int, symbol: Optional[s
                 book.append(dict({k: p.get(k) for k in ("symbol", "direction", "notional_usdt", "entry_order_id",
                                                         "entry_time_ts")}, kind="position"))
         book_error = None
+        registry_skipped = False
         registry = os.path.join(base_dir, "logs", "pending_entries.json")
         try:
             if os.path.exists(registry):
-                with open(registry, "r", encoding="utf-8") as f:
-                    data = json.load(f)
+                raw = None
+                if os.path.getsize(registry) <= GATE_DENIAL_REGISTRY_MAX_BYTES:
+                    with open(registry, "rb") as f:
+                        raw = f.read(GATE_DENIAL_REGISTRY_MAX_BYTES + 1)
+                # above the cap (also when it grew after getsize): not parsed, the book is flagged incomplete
+                registry_skipped = raw is None or len(raw) > GATE_DENIAL_REGISTRY_MAX_BYTES
+                data = {"entries": {}} if registry_skipped else json.loads(raw.decode("utf-8"))
                 entries = data.get("entries") if isinstance(data, dict) else None
                 if not isinstance(entries, dict):
                     raise ValueError("pending entries registry malformed")
@@ -6107,17 +6213,20 @@ def _record_gate_denial(base_dir: str, env: str, now_ts: int, symbol: Optional[s
                  "session_state_ts": state.get("last_updated_ts"), "age_seconds": age_seconds,
                  "delta_bias": delta_bias, "net_notional_delta_usdt": portfolio.get("net_notional_delta_usdt"),
                  "book": book[:GATE_DENIAL_BOOK_MAX_ITEMS],
-                 "book_truncated": len(book) > GATE_DENIAL_BOOK_MAX_ITEMS, "book_error": book_error}
+                 "book_truncated": len(book) > GATE_DENIAL_BOOK_MAX_ITEMS or registry_skipped,
+                 "book_error": book_error}
+        event.update(_gate_denial_sizing(cand, state, env, user_prof, base_dir, now_ts))
         line = json.dumps(event, ensure_ascii=False, default=str) + "\n"
         if len(line.encode("utf-8")) > GATE_DENIAL_MAX_BYTES:
             event.update(book=[], book_truncated=True)
             line = json.dumps(event, ensure_ascii=False, default=str) + "\n"
             if len(line.encode("utf-8")) > GATE_DENIAL_MAX_BYTES:
+                _gate_denial_recorder_errors += 1
                 return
         with open(path, "a", encoding="utf-8") as f:
             f.write(line)
     except Exception:
-        pass
+        _gate_denial_recorder_errors += 1
 
 
 def _trading_lease_denial(base_dir: str, conversation_id: Optional[str], runtime: Optional[str], now_ts: int,
@@ -6391,7 +6500,8 @@ def evaluate_trade_opening(cmd: str, args: dict, mcp_args: dict, base_dir: str,
         if delta_bias == "LONG_HEAVY" and trade_dir == "LONG":
             # Issue #261: record-only, after the decision; never changes it
             with contextlib.suppress(Exception):
-                _record_gate_denial(base_dir, env, now_ts, target_sym, trade_dir, cand, state, delta_bias, age_seconds)
+                _record_gate_denial(base_dir, env, now_ts, target_sym, trade_dir, cand, state, delta_bias, age_seconds,
+                                    user_prof=user_prof)
             return "deny", (
                 "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Delta-Neutral Hard Gate): "
                 f"Portfolio is bullishly unbalanced (Delta: +${portfolio.get('net_notional_delta_usdt', 0):.2f} USDT / LONG_HEAVY). "
@@ -6399,7 +6509,8 @@ def evaluate_trade_opening(cmd: str, args: dict, mcp_args: dict, base_dir: str,
             )
         if delta_bias == "SHORT_HEAVY" and trade_dir == "SHORT":
             with contextlib.suppress(Exception):
-                _record_gate_denial(base_dir, env, now_ts, target_sym, trade_dir, cand, state, delta_bias, age_seconds)
+                _record_gate_denial(base_dir, env, now_ts, target_sym, trade_dir, cand, state, delta_bias, age_seconds,
+                                    user_prof=user_prof)
             return "deny", (
                 "🚨 BLOCKED BY PRE-TOOL-USE HOOK (Delta-Neutral Hard Gate): "
                 f"Portfolio is bearishly unbalanced (Delta: -${abs(portfolio.get('net_notional_delta_usdt', 0)):.2f} USDT / SHORT_HEAVY). "
@@ -6649,10 +6760,24 @@ def evaluate_payload(payload: dict) -> Tuple[str, str, str]:
 # Output contracts
 # =============================================================================
 def _write_heartbeat(mode: str, tool: str, decision: str) -> None:
-    """Best-effort liveness signal for trading_doctor; never changes the decision."""
+    """Best-effort liveness signal for trading_doctor; never changes the decision. Issue #275:
+    gate_denial_recorder_errors = the previous heartbeat's count (bounded read) + this process's failed
+    _record_gate_denial calls (consumed once written)."""
+    global _gate_denial_recorder_errors
     try:
         path = os.environ.get(HEARTBEAT_ENV_OVERRIDE) or os.path.join(find_workspace_root(), "logs", "hook_heartbeat.json")
         now = time.time()
+        pending_errors = _gate_denial_recorder_errors
+        recorder_errors = pending_errors
+        try:
+            if os.path.isfile(path):
+                with open(path, "rb") as f:
+                    prev = json.loads(f.read(HEARTBEAT_READ_MAX_BYTES).decode("utf-8"))
+                prev_errors = prev.get("gate_denial_recorder_errors") if isinstance(prev, dict) else None
+                if isinstance(prev_errors, int) and not isinstance(prev_errors, bool) and prev_errors > 0:
+                    recorder_errors += prev_errors
+        except Exception:
+            pass
         record = {
             "hook": HOOK_NAME,
             "mode": mode,
@@ -6660,6 +6785,7 @@ def _write_heartbeat(mode: str, tool: str, decision: str) -> None:
             "last_seen_utc": datetime.datetime.fromtimestamp(now, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
             "tool": tool,
             "decision": decision,
+            "gate_denial_recorder_errors": recorder_errors,
         }
         if atomic_write_json is not None:
             atomic_write_json(path, record)
@@ -6669,6 +6795,7 @@ def _write_heartbeat(mode: str, tool: str, decision: str) -> None:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(record, f)
             os.replace(tmp, path)
+        _gate_denial_recorder_errors -= pending_errors
     except Exception:
         pass
 

@@ -22,9 +22,10 @@ order. Regret and the policy replay are computed in scripts/shadow_analytics.py.
 Hook denials (issue #261): when pre_trade_guard.py denies a dossier-approved candidate on the Delta-Neutral gate it
 appends one event to logs/gate_denials.jsonl (its own ground-truth log: dossier prices / score / sha and the cached
 book, source session_state_cache). register_from_gate_denials (run first by --register-from-eval, i.e. at every
-record_evaluation.py) turns recent events into DELTA_GATE_POST_APPROVAL rows (gate_source "hook_denial", blockers
-and book via book_from_sources, registered_at_ts = the denial time), once per dossier_sha256 + symbol + direction.
-Denials by the executor's own Gate 1 (live book) are not recorded.
+record_evaluation.py, and, issue #275, by --audit and --loop) turns recent events into DELTA_GATE_POST_APPROVAL rows
+(gate_source "hook_denial", blockers and book via book_from_sources, registered_at_ts = the denial time, the hook's
+notional_usdt / risk_usdt when it could derive them), once per dossier_sha256 + symbol + direction (an event without
+a sha: env + symbol + direction + time window). Denials by the executor's own Gate 1 (live book) are not recorded.
 
 Usage:
   python3 scripts/shadow_tracker.py --register-from-eval
@@ -46,7 +47,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from utils.atomic_writer import atomic_write_json, atomic_append_jsonl
 # Shared with shadow_analytics.py (issue #290), re-exported here: st.GATE_ENUM, st.row_gate, ... keep working
 from utils.shadow_common import (  # noqa: F401
-    GATE_ENUM, GATE_FALLBACK, POST_APPROVAL_GATE, BLOCKER_GATES, DEDUPE_WINDOW_SECONDS, row_gate)
+    GATE_ENUM, GATE_FALLBACK, POST_APPROVAL_GATE, BLOCKER_GATES, DEDUPE_WINDOW_SECONDS, row_gate, gate_event_key)
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOGS_DIR = os.path.join(BASE_DIR, "logs")
@@ -273,11 +274,13 @@ def _env_name(value) -> str:
     return "prod" if v == "mainnet" else v
 
 
-def _latest_audit_by_symbol(path: str, until_ts: Optional[float] = None) -> Dict[str, dict]:
+def _latest_audit_by_symbol(path: str, until_ts: Optional[float] = None,
+                            records: Optional[List[dict]] = None) -> Dict[str, dict]:
     """Latest non-event entry record (with total_qty) per symbol of logs/trades_audit.jsonl (missing file: {});
-    with until_ts, records timestamped later are ignored (a later trade is not the blocker of an older event)."""
+    with until_ts, records timestamped later are ignored (a later trade is not the blocker of an older event).
+    records: the file's records already loaded (issue #275: one read per intake call), else path is read."""
     latest: Dict[str, dict] = {}
-    for rec in load_jsonl(path):
+    for rec in (load_jsonl(path) if records is None else records):
         if isinstance(rec, dict) and not rec.get("event") and "total_qty" in rec and rec.get("symbol"):
             ts = _to_float(rec.get("timestamp"))
             if until_ts is not None and ts is not None and ts > until_ts:
@@ -371,8 +374,20 @@ def _trimmed_book(items: list) -> list:
             for i in items]
 
 
-def _register_gate_denial(ev, now_ts: int, seen: set, stats: Optional[dict] = None) -> Optional[dict]:
-    """One logs/gate_denials.jsonl event -> a DELTA_GATE_POST_APPROVAL shadow row (None when skipped)."""
+def _gate_row_key(row: dict) -> Optional[tuple]:
+    """gate_event_key of a shadow row: its dossier_sha256, else for a hook_denial row its event env + time window."""
+    sym, direction = row.get("symbol"), str(row.get("direction") or "").upper()
+    if isinstance(row.get("dossier_sha256"), str) and row.get("dossier_sha256"):
+        return gate_event_key(row["dossier_sha256"], None, sym, direction, None)
+    if row.get("gate_source") == "hook_denial":
+        return gate_event_key(None, _env_name(row.get("gate_event_env")), sym, direction, row.get("registered_at_ts"))
+    return None
+
+
+def _register_gate_denial(ev, now_ts: int, seen: set, stats: Optional[dict] = None,
+                          audit: Optional[list] = None) -> Optional[dict]:
+    """One logs/gate_denials.jsonl event -> a DELTA_GATE_POST_APPROVAL shadow row (None when skipped). seen: the
+    gate_event_key of rows already registered; audit: a one-item list caching the trades_audit.jsonl records."""
     if not isinstance(ev, dict) or ev.get("gate") != POST_APPROVAL_GATE:
         return None
     ts = _to_float(ev.get("ts"))
@@ -384,13 +399,20 @@ def _register_gate_denial(ev, now_ts: int, seen: set, stats: Optional[dict] = No
     if not sym or direction not in ("LONG", "SHORT") or any(p is None or p <= 0 for p in prices):
         return None
     sha = ev.get("dossier_sha256") if isinstance(ev.get("dossier_sha256"), str) and ev.get("dossier_sha256") else None
-    if sha and (sha, sym, direction) in seen:
-        return None
     env = ev.get("env") if isinstance(ev.get("env"), str) else None
+    # issue #275: an event without a sha (TESTNET) is identified by env + symbol + direction + time window
+    key = gate_event_key(sha, None if sha else _env_name(env), sym, direction, ts)
+    if key in seen:
+        return None
+    if audit is None:
+        audit = []
+    if not audit:
+        audit.append(load_jsonl(TRADES_AUDIT_FILE))
     raw = [i for i in ev.get("book") or [] if isinstance(i, dict)] if isinstance(ev.get("book"), list) else []
     state = {"active_positions": [i for i in raw if i.get("kind") == "position"]}
     entries = {str(n): i for n, i in enumerate(i for i in raw if i.get("kind") == "resting")}
-    book = {"items": book_from_sources(state, entries, _latest_audit_by_symbol(TRADES_AUDIT_FILE, until_ts=ts), env)}
+    book = {"items": book_from_sources(state, entries,
+                                       _latest_audit_by_symbol(TRADES_AUDIT_FILE, until_ts=ts, records=audit[0]), env)}
     net = _to_float(ev.get("net_notional_delta_usdt"))
     detail = (f"hook denied {sym} {direction} after approval: delta_bias {ev.get('delta_bias')} (cached net delta "
               f"{'?' if net is None else f'{net:+.2f}'} USDT, session_state age {ev.get('age_seconds')}s)")
@@ -405,44 +427,76 @@ def _register_gate_denial(ev, now_ts: int, seen: set, stats: Optional[dict] = No
         extra["book_truncated"] = True
     if ev.get("book_error"):
         extra["blockers_error"] = str(ev["book_error"])[:200]
+    # issue #275: the hook's notional / risk (equity x profile risk, equity_source session_state | primed_brief);
+    # without them the default risk is kept
+    notional, risk = _to_float(ev.get("notional_usdt")), _to_float(ev.get("risk_usdt"))
+    if notional is not None and notional > 0:
+        extra["notional_usdt"] = notional
+        extra["notional_derived"] = bool(ev.get("notional_derived"))
+        if isinstance(ev.get("equity_source"), str) and ev.get("equity_source"):
+            extra["equity_source"] = ev["equity_source"][:40]
     entry, sl, tp1, tp2 = prices
     row = register_shadow_trade(
         symbol=sym, direction=direction, trigger_price=entry, sl_price=sl, tp1_price=tp1, tp2_price=tp2,
         current_price=entry, rejection_reason=f"[{POST_APPROVAL_GATE}] {detail}"[:GATE_DETAIL_MAX_CHARS],
         rejection_category=POST_APPROVAL_GATE, gate=POST_APPROVAL_GATE, gate_detail=detail[:GATE_DETAIL_MAX_CHARS],
+        target_dollar_risk=risk if risk is not None and risk > 0 else 1.50,
         gate_source="hook_denial", score=_to_float(ev.get("score")), dossier_sha256=sha, extra=extra,
         registered_at_ts=int(ts), stats=stats)
-    if row and sha:
-        seen.add((sha, sym, direction))
+    if row and key is not None:
+        seen.add(key)
     return row
 
 
 def register_from_gate_denials(now_ts: Optional[int] = None, stats: Optional[dict] = None) -> int:
     """Registers the hook's delta-gate denials of approved candidates (logs/gate_denials.jsonl, issue #261) as
     DELTA_GATE_POST_APPROVAL shadow rows: gate_source "hook_denial", blockers and book from the event's cached book
-    (book_from_sources; position scores from trades_audit records not newer than the event), registered_at_ts = the
-    denial time and trigger = current price = the dossier entry. Reads only the last GATE_DENIAL_TAIL_LINES lines and
-    events of the last GATE_DENIAL_MAX_AGE_SECONDS; skips events without valid dossier prices. Idempotent through
-    register_shadow_trade's dedupe (stats: see there). A missing or garbled file registers nothing; never raises."""
+    (book_from_sources; position scores from trades_audit records not newer than the event, the file read once per
+    call), registered_at_ts = the denial time, trigger = current price = the dossier entry, and the event's
+    notional_usdt / risk_usdt (target_dollar_risk) / equity_source when present (issue #275). Reads only the last
+    GATE_DENIAL_TAIL_LINES lines and events of the last GATE_DENIAL_MAX_AGE_SECONDS; skips events without valid
+    dossier prices. Idempotent through gate_event_key (dossier_sha256 + symbol + direction, else env + symbol +
+    direction + time window), pending and resolved rows, and register_shadow_trade's dedupe (stats: see there).
+    stats also receives "gate_denials_garbled" (lines that are not JSON) and "gate_denials_error" (file unreadable)
+    when non-zero. A missing or garbled file registers nothing; never raises."""
     try:
         if not os.path.exists(GATE_DENIALS_FILE):
             return 0
         with open(GATE_DENIALS_FILE, "r", encoding="utf-8", errors="replace") as f:
             lines = list(collections.deque(f, maxlen=GATE_DENIAL_TAIL_LINES))
         now = int(time.time()) if now_ts is None else int(now_ts)
-        seen = {(t.get("dossier_sha256"), t.get("symbol"), str(t.get("direction") or "").upper())
-                for t in load_jsonl(SHADOW_TRADES_FILE) + load_jsonl(SHADOW_RESOLVED_FILE)
-                if isinstance(t, dict) and t.get("dossier_sha256")}
-    except Exception:
+        seen = {_gate_row_key(t) for t in load_jsonl(SHADOW_TRADES_FILE) + load_jsonl(SHADOW_RESOLVED_FILE)
+                if isinstance(t, dict)} - {None}
+    except Exception as e:
+        if stats is not None:
+            stats["gate_denials_error"] = f"{type(e).__name__}: {e}"[:200]
         return 0
-    count = 0
+    count = garbled = 0
+    audit: list = []
     for line in lines:
+        if not line.strip():
+            continue
         try:
-            if _register_gate_denial(json.loads(line), now, seen, stats):
+            ev = json.loads(line)
+        except ValueError:
+            garbled += 1
+            continue
+        try:
+            if _register_gate_denial(ev, now, seen, stats, audit):
                 count += 1
         except Exception:
             continue
+    if garbled and stats is not None:
+        stats["gate_denials_garbled"] = stats.get("gate_denials_garbled", 0) + garbled
     return count
+
+
+def _gate_denials_note(stats: dict) -> str:
+    """The intake's lost-event counters for the printed lines (issue #275)."""
+    note = f"garbled gate_denials lines skipped {stats.get('gate_denials_garbled', 0)}"
+    if stats.get("gate_denials_error"):
+        note += f", gate_denials unreadable ({stats['gate_denials_error']})"
+    return note
 
 def register_from_evaluation(stats: Optional[dict] = None) -> int:
     """Reads latest evaluation brief and dossier, auto-registering rejected setups, and first the hook's recent
@@ -850,7 +904,17 @@ def _register_and_print() -> int:
     stats = {"deduped_window": 0}
     count = register_from_evaluation(stats)
     print(f"📥 Registered {count} candidate(s) into shadow ledger (deduped_window {stats['deduped_window']}: "
-          f"same symbol/direction/gate within {DEDUPE_WINDOW_SECONDS} s).")
+          f"same symbol/direction/gate within {DEDUPE_WINDOW_SECONDS} s; {_gate_denials_note(stats)}).")
+    return count
+
+
+def _register_gate_denials_and_print(stream=None) -> int:
+    """register_from_gate_denials with its counters printed (--audit, issue #275: hook denials are picked up without
+    waiting for the next record_evaluation.py)."""
+    stats: dict = {}
+    count = register_from_gate_denials(stats=stats)
+    print(f"📥 Registered {count} hook gate denial(s) into shadow ledger ({_gate_denials_note(stats)}).",
+          file=stream or sys.stdout)
     return count
 
 
@@ -867,6 +931,8 @@ def main():
         _register_and_print()
 
     if args.audit or not (args.register_from_eval or args.loop or args.json):
+        if not args.register_from_eval:   # already read by register_from_evaluation; --json keeps stdout JSON
+            _register_gate_denials_and_print(sys.stderr if args.json else None)
         res = audit_shadow_trades()
         if not args.json:
             print_shadow_dashboard()
