@@ -10,6 +10,7 @@ import os
 import json
 import shutil
 import tempfile
+import time
 import unittest
 import subprocess
 import sys
@@ -26,6 +27,13 @@ from scripts.hooks import post_pr_review_hook as post_hook
 from scripts.hooks import pr_review_stop_hook as stop_hook
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+for _p in (str(REPO_ROOT / "scripts"), str(REPO_ROOT / "tests")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+import trading_doctor  # noqa: E402
+import test_issue_172_guardian_trailing as t172  # noqa: E402  (module import: its offline run_doctor harness)
+
 ALL_REVIEWERS = {"agentic_harness", "binance_microstructure", "prompt_engineering", "trading_risk"}
 READ_ONLY_TOOLS = {"view_file", "grep_search", "list_dir", "find_by_name", "send_message"}
 
@@ -522,6 +530,15 @@ class TestPRReviewHooks(unittest.TestCase):
         "git push -fd origin fix/x",
         "git push origin :fix/x",
         "git push origin +:fix/x",
+        # Issue #257: `<<$WORD` is a heredoc ending at the literal `$WORD` line; ordinary heredocs stay hidden
+        "cat <<$WORD\ngit push origin fix/x\n$WORD",
+        "cat <<${WORD}\ngit push origin fix/x\n${WORD}",
+        "cat <<\"EOF\"\ngit push origin fix/x\nEOF",
+        "cat <<-EOF\n\tgit push origin fix/x\n\tEOF",
+        # bash evaluates `((...))` as arithmetic when it closes with `))`: the push never runs
+        "((cd x; git push origin fix/x))",
+        # bash lexes `<<` outside `((...))` as a heredoc, also in `let` arguments: the push is its body
+        "let x=1<<3\ngit push origin fix/x",
     )
     ARMING = (
         "git push -u origin fix/x",
@@ -545,6 +562,25 @@ class TestPRReviewHooks(unittest.TestCase):
         # PR body with quotes and an unbalanced `)` inside a heredoc in "$(...)"
         "gh pr create --title \"t\" --body \"$(cat <<'EOF'\n- fixes \"quoted\" text\n1) item; git push origin main\n"
         "EOF\n)\"",
+        # Issue #257: `((...))` right after a separator is arithmetic (`<<` is a shift), not a heredoc
+        "x;((1<<3))\ngit push origin fix/x",
+        "x;((1<<3)); git push origin fix/x",
+        "true&&((1<<3))\ngit push origin fix/x",
+        "x|((1<<3))\ngit push origin fix/x",
+        "(((1<<3)))\ngit push origin fix/x",
+        "((cd x; git push origin main))\ngit push origin fix/x",
+        "((cd x); git push origin fix/x)",  # `)` not followed by `)`: nested subshells, the push runs
+        'let "x=1<<3"\ngit push origin fix/x',
+        "let x=1<<3\n3\ngit push origin fix/x",  # the heredoc of `let x=1<<3` ends at the `3` line
+        "cat <<$WORD\ngit push origin main\n$WORD\ngit push origin fix/x",
+        "cat <<'EOF'\ngit push origin main\nEOF\ngit push origin fix/x",
+        "cat <<\"EOF\"\ngit push origin main\nEOF\ngit push origin fix/x",
+        "cat <<-EOF\n\tgit push origin main\n\tEOF\ngit push origin fix/x",
+        # A value-taking `-o` ending a short-flag cluster; `#` inside a word is no comment
+        "git push -fo ci.skip origin fix/x",
+        "git push origin fix/#12",
+        "echo $#; git push origin fix/x",
+        "git push origin fix/x # ; git push origin main",  # a comment still starts at a word start
     )
 
     def test_issue_115_mentions_do_not_arm(self):
@@ -627,6 +663,47 @@ class TestPRReviewHooks(unittest.TestCase):
                 self.assertEqual(state_mod.load_state(), {})
         events = [json.loads(e) for e in Path(state_mod.events_path()).read_text(encoding="utf-8").splitlines()]
         self.assertEqual([e["event"] for e in events], ["detect_error", "detect_error"])
+
+    def test_issue_257_directory_stack_and_powershell_parameters(self):
+        find = post_hook.find_review_trigger
+        cases = (
+            ("cd /a && pushd /b && popd; git push", "/a"),
+            ("pushd /a && pushd /b && popd && git push", "/a"),
+            ("pushd /a && pushd /b && popd && popd && git push", "/start"),
+            ("cd /a && popd && git push", "/start"),  # empty stack: the start directory
+            ("Push-Location /a; Push-Location -Path /b; Pop-Location; git push", "/a"),
+            ("cd /a; Push-Location -LiteralPath /b; Pop-Location; git push", "/a"),
+            # Another PowerShell parameter's value or a stack rotation is no directory: keep the current one
+            ("cd /a; Push-Location -StackName foo; git push", "/a"),
+            ("cd /a; Set-Location -StackName foo; git push", "/a"),
+            ("cd /a; pushd +1; git push", "/a"),
+            ("cd /a; pushd -1; git push", "/a"),
+            ("cd /a; pushd +1; popd; git push", "/start"),  # the rotation pushed nothing
+            ("cd -P /wt && git push", "/wt"),  # single-letter flags are skipped
+        )
+        for command, directory in cases:
+            with self.subTest(command=command):
+                self.assertEqual(find(command, "/start").directory, directory)
+
+    def test_issue_257_scanner_residuals(self):
+        find = post_hook.find_review_trigger
+        self.assertEqual(find("git push -fo ci.skip origin fix/x", "/start").branch, "fix/x")
+        self.assertEqual(find("git push -foci.skip origin fix/x", "/start").branch, "fix/x")
+        self.assertEqual(find("git push -uo ci.skip origin fix/x", "/start").branch, "fix/x")
+        self.assertIsNone(find("git push -fdo ci.skip origin fix/x", "/start"))  # still a delete push
+        self.assertEqual(find("git push origin fix/#12", "/start").branch, "fix/#12")
+        self.assertEqual(find("git push origin fix/x # ; git push origin main", "/start").branch, "fix/x")
+        self.assertEqual(find("cat <<$W > n.md\ngh pr create\n$W\ngit push origin fix/x", "/start"),
+                         post_hook.ReviewTrigger("push", "fix/x", "/start"))
+        self.assertEqual(find("x;((1<<3))\ngit push origin fix/x", "/start").branch, "fix/x")
+        self.assertEqual(find("((cd x; git push origin fix/y))\ngit push origin fix/x", "/start").branch, "fix/x")
+        self.assertEqual(find("((cd /wt); git push origin fix/x)", "/start"),
+                         post_hook.ReviewTrigger("push", "fix/x", "/wt"))
+        self.assertIsNone(find("((cd x; git push origin fix/x))", "/start"))
+        self.assertIsNone(find("let x=1<<3\ngit push origin fix/x", "/start"))
+        # An unclosed `((` command still never arms
+        with self.assertRaises(ValueError):
+            find("x;((1<<3\ngit push origin fix/x", "/start")
 
     def test_issue_115_branch_resolution_uses_the_command_directory(self):
         self.checkout_branches["/wt"] = "fix/from-worktree"
@@ -759,6 +836,49 @@ class TestPRReviewHooks(unittest.TestCase):
             "conversationId": "conv-parent", "executionNum": 1, "terminationReason": "model_stop", "fullyIdle": True})
         self.assertEqual(res.returncode, 0)
         self.assertEqual(json.loads(res.stdout)["decision"], "continue")
+
+
+class TestPRHookDoctorLine(unittest.TestCase):
+    """Issue #257: the doctor surfaces the PR review hook's detect_error events (informational only)."""
+
+    def setUp(self):
+        self.logs = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.logs, True)
+        self.now = 1_800_000_000.0
+
+    def _write(self, *lines):
+        with open(os.path.join(self.logs, "pr_hook_events.jsonl"), "w", encoding="utf-8") as f:
+            f.write("".join(line + "\n" for line in lines))
+
+    def test_counts_detect_errors_of_the_last_24h(self):
+        self.assertTrue(trading_doctor.pr_hook_detect_error_line(self.logs, self.now).startswith("0 "))  # no file
+        self._write(json.dumps({"event": "detect_error", "timestamp": self.now - 60}),
+                    json.dumps({"event": "detect_error", "timestamp": self.now - 23 * 3600}),
+                    json.dumps({"event": "detect_error", "timestamp": self.now - 25 * 3600}),  # too old
+                    json.dumps({"event": "review_pending", "timestamp": self.now - 60}),
+                    json.dumps({"event": "detect_error"}),  # no timestamp
+                    json.dumps(["not", "a", "dict"]), "{bad json")
+        line = trading_doctor.pr_hook_detect_error_line(self.logs, self.now)
+        self.assertTrue(line.startswith("2 PR review hook detect_error event(s) in the last 24h"), line)
+        self.assertNotIn(".jsonl", line)
+
+    def test_run_doctor_prints_the_line_and_never_fails_on_it(self):
+        doctor = t172.TestDoctorGuardianException("setUp")  # its offline run_doctor harness (exchange faked)
+        doctor.setUp()
+        self.addCleanup(doctor.doCleanups)
+        code, out = doctor._run_doctor(**{"sync_session_state.LOGS_DIR": self.logs})
+        self.assertIn("ℹ️  [PR-HOOK] 0 PR review hook detect_error event(s)", out)
+        self._write(json.dumps({"event": "detect_error", "timestamp": time.time()}))
+        code2, out2 = doctor._run_doctor(**{"sync_session_state.LOGS_DIR": self.logs})
+        self.assertEqual(code2, code)
+        self.assertIn("ℹ️  [PR-HOOK] 1 PR review hook detect_error event(s)", out2)
+        # An unreadable events file is reported, never a warning or a failure
+        with mock.patch("trading_doctor.pr_hook_detect_error_line", side_effect=PermissionError("denied")):
+            code3, out3 = doctor._run_doctor(**{"sync_session_state.LOGS_DIR": self.logs})
+        self.assertEqual(code3, code)
+        self.assertIn("ℹ️  [PR-HOOK] PR review hook events unreadable (PermissionError).", out3)
+        self.assertNotIn("⚠️  [PR-HOOK]", out3)
+        self.assertNotIn("❌ [PR-HOOK]", out3)
 
 
 if __name__ == "__main__":
