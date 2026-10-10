@@ -292,7 +292,8 @@ class TestChainGuardHistory(t267._RecheckWorkspace):
     def test_stripped_recheck_is_still_refused_via_history(self):
         record = self.record_recheck_and_strip()
         self.assertEqual(self.history_row(record)["recheck_of"], record["recheck_of"]["sha256"])
-        self.assertRefused("the latest dossier is already a re-check")
+        # Issue #284: the refusal names the session of the dossier that is already a re-check
+        self.assertRefused(f"the dossier of session {record['parent_conversation_id']} is already a re-check")
         with self.assertRaises(rcb.RecheckError):  # a known session reads the same history
             rcb.load_confirmed_plan(SYMBOL, DIRECTION, "prod", self.workspace,
                                     session=record["parent_conversation_id"])

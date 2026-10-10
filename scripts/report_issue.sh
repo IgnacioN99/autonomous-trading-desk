@@ -13,6 +13,8 @@
 # Issue #270: the body carries the same "Fingerprint ID" as report_agent_issue.py; before creating, an OPEN issue
 # with that fingerprint is looked up (report_agent_issue.py --find-open-issue, bounded) and, if found, reported
 # instead of a duplicate. Offline or on any lookup failure the report is created or queued as before.
+# Issue #284: a hit is also counted in the local fingerprint store; an open issue LESS severe than this report
+# (its severity:* label) never swallows it. --sync does no lookup.
 #
 # Every issue carries the mandatory labels severity:<level> and priority:<Px>
 # (priority defaults from severity: CRITICAL->P0, HIGH->P1, MEDIUM->P2, LOW->P3).
@@ -746,10 +748,10 @@ if command -v python3 >/dev/null 2>&1 && [ -f "$DEDUPE_HELPER" ]; then
     fi
     if type -P timeout >/dev/null 2>&1; then
         LOOKUP_OUT=$(timeout 10 python3 "$DEDUPE_HELPER" --find-open-issue --title "$TITLE" --error "$ERROR_DETAIL" \
-            --repo "$LOOKUP_REPO" </dev/null 2>/dev/null || true)
+            --severity "$SEVERITY" --repo "$LOOKUP_REPO" </dev/null 2>/dev/null || true)
     else
         LOOKUP_OUT=$(python3 "$DEDUPE_HELPER" --find-open-issue --title "$TITLE" --error "$ERROR_DETAIL" \
-            --repo "$LOOKUP_REPO" </dev/null 2>/dev/null || true)
+            --severity "$SEVERITY" --repo "$LOOKUP_REPO" </dev/null 2>/dev/null || true)
     fi
     while IFS=$'\t' read -r l_key l_val; do
         if [ "$l_key" = "fingerprint" ] && [[ "$l_val" =~ ^[0-9a-f]{16}$ ]]; then

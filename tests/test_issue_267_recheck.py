@@ -346,6 +346,11 @@ class _RecheckWorkspace(tdp.TranscriptFixture):
 
     def setUp(self):
         super().setUp()
+        # Issue #284: CLAUDE_CODE_SESSION_ID selects a dossier file; these fixtures run without one (hermetic)
+        env = patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop(rcb.SESSION_ENV, None)
         self.brief_path = os.path.join(self.workspace, "logs", "primed_brief.json")
         self.dossier_path = dp.default_dossier_path(self.workspace)
 
@@ -640,7 +645,9 @@ class TestRecorderRecheckLink(_RecheckWorkspace):
                     brief_bytes = f.read()
                 code, _, err = self.run_brief()
                 self.assertEqual(code, 2)
-                self.assertIn("the latest dossier is already a re-check: ask the user again or run a full scan", err)
+                # Issue #284: the refusal names the session of the dossier that is already a re-check
+                self.assertIn(f"the dossier of session {record['parent_conversation_id']} is already a re-check: "
+                              "ask the user again or run a full scan", err)
                 self.fetch.assert_not_called()
                 with open(self.brief_path, "rb") as f:
                     self.assertEqual(f.read(), brief_bytes)  # no new brief written

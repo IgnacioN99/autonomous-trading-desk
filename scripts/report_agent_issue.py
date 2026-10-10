@@ -18,9 +18,18 @@ Resilience Features:
    occurred within the past 24 hours, updates telemetry rather than spamming new issues. The fingerprint file's
    read-modify-write is serialised with utils/file_lock.py (best effort, never blocks). Issue #270 (sessions in
    parallel): before creating an issue, find_open_issue looks the fingerprint up in the OPEN GitHub issues (one
-   `gh issue list`, bounded by DEDUPE_LOOKUP_TIMEOUT_S = 5 s, the only extra latency for in-process callers); a hit
-   is counted locally instead of creating a duplicate, and any lookup failure creates or queues as before.
-   `--find-open-issue` exposes the same fingerprint and lookup to report_issue.sh.
+   `gh issue list`); a hit is counted locally instead of creating a duplicate, and any lookup failure creates or
+   queues as before. Issue #284: a hit whose `severity:*` label is LESS severe than the new report does not swallow
+   it (the new issue is created), and neither does a local 24 h record of a less severe report (records keep their
+   severity; one written before #284 deduplicates as before). An open issue without a `severity:*` label still
+   swallows even a CRITICAL report (both reporters always label their issues). Extra latency besides
+   the GitHub POST itself: the lookup plus up to 3 fingerprint-lock waits per call (the 24 h check, the hit or the
+   new record, and the backlog record when that write fails). In-process callers (executor, guardian, night
+   cutoff: report_issue() defaults) are bounded to INPROCESS_LOOKUP_TIMEOUT_S = 3 s + 3 x INPROCESS_LOCK_WAIT_S
+   = 1 s (worst case 6 s); the CLI keeps DEDUPE_LOOKUP_TIMEOUT_S = 5 s + 3 x file_lock.LOCK_WAIT_S = 2 s.
+   `--find-open-issue` exposes the same fingerprint, lookup and severity rule to report_issue.sh and records a hit
+   locally. Backlog sync (--sync-backlog, report_issue.sh --sync) does no lookup: it only skips fingerprints this
+   machine already published. The logs directory follows ISSUE_REPORTER_LOGS_DIR when set (as report_issue.sh).
 
 6. Structured Report: six-section body (scripts/utils/issue_telemetry.py, same headings as report_issue.sh)
    with runtime/ledger telemetry and mandatory severity:* + priority:* labels that are never silently dropped.
@@ -59,7 +68,7 @@ if SCRIPTS_DIR not in sys.path:
 
 from utils import issue_telemetry  # noqa: E402
 from utils import file_lock  # noqa: E402
-LOGS_DIR = os.path.join(BASE_DIR, "logs")
+LOGS_DIR = os.environ.get("ISSUE_REPORTER_LOGS_DIR") or os.path.join(BASE_DIR, "logs")
 BACKLOG_FILE = os.path.join(LOGS_DIR, "issues_backlog.jsonl")
 FINGERPRINTS_FILE = os.path.join(LOGS_DIR, "issues_fingerprints.json")
 DEFAULT_REPO = None
@@ -217,21 +226,45 @@ def save_fingerprints(data: Dict[str, Any]):
             pass
         raise
 
-def set_fingerprint(fingerprint: str, entry: Dict[str, Any]):
-    """Locked read-modify-write of one fingerprint record (issue #270: reporters of parallel sessions)."""
-    with file_lock.locked(FINGERPRINTS_FILE):
+def set_fingerprint(fingerprint: str, entry: Dict[str, Any], wait_s: Optional[float] = None):
+    """Locked read-modify-write of one fingerprint record (issue #270: reporters of parallel sessions). wait_s: the
+    lock wait (None: file_lock.LOCK_WAIT_S)."""
+    with file_lock.locked(FINGERPRINTS_FILE, wait_s):
         cache = load_fingerprints()
         cache[fingerprint] = entry
         save_fingerprints(cache)
 
-DEDUPE_LOOKUP_TIMEOUT_S = 5.0
+DEDUPE_LOOKUP_TIMEOUT_S = 5.0  # CLI (and report_issue.sh) open-issue lookup bound
+# Issue #284: report_issue() defaults for in-process callers (executor / guardian close and abort-failure paths)
+INPROCESS_LOOKUP_TIMEOUT_S = 3.0
+INPROCESS_LOCK_WAIT_S = 1.0
 FINGERPRINT_RE = re.compile(r"^[0-9a-f]{16}$")
+SEVERITY_LABEL_RE = re.compile(r"^severity:(critical|high|medium|low)$", re.IGNORECASE)
+
+def _issue_severity(labels: Any) -> Optional[str]:
+    """The most severe `severity:*` label of a gh issue (label objects or names), None when there is none."""
+    found = []
+    for label in labels if isinstance(labels, list) else []:
+        name = label.get("name") if isinstance(label, dict) else label
+        m = SEVERITY_LABEL_RE.match(str(name or "").strip())
+        if m:
+            found.append(m.group(1).upper())
+    return min(found, key=issue_telemetry.SEVERITIES.index) if found else None
+
+def severity_outranks(new: Any, existing: Any) -> bool:
+    """Issue #284: True when the new report's severity is higher (CRITICAL > HIGH > MEDIUM > LOW) than the open
+    issue's. An unknown severity on either side is False: the hit deduplicates as before."""
+    order = issue_telemetry.SEVERITIES
+    new, existing = str(new or "").upper(), str(existing or "").upper()
+    return new in order and existing in order and order.index(new) < order.index(existing)
 
 def find_open_issue(fingerprint: str, repo: Optional[str],
                     timeout: float = DEDUPE_LOOKUP_TIMEOUT_S) -> Optional[Dict[str, Any]]:
-    """Issue #270: {"number", "url"} of an OPEN issue of `repo` whose body carries `fingerprint` (the "Fingerprint ID"
-    row of both reporters), from one `gh issue list` call bounded by `timeout` seconds. None when there is none and
-    on ANY failure (no gh, unauthenticated, offline, timeout, unexpected output): the caller creates or queues."""
+    """Issue #270: {"number", "url", "severity"} of an OPEN issue of `repo` whose body carries `fingerprint` (the
+    "Fingerprint ID" row of both reporters; severity: its `severity:*` label, issue #284, else None; with several
+    matches the most severe one, unlabelled ones last), from one
+    `gh issue list` call bounded by `timeout` seconds. None when there is none and on ANY failure (no gh,
+    unauthenticated, offline, timeout, unexpected output): the caller creates or queues."""
     if not repo or not FINGERPRINT_RE.match(str(fingerprint or "")):
         return None
     try:
@@ -239,17 +272,46 @@ def find_open_issue(fingerprint: str, repo: Optional[str],
             return None
         res = subprocess.run(
             ["gh", "issue", "list", "--repo", repo, "--state", "open", "--search", f"{fingerprint} in:body",
-             "--json", "number,url,body", "--limit", "10"],
+             "--json", "number,url,body,labels", "--limit", "10"],
             capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL
         )
         if res.returncode != 0:
             return None
-        for item in json.loads(res.stdout or "[]"):
-            if isinstance(item, dict) and fingerprint in str(item.get("body") or "") and item.get("url"):
-                return {"number": item.get("number"), "url": item.get("url")}
+        matches = [{"number": item.get("number"), "url": item.get("url"),
+                    "severity": _issue_severity(item.get("labels"))}
+                   for item in json.loads(res.stdout or "[]")
+                   if isinstance(item, dict) and fingerprint in str(item.get("body") or "") and item.get("url")]
+        if matches:
+            # Issue #284: the most severe match (independent of gh's ordering); unlabelled ones rank last
+            return min(matches, key=lambda m: issue_telemetry.SEVERITIES.index(m["severity"])
+                       if m["severity"] else len(issue_telemetry.SEVERITIES))
     except Exception:
         return None
     return None
+
+def _more_severe(a: Any, b: Any) -> Optional[str]:
+    """The more severe of two severities (an unknown one is ignored); None when both are unknown."""
+    return b if severity_outranks(b, a) or (a not in issue_telemetry.SEVERITIES) else a
+
+def record_open_issue_hit(fingerprint: str, title: str, found: Dict[str, Any], now_ts: int,
+                          wait_s: Optional[float] = None, severity: Optional[str] = None) -> int:
+    """Counts a hit on an open issue in the local fingerprint store (locked); returns the occurrences. The record's
+    severity (issue #284) is the more severe of the issue's label and the report's."""
+    with file_lock.locked(FINGERPRINTS_FILE, wait_s):
+        fp_cache = load_fingerprints()
+        prev = fp_cache.get(fingerprint) if isinstance(fp_cache.get(fingerprint), dict) else {}
+        occurrences = prev.get("count", 1) + 1
+        fp_cache[fingerprint] = {
+            "title": title,
+            "issue_number": found.get("number"),
+            "html_url": found.get("url"),
+            "last_seen_ts": now_ts,
+            "count": occurrences,
+            "status": PUBLISHED_GITHUB,
+            "severity": _more_severe(found.get("severity"), str(severity or "").upper() or None)
+        }
+        save_fingerprints(fp_cache)
+    return occurrences
 
 def append_to_backlog(issue_payload: Dict[str, Any]):
     os.makedirs(LOGS_DIR, exist_ok=True)
@@ -441,13 +503,18 @@ def report_issue(
     context_file: str = "",
     output_file: str = "",
     impact: str = "",
-    acceptance_criteria: str = ""
+    acceptance_criteria: str = "",
+    lookup_timeout_s: float = INPROCESS_LOOKUP_TIMEOUT_S,
+    lock_wait_s: Optional[float] = INPROCESS_LOCK_WAIT_S
 ) -> Dict[str, Any]:
     """
     Main exportable function for subagents and desk scripts to report failures.
     Applies deduplication, markdown formatting, telemetry sanitization,
     and fail-safe dispatch (online or local backlog).
     Severity/priority are case-insensitive; priority defaults from severity. Invalid values raise ValueError.
+    lookup_timeout_s / lock_wait_s (issue #284): the open-issue lookup bound and each of the (up to 3)
+    fingerprint-lock waits; the defaults bound in-process callers (3 s + 3 x 1 s), main() passes the CLI values
+    (5 s, 2 s).
     """
     severity = issue_telemetry.normalize_severity(severity)
     priority = issue_telemetry.normalize_priority(priority, severity)
@@ -464,31 +531,27 @@ def report_issue(
     # 24-hour deduplication control (locked read-modify-write, issue #270)
     occurrences = None
     if not force_sync:
-        with file_lock.locked(FINGERPRINTS_FILE):
+        with file_lock.locked(FINGERPRINTS_FILE, lock_wait_s):
             fp_cache = load_fingerprints()
             entry = fp_cache.get(fingerprint)
-            if isinstance(entry, dict) and now_ts - entry.get("last_seen_ts", 0) < 86400:  # Less than 24h
+            # Less than 24h, and (issue #284) never a report more severe than the recorded one (a record without
+            # a severity, written before #284, deduplicates as before)
+            if (isinstance(entry, dict) and now_ts - entry.get("last_seen_ts", 0) < 86400
+                    and not severity_outranks(severity, entry.get("severity"))):
                 occurrences = entry.get("count", 1) + 1
                 entry["count"] = occurrences
                 entry["last_seen_ts"] = now_ts
                 save_fingerprints(fp_cache)
     if occurrences is None and not force_sync and target_repo and os.getenv("GITHUB_TOKEN"):
         # Issue #270: another session (or reporter) may already have an OPEN issue for this fingerprint
-        found = find_open_issue(fingerprint, target_repo)
-        if found:
-            with file_lock.locked(FINGERPRINTS_FILE):
-                fp_cache = load_fingerprints()
-                prev = fp_cache.get(fingerprint) if isinstance(fp_cache.get(fingerprint), dict) else {}
-                occurrences = prev.get("count", 1) + 1
-                fp_cache[fingerprint] = {
-                    "title": clean_title,
-                    "issue_number": found.get("number"),
-                    "html_url": found.get("url"),
-                    "last_seen_ts": now_ts,
-                    "count": occurrences,
-                    "status": PUBLISHED_GITHUB
-                }
-                save_fingerprints(fp_cache)
+        found = find_open_issue(fingerprint, target_repo, timeout=lookup_timeout_s)
+        if found and severity_outranks(severity, found.get("severity")):
+            # Issue #284: a less severe open issue never swallows this report
+            print(f"ℹ️ Open issue #{found.get('number')} carries fingerprint {fingerprint} at severity "
+                  f"{found.get('severity')}, lower than {severity}: creating a new issue.")
+        elif found:
+            occurrences = record_open_issue_hit(fingerprint, clean_title, found, now_ts, wait_s=lock_wait_s,
+                                                severity=severity)
             print(f"ℹ️ Open issue #{found.get('number')} ({found.get('url')}) already reports fingerprint {fingerprint}.")
     if occurrences is not None:
         msg = f"Deduplication active: Error '{clean_title}' was already reported previously (Occurrences: {occurrences}). Omitting duplicate issue."
@@ -546,8 +609,9 @@ def report_issue(
             "title": clean_title,
             "last_seen_ts": now_ts,
             "count": 1,
-            "status": "QUEUED_OFFLINE"
-        })
+            "status": "QUEUED_OFFLINE",
+            "severity": severity
+        }, wait_s=lock_wait_s)
         return issue_record
 
     token = os.getenv("GITHUB_TOKEN")
@@ -567,8 +631,9 @@ def report_issue(
                 "html_url": gh_res.get("html_url"),
                 "last_seen_ts": now_ts,
                 "count": 1,
-                "status": status
-            })
+                "status": status,
+                "severity": severity
+            }, wait_s=lock_wait_s)
 
             if gh_res.get("url_unknown"):
                 print("✅ GITHUB ISSUE CREATED (URL unknown: see the warning above)")
@@ -588,8 +653,9 @@ def report_issue(
         "title": clean_title,
         "last_seen_ts": now_ts,
         "count": 1,
-        "status": "QUEUED_OFFLINE"
-    })
+        "status": "QUEUED_OFFLINE",
+        "severity": severity
+    }, wait_s=lock_wait_s)
     return issue_record
 
 def _fingerprint_published(entry: Any) -> bool:
@@ -741,8 +807,10 @@ def main():
     parser.add_argument("--force", action="store_true", help="Bypass 24h deduplication and force issue creation")
     parser.add_argument("--find-open-issue", action="store_true",
                         help="Issue #270 (used by report_issue.sh): print 'fingerprint<TAB><fp>' for --title/--error "
-                             "and, only with --repo, 'open_issue<TAB><url>' when an OPEN issue carries it "
-                             "(bounded gh lookup; any failure prints nothing more). Never creates or queues.")
+                             "and, only with --repo, 'open_issue<TAB><url>' when an OPEN issue carries it and is not "
+                             "less severe than --severity (issue #284; the hit is then counted in the local "
+                             "fingerprint store). Bounded gh lookup; any failure prints nothing more. Never creates "
+                             "or queues an issue.")
 
     args = parser.parse_args()
 
@@ -754,10 +822,15 @@ def main():
         if not args.title or not args.error:
             parser.print_help()
             sys.exit(1)
-        fingerprint = compute_fingerprint(sanitize_telemetry(args.title), args.error)
+        clean_title = sanitize_telemetry(args.title)
+        fingerprint = compute_fingerprint(clean_title, args.error)
         print(f"fingerprint\t{fingerprint}")
         found = find_open_issue(fingerprint, args.repo) if args.repo else None
-        if found:
+        if found and not severity_outranks(args.severity, found.get("severity")):
+            try:  # issue #284: a shell dedupe hit is counted locally too (best effort: the dedupe stands)
+                record_open_issue_hit(fingerprint, clean_title, found, int(time.time()), severity=args.severity)
+            except Exception:
+                pass
             print(f"open_issue\t{found['url']}")
         return
 
@@ -783,7 +856,9 @@ def main():
         context_file=args.context_file,
         output_file=args.output_file,
         impact=args.impact,
-        acceptance_criteria=args.acceptance_criteria
+        acceptance_criteria=args.acceptance_criteria,
+        lookup_timeout_s=DEDUPE_LOOKUP_TIMEOUT_S,  # issue #284: the CLI keeps 5 s / 2 s
+        lock_wait_s=file_lock.LOCK_WAIT_S
     )
     print(json.dumps(res, indent=2, ensure_ascii=False))
 
