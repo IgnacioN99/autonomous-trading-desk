@@ -36,6 +36,12 @@ open / fills_unavailable rows and rows without realized R are excluded and count
    recommendation: per max_fee_r candidate 0.03-0.10, n / net expectancy / total net R of the trades the executor's
    fee-in-R gate would keep vs reject, utils.gate_limits.expected_fee_r of the stop distance; n < 10 flagged
    insufficient_n). The calibration store is unaffected (it keeps its own fields only).
+8. Entry quality (issue #269, new top-level keys over the resolved trades, data only): "immediate_stop_outs" (count
+   and share of trades with exit_reason SL, or all legs SL, and mfe_r < 0.3; rows without mfe_r are counted as
+   unavailable, outside the share), "mfe_distribution" (mfe_r histogram, edges 0 / 0.3 / 0.5 / 1 / 1.8 / 3 R, low
+   inclusive, plus mean / median), "expectancy_by_direction" (the direction_split expectancies, not recomputed) and
+   "expectancy_by_trigger_distance" (unavailable: real trades store no trigger; scripts/entry_policy_sim.py reports
+   it for shadow rows).
 "source" reports the file's age and the env / since stamped in its rows; the human output warns when it is older
 than 24 h or its env differs from --env.
 
@@ -278,6 +284,42 @@ def _direction_split(rows, r_values):
     return out
 
 
+# Issue #269: entry quality (data only). MFE histogram edges in R, (label, low inclusive, high exclusive).
+IMMEDIATE_MFE_R = 0.3
+MFE_BUCKETS = (("<0.3", 0.0, 0.3), ("0.3-0.5", 0.3, 0.5), ("0.5-1", 0.5, 1.0), ("1-1.8", 1.0, 1.8), ("1.8-3", 1.8, 3.0),
+               (">=3", 3.0, None))
+TRIGGER_DISTANCE_NOTE = ("Data note: trigger distance is not stored for real trades (no trigger price or price at "
+                         "placement in the audit record); see scripts/entry_policy_sim.py for the shadow view.")
+
+
+def _full_sl(row):
+    """exit_reason SL, or every leg an SL (trade_outcomes' full_sl)."""
+    legs = row.get("legs") if isinstance(row.get("legs"), list) else []
+    return row.get("exit_reason") == "SL" or (bool(legs) and all(isinstance(l, dict) and l.get("reason") == "SL"
+                                                                   for l in legs))
+
+
+def _immediate_stop_outs(rows):
+    """Closed trades stopped at SL whose MFE (trade_outcomes' mfe_r, up to the exit) stayed < IMMEDIATE_MFE_R; rows
+    without mfe_r (older rows, no klines) are counted as unavailable and kept out of the share."""
+    known = [r for r in rows if _num(r.get("mfe_r")) is not None]
+    count = sum(1 for r in known if _full_sl(r) and _num(r.get("mfe_r")) < IMMEDIATE_MFE_R)
+    return {"count": count, "share": round(count / len(known), 4) if known else None, "n_with_mfe_r": len(known),
+            "unavailable": len(rows) - len(known), "mfe_threshold_r": IMMEDIATE_MFE_R,
+            "definition": "exit_reason SL (or all legs SL) and mfe_r < 0.3"}
+
+
+def _mfe_distribution(rows):
+    """Histogram of mfe_r over MFE_BUCKETS (R; low inclusive, high exclusive) with mean and median."""
+    values = sorted(v for v in (_num(r.get("mfe_r")) for r in rows) if v is not None)
+    buckets = [{"bucket": label, "n": sum(1 for v in values if v >= lo and (hi is None or v < hi))}
+               for label, lo, hi in MFE_BUCKETS]
+    n = len(values)
+    median = None if not n else round(values[n // 2] if n % 2 else (values[n // 2 - 1] + values[n // 2]) / 2, 4)
+    return {"unit": "R", "edges": [lo for _l, lo, _h in MFE_BUCKETS] + [None], "buckets": buckets, "n": n,
+            "unavailable": len(rows) - n, "mean_mfe_r": _mean(values), "median_mfe_r": median}
+
+
 def _fee_threshold_backtest(rows):
     """Issue #268 (report only): for each FEE_BACKTEST_THRESHOLDS value, n / net expectancy / total net R of the rows
     the fee-in-R gate would keep (expected_fee_r <= threshold, as the gate) vs reject. Rows without a stop distance
@@ -468,6 +510,7 @@ def generate_scorecard(env, outcomes_path=None, now=None, write_calibration=Fals
         written = bool(atomic_write_json(scal.store_path(_workspace_dir()), store))
 
     n = len(resolved)
+    direction_split = _direction_split(resolved, r_values)
     performance = dict(stats)
     performance.update(
         mean_realized_r_gross=_mean(_num(r.get("realized_r_gross")) for r in resolved),
@@ -486,8 +529,13 @@ def generate_scorecard(env, outcomes_path=None, now=None, write_calibration=Fals
         "fees": _fees_block(resolved),
         "fees_by_stop_bucket": _fees_by_stop_bucket(resolved),
         "gross_vs_net": _gross_vs_net(resolved),
-        "direction_split": _direction_split(resolved, r_values),
+        "direction_split": direction_split,
         "fee_threshold_backtest": _fee_threshold_backtest(resolved),
+        "immediate_stop_outs": _immediate_stop_outs(resolved),
+        "mfe_distribution": _mfe_distribution(resolved),
+        "expectancy_by_direction": {"source": "direction_split",
+                                    **{d: s["expectancy_r"] for d, s in direction_split.items()}},
+        "expectancy_by_trigger_distance": {"available": False, "note": TRIGGER_DISTANCE_NOTE},
         "score_calibration": _calibration_block(store, min_trades, written, min_lcb_r),
         "insights": {"env_agnostic": True, "loss_cause_clusters": cause_clusters},
         "recommendations": _recommendations(n, stats["expectancy_r"], stats["profit_factor_r"], cause_clusters,
@@ -535,6 +583,23 @@ def _fee_report_lines(sc: dict) -> list:
     return lines
 
 
+def _entry_report_lines(sc: dict) -> list:
+    """Issue #269 report section (data only, never an instruction): immediate stop-outs, MFE histogram."""
+    imm, mfe = sc.get("immediate_stop_outs") or {}, sc.get("mfe_distribution") or {}
+    share = imm.get("share")
+    lines = ["🚪 ENTRY QUALITY (data, not an instruction):",
+             f"  • Immediate stop-outs (SL with MFE < {imm.get('mfe_threshold_r', IMMEDIATE_MFE_R)}R): "
+             f"{imm.get('count', 0)} of {imm.get('n_with_mfe_r', 0)} trades with mfe_r "
+             f"({_fmt(share * 100 if share is not None else None, '.1f')}%) | without mfe_r: {imm.get('unavailable', 0)}",
+             f"  • MFE (R): n={mfe.get('n', 0)} | mean {_fmt(mfe.get('mean_mfe_r'), '.2f')} | median "
+             f"{_fmt(mfe.get('median_mfe_r'), '.2f')} | without mfe_r: {mfe.get('unavailable', 0)}",
+             "  • MFE histogram: " + " | ".join(f"{b['bucket']}: {b['n']}" for b in mfe.get("buckets") or []),
+             "  • Expectancy by direction: see BY DIRECTION above (direction_split).",
+             f"  {TRIGGER_DISTANCE_NOTE}",
+             "-" * 70]
+    return lines
+
+
 def format_scorecard_report(sc: dict) -> str:
     p = sc["performance"]
     src = sc["source"]
@@ -562,6 +627,7 @@ def format_scorecard_report(sc: dict) -> str:
                      f"Expectancy: {_fmt(stats['expectancy_r'], '+.4f')}R")
     lines.append("-" * 70)
     lines.extend(_fee_report_lines(sc))
+    lines.extend(_entry_report_lines(sc))
     cal = sc.get("score_calibration")
     if cal:
         lines.append("🎯 CALIBRATION BY SCORE BUCKET (dossier score; heuristic, not a probability; PROD):")
