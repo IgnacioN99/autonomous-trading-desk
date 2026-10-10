@@ -39,7 +39,7 @@ graph TD
     end
 
     subgraph L3 ["Layer 3: Deterministic Context Primer"]
-        BRIEF["scripts/prime_evaluator_brief.py<br/>• Compacts 35k chat tokens into &lt; 1,800 token brief<br/>• Zero information loss, zero hallucination"]
+        BRIEF["scripts/prime_evaluator_brief.py<br/>• Compacts 35k chat tokens into &lt; 3,000 token brief<br/>• Zero information loss, zero hallucination"]
     end
 
     subgraph L4 ["Layer 4: Clean-Room Isolated Evaluator"]
@@ -78,7 +78,7 @@ Natural language instructions are not a reliable safety barrier in live financia
 - **Daily Loss Gate (opening orders only):** in PROD the executor reads today's (UTC) fills live (`GET /fapi/v1/userTrades`) and refuses a new entry once the day's net realized PnL (realized PnL minus USDT commissions) is at or below -`daily_stop_r` (default 3) x `risk_pct_equity` x the start-of-day equity, or after `max_consecutive_sl` (default 2) consecutive full stop-losses (trades closed today at <= -0.8R net; a scratch or a winner ends the streak, a smaller loss neither adds nor ends it); YOLO entries also stop after `yolo_max_daily_losses` (default 1) YOLO full losses. Unreadable or truncated fills, trades that cannot be counted per trade, and MCP mode (the gateway does not serve `userTrades`) refuse every PROD opening (fail closed). No profile value turns the gate off: the limits only accept values > 0 / >= 1 (invalid = default). It resets at 00:00 UTC; close, break-even, heal and protect commands never consult it; TESTNET skips it. `sync_session_state.py`, the brief and the doctor show its cached state.
 
 ### 2. Clean-Room Context Isolation
-Long conversational histories accumulate token baggage, emotional bias from past streaks, and prompt drift. ATD packs real-time exchange data into an ultra-dense brief (< 1,800 tokens) and spawns an ephemeral clean-room evaluator (`isolated_market_evaluator`) with:
+Long conversational histories accumulate token baggage, emotional bias from past streaks, and prompt drift. ATD packs real-time exchange data into an ultra-dense brief (< 3,000 tokens) and spawns an ephemeral clean-room evaluator (`isolated_market_evaluator`) with:
 * **Canonical XML Hierarchy:** `<identity_and_role>`, `<operational_rules>`, `<negative_constraints>`, `<deliberation_protocol>`, `<few_shot_examples>`, `<output_contract>`.
 * **Negative Few-Shots:** Explicit exemplars training the agent when **NOT** to act (e.g. aborting Longs on Delta gates, rejecting low-volume "Fake Tier S" setups, suppressing redundant search calls).
 * **Forced Deliberation Checklist:** A mandatory, visible `## Precondition Checklist` (delta gate, brief freshness, institutional volume, friction, macro and catalyst checks, each with the brief value and a PASS/FAIL result) published before the Master Dossier. No XML scratch tags: Claude rejects them.
@@ -433,7 +433,7 @@ autonomous-trading-desk/
 │   ├── funding_arbitrage.py           # Cash-and-carry & delta-neutral pairs
 │   ├── market_regime.py               # Macro BTC regime classifier
 │   ├── microstructure_engine.py       # CVD, taker ratios, tape imbalance
-│   ├── prime_evaluator_brief.py       # Context packing engine (<1,800 tokens)
+│   ├── prime_evaluator_brief.py       # Context packing engine (<3,000 tokens)
 │   ├── quant_risk_engine.py           # MacKinnon 2010 cointegration & dynamic equity sizing
 │   ├── record_evaluation.py           # Records the evaluator dossier (--from-subagent)
 │   ├── remember_trade_lesson.py       # Append-only immutable memory

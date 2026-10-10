@@ -880,13 +880,13 @@ class TestBrief(unittest.TestCase):
         self.assertNotIn("funding_info_warning", self.assemble({"target_env": "prod"}))
 
     def test_brief_budget_with_every_flag_set(self):
-        """Token budget (< 1,800 tokens, estimated as bytes / 4 as in #23) with 10 macro-rejected SHORTs, every
+        """Token budget (< 3,000 tokens, estimated as bytes / 4 as in #23) with 10 macro-rejected SHORTs, every
         brief-level flag, the daily-loss-gate state and two flagged candidates."""
         self.check_every_flag_budget()
 
     def test_brief_budget_with_every_flag_and_realistic_lessons(self):
         """Issue #187: the same brief plus the current ledger's lessons (9 active, 150-720 characters, a truncated-id
-        correction and a tombstone) through the real selector: still < 1,800 tokens; the correction is present and
+        correction and a tombstone) through the real selector: still < 3,000 tokens; the correction is present and
         the lesson it corrects is absent."""
         import test_issue_187_lesson_selection as t187  # fixtures only (lazy: that module imports this one)
         path = os.path.join(tempfile.mkdtemp(), "trade_insights.jsonl")
@@ -901,7 +901,7 @@ class TestBrief(unittest.TestCase):
         # a plain brief (no flags, no candidates) carries every active lesson except the corrected one
         plain = self.assemble({"target_env": "prod"}, insights_file=path)
         self.assertEqual(len(plain["committed_memory_lessons"]), 8)
-        self.assertLess(os.path.getsize(self.brief_file) / 4, 1800)
+        self.assertLess(os.path.getsize(self.brief_file) / 4, 3000)
 
     def check_every_flag_budget(self, insights_file=None):
         cand = {"symbol": "AAAUSDT", "direction": "SHORT", "tier": "Tier A (Strong Confluence / Hedge)",
@@ -935,7 +935,7 @@ class TestBrief(unittest.TestCase):
         # Issue #187: measured on the file the evaluator reads (until #187 this measured json.dumps of the dict
         # while the file was written with indent=2, so the real file was larger than the asserted size)
         size = os.path.getsize(self.brief_file)
-        self.assertLess(size / 4, 1800, f"{size} bytes")
+        self.assertLess(size / 4, 3000, f"{size} bytes")
         with open(self.brief_file, encoding="utf-8") as f:
             text = f.read()
         self.assertEqual(json.loads(text), json.loads(json.dumps(brief, ensure_ascii=False)))

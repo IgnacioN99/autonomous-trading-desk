@@ -53,7 +53,7 @@ Rigorously audit the following agentic architecture principles:
    - An agent must never rely on its conversation memory or on unsynchronized local variables to know whether it is exposed to the market.
 
 4. **Context Packing & Clean-Room Evaluator:**
-   - Evaluator subagents (`isolated_market_evaluator`, defined in `.agents/agents/isolated_market_evaluator/agent.md` and invoked with `invoke_subagent`; its verdict is recorded with `scripts/record_evaluation.py --from-subagent <conversationId>`) must run in an ephemeral, clean context, receiving an ultra-dense, deterministically generated brief (<1,800 tokens via `scripts/prime_evaluator_brief.py`).
+   - Evaluator subagents (`isolated_market_evaluator`, defined in `.agents/agents/isolated_market_evaluator/agent.md` and invoked with `invoke_subagent`; its verdict is recorded with `scripts/record_evaluation.py --from-subagent <conversationId>`) must run in an ephemeral, clean context, receiving an ultra-dense, deterministically generated brief (<3,000 tokens via `scripts/prime_evaluator_brief.py`).
    - This avoids attention degradation and the "long-context blindness" accumulated in long chats.
    - The same isolation applies to the PR reviewer subagents (`.agents/agents/*_reviewer/agent.md`): read-only tools, `commandExecutionPolicy: "off"`, verdicts assembled from their transcripts.
 
