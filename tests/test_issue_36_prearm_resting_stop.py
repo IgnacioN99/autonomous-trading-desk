@@ -2,10 +2,11 @@
 """
 test_issue_36_prearm_resting_stop.py - Offline tests for issues #36, #39 and #118 (protect-pending hardening).
 
-#36  A resting entry (untriggered STOP_MARKET, resting LIMIT) gets its planned Stop Loss pre-armed at placement as a
-     closePosition STOP_MARKET on KEYS when it is not crossed; the record (schema v2) stores the outcome; the guardian
-     verifies the pre-arm at fill (no second placement), places the planned stop when it was consumed, reads -4130 as
-     "kept", and cancels the pre-arm (by algo id only) on every entry-ending path without a position.
+#36  A resting LIMIT entry gets its planned Stop Loss pre-armed at placement as a closePosition STOP_MARKET on KEYS
+     when it is not crossed; an untriggered STOP_MARKET entry never is (issue #232: skipped:no_position, Binance
+     answers -4509 on a flat symbol; the guardian places its SL at fill). The record (schema v2) stores the outcome;
+     the guardian verifies the pre-arm at fill (no second placement), places the planned stop when it was consumed,
+     reads -4130 as "kept", and cancels the pre-arm (by algo id only) on every entry-ending path without a position.
 #39  KEYS closePosition stops are never resized; the inline partial-fill abort and the crossed-SL close use the live
      size (the entry remainder is cancelled first); a failed crossed close in place mode gets an orphan-heal stop; the
      audit record logs the real R:R to TP2, the TP1 distance and fill-quality flags.
